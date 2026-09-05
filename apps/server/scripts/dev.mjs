@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { superviseWorker } from "./worker-supervisor.mjs";
 
 const commonArgs = [
   "--watch",
@@ -12,17 +13,23 @@ const children = [
     stdio: "inherit",
     env: process.env,
   }),
-  spawn(process.execPath, [...commonArgs, "./src/worker.ts"], {
+];
+
+// Worker code changes require a dev restart; never abandon in-flight paid jobs
+// merely because a shared source file was edited.
+const worker = superviseWorker({ spawnWorker: () =>
+  spawn(process.execPath, [...commonArgs.filter(arg => arg !== "--watch"), "./src/worker.ts"], {
     stdio: "inherit",
     env: { ...process.env, WORKER_ID: process.env.WORKER_ID ?? "w1" },
   }),
-];
+});
 
 let stopping = false;
 
 function stop(exitCode = 0) {
   if (stopping) return;
   stopping = true;
+  worker.stop();
   for (const child of children) {
     if (!child.killed) child.kill();
   }

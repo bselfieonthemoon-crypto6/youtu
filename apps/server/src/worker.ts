@@ -20,8 +20,9 @@ import {
   type ExecutorContext,
   getExecutor,
 } from "./features/jobs/job-executor.js";
-import { createJobService } from "./features/jobs/job-service.js";
+import { createJobService, JobServiceError } from "./features/jobs/job-service.js";
 import { type PgmqMessage, createPgmqClient } from "./queue/pgmq-client.js";
+import { trackTask } from "./queue/track-task.js";
 import { createAdminSupabaseClient } from "./supabase/admin.js";
 import { createUserSupabaseClientFactory } from "./supabase/user.js";
 
@@ -329,7 +330,7 @@ async function main() {
               }
             },
           };
-          const task = processMessage(
+          trackTask(inFlight, () => processMessage(
             queue,
             msg,
             ctx,
@@ -338,8 +339,10 @@ async function main() {
             workspaceProviderResolver,
             designJobFinalizer,
             designPreviewFailures,
-          ).finally(() => inFlight.delete(task));
-          inFlight.add(task);
+          ), (error) => console.error(
+            `${tag} Task infrastructure error queue=${queue} msgId=${msg.msg_id}; retained for recovery:`,
+            error,
+          ));
         }
       } catch (err) {
         console.error(`${tag} Error polling ${queue}:`, err);
@@ -403,7 +406,17 @@ export async function processMessage(
   // never reach a provider.
   const claimed = await ctx.jobService.markRunning(jobId);
   if (!claimed) {
-    const job = await ctx.jobService.getJobAdmin(jobId);
+    const job = await ctx.jobService.getJobAdmin(jobId).catch(async (error) => {
+      if (error instanceof JobServiceError && error.code === "job_not_found") {
+        // A deleted job can leave a queue message behind. Only a confirmed
+        // missing row is terminal; transient lookup failures must be retried.
+        await ctx.pgmq.archive(queue, msg.msg_id);
+        console.warn(`${tag} Archived orphan message ${msg.msg_id} for missing job ${jobId}`);
+        return null;
+      }
+      throw error;
+    });
+    if (!job) return;
     if (job.status === "canceled") {
       await refundTerminalJob(jobId, "canceled", ctx, creditService, tag);
       await ctx.pgmq.archive(queue, msg.msg_id);

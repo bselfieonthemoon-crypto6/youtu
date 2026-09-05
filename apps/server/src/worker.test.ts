@@ -2,9 +2,32 @@ import { describe, expect, it, vi } from "vitest";
 
 import { registerDesignAsyncExecutors } from "./features/designs/design-async-worker.js";
 import { getExecutor, registerExecutor } from "./features/jobs/job-executor.js";
+import { JobServiceError } from "./features/jobs/job-service.js";
 import { WORKER_QUEUES, processMessage, refundTerminalJob } from "./worker.js";
 
 describe("worker claim gate", () => {
+  it.each(["job_not_found", "job_query_failed"] as const)("distinguishes orphan messages from %s lookup errors", async (code) => {
+    const archive = vi.fn(async () => true);
+    const incrementAttempt = vi.fn();
+    const error = new JobServiceError(code, 'lookup error', code === 'job_not_found' ? 404 : 500);
+    const ctx = { jobService: {
+      markRunning: vi.fn(async () => false),
+      getJobAdmin: vi.fn(async () => { throw error; }),
+      incrementAttempt,
+    }, pgmq: { archive } };
+    const pending = processMessage('image_generation_jobs', {
+      msg_id: 81, read_ct: 1, enqueued_at: '', vt: '',
+      message: { job_id: 'deleted-job', job_type: 'image_generation' },
+    }, ctx as never, {} as never, '[worker:test]');
+    if (code === 'job_not_found') {
+      await expect(pending).resolves.toBeUndefined();
+      expect(archive).toHaveBeenCalledWith('image_generation_jobs', 81);
+    } else {
+      await expect(pending).rejects.toBe(error);
+      expect(archive).not.toHaveBeenCalled();
+    }
+    expect(incrementAttempt).not.toHaveBeenCalled();
+  });
   it("consumes preview and export queues and makes unavailable renderers terminal", async () => {
     expect(WORKER_QUEUES).toEqual(
       expect.arrayContaining(["design_preview_jobs", "design_export_jobs"]),

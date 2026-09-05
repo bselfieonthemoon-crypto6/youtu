@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readImageDimensions } from "./image-dimensions.js";
 import { generateImage } from "../../../generation/image-generation.js";
 import { resolveImageProviderName } from "../../../generation/providers/registry.js";
 import { safeDownload } from "../../../security/safe-download.js";
@@ -249,6 +250,7 @@ registerExecutor(
       }
 
       // Upload user-owned media to the private workspace-assets bucket.
+      const dimensions = await readImageDimensions(buffer);
       const timestamp = Date.now();
       const objectPath = `${workspaceId}/generated/${timestamp}-${jobId}.png`;
 
@@ -298,8 +300,8 @@ registerExecutor(
         asset_id: (assetRow as { id: string }).id,
         signed_url: urlData.signedUrl,
         object_path: objectPath,
-        width: generated.width,
-        height: generated.height,
+        width: dimensions.width,
+        height: dimensions.height,
         mime_type: outputMimeType,
       };
     } finally {
