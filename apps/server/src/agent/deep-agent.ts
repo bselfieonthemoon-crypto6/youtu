@@ -24,6 +24,7 @@ import {
   LOOMIC_THINKING_MODE_PROMPT,
 } from "./prompts/loomic-main.js";
 import { createVideoSubAgent } from "./sub-agents.js";
+import { buildDesignGuidance } from "./prompts/design-guidance.js";
 import type { DesignToolDependencies } from "./tools/design-tools.js";
 import type {
   PersistImageFn,
@@ -133,6 +134,8 @@ export function createLoomicDeepAgent(options: {
       .join("\n");
     systemPrompt += `\n\n## Skills\n\nThe following skills are enabled in this workspace:\n${skillsList}`;
   }
+
+  systemPrompt += buildDesignGuidance(wsSkills);
 
   return createDeepAgent({
     backend: backendResult.factory,
