@@ -2,6 +2,7 @@ import type {
   AssetSignedUrlResponse,
   CanvasDetail,
   ChatMessageCreateRequest,
+  CreateImageJobRequest,
   JobResponse,
   MarketplaceDetail,
   MarketplaceSearchResponse,
@@ -25,10 +26,46 @@ import type {
   ViewerResponse,
   WorkspaceSettingsResponse,
   WorkspaceSkillListResponse,
+  ProviderConfigCreateRequest,
+  ProviderConfigListResponse,
+  ProviderConfigResponse,
+  ProviderConfigUpdateRequest,
+  ProviderConnectionTestResponse,
+  ProviderModelDiscoveryResponse,
+  WorkspaceMemberCreateRequest,
+  WorkspaceMemberListResponse,
+  WorkspaceMemberResponse,
+  WorkspaceMemberUpdateRequest,
+} from "@loomic/shared";
+import {
+  canvasGetResponseSchema,
+  canvasSaveResponseSchema,
+  providerConfigListResponseSchema,
+  providerConfigResponseSchema,
+  providerConnectionTestResponseSchema,
+  providerModelDiscoveryResponseSchema,
+  workspaceMemberListResponseSchema,
+  workspaceMemberResponseSchema,
 } from "@loomic/shared";
 
 import { dedupeRequest } from "./dedupe-request";
 import { getServerBaseUrl } from "./env";
+import {
+  parseAgentRunDetailResponse,
+  parseAgentRunListPage,
+  type AgentRunDetail,
+  type AgentRunListPage,
+} from "./agent-run-history";
+
+export type {
+  AgentRunDetail,
+  AgentRunExecutionMode,
+  AgentRunListPage,
+  AgentRunStatus,
+  AgentRunSummary,
+  AgentRunToolCounts,
+  AgentRunToolExecutionDetail,
+} from "./agent-run-history";
 
 // --- Error types ---
 
@@ -187,7 +224,9 @@ export async function fetchCanvas(
     { headers: authHeaders(accessToken) },
   );
   if (!response.ok) return handleErrorResponse(response);
-  return (await response.json()) as { canvas: CanvasDetail };
+  return canvasGetResponseSchema.parse(await response.json()) as {
+    canvas: CanvasDetail;
+  };
 }
 
 export async function saveCanvas(
@@ -198,7 +237,7 @@ export async function saveCanvas(
     appState: Record<string, unknown>;
     files: Record<string, Record<string, unknown>>;
   },
-): Promise<void> {
+): Promise<number> {
   const response = await fetch(
     `${getServerBaseUrl()}/api/canvases/${canvasId}`,
     {
@@ -208,6 +247,7 @@ export async function saveCanvas(
     },
   );
   if (!response.ok) return handleErrorResponse(response);
+  return canvasSaveResponseSchema.parse(await response.json()).revision;
 }
 
 export async function uploadThumbnail(
@@ -266,8 +306,13 @@ export async function updateWorkspaceSettings(
   return (await response.json()) as WorkspaceSettingsResponse;
 }
 
-export async function fetchModels(): Promise<ModelListResponse> {
-  const response = await fetch(`${getServerBaseUrl()}/api/models`);
+export async function fetchModels(
+  accessToken?: string,
+): Promise<ModelListResponse> {
+  const url = `${getServerBaseUrl()}/api/models`;
+  const response = accessToken
+    ? await fetch(url, { headers: authHeaders(accessToken) })
+    : await fetch(url);
   if (!response.ok) {
     throw new Error(`Failed to fetch models: ${response.status}`);
   }
@@ -415,6 +460,7 @@ export async function deleteAsset(
 
 export type GenerateImageResponse = {
   url: string;
+  assetId: string;
   prompt: string;
   mimeType: string;
   width: number;
@@ -423,6 +469,7 @@ export type GenerateImageResponse = {
 
 export type ImageModelInfo = {
   id: string;
+  supportsExact2K?: boolean;
   displayName: string;
   description: string;
   provider: string;
@@ -432,10 +479,13 @@ export type ImageModelInfo = {
   minTier?: string;
 };
 
-export async function fetchImageModels(): Promise<{
+export async function fetchImageModels(accessToken?: string): Promise<{
   models: ImageModelInfo[];
 }> {
-  const response = await fetch(`${getServerBaseUrl()}/api/image-models`);
+  const url = `${getServerBaseUrl()}/api/image-models`;
+  const response = accessToken
+    ? await fetch(url, { headers: authHeaders(accessToken) })
+    : await fetch(url);
   if (!response.ok) {
     throw new Error(`Failed to fetch image models: ${response.status}`);
   }
@@ -477,10 +527,13 @@ export type VideoModelInfo = {
   };
 };
 
-export async function fetchVideoModels(): Promise<{
+export async function fetchVideoModels(accessToken?: string): Promise<{
   models: VideoModelInfo[];
 }> {
-  const response = await fetch(`${getServerBaseUrl()}/api/video-models`);
+  const url = `${getServerBaseUrl()}/api/video-models`;
+  const response = accessToken
+    ? await fetch(url, { headers: authHeaders(accessToken) })
+    : await fetch(url);
   if (!response.ok) {
     throw new Error(`Failed to fetch video models: ${response.status}`);
   }
@@ -562,6 +615,262 @@ export async function fetchJob(
   });
   if (!response.ok) return handleErrorResponse(response);
   return (await response.json()) as JobResponse;
+}
+
+export async function createImageGenerationJob(
+  accessToken: string,
+  payload: CreateImageJobRequest,
+): Promise<JobResponse> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/jobs/image-generation`,
+    {
+      method: "POST",
+      headers: authJsonHeaders(accessToken),
+      body: JSON.stringify(payload),
+    },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as JobResponse;
+}
+
+export async function recognizeCanvasImageText(
+  accessToken: string,
+  canvasId: string,
+  image: { assetId: string; url: string; mimeType: string },
+): Promise<{ texts: string[] }> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/images/recognize-text`,
+    {
+      method: "POST",
+      headers: authJsonHeaders(accessToken),
+      body: JSON.stringify({ canvasId, image }),
+    },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  const payload = (await response.json()) as { texts?: unknown };
+  return {
+    texts: Array.isArray(payload.texts)
+      ? payload.texts.filter((item): item is string => typeof item === "string")
+      : [],
+  };
+}
+
+// --- Workspace provider configurations (admin only) ---
+
+export async function fetchProviderConfigs(
+  accessToken: string,
+): Promise<ProviderConfigListResponse> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/workspace/provider-configs`,
+    { headers: authHeaders(accessToken) },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return providerConfigListResponseSchema.parse(await response.json());
+}
+
+export async function createProviderConfig(
+  accessToken: string,
+  data: ProviderConfigCreateRequest,
+): Promise<ProviderConfigResponse> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/workspace/provider-configs`,
+    {
+      method: "POST",
+      headers: authJsonHeaders(accessToken),
+      body: JSON.stringify(data),
+    },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return providerConfigResponseSchema.parse(await response.json());
+}
+
+export async function updateProviderConfig(
+  accessToken: string,
+  providerId: string,
+  data: ProviderConfigUpdateRequest,
+): Promise<ProviderConfigResponse> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/workspace/provider-configs/${encodeURIComponent(providerId)}`,
+    {
+      method: "PUT",
+      headers: authJsonHeaders(accessToken),
+      body: JSON.stringify(data),
+    },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return providerConfigResponseSchema.parse(await response.json());
+}
+
+export async function deleteProviderConfig(
+  accessToken: string,
+  providerId: string,
+): Promise<void> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/workspace/provider-configs/${encodeURIComponent(providerId)}`,
+    { method: "DELETE", headers: authHeaders(accessToken) },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+}
+
+export async function testProviderConnection(
+  accessToken: string,
+  providerId: string,
+): Promise<ProviderConnectionTestResponse> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/workspace/provider-configs/${encodeURIComponent(providerId)}/test`,
+    { method: "POST", headers: authHeaders(accessToken) },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return providerConnectionTestResponseSchema.parse(await response.json());
+}
+
+export async function discoverProviderModels(
+  accessToken: string,
+  providerId: string,
+): Promise<ProviderModelDiscoveryResponse> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/workspace/provider-configs/${encodeURIComponent(providerId)}/discover-models`,
+    { method: "POST", headers: authHeaders(accessToken) },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return providerModelDiscoveryResponseSchema.parse(await response.json());
+}
+
+// --- Workspace members (owner/admin only) ---
+
+export async function fetchWorkspaceMembers(
+  accessToken: string,
+): Promise<WorkspaceMemberListResponse> {
+  const response = await fetch(`${getServerBaseUrl()}/api/workspace/members`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return workspaceMemberListResponseSchema.parse(await response.json());
+}
+
+export async function addWorkspaceMember(
+  accessToken: string,
+  data: WorkspaceMemberCreateRequest,
+): Promise<WorkspaceMemberResponse> {
+  const response = await fetch(`${getServerBaseUrl()}/api/workspace/members`, {
+    method: "POST",
+    headers: authJsonHeaders(accessToken),
+    body: JSON.stringify(data),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return workspaceMemberResponseSchema.parse(await response.json());
+}
+
+export async function updateWorkspaceMember(
+  accessToken: string,
+  userId: string,
+  data: WorkspaceMemberUpdateRequest,
+): Promise<WorkspaceMemberResponse> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/workspace/members/${encodeURIComponent(userId)}`,
+    {
+      method: "PATCH",
+      headers: authJsonHeaders(accessToken),
+      body: JSON.stringify(data),
+    },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return workspaceMemberResponseSchema.parse(await response.json());
+}
+
+export async function removeWorkspaceMember(
+  accessToken: string,
+  userId: string,
+): Promise<void> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/workspace/members/${encodeURIComponent(userId)}`,
+    { method: "DELETE", headers: authHeaders(accessToken) },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+}
+
+// --- Agent Run History API ---
+
+export async function fetchSessionRuns(
+  accessToken: string,
+  sessionId: string,
+  options: { cursor?: string; limit?: number } = {},
+): Promise<AgentRunListPage> {
+  if (
+    options.limit !== undefined &&
+    (!Number.isInteger(options.limit) ||
+      options.limit < 1 ||
+      options.limit > 50)
+  ) {
+    throw new RangeError("Run history limit must be an integer from 1 to 50.");
+  }
+
+  const query = new URLSearchParams();
+  if (options.cursor) query.set("cursor", options.cursor);
+  if (options.limit !== undefined) query.set("limit", String(options.limit));
+  const suffix = query.size > 0 ? `?${query.toString()}` : "";
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/chat/sessions/${encodeURIComponent(sessionId)}/runs${suffix}`,
+    { headers: authHeaders(accessToken) },
+  );
+  if (!response.ok) return handleRunHistoryErrorResponse(response);
+  return parseAgentRunListPage(await readJsonResponse(response));
+}
+
+export async function fetchAgentRunDetail(
+  accessToken: string,
+  sessionId: string,
+  runId: string,
+): Promise<AgentRunDetail> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/chat/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}`,
+    { headers: authHeaders(accessToken) },
+  );
+  if (!response.ok) return handleRunHistoryErrorResponse(response);
+  return parseAgentRunDetailResponse(await readJsonResponse(response));
+}
+
+async function handleRunHistoryErrorResponse(
+  response: Response,
+): Promise<never> {
+  if (response.status === 401) throw new ApiAuthError();
+  const body = await response.json().catch(() => null);
+  const code = body?.error?.code ?? `http_${response.status}`;
+  const message = body?.error?.message ?? body?.message ?? "Request failed";
+  throw new ApiApplicationError(code, message);
+}
+
+async function readJsonResponse(response: Response): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch {
+    throw new ApiApplicationError(
+      "invalid_response",
+      "Server returned an invalid JSON response.",
+    );
+  }
+}
+
+export type RestoreJobToCanvasResponse = {
+  jobId: string;
+  canvasId: string;
+  elementId: string;
+  inserted: boolean;
+};
+
+export async function restoreJobToCanvas(
+  accessToken: string,
+  jobId: string,
+): Promise<RestoreJobToCanvasResponse> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/jobs/${encodeURIComponent(jobId)}/restore-to-canvas`,
+    {
+      method: "POST",
+      headers: authHeaders(accessToken),
+    },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as RestoreJobToCanvasResponse;
 }
 
 // --- Skills API ---

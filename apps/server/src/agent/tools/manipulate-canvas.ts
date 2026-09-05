@@ -1,5 +1,18 @@
 import { tool } from "langchain";
 import { z } from "zod";
+import type { CanvasContent } from "@loomic/shared";
+import { mergeCanvasContent } from "../../features/canvas/canvas-content-merge.js";
+import {
+  garbageCollectOrphanAssets,
+  reconcileCanvasAssetReferences,
+} from "../../features/canvas/canvas-asset-references.js";
+import {
+  assertDestructiveTargetsUnchanged,
+  type DestructiveConfirmationService,
+  type DestructiveProposal,
+  type DestructiveTarget,
+  type FrozenCanvasOperation,
+} from "../../features/agent-actions/destructive-confirmation-service.js";
 import {
   CanvasElement,
   HandlerResult,
@@ -103,6 +116,34 @@ const manipulateCanvasSchema = z.object({
 
 // Flat operation type — all fields optional except `action`.
 type Operation = z.infer<typeof operationSchema>;
+
+const MAX_CANVAS_WRITE_ATTEMPTS = 3;
+
+/**
+ * Destructive canvas operations require an explicit instruction in the raw
+ * user message for the current run. This deliberately does not inspect the
+ * model's rewritten plan: generating or refining a design never implies that
+ * previous results may be removed.
+ */
+export function hasExplicitCanvasDeleteIntent(prompt: unknown): boolean {
+  if (typeof prompt !== "string") return false;
+
+  const text = prompt.trim().toLowerCase();
+  if (!text) return false;
+
+  const deleteVerb =
+    /(?:删除|删掉|删了|移除|清除|清空|去掉|丢弃|delete|remove|clear|discard)/i;
+  if (!deleteVerb.test(text)) return false;
+
+  // Prefer preservation whenever the instruction contains an explicit
+  // prohibition. Ambiguous mixed instructions should be clarified by the
+  // agent instead of risking data loss.
+  const preservationInstruction =
+    /(?:不要|不准|禁止|别|不可|不能|无需|不用)\s*(?:删除|删掉?|移除|清除|清空|去掉|丢弃)|(?:保留|保存)\s*(?:好|住|着|全部|所有|旧|原|已有)?|(?:do\s+not|don't|dont|never)\s+(?:delete|remove|clear|discard)|(?:keep|preserve)\s+(?:the\s+)?(?:old|existing|previous|all)/i;
+  if (preservationInstruction.test(text)) return false;
+
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // Operation handlers
@@ -723,17 +764,209 @@ const handlers: Record<
   update_text: applyUpdateText,
 };
 
+type ManipulationResult = {
+  success?: true;
+  applied?: number;
+  summary?: string;
+  createdIds?: Record<string, string>;
+  errors?: string[];
+  error?:
+    | "canvas_not_found"
+    | "write_failed"
+    | "write_conflict"
+    | "confirmation_required"
+    | "confirmation_unavailable";
+  message?: string;
+  confirmation?: DestructiveProposal;
+};
+
+type ManipulationOptions = {
+  confirmationService?: DestructiveConfirmationService;
+  userId?: string;
+  /** Only the confirmation service's frozen execute closure sets this. */
+  destructiveDeletionAuthorized?: boolean;
+  expectedDestructiveTargets?: DestructiveTarget[];
+};
+
+/**
+ * Re-read and re-apply the requested operations after every CAS conflict.
+ * This is important for positional operations and bindings: merging a mutation
+ * calculated from a stale snapshot is not enough when another writer moved or
+ * inserted elements in the meantime.
+ */
+export async function manipulateCanvasWithCas(
+  client: { from: (table: string) => any },
+  canvasId: string,
+  operations: Operation[],
+  _userPrompt: unknown,
+  options?: ManipulationOptions,
+): Promise<ManipulationResult> {
+  for (let attempt = 0; attempt < MAX_CANVAS_WRITE_ATTEMPTS; attempt += 1) {
+    const { data, error } = await client
+      .from("canvases")
+      .select("content, updated_at")
+      .eq("id", canvasId)
+      .single();
+
+    if (error || !data) {
+      return {
+        error: "canvas_not_found",
+        message: "Canvas not found or access denied.",
+      };
+    }
+
+    const content = ((data.content as CanvasContent) ?? {
+      elements: [],
+      appState: {},
+      files: {},
+    }) as CanvasContent;
+
+    if (
+      options?.destructiveDeletionAuthorized &&
+      options.expectedDestructiveTargets
+    ) {
+      // Revalidate inside every CAS attempt. This closes the gap between the
+      // confirmation service's check and the actual read-modify-write.
+      assertDestructiveTargetsUnchanged(
+        content,
+        options.expectedDestructiveTargets,
+      );
+    }
+
+    if (
+      operations.some((operation) => operation.action === "delete") &&
+      !options?.destructiveDeletionAuthorized
+    ) {
+      if (!options?.confirmationService || !options.userId) {
+        return {
+          error: "confirmation_unavailable",
+          message: "Deletion requires an authenticated confirmation service.",
+        };
+      }
+
+      const loadCanvas = async (): Promise<CanvasContent> => {
+        const { data: latest, error: latestError } = await client
+          .from("canvases")
+          .select("content")
+          .eq("id", canvasId)
+          .single();
+        if (latestError || !latest) throw new Error("Canvas not found or access denied.");
+        return (latest.content as CanvasContent) ?? {
+          elements: [],
+          appState: {},
+          files: {},
+        };
+      };
+      const confirmation = options.confirmationService.propose({
+        userId: options.userId,
+        canvasId,
+        content,
+        operations: structuredClone(operations) as FrozenCanvasOperation[],
+        loadCanvas,
+        execute: async (frozenOperations, expectedTargets) =>
+          manipulateCanvasWithCas(
+            client,
+            canvasId,
+            frozenOperations as Operation[],
+            undefined,
+            {
+              destructiveDeletionAuthorized: true,
+              expectedDestructiveTargets: expectedTargets,
+            },
+          ),
+      });
+      return {
+        error: "confirmation_required",
+        message: "Deletion was not applied. User confirmation is required.",
+        confirmation,
+      };
+    }
+    // Operation handlers mutate elements, so clone the persisted snapshot.
+    const elements = structuredClone(
+      (content.elements as CanvasElement[] | undefined) ?? [],
+    );
+    const descriptions: string[] = [];
+    const errors: string[] = [];
+    const createdIds: Record<string, string> = {};
+
+    for (let i = 0; i < operations.length; i++) {
+      const op = operations[i]!;
+      try {
+        const handler = handlers[op.action];
+        const result = handler(elements, op);
+        if (result.description.startsWith("[skip]")) {
+          errors.push(result.description);
+        } else {
+          descriptions.push(result.description);
+          if (result.createdId) createdIds[`op_${i}`] = result.createdId;
+        }
+      } catch (operationError) {
+        errors.push(
+          `[error] ${op.action}: ${(operationError as Error).message}`,
+        );
+      }
+    }
+
+    validateBindings(elements);
+    const incoming = { ...content, elements } as CanvasContent;
+    const updatedContent = mergeCanvasContent(content, incoming);
+    const { data: updated, error: writeError } = await client
+      .from("canvases")
+      .update({ content: updatedContent })
+      .eq("id", canvasId)
+      .eq("updated_at", data.updated_at)
+      .select("id")
+      .maybeSingle();
+
+    if (writeError) {
+      return {
+        error: "write_failed",
+        message: `Failed to save canvas: ${writeError.message}`,
+      };
+    }
+    if (!updated) continue;
+
+    try {
+      const orphanIds = await reconcileCanvasAssetReferences(
+        client as any,
+        canvasId,
+        updatedContent,
+      );
+      await garbageCollectOrphanAssets(client as any, orphanIds);
+    } catch {
+      errors.push("[error] asset cleanup will be retried on the next canvas save");
+    }
+
+    const result: ManipulationResult = {
+      success: true,
+      applied: descriptions.length,
+      summary: descriptions.join("; "),
+    };
+    if (Object.keys(createdIds).length > 0) result.createdIds = createdIds;
+    if (errors.length > 0) result.errors = errors;
+    return result;
+  }
+
+  return {
+    error: "write_conflict",
+    message: "Canvas changed repeatedly while saving. Please retry.",
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tool factory
 // ---------------------------------------------------------------------------
 
 export function createManipulateCanvasTool(deps: {
   createUserClient: (accessToken: string) => any;
+  destructiveConfirmationService?: DestructiveConfirmationService;
 }) {
   return tool(
     async (input, config) => {
       const canvasId = (config as any)?.configurable?.canvas_id;
       const accessToken = (config as any)?.configurable?.access_token;
+      const userPrompt = (config as any)?.configurable?.user_prompt;
+      const userId = (config as any)?.configurable?.user_id;
 
       if (!canvasId || !accessToken) {
         return JSON.stringify({
@@ -743,86 +976,26 @@ export function createManipulateCanvasTool(deps: {
         });
       }
 
-      // --- Read current canvas -------------------------------------------------
       const client = deps.createUserClient(accessToken);
-      const { data, error } = await client
-        .from("canvases")
-        .select("content")
-        .eq("id", canvasId)
-        .single();
-
-      if (error || !data) {
-        return JSON.stringify({
-          error: "canvas_not_found",
-          message: "Canvas not found or access denied.",
-        });
-      }
-
-      const content = data.content as {
-        elements?: CanvasElement[];
-        appState?: Record<string, unknown>;
-      };
-      const elements: CanvasElement[] = content.elements ?? [];
-
-      // --- Apply operations ----------------------------------------------------
-      const descriptions: string[] = [];
-      const errors: string[] = [];
-      const createdIds: Record<string, string> = {};
-
-      for (let i = 0; i < input.operations.length; i++) {
-        const op = input.operations[i]!;
-        try {
-          const handler = handlers[op.action];
-          const result = handler(elements, op);
-          if (result.description.startsWith("[skip]")) {
-            errors.push(result.description);
-          } else {
-            descriptions.push(result.description);
-            if (result.createdId) {
-              createdIds[`op_${i}`] = result.createdId;
-            }
-          }
-        } catch (e) {
-          errors.push(`[error] ${op.action}: ${(e as Error).message}`);
-        }
-      }
-
-      // --- Post-processing: clean up orphan bindings ---------------------------
-      // Must run after all operations so cascaded deletes are visible.
-      validateBindings(elements);
-
-      // --- Write back ----------------------------------------------------------
-      const updatedContent = { ...content, elements };
-      const { error: writeError } = await client
-        .from("canvases")
-        .update({ content: updatedContent })
-        .eq("id", canvasId);
-
-      if (writeError) {
-        return JSON.stringify({
-          error: "write_failed",
-          message: `Failed to save canvas: ${writeError.message}`,
-        });
-      }
-
-      // --- Build result --------------------------------------------------------
-      const result: Record<string, unknown> = {
-        success: true,
-        applied: descriptions.length,
-        summary: descriptions.join("; "),
-      };
-      if (Object.keys(createdIds).length > 0) {
-        result.createdIds = createdIds;
-      }
-      if (errors.length > 0) {
-        result.errors = errors;
-      }
-      return JSON.stringify(result);
+      return JSON.stringify(
+        await manipulateCanvasWithCas(
+          client,
+          canvasId,
+          input.operations,
+          userPrompt,
+          {
+            ...(deps.destructiveConfirmationService
+              ? { confirmationService: deps.destructiveConfirmationService }
+              : {}),
+            ...(typeof userId === "string" ? { userId } : {}),
+          },
+        ),
+      );
     },
     {
       name: "manipulate_canvas",
       description:
-        "Manipulate elements on the canvas. Supports: move, resize, delete (cascades to bound text), update_style, update_text (modify text content of any element or its label), add_text, add_shape (with optional label for centered text), add_line (with optional element binding for auto-connected arrows), align, distribute, reorder. Use inspect_canvas first to understand the current layout. Returns created element IDs for subsequent binding.",
+        "Manipulate Excalidraw elements on the infinite canvas only. NEVER use this tool for a native design document, a design_id, or objects returned by inspect_design/get_design_objects; use manipulate_design for those. Supports: move, resize, delete (ONLY when the current raw user message explicitly requests deletion; generating or refining never permits cleanup of old results), update_style, update_text (modify text content of any canvas element or its label), add_text, add_shape (with optional label for centered text), add_line (with optional element binding for auto-connected arrows), align, distribute, reorder. Use inspect_canvas first to understand the infinite-canvas layout. Returns created canvas element IDs for subsequent binding.",
       schema: manipulateCanvasSchema,
     },
   );

@@ -53,6 +53,7 @@ export type PaymentService = {
   handleWebhookEvent(
     eventName: string,
     payload: WebhookPayload,
+    paymentFingerprint: string,
   ): Promise<void>;
 
   getSubscriptionStatus(workspaceId: string): Promise<SubscriptionStatus>;
@@ -141,7 +142,7 @@ export function createPaymentService(options: {
       return { checkoutUrl: result.checkoutUrl };
     },
 
-    async handleWebhookEvent(eventName, payload) {
+    async handleWebhookEvent(eventName, payload, paymentFingerprint) {
       const workspaceId = payload.meta.custom_data?.workspace_id;
       const attrs = payload.data.attributes;
       const subscriptionId = payload.data.id;
@@ -154,13 +155,20 @@ export function createPaymentService(options: {
           }
 
           const resolved = resolvePlanFromVariant(attrs.variant_id);
-          const plan: SubscriptionPlan = resolved?.plan ?? "starter";
-          const billingPeriod: BillingPeriod = resolved?.period ?? "monthly";
+          if (!resolved) {
+            throw new PaymentServiceError(
+              "variant_not_found",
+              "The payment provider variant is not configured.",
+              400,
+            );
+          }
+          const plan: SubscriptionPlan = resolved.plan;
+          const billingPeriod: BillingPeriod = resolved.period;
 
           // NOTE: lemon_squeezy_* columns added via migration but not yet in
           // generated Database type — cast to `any` for update calls.
           const admin = getAdminClient();
-          await (admin as any)
+          const { error } = await (admin as any)
             .from("subscriptions")
             .update({
               plan,
@@ -174,6 +182,9 @@ export function createPaymentService(options: {
               updated_at: new Date().toISOString(),
             })
             .eq("workspace_id", workspaceId);
+          if (error) {
+            throw webhookDatabaseError();
+          }
 
           // Credits are granted by the subscription_payment_success event
           // which always fires alongside subscription_created on initial purchase.
@@ -208,14 +219,12 @@ export function createPaymentService(options: {
             updateData.canceled_at = null;
           }
 
-          await (admin as any)
+          const { error } = await (admin as any)
             .from("subscriptions")
             .update(updateData)
             .eq("workspace_id", wsId);
-
-          // If plan changed (upgrade/downgrade), grant credits difference
-          if (resolved) {
-            await grantMonthlyCredits(getAdminClient(), wsId, resolved.plan);
+          if (error) {
+            throw webhookDatabaseError();
           }
           break;
         }
@@ -229,13 +238,16 @@ export function createPaymentService(options: {
           }
 
           // Mark as cancelled but keep plan active until period end
-          await admin
+          const { error } = await admin
             .from("subscriptions")
             .update({
               canceled_at: attrs.ends_at ?? new Date().toISOString(),
               updated_at: new Date().toISOString(),
             })
             .eq("workspace_id", wsId);
+          if (error) {
+            throw webhookDatabaseError();
+          }
           break;
         }
 
@@ -248,27 +260,35 @@ export function createPaymentService(options: {
           }
 
           // Get current plan for the workspace
-          const { data: sub } = await admin
+          const { data: sub, error: subError } = await admin
             .from("subscriptions")
             .select("plan, current_period_end")
             .eq("workspace_id", wsId)
             .maybeSingle();
 
-          if (sub) {
-            // Update renewal period
-            await admin
-              .from("subscriptions")
-              .update({
-                current_period_end: attrs.renews_at ?? null,
-                canceled_at: null,
-                updated_at: new Date().toISOString(),
-              })
-              .eq("workspace_id", wsId);
-
-            // Grant monthly credits for renewal
-            const plan = sub.plan as SubscriptionPlan;
-            await grantMonthlyCredits(getAdminClient(), wsId, plan);
+          if (subError || !sub) {
+            throw webhookDatabaseError();
           }
+
+          const { error: updateError } = await admin
+            .from("subscriptions")
+            .update({
+              current_period_end: attrs.renews_at ?? null,
+              canceled_at: null,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("workspace_id", wsId);
+          if (updateError) {
+            throw webhookDatabaseError();
+          }
+
+          const plan = sub.plan as SubscriptionPlan;
+          await grantMonthlyCredits(
+            getAdminClient(),
+            wsId,
+            plan,
+            paymentFingerprint,
+          );
           break;
         }
 
@@ -290,7 +310,7 @@ export function createPaymentService(options: {
           }
 
           // Downgrade to free plan
-          await (admin as any)
+          const { error } = await (admin as any)
             .from("subscriptions")
             .update({
               plan: "free",
@@ -304,6 +324,9 @@ export function createPaymentService(options: {
               updated_at: new Date().toISOString(),
             })
             .eq("workspace_id", wsId);
+          if (error) {
+            throw webhookDatabaseError();
+          }
           break;
         }
 
@@ -430,50 +453,25 @@ async function grantMonthlyCredits(
   admin: AdminSupabaseClient,
   workspaceId: string,
   plan: SubscriptionPlan,
+  paymentFingerprint: string,
 ): Promise<void> {
-  const config = PLAN_CONFIGS[plan];
-  if (config.monthlyCredits <= 0) return;
-
-  const { data: balanceRow } = await admin
-    .from("credit_balances")
-    .select("balance, version")
-    .eq("workspace_id", workspaceId)
-    .maybeSingle();
-
-  if (balanceRow) {
-    const newBalance = (balanceRow.balance ?? 0) + config.monthlyCredits;
-    await admin
-      .from("credit_balances")
-      .update({
-        balance: newBalance,
-        version: (balanceRow.version ?? 0) + 1,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("workspace_id", workspaceId);
-
-    await admin.from("credit_transactions").insert({
-      workspace_id: workspaceId,
-      transaction_type: "subscription_grant",
-      amount: config.monthlyCredits,
-      balance_after: newBalance,
-      description: `${plan} plan — monthly credits granted`,
-    });
-  } else {
-    // Create balance row if it doesn't exist
-    await admin.from("credit_balances").insert({
-      workspace_id: workspaceId,
-      balance: config.monthlyCredits,
-      version: 1,
-    });
-
-    await admin.from("credit_transactions").insert({
-      workspace_id: workspaceId,
-      transaction_type: "subscription_grant",
-      amount: config.monthlyCredits,
-      balance_after: config.monthlyCredits,
-      description: `${plan} plan — initial monthly credits granted`,
-    });
+  if (PLAN_CONFIGS[plan].monthlyCredits <= 0) return;
+  const { error } = await (admin.rpc as any)("grant_subscription_credits", {
+    p_workspace_id: workspaceId,
+    p_plan: plan,
+    p_payment_fingerprint: paymentFingerprint,
+  });
+  if (error) {
+    throw webhookDatabaseError();
   }
+}
+
+function webhookDatabaseError(): PaymentServiceError {
+  return new PaymentServiceError(
+    "webhook_processing_failed",
+    "Failed to persist the payment event.",
+    500,
+  );
 }
 
 // ── Variant map builder ──────────────────────────────────────

@@ -3,14 +3,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type {
+  DesignSyncEvent,
+  RunCreateRequest,
   StreamEvent,
   WsCommandAck,
   WsRpcRequest,
-  RunCreateRequest,
 } from "@loomic/shared";
+import { designSyncEventSchema } from "@loomic/shared";
 import { getServerBaseUrl } from "../lib/env";
 
 type EventCallback = (event: StreamEvent) => void;
+type DesignSyncCallback = (event: DesignSyncEvent) => void;
+
+export function parseDesignSyncMessage(value: unknown): DesignSyncEvent | null {
+  const parsed = designSyncEventSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
 type RPCHandler = (
   params: Record<string, unknown>,
 ) => Promise<Record<string, unknown>>;
@@ -22,23 +30,33 @@ export type WebSocketHandle = {
     onAck?: (ack: WsCommandAck) => void,
   ) => void;
   cancelRun: (runId: string) => void;
+  confirmAction: (
+    confirmationId: string,
+    decision: "confirm" | "cancel",
+    onAck?: (ack: WsCommandAck) => void,
+  ) => void;
+  retryTool: (
+    toolExecutionId: string,
+    requestId: string,
+    onAck?: (ack: WsCommandAck) => void,
+  ) => void;
   onEvent: (cb: EventCallback) => () => void;
+  onDesignSync?: (cb: DesignSyncCallback) => () => void;
   registerRPC: (method: string, handler: RPCHandler) => () => void;
   resumeCanvas: (canvasId: string, onAck?: (ack: WsCommandAck) => void) => void;
 };
 
-export function useWebSocket(
-  getToken: () => string | null,
-): WebSocketHandle {
+export function useWebSocket(getToken: () => string | null): WebSocketHandle {
   const wsRef = useRef<WebSocket | null>(null);
   const connectionIdRef = useRef(
     (() => {
       if (typeof sessionStorage !== "undefined") {
         const stored = sessionStorage.getItem("ws_connection_id");
         if (stored) return stored;
-        const id = typeof crypto !== "undefined" && crypto.randomUUID
-          ? crypto.randomUUID()
-          : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const id =
+          typeof crypto !== "undefined" && crypto.randomUUID
+            ? crypto.randomUUID()
+            : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
         sessionStorage.setItem("ws_connection_id", id);
         return id;
       }
@@ -53,9 +71,10 @@ export function useWebSocket(
   const disposed = useRef(false);
 
   const eventListeners = useRef<Set<EventCallback>>(new Set());
-  const ackListeners = useRef<
-    Map<string, (ack: WsCommandAck) => void>
-  >(new Map());
+  const designSyncListeners = useRef<Set<DesignSyncCallback>>(new Set());
+  const ackListeners = useRef<Map<string, (ack: WsCommandAck) => void>>(
+    new Map(),
+  );
   const rpcHandlers = useRef<Map<string, RPCHandler>>(new Map());
 
   const connect = useCallback(() => {
@@ -79,9 +98,7 @@ export function useWebSocket(
     }
 
     const serverBase = getServerBaseUrl();
-    const wsUrl =
-      serverBase.replace(/^http/, "ws") +
-      `/api/ws?token=${encodeURIComponent(token)}&connectionId=${encodeURIComponent(connectionIdRef.current)}`;
+    const wsUrl = `${serverBase.replace(/^http/, "ws")}/api/ws?token=${encodeURIComponent(token)}&connectionId=${encodeURIComponent(connectionIdRef.current)}`;
 
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
@@ -101,7 +118,20 @@ export function useWebSocket(
         return;
       }
 
-      if (msg.type === "event") {
+      if (msg.type === "design.sync") {
+        const designEvent = parseDesignSyncMessage(msg);
+        if (!designEvent) {
+          console.warn("[ws] received malformed design.sync event:", msg);
+          return;
+        }
+        for (const cb of designSyncListeners.current) {
+          try {
+            cb(designEvent);
+          } catch (listenerErr) {
+            console.error("[ws] design.sync listener threw:", listenerErr);
+          }
+        }
+      } else if (msg.type === "event") {
         const streamEvent = msg.event as StreamEvent;
         // Defensive: skip malformed events without proper structure
         if (!streamEvent || typeof streamEvent !== "object") {
@@ -119,7 +149,13 @@ export function useWebSocket(
       } else if (msg.type === "command.ack") {
         const cb = ackListeners.current.get(msg.action as string);
         if (cb) {
-          ackListeners.current.delete(msg.action as string);
+          const keepConfirmationListener =
+            msg.action === "agent.confirm_action" &&
+            (msg.payload as Record<string, unknown> | undefined)?.status ===
+              "accepted";
+          if (!keepConfirmationListener) {
+            ackListeners.current.delete(msg.action as string);
+          }
           try {
             cb(msg as unknown as WsCommandAck);
           } catch (ackErr) {
@@ -147,10 +183,7 @@ export function useWebSocket(
       }
 
       if (!disposed.current) {
-        const delay = Math.min(
-          30_000,
-          1000 * Math.pow(2, reconnectAttempt.current),
-        );
+        const delay = Math.min(30_000, 1000 * 2 ** reconnectAttempt.current);
         const attempt = reconnectAttempt.current + 1;
         console.log(
           `[ws] scheduling reconnect attempt ${attempt} in ${delay}ms (code: ${event.code})`,
@@ -183,9 +216,7 @@ export function useWebSocket(
     try {
       const result = await handler(req.params);
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({ type: "rpc.response", id: req.id, result }),
-        );
+        ws.send(JSON.stringify({ type: "rpc.response", id: req.id, result }));
       }
     } catch (error) {
       if (ws.readyState === WebSocket.OPEN) {
@@ -216,7 +247,10 @@ export function useWebSocket(
     (action: string, payload: Record<string, unknown>): boolean => {
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) {
-        console.warn("[ws] command dropped -- not connected, readyState:", ws?.readyState);
+        console.warn(
+          "[ws] command dropped -- not connected, readyState:",
+          ws?.readyState,
+        );
         return false;
       }
       try {
@@ -232,10 +266,7 @@ export function useWebSocket(
   );
 
   const startRun = useCallback(
-    (
-      payload: RunCreateRequest,
-      onAck?: (ack: WsCommandAck) => void,
-    ) => {
+    (payload: RunCreateRequest, onAck?: (ack: WsCommandAck) => void) => {
       if (onAck) {
         ackListeners.current.set("agent.run", onAck);
       }
@@ -254,6 +285,38 @@ export function useWebSocket(
   const cancelRun = useCallback(
     (runId: string) => {
       sendCommand("agent.cancel", { runId });
+    },
+    [sendCommand],
+  );
+
+  const confirmAction = useCallback(
+    (
+      confirmationId: string,
+      decision: "confirm" | "cancel",
+      onAck?: (ack: WsCommandAck) => void,
+    ) => {
+      if (onAck) ackListeners.current.set("agent.confirm_action", onAck);
+      const sent = sendCommand("agent.confirm_action", {
+        confirmationId,
+        decision,
+      });
+      if (!sent) ackListeners.current.delete("agent.confirm_action");
+    },
+    [sendCommand],
+  );
+
+  const retryTool = useCallback(
+    (
+      toolExecutionId: string,
+      requestId: string,
+      onAck?: (ack: WsCommandAck) => void,
+    ) => {
+      if (onAck) ackListeners.current.set("agent.retry_tool", onAck);
+      const sent = sendCommand("agent.retry_tool", {
+        toolExecutionId,
+        requestId,
+      });
+      if (!sent) ackListeners.current.delete("agent.retry_tool");
     },
     [sendCommand],
   );
@@ -278,15 +341,27 @@ export function useWebSocket(
     };
   }, []);
 
-  const registerRPC = useCallback(
-    (method: string, handler: RPCHandler) => {
-      rpcHandlers.current.set(method, handler);
-      return () => {
-        rpcHandlers.current.delete(method);
-      };
-    },
-    [],
-  );
+  const onDesignSync = useCallback((cb: DesignSyncCallback) => {
+    designSyncListeners.current.add(cb);
+    return () => designSyncListeners.current.delete(cb);
+  }, []);
 
-  return { connected, startRun, cancelRun, onEvent, registerRPC, resumeCanvas };
+  const registerRPC = useCallback((method: string, handler: RPCHandler) => {
+    rpcHandlers.current.set(method, handler);
+    return () => {
+      rpcHandlers.current.delete(method);
+    };
+  }, []);
+
+  return {
+    connected,
+    startRun,
+    cancelRun,
+    confirmAction,
+    retryTool,
+    onEvent,
+    onDesignSync,
+    registerRPC,
+    resumeCanvas,
+  };
 }

@@ -202,6 +202,22 @@ export class ConnectionManager {
     return delivered;
   }
 
+  /** Send a protocol-level message to every open connection viewing a canvas. */
+  sendToCanvas(canvasId: string, message: Record<string, unknown>): boolean {
+    const ids = this.canvasIndex.get(canvasId);
+    if (!ids) return false;
+    const payload = JSON.stringify(message);
+    let delivered = false;
+    for (const connectionId of ids) {
+      const entry = this.connections.get(connectionId);
+      if (entry && entry.ws.readyState === 1) {
+        entry.ws.send(payload);
+        delivered = true;
+      }
+    }
+    return delivered;
+  }
+
   /**
    * Backward-compatible send: delegates to sendToUser.
    */
@@ -254,6 +270,28 @@ export class ConnectionManager {
         }),
       );
     });
+  }
+
+  /**
+   * Send an RPC only to a browser connection that is currently bound to the
+   * requested canvas. This avoids selecting a home/settings tab for users who
+   * have several Loomic tabs open.
+   */
+  async rpcToCanvas<T = unknown>(
+    canvasId: string,
+    method: string,
+    params: Record<string, unknown>,
+    timeout = 10_000,
+  ): Promise<T> {
+    const ids = this.canvasIndex.get(canvasId);
+    if (!ids) throw new Error(`Canvas connection ${canvasId} not available`);
+    for (const connectionId of ids) {
+      const entry = this.connections.get(connectionId);
+      if (entry?.ws.readyState === 1) {
+        return this.rpc<T>(connectionId, method, params, timeout);
+      }
+    }
+    throw new Error(`Canvas connection ${canvasId} not available`);
   }
 
   /**

@@ -1,0 +1,85 @@
+# Version-control and local agent/editor state
+.git
+.git/**
+.agents
+.claude
+.codex
+.idea
+.vscode
+.DS_Store
+Thumbs.db
+
+# Local environment files and secrets; keep the checked-in template available.
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# Dependency trees and generated build caches
+node_modules
+**/node_modules
+.next
+**/.next
+.turbo
+**/.turbo
+dist
+**/dist
+build
+**/build
+coverage
+**/coverage
+test-results
+**/test-results
+playwright-report
+**/playwright-report
+blob-report
+**/blob-report
+*.tsbuildinfo
+**/*.tsbuildinfo
+
+# Local runtime output and temporary files
+artifacts
+logs
+**/logs
+*.log
+**/*.log
+.cache
+**/.cache
+.pytest_cache
+**/.pytest_cache
+__pycache__
+**/__pycache__
+.venv
+**/.venv
+tmp
+**/tmp
+temp
+**/temp
+*.tmp
+**/*.tmp
+*.temp
+**/*.temp
+*~
+
+# Local Supabase state is not part of the production image.
+supabase/.temp
+
+# Exclude ad-hoc local model downloads while retaining the three model bundles
+# copied unconditionally by apps/server/Dockerfile.
+models/*
+!models/feynobg/
+!models/feynobg/**
+!models/lama/
+!models/lama/**
+!models/sam2.1-hiera-tiny/
+!models/sam2.1-hiera-tiny/**
+
+# Do not upload caches or incomplete downloads inside delivered model bundles.
+models/**/.cache
+models/**/tmp
+models/**/temp
+models/**/*.part
+models/**/*.download
+models/**/*.tmp

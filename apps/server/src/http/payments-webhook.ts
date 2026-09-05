@@ -40,7 +40,12 @@ export async function registerPaymentWebhookRoute(
       .update(rawBody)
       .digest("hex");
 
-    if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+    const supplied = Buffer.from(signature);
+    const expectedBytes = Buffer.from(expected);
+    if (
+      supplied.length !== expectedBytes.length ||
+      !crypto.timingSafeEqual(supplied, expectedBytes)
+    ) {
       return reply.code(401).send({ error: "Invalid webhook signature" });
     }
 
@@ -58,6 +63,10 @@ export async function registerPaymentWebhookRoute(
     }
 
     const workspaceId = payload.meta?.custom_data?.workspace_id ?? null;
+    const deliveryFingerprint = crypto
+      .createHash("sha256")
+      .update(rawBody)
+      .digest("hex");
 
     // ── 3. Log to payment_events audit table ─────────────────
     // NOTE: payment_events table is added via migration but not yet in the
@@ -73,23 +82,41 @@ export async function registerPaymentWebhookRoute(
         workspace_id: workspaceId,
         payload: payload as unknown as Record<string, unknown>,
         processed: false,
+        delivery_fingerprint: deliveryFingerprint,
       });
 
     if (insertError) {
-      console.error("[Webhook] Failed to log payment event:", (insertError as any).message);
-      // Continue processing even if audit logging fails
+      const { data: existing } = await (admin as any)
+        .from("payment_events")
+        .select("processed")
+        .eq("delivery_fingerprint", deliveryFingerprint)
+        .maybeSingle();
+      if ((existing as any)?.processed === true) {
+        return reply.code(200).send({ received: true, duplicate: true });
+      }
+      if (!existing) {
+        console.error("[Webhook] Failed to log payment event:", (insertError as any).message);
+        return reply.code(500).send({ error: "Failed to persist webhook" });
+      }
     }
 
     // ── 4. Process event ─────────────────────────────────────
     try {
-      await options.paymentService.handleWebhookEvent(eventName, payload);
+      await options.paymentService.handleWebhookEvent(
+        eventName,
+        payload,
+        deliveryFingerprint,
+      );
 
       // Mark as processed
-      if (eventId) {
-        await (admin as any)
+      {
+        const { error: markError } = await (admin as any)
           .from("payment_events")
-          .update({ processed: true })
-          .eq("lemon_squeezy_event_id", eventId);
+          .update({ processed: true, error_message: null })
+          .eq("delivery_fingerprint", deliveryFingerprint);
+        if (markError) {
+          throw new Error("Failed to mark payment event as processed.");
+        }
       }
     } catch (processingError) {
       const errorMessage =
@@ -100,15 +127,14 @@ export async function registerPaymentWebhookRoute(
       console.error(`[Webhook] Error processing ${eventName}:`, errorMessage);
 
       // Record error in audit trail
-      if (eventId) {
+      {
         await (admin as any)
           .from("payment_events")
           .update({ error_message: errorMessage })
-          .eq("lemon_squeezy_event_id", eventId);
+          .eq("delivery_fingerprint", deliveryFingerprint);
       }
 
-      // Still return 200 to prevent Lemon Squeezy from retrying endlessly.
-      // The error is logged for manual investigation.
+      return reply.code(500).send({ error: "Webhook processing failed" });
     }
 
     return reply.code(200).send({ received: true });

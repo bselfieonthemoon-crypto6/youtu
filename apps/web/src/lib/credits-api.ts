@@ -3,7 +3,6 @@ import type {
   CreditBalanceResponse,
   CreditTransactionsResponse,
   ClaimDailyResponse,
-  SubscriptionPlan,
 } from "@loomic/shared";
 
 import { getServerBaseUrl } from "./env";
@@ -13,13 +12,6 @@ import { ApiAuthError, ApiApplicationError } from "./server-api";
 
 function authHeaders(accessToken: string): Record<string, string> {
   return { Authorization: `Bearer ${accessToken}` };
-}
-
-function authJsonHeaders(accessToken: string): Record<string, string> {
-  return {
-    Authorization: `Bearer ${accessToken}`,
-    "content-type": "application/json",
-  };
 }
 
 async function handleErrorResponse(response: Response): Promise<never> {
@@ -70,18 +62,3 @@ export async function claimDailyCredits(
   return (await response.json()) as ClaimDailyResponse;
 }
 
-export async function adminSetPlan(
-  accessToken: string,
-  plan: SubscriptionPlan,
-): Promise<CreditBalanceResponse> {
-  const response = await fetch(
-    `${getServerBaseUrl()}/api/credits/admin/set-plan`,
-    {
-      method: "POST",
-      headers: authJsonHeaders(accessToken),
-      body: JSON.stringify({ plan }),
-    },
-  );
-  if (!response.ok) return handleErrorResponse(response);
-  return (await response.json()) as CreditBalanceResponse;
-}

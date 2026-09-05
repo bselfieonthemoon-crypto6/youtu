@@ -205,20 +205,26 @@ export function useChatSessions({
     async (sessionId: string) => {
       if (sessionId === activeSessionIdRef.current) return;
       if (streaming) setStreaming(false);
+      activeSessionIdRef.current = sessionId;
       setActiveSessionId(sessionId);
       onSessionChangeRef.current?.(sessionId);
 
       const cached = msgCacheRef.current.get(sessionId);
       if (cached && cached.length > 0) {
+        messagesRef.current = cached;
         setMessages(cached);
       } else {
+        messagesRef.current = [];
         setMessages([]);
         setMessagesLoading(true);
         try {
           const msgRes = await fetchMessages(accessTokenRef.current, sessionId);
           const mapped = mapServerMessages(msgRes.messages);
           msgCacheRef.current.set(sessionId, mapped);
-          setMessages(mapped);
+          if (activeSessionIdRef.current === sessionId) {
+            messagesRef.current = mapped;
+            setMessages(mapped);
+          }
         } catch (err) {
           console.error("[chat] Failed to load session messages:", err);
         } finally {
@@ -232,14 +238,31 @@ export function useChatSessions({
   // ── New chat ──
   const handleNewChat = useCallback(async () => {
     if (streaming) setStreaming(false);
+    const previousSessionId = activeSessionIdRef.current;
+    const previousMessages = messagesRef.current;
+    // Isolate the pending session immediately so late events from the old run
+    // can update only its cache, never the newly cleared conversation panel.
+    activeSessionIdRef.current = null;
+    messagesRef.current = [];
+    setActiveSessionId(null);
+    setMessages([]);
+    setMessagesLoading(true);
     try {
       const res = await createSession(accessTokenRef.current, canvasId);
       setSessions((prev) => [res.session, ...prev]);
+      activeSessionIdRef.current = res.session.id;
+      messagesRef.current = [];
+      msgCacheRef.current.set(res.session.id, []);
       setActiveSessionId(res.session.id);
       onSessionChangeRef.current?.(res.session.id);
       setMessages([]);
     } catch {
-      // Silently fail
+      activeSessionIdRef.current = previousSessionId;
+      messagesRef.current = previousMessages;
+      setActiveSessionId(previousSessionId);
+      setMessages(previousMessages);
+    } finally {
+      setMessagesLoading(false);
     }
   }, [canvasId, streaming]);
 
@@ -254,6 +277,8 @@ export function useChatSessions({
         try {
           const res = await createSession(token, canvasId);
           setSessions([res.session]);
+          activeSessionIdRef.current = res.session.id;
+          messagesRef.current = [];
           setActiveSessionId(res.session.id);
           onSessionChangeRef.current?.(res.session.id);
           setMessages([]);
@@ -264,6 +289,8 @@ export function useChatSessions({
         setSessions(remaining);
         if (sessionId === activeSessionIdRef.current) {
           const next = remaining[0]!;
+          activeSessionIdRef.current = next.id;
+          messagesRef.current = [];
           setActiveSessionId(next.id);
           onSessionChangeRef.current?.(next.id);
           setMessagesLoading(true);
@@ -271,7 +298,10 @@ export function useChatSessions({
             .then((msgRes) => {
               const mapped = mapServerMessages(msgRes.messages);
               msgCacheRef.current.set(next.id, mapped);
-              setMessages(mapped);
+              if (activeSessionIdRef.current === next.id) {
+                messagesRef.current = mapped;
+                setMessages(mapped);
+              }
             })
             .catch(() => setMessages([]))
             .finally(() => setMessagesLoading(false));

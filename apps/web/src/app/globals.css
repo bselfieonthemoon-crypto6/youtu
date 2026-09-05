@@ -368,6 +368,88 @@
   display: none !important;
 }
 
+/* Canvas context menu — compact and aligned with the Loomic UI. */
+.excalidraw .popover:has(> .context-menu) {
+  z-index: 10;
+  padding: 0;
+}
+
+.excalidraw .context-menu {
+  min-width: 210px !important;
+  margin: 0 !important;
+  padding: 4px !important;
+  overflow: hidden !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 12px !important;
+  background-color: color-mix(in oklab, var(--background) 95%, transparent) !important;
+  color: var(--foreground) !important;
+  box-shadow:
+    0 14px 36px rgb(0 0 0 / 14%),
+    0 2px 8px rgb(0 0 0 / 6%) !important;
+  backdrop-filter: blur(8px) !important;
+}
+
+.excalidraw .context-menu li {
+  margin: 0;
+}
+
+.excalidraw .context-menu .context-menu-item {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-width: 0;
+  min-height: 32px;
+  padding: 6px 9px;
+  border-radius: 8px !important;
+  color: var(--popover-foreground);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 20px;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.excalidraw .context-menu .context-menu-item:hover,
+.excalidraw .context-menu .context-menu-item:focus-visible {
+  color: var(--foreground);
+  background: var(--muted);
+  outline: none;
+}
+
+.excalidraw .context-menu .context-menu-item__label {
+  min-width: 0;
+  margin-inline-end: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.excalidraw .context-menu .context-menu-item__shortcut {
+  color: var(--muted-foreground);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0;
+  opacity: 0.72;
+}
+
+.excalidraw .context-menu .context-menu-item-separator {
+  height: 1px;
+  margin: 5px 8px;
+  border: 0;
+  background: var(--border);
+}
+
+.excalidraw .context-menu .context-menu-item.dangerous .context-menu-item__label {
+  color: var(--destructive);
+}
+
+.excalidraw .context-menu .context-menu-item.dangerous:hover {
+  background: color-mix(in oklab, var(--destructive) 10%, transparent);
+}
+
+.excalidraw .context-menu .context-menu-item.dangerous:hover .context-menu-item__label {
+  color: var(--destructive);
+}
+
 /* Image generator shimmer animation */
 @keyframes shimmer-scan {
   0% {

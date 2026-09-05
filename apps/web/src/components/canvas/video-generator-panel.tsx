@@ -79,21 +79,42 @@ export function VideoGeneratorPanel({
   // Fetch available models with error logging
   useEffect(() => {
     let cancelled = false;
-    fetchVideoModels()
+    fetchVideoModels(accessTokenRef.current)
       .then((r) => {
         if (cancelled) return;
         setModels(r.models);
         setModel((current) => {
-          if (r.models.length === 0 || r.models.some((m) => m.id === current)) {
-            return current;
+          const selected =
+            r.models.find((candidate) => candidate.id === current) ??
+            r.models[0];
+          if (!selected) return current;
+          const allowedDurations: readonly number[] =
+            selected.limits?.allowedDurations ?? DURATIONS;
+          const nextDuration = allowedDurations.includes(duration)
+            ? duration
+            : allowedDurations.includes(8)
+              ? 8
+              : (allowedDurations[0] ?? duration);
+          const allowedResolutions = supportedResolutions(selected);
+          const nextResolution = allowedResolutions.includes(
+            resolution as VideoResolution,
+          )
+            ? (resolution as VideoResolution)
+            : (allowedResolutions[0] ?? "720p");
+          if (
+            selected.id !== current ||
+            nextDuration !== duration ||
+            nextResolution !== resolution
+          ) {
+            setDuration(nextDuration);
+            setResolution(nextResolution);
+            updateVideoGeneratorElement(excalidrawApi, elementId, {
+              model: selected.id,
+              duration: nextDuration,
+              resolution: nextResolution,
+            });
           }
-          const fallback = r.models[0];
-          if (!fallback) return current;
-          const fallbackId = fallback.id;
-          updateVideoGeneratorElement(excalidrawApi, elementId, {
-            model: fallbackId,
-          });
-          return fallbackId;
+          return selected.id;
         });
       })
       .catch((err) => {
@@ -102,7 +123,7 @@ export function VideoGeneratorPanel({
     return () => {
       cancelled = true;
     };
-  }, [excalidrawApi, elementId]);
+  }, [duration, excalidrawApi, elementId, resolution]);
 
   // Close dropdowns when clicking outside the panel
   useEffect(() => {
@@ -171,12 +192,15 @@ export function VideoGeneratorPanel({
 
   const handleResolutionChange = useCallback(
     (value: VideoResolution) => {
+      const nextDuration = value === "1080p" ? 8 : duration;
       setResolution(value);
+      setDuration(nextDuration);
       updateVideoGeneratorElement(excalidrawApi, elementId, {
         resolution: value,
+        duration: nextDuration,
       });
     },
-    [excalidrawApi, elementId],
+    [duration, excalidrawApi, elementId],
   );
 
   const handleModelChange = useCallback(

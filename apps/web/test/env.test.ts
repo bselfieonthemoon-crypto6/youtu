@@ -8,14 +8,11 @@ describe("@loomic/web env helpers", () => {
   });
 
   it("loads the browser-safe Supabase env and explicit server base url", () => {
-    const env = loadWebEnv(
-      {},
-      {
-        NEXT_PUBLIC_SERVER_BASE_URL: "http://localhost:4010",
-        NEXT_PUBLIC_SUPABASE_URL: " https://example.supabase.co ",
-        NEXT_PUBLIC_SUPABASE_ANON_KEY: " anon-key ",
-      } as unknown as NodeJS.ProcessEnv,
-    );
+    const env = loadWebEnv({
+      serverBaseUrl: "http://localhost:4010",
+      supabaseUrl: "https://example.supabase.co",
+      supabaseAnonKey: "anon-key",
+    });
 
     expect(env).toEqual({
       serverBaseUrl: "http://localhost:4010",
@@ -26,12 +23,7 @@ describe("@loomic/web env helpers", () => {
 
   it("rejects missing browser-safe Supabase env values", () => {
     expect(() =>
-      loadWebEnv(
-        {},
-        {
-          NEXT_PUBLIC_SUPABASE_URL: "https://example.supabase.co",
-        } as unknown as NodeJS.ProcessEnv,
-      ),
+      loadWebEnv({ supabaseUrl: "https://example.supabase.co" }),
     ).toThrow(/NEXT_PUBLIC_SUPABASE_ANON_KEY/);
   });
 

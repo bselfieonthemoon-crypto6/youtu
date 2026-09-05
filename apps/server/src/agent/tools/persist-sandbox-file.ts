@@ -95,7 +95,7 @@ export function createPersistSandboxFileTool(deps: PersistSandboxFileDeps) {
           ? `${workspaceId}/generated/${Date.now()}-${fileName}`
           : `uploads/${Date.now()}-${fileName}`;
         const { data, error } = await client.storage
-          .from("project-assets")
+          .from("workspace-assets")
           .upload(storagePath, fileBuffer, {
             contentType: mimeType,
             upsert: false,
@@ -106,7 +106,7 @@ export function createPersistSandboxFileTool(deps: PersistSandboxFileDeps) {
         }
 
         const signedResult = await client.storage
-          .from("project-assets")
+          .from("workspace-assets")
           .createSignedUrl(data.path, 3600);
 
         if (signedResult.error || !signedResult.data) {

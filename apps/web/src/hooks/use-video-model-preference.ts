@@ -4,13 +4,11 @@ import { useCallback, useSyncExternalStore } from "react";
 import type { VideoGenerationPreference } from "@loomic/shared";
 
 const STORAGE_KEY = "loomic:video-model-preference";
-const DEFAULT_MODEL = "google/veo-3.1";
-
 export type VideoModelPreference = VideoGenerationPreference;
 
 const defaultPreference: VideoModelPreference = {
   mode: "auto",
-  models: [DEFAULT_MODEL],
+  models: [],
 };
 
 const listeners = new Set<() => void>();
@@ -52,15 +50,16 @@ function normalizePreference(
 
   const models = Array.isArray(preference.models)
     ? preference.models.filter(
-        (model): model is string => typeof model === "string" && model.length > 0,
+        (model): model is string =>
+          typeof model === "string" && model.trim().length > 0,
       )
-    : typeof preference.model === "string" && preference.model.length > 0
+    : typeof preference.model === "string" && preference.model.trim().length > 0
       ? [preference.model]
       : defaultPreference.models;
 
   return {
     mode: preference.mode === "manual" ? "manual" : "auto",
-    models: models.length > 0 ? models : defaultPreference.models,
+    models,
   };
 }
 

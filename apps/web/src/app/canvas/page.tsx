@@ -15,13 +15,22 @@ import { ChatSidebar } from "../../components/chat-sidebar";
 import { CanvasEmptyHint } from "../../components/canvas-empty-hint";
 import { CanvasLogoMenu } from "../../components/canvas-logo-menu";
 import { EditableProjectName } from "../../components/editable-project-name";
-import { insertImageOnCanvas, insertVideoOnCanvas } from "../../lib/canvas-elements";
+import {
+  insertImageOnCanvas,
+  insertVideoOnCanvas,
+} from "../../lib/canvas-elements";
+import {
+  mergeCanvasElements,
+  type CanvasElementLike,
+} from "../../lib/canvas-element-merge";
 import { fetchCanvas, fetchProject, ApiAuthError } from "../../lib/server-api";
 import { BrandKitSelector } from "../../components/brand-kit-selector";
 import { CanvasBottomBar } from "../../components/canvas-bottom-bar";
 import { CanvasFilesPanel } from "../../components/canvas-files-panel";
 import { CanvasLayersPanel } from "../../components/canvas-layers-panel";
 import { CreditHeaderButton } from "../../components/credits/credit-header-button";
+import type { CanvasImageChatCommand } from "../../components/canvas/image-toolbar-types";
+import { DesignEditorSession } from "../../components/design/design-editor-session";
 
 function CanvasPageContent() {
   const searchParams = useSearchParams();
@@ -29,7 +38,9 @@ function CanvasPageContent() {
   const initialSessionId = searchParams.get("session") ?? undefined;
   // Capture prompt once — router.replace will strip it from URL, but the
   // value must survive for the auto-send effect in ChatSidebar.
-  const [initialPrompt] = useState(() => searchParams.get("prompt") ?? undefined);
+  const [initialPrompt] = useState(
+    () => searchParams.get("prompt") ?? undefined,
+  );
   const { user, session, loading: authLoading, signOut } = useAuth();
   const router = useRouter();
 
@@ -37,6 +48,7 @@ function CanvasPageContent() {
     id: string;
     name: string;
     projectId: string;
+    revision: number;
     content: {
       elements: Record<string, unknown>[];
       appState: Record<string, unknown>;
@@ -54,7 +66,19 @@ function CanvasPageContent() {
   const [filesOpen, setFilesOpen] = useState(false);
   const [brandKitId, setBrandKitId] = useState<string | null>(null);
   const [projectName, setProjectName] = useState("Untitled");
-  const [selectedCanvasElements, setSelectedCanvasElements] = useState<CanvasSelectedElement[]>([]);
+  const [selectedCanvasElements, setSelectedCanvasElements] = useState<
+    CanvasSelectedElement[]
+  >([]);
+  const [imageChatCommand, setImageChatCommand] =
+    useState<CanvasImageChatCommand | null>(null);
+  const [activeDesign, setActiveDesign] = useState<{ designId: string } | null>(
+    null,
+  );
+  const pageRootRef = useRef<HTMLDivElement>(null);
+  const canvasLoadGenerationRef = useRef(0);
+  const canvasSyncGenerationRef = useRef(0);
+  const canvasIdRef = useRef(canvasId);
+  canvasIdRef.current = canvasId;
 
   const excalidrawApiRef = useRef<any>(null);
   const [excalidrawApi, setExcalidrawApi] = useState<any>(null);
@@ -66,11 +90,31 @@ function CanvasPageContent() {
 
   // Stable callbacks for panel toggles to prevent re-renders of child components
   const handleOpenChat = useCallback(() => setChatOpen(true), []);
+  const handleImageChatCommand = useCallback(
+    (command: CanvasImageChatCommand) => {
+      setChatOpen(true);
+      setImageChatCommand(command);
+    },
+    [],
+  );
   const handleToggleChat = useCallback(() => setChatOpen((v) => !v), []);
-  const handleToggleLayers = useCallback(() => { setLayersOpen((v) => !v); setFilesOpen(false); }, []);
-  const handleToggleFiles = useCallback(() => { setFilesOpen((v) => !v); setLayersOpen(false); }, []);
+  const handleToggleLayers = useCallback(() => {
+    setLayersOpen((v) => !v);
+    setFilesOpen(false);
+  }, []);
+  const handleToggleFiles = useCallback(() => {
+    setFilesOpen((v) => !v);
+    setLayersOpen(false);
+  }, []);
   const handleCloseLayers = useCallback(() => setLayersOpen(false), []);
   const handleCloseFiles = useCallback(() => setFilesOpen(false), []);
+  const handleCanvasRevisionChange = useCallback((revision: number) => {
+    setCanvasData((current) =>
+      current && revision > current.revision
+        ? { ...current, revision }
+        : current,
+    );
+  }, []);
 
   const accessToken = session?.access_token;
   const accessTokenRef = useRef(accessToken);
@@ -105,33 +149,96 @@ function CanvasPageContent() {
     const api = excalidrawApiRef.current;
     const token = accessTokenRef.current;
     if (!api || !token || !canvasData) return;
+    const requestedCanvasId = canvasData.id;
+    const syncGeneration = ++canvasSyncGenerationRef.current;
     try {
-      const { canvas } = await fetchCanvas(token, canvasData.id);
+      const { canvas } = await fetchCanvas(token, requestedCanvasId);
+      if (
+        canvasIdRef.current !== requestedCanvasId ||
+        canvasSyncGenerationRef.current !== syncGeneration ||
+        excalidrawApiRef.current !== api
+      ) {
+        return;
+      }
+      handleCanvasRevisionChange(canvas.revision);
       const elements = canvas.content.elements ?? [];
       const files = (canvas.content as Record<string, unknown>).files as
-        Record<string, { id: string; dataURL: string; mimeType: string; created: number }> | undefined;
+        | Record<
+            string,
+            {
+              id: string;
+              dataURL?: string;
+              storageUrl?: string;
+              mimeType: string;
+              created: number;
+            }
+          >
+        | undefined;
 
-      // Sync files (base64 dataURLs from backend-inserted images) into Excalidraw
+      // Publish refreshed file metadata to CanvasEditor. It performs bounded,
+      // viewport-aware hydration instead of starting an unbounded second wave
+      // of image downloads during reconnect or job completion.
       if (files && Object.keys(files).length > 0) {
-        api.addFiles(Object.values(files));
+        setCanvasData((current) =>
+          current?.id === requestedCanvasId
+            ? {
+                ...current,
+                content: {
+                  ...current.content,
+                  elements,
+                  files,
+                },
+              }
+            : current,
+        );
       }
 
-      api.updateScene({ elements, captureUpdate: "IMMEDIATELY" });
+      const localElements =
+        api.getSceneElementsIncludingDeleted?.() ?? api.getSceneElements();
+      const remoteElements = elements.filter(
+        (element): element is Record<string, unknown> & CanvasElementLike =>
+          typeof element.id === "string",
+      );
+      const localIds = new Set(
+        (localElements as CanvasElementLike[]).map((element) => element.id),
+      );
+      const addedElements = remoteElements.filter(
+        (element) => !element.isDeleted && !localIds.has(element.id),
+      );
+      const mergedElements = mergeCanvasElements(
+        localElements as CanvasElementLike[],
+        remoteElements,
+      );
+      api.updateScene({
+        elements: mergedElements,
+        captureUpdate: "IMMEDIATELY",
+      });
+      if (addedElements.length > 0) {
+        // Focus the newly generated node rather than fitting the entire
+        // (potentially very large) canvas, where the result can look missing.
+        requestAnimationFrame(() =>
+          api.scrollToContent?.(addedElements, {
+            animate: true,
+            fitToContent: true,
+          }),
+        );
+      }
     } catch (err) {
       console.warn("Failed to sync canvas:", err);
     }
-  }, [canvasData]);
+  }, [canvasData, handleCanvasRevisionChange]);
 
-  // Fallback polling for timed-out generation jobs.
-  // When the agent's tool times out but the worker eventually succeeds,
-  // the backend will have already inserted the element into the canvas.
-  // This hook detects completion and triggers a canvas re-fetch.
+  // Fallback polling for timed-out generation jobs. A successful job is not
+  // assumed to be on the canvas: this callback only fires when the server's
+  // authoritative job state already includes an element id.
   const { checkForTimedOutJobs } = useJobFallbackPolling({
     accessTokenRef,
-    onJobSucceeded: useCallback((_jobId: string, _jobType: string) => {
-      // Element was inserted by backend — just refresh the canvas
-      handleCanvasSync();
-    }, [handleCanvasSync]),
+    onJobSucceeded: useCallback(
+      (_jobId: string, _jobType: string, _elementId: string) => {
+        handleCanvasSync();
+      },
+      [handleCanvasSync],
+    ),
   });
 
   const handleSessionChange = useCallback(
@@ -156,15 +263,13 @@ function CanvasPageContent() {
         const file = files[el.fileId];
         const dataURL = file?.dataURL ?? "";
         const title =
-          el.customData?.title ||
-          el.customData?.label ||
-          `Image ${idx}`;
+          el.customData?.title || el.customData?.label || `Image ${idx}`;
         return {
           kind: "canvas-image",
           id: el.id,
           name: title,
           thumbnailUrl: dataURL,
-          assetId: el.id,
+          assetId: el.customData?.assetId ?? file?.assetId ?? el.id,
           url: dataURL,
           mimeType: file?.mimeType ?? "image/png",
         };
@@ -185,14 +290,24 @@ function CanvasPageContent() {
     const token = accessTokenRef.current;
     if (!canvasId || !token) return;
 
+    const loadGeneration = ++canvasLoadGenerationRef.current;
+    let cancelled = false;
+    const isCurrentLoad = () =>
+      !cancelled && canvasLoadGenerationRef.current === loadGeneration;
+
     setPageLoading(true);
-    fetchCanvas(token, canvasId)
+    setError(null);
+    setBrandKitId(null);
+    setProjectName("Untitled");
+    void fetchCanvas(token, canvasId)
       .then((data) => {
+        if (!isCurrentLoad()) return;
         const c = data.canvas;
         setCanvasData({
           id: c.id,
           name: c.name,
           projectId: c.projectId,
+          revision: c.revision,
           content: {
             elements: c.content.elements ?? [],
             appState: c.content.appState ?? {},
@@ -203,12 +318,18 @@ function CanvasPageContent() {
         // Fetch project to get brand_kit_id and name
         fetchProject(token, c.projectId)
           .then((projectData) => {
+            if (!isCurrentLoad()) return;
             setBrandKitId(projectData.project.brand_kit_id);
             setProjectName(projectData.project.name ?? "Untitled");
           })
-          .catch((err) => console.warn("Failed to fetch project for brand kit:", err));
+          .catch((err) => {
+            if (isCurrentLoad()) {
+              console.warn("Failed to fetch project for brand kit:", err);
+            }
+          });
       })
       .catch((err) => {
+        if (!isCurrentLoad()) return;
         if (err instanceof ApiAuthError) {
           signOutRef.current().then(() => routerRef.current.replace("/login"));
           return;
@@ -216,6 +337,9 @@ function CanvasPageContent() {
         setError("Failed to load canvas.");
         setPageLoading(false);
       });
+    return () => {
+      cancelled = true;
+    };
     // Intentionally omitting accessTokenRef (stable ref) and signOutRef/routerRef
     // (ref wrappers) from deps — only re-run when auth resolves, user changes, or
     // canvasId changes. Token refresh (e.g. tab switch) must NOT trigger a reload.
@@ -245,7 +369,7 @@ function CanvasPageContent() {
   if (!canvasData || !accessToken) return null;
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden">
+    <div ref={pageRootRef} className="flex h-screen w-screen overflow-hidden">
       {/* Top-left navigation bar */}
       <div className="absolute top-3 left-3 z-20 flex items-center gap-1.5">
         <CanvasLogoMenu
@@ -269,18 +393,27 @@ function CanvasPageContent() {
       {/* Canvas always takes full width; on mobile/tablet, ChatSidebar overlays instead of side-by-side */}
       <div className="flex-1 relative min-w-0 overflow-hidden">
         {/* Credits button — canvas area top-right, NOT chatbar */}
-        <div className="absolute top-3 right-3 z-20">
+        <div
+          className={`absolute top-3 z-20 transition-[right] duration-200 ${
+            chatOpen ? "right-3" : "right-[84px]"
+          }`}
+        >
           <CreditHeaderButton />
         </div>
         <CanvasEditor
           canvasId={canvasData.id}
           projectId={canvasData.projectId}
           accessToken={accessToken}
+          canvasRevision={canvasData.revision}
           initialContent={canvasData.content}
           onApiReady={handleApiReady}
           ws={ws}
           leftPanelOpen={layersOpen || filesOpen}
           onSelectionChange={setSelectedCanvasElements}
+          onImageChatCommand={handleImageChatCommand}
+          onCanvasRefreshRequest={handleCanvasSync}
+          onCanvasRevisionChange={handleCanvasRevisionChange}
+          onOpenDesign={setActiveDesign}
         />
         <CanvasEmptyHint
           excalidrawApi={excalidrawApi}
@@ -321,7 +454,18 @@ function CanvasPageContent() {
         currentBrandKitId={brandKitId}
         ws={ws}
         selectedCanvasElements={selectedCanvasElements}
+        imageChatCommand={imageChatCommand}
+        onOpenDesign={(designId) => setActiveDesign({ designId })}
       />
+      {activeDesign && pageRootRef.current && (
+        <DesignEditorSession
+          accessToken={accessToken}
+          designId={activeDesign.designId}
+          backgroundRoot={pageRootRef.current}
+          onClose={() => setActiveDesign(null)}
+          ws={ws}
+        />
+      )}
     </div>
   );
 }

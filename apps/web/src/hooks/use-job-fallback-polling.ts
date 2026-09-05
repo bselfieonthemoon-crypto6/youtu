@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useRef } from "react";
 
 import type { StreamEvent } from "@loomic/shared";
 
+import type { BackgroundJob } from "@loomic/shared";
 import { fetchJob } from "../lib/server-api";
 
 // --- Constants ---
@@ -13,22 +14,68 @@ const POLL_INTERVAL_MS = 5_000;
 /** Maximum total polling duration before giving up (ms) */
 const MAX_POLL_DURATION_MS = 10 * 60 * 1_000; // 10 minutes
 /** Terminal job statuses that should stop polling */
-const TERMINAL_FAILURE_STATUSES = new Set(["failed", "dead_letter", "canceled"]);
+const TERMINAL_FAILURE_STATUSES = new Set(["dead_letter", "canceled"]);
 
 // --- Types ---
 
 type UseJobFallbackPollingOptions = {
-  /** Called when a timed-out job succeeds — trigger canvas re-fetch */
-  onJobSucceeded: (jobId: string, jobType: string) => void;
+  /** Called only when the successful job already has a canvas element. */
+  onJobSucceeded: (jobId: string, jobType: string, elementId: string) => void;
   /** Ref to the current access token — avoids stale closure issues */
   accessTokenRef: React.RefObject<string | undefined>;
 };
 
-type ActivePoll = {
-  intervalId: ReturnType<typeof setInterval>;
-  startedAt: number;
-  jobType: string;
-};
+type SharedPoll = { promise: Promise<BackgroundJob> };
+
+const sharedPolls = new Map<string, SharedPoll>();
+
+function delay(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+export function readGenerationJobElementId(job: BackgroundJob): string | null {
+  const row = job as BackgroundJob & { canvas_element_id?: unknown };
+  if (typeof row.canvas_element_id === "string" && row.canvas_element_id) {
+    return row.canvas_element_id;
+  }
+  const result = job.result;
+  if (!result) return null;
+  const value = result.canvas_element_id ?? result.elementId ?? result.element_id;
+  return typeof value === "string" && value ? value : null;
+}
+
+/**
+ * Wait for one existing server job. Calls sharing a jobId reuse the same poll;
+ * this function never creates, enqueues, debits, or retries generation work.
+ */
+export function waitForGenerationJob(
+  accessToken: string,
+  jobId: string,
+): Promise<BackgroundJob> {
+  const existing = sharedPolls.get(jobId);
+  if (existing) return existing.promise;
+
+  const promise = (async () => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt <= MAX_POLL_DURATION_MS) {
+      const { job } = await fetchJob(accessToken, jobId);
+      if (
+        job.status === "succeeded" ||
+        TERMINAL_FAILURE_STATUSES.has(job.status) ||
+        (job.status === "failed" && job.attempt_count >= job.max_attempts)
+      ) {
+        return job;
+      }
+      await delay(POLL_INTERVAL_MS);
+    }
+    throw new Error("等待生成结果超时，请稍后再试。");
+  })().finally(() => {
+    sharedPolls.delete(jobId);
+  });
+
+  sharedPolls.set(jobId, { promise });
+  return promise;
+}
 
 // --- Hook ---
 
@@ -43,121 +90,38 @@ type ActivePoll = {
  * This prevents users from losing both their result and credits when the
  * backend times out but the worker eventually succeeds.
  *
- * Since the backend now inserts elements into the canvas directly, this hook
- * simply notifies the caller so it can trigger a canvas re-fetch (canvas.sync).
+ * A successful worker job is not necessarily inserted into the canvas. The
+ * canvas is refreshed only when the authoritative job record contains an
+ * element id; otherwise the tool card offers the explicit restore action.
  */
 export function useJobFallbackPolling({
   onJobSucceeded,
   accessTokenRef,
 }: UseJobFallbackPollingOptions) {
-  // Track active polls by jobId to avoid duplicates
-  const activePollsRef = useRef<Map<string, ActivePoll>>(new Map());
-
   // Keep callback ref current to avoid stale closures in intervals
   const onJobSucceededRef = useRef(onJobSucceeded);
   onJobSucceededRef.current = onJobSucceeded;
-
-  // Cleanup: stop all active polls on unmount
-  useEffect(() => {
-    return () => {
-      for (const [jobId, poll] of activePollsRef.current.entries()) {
-        clearInterval(poll.intervalId);
-        console.log(`[job-fallback] Cleanup: stopped polling for job ${jobId}`);
-      }
-      activePollsRef.current.clear();
-    };
-  }, []);
-
-  /**
-   * Stop polling for a specific job and remove from active polls map.
-   */
-  const stopPolling = useCallback((jobId: string) => {
-    const poll = activePollsRef.current.get(jobId);
-    if (poll) {
-      clearInterval(poll.intervalId);
-      activePollsRef.current.delete(jobId);
-    }
-  }, []);
 
   /**
    * Start polling a specific job until it reaches a terminal state.
    */
   const startPolling = useCallback(
     (jobId: string, jobType: string) => {
-      // Guard against duplicate polling for the same job
-      if (activePollsRef.current.has(jobId)) {
-        console.log(
-          `[job-fallback] Already polling job ${jobId}, skipping duplicate`,
-        );
-        return;
-      }
-
-      const startedAt = Date.now();
-      console.log(
-        `[job-fallback] Starting fallback polling for ${jobType} job ${jobId}`,
-      );
-
-      const intervalId = setInterval(async () => {
-        // Safety: check max duration
-        const elapsed = Date.now() - startedAt;
-        if (elapsed > MAX_POLL_DURATION_MS) {
-          console.warn(
-            `[job-fallback] Giving up on job ${jobId} after ${Math.round(elapsed / 1000)}s`,
-          );
-          stopPolling(jobId);
-          return;
-        }
-
-        const token = accessTokenRef.current;
-        if (!token) {
-          // Token not available (e.g. user logged out) — stop polling
-          console.warn(
-            `[job-fallback] No access token available, stopping poll for job ${jobId}`,
-          );
-          stopPolling(jobId);
-          return;
-        }
-
-        try {
-          const { job } = await fetchJob(token, jobId);
-
-          if (job.status === "succeeded" && job.result) {
-            console.log(
-              `[job-fallback] Job ${jobId} succeeded after fallback polling (${Math.round(elapsed / 1000)}s)`,
-            );
-            stopPolling(jobId);
-            // Backend has already inserted the element into the canvas.
-            // Notify caller to trigger a canvas re-fetch.
-            onJobSucceededRef.current(jobId, job.job_type ?? "unknown");
-            return;
+      const token = accessTokenRef.current;
+      if (!token) return;
+      void waitForGenerationJob(token, jobId)
+        .then((job) => {
+          if (job.status !== "succeeded") return;
+          const elementId = readGenerationJobElementId(job);
+          if (elementId) {
+            onJobSucceededRef.current(jobId, jobType, elementId);
           }
-
-          if (TERMINAL_FAILURE_STATUSES.has(job.status)) {
-            console.warn(
-              `[job-fallback] Job ${jobId} reached terminal status: ${job.status}`,
-            );
-            stopPolling(jobId);
-            return;
-          }
-
-          // Still running — continue polling
-        } catch (err) {
-          // Network error or API error — log but continue polling
-          // (transient errors should not stop the recovery mechanism)
-          console.warn(
-            `[job-fallback] Poll error for job ${jobId}:`,
-            err,
-          );
-        }
-      }, POLL_INTERVAL_MS);
-
-      activePollsRef.current.set(jobId, {
-        intervalId,
-        startedAt,
-        jobType,
-      });
+        })
+        .catch((error) => {
+          console.warn(`[job-fallback] Poll error for job ${jobId}:`, error);
+        });
     },
-    [accessTokenRef, stopPolling],
+    [accessTokenRef],
   );
 
   /**

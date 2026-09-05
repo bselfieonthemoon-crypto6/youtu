@@ -38,8 +38,9 @@ export function createScreenshotCanvasTool(deps: {
     schema: screenshotCanvasSchema,
     func: async (input, _runManager, config): Promise<string> => {
       const userId = (config as any)?.configurable?.user_id;
+      const canvasId = (config as any)?.configurable?.canvas_id;
 
-      if (!userId) {
+      if (!userId || !canvasId) {
         return JSON.stringify({
           error: "no_user_context",
           message: "screenshot_canvas requires a user context to communicate with the browser.",
@@ -47,8 +48,8 @@ export function createScreenshotCanvasTool(deps: {
       }
 
       try {
-        const result = await deps.connectionManager.rpc<ScreenshotResult>(
-          userId,
+        const result = await deps.connectionManager.rpcToCanvas<ScreenshotResult>(
+          canvasId,
           "canvas.screenshot",
           {
             mode: input.mode,

@@ -1,4 +1,4 @@
-import type { BackendFactory } from "deepagents";
+import type { AnyBackendProtocol, BackendFactory } from "deepagents";
 
 import type { ServerEnv } from "../../config/env.js";
 import { createDevelopmentBackend } from "./dev.js";
@@ -10,9 +10,16 @@ type AgentBackendEnv = Pick<
 >;
 
 export type AgentBackendResult = {
-  factory: BackendFactory;
+  factory: SyncBackendFactory;
   sandboxDir?: string;
 };
+
+// Loomic's factories build their backend synchronously. DeepAgents 1.8.8
+// broadened BackendFactory to also allow a Promise, while createDeepAgent still
+// requires a synchronous factory. Keep that stronger invariant at our boundary.
+export type SyncBackendFactory = (
+  ...args: Parameters<BackendFactory>
+) => AnyBackendProtocol;
 
 export function createAgentBackend(
   env: AgentBackendEnv,

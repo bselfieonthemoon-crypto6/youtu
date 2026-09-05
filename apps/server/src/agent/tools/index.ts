@@ -1,22 +1,33 @@
 import type { StructuredTool } from "@langchain/core/tools";
-import type { BackendFactory, BackendProtocol } from "deepagents";
+import type { AnyBackendProtocol } from "deepagents";
 
+import type { DestructiveConfirmationService } from "../../features/agent-actions/destructive-confirmation-service.js";
+import type {
+  AvailableModel,
+  AvailableVideoModel,
+} from "../../generation/providers/registry.js";
 import type { ConnectionManager } from "../../ws/connection-manager.js";
+import type { SyncBackendFactory } from "../backends/index.js";
 import { createBrandKitTool } from "./brand-kit.js";
-import { createInspectCanvasTool } from "./inspect-canvas.js";
-import { createManipulateCanvasTool } from "./manipulate-canvas.js";
 import {
-  createImageGenerateTool,
+  type DesignToolDependencies,
+  createDesignTools,
+} from "./design-tools.js";
+import {
   type PersistImageFn,
   type SubmitImageJobFn,
+  createImageGenerateTool,
 } from "./image-generate.js";
+import { createImageGenerationConfirmationTool } from "./image-generation-confirmation.js";
+import { createInspectCanvasTool } from "./inspect-canvas.js";
+import { createManipulateCanvasTool } from "./manipulate-canvas.js";
+import { createPersistSandboxFileTool } from "./persist-sandbox-file.js";
 import { createProjectSearchTool } from "./project-search.js";
 import { createScreenshotCanvasTool } from "./screenshot-canvas.js";
 import {
-  createVideoGenerateTool,
   type SubmitVideoJobFn,
+  createVideoGenerateTool,
 } from "./video-generate.js";
-import { createPersistSandboxFileTool } from "./persist-sandbox-file.js";
 
 export { createImageGenerateTool } from "./image-generate.js";
 export { createVideoGenerateTool } from "./video-generate.js";
@@ -40,62 +51,114 @@ export { createManipulateCanvasTool } from "./manipulate-canvas.js";
 //   task        — 分发子任务到 subagent
 //   write_todos — 管理 TODO 列表
 //
-// 我们使用 LocalShellBackend 作为 CompositeBackend 的 default backend，
-// 它实现了 SandboxBackendProtocol，因此 execute 工具自动可用。
-// 代码执行无需额外自定义工具。
+// 开发模式可使用 LocalShellBackend；生产 state 模式使用 StateBackend，
+// 不向多租户 Agent 暴露主机 shell。
 //
 // CompositeBackend 路由互不干扰：
 //   /workspace/  → StoreBackend (PostgresStore) — 文件持久化
 //   /memories/   → StoreBackend (PostgresStore) — agent 记忆
 //   /skills/     → FilesystemBackend            — 系统 skills
-//   default      → LocalShellBackend            — execute + 临时文件
+//   default      → StateBackend / dev shell     — 由运行模式决定
 // ---------------------------------------------------------------------------
 
 export function createMainAgentTools(
-  backend: BackendProtocol | BackendFactory,
+  backend: AnyBackendProtocol | SyncBackendFactory,
   deps: {
     createUserClient: (accessToken: string) => any;
+    destructiveConfirmationService?: DestructiveConfirmationService;
     brandKitId?: string | null;
     connectionManager?: ConnectionManager;
     persistImage?: PersistImageFn;
     sandboxDir?: string;
     submitImageJob?: SubmitImageJobFn;
     submitVideoJob?: SubmitVideoJobFn;
+    availableImageModels?: AvailableModel[];
+    availableVideoModels?: AvailableVideoModel[];
+    designTools?: DesignToolDependencies;
   },
 ) {
   const tools: StructuredTool[] = [
     createProjectSearchTool(backend),
     createInspectCanvasTool(deps),
-    createManipulateCanvasTool(deps),
-    createImageGenerateTool({
-      ...(deps.persistImage ? { persistImage: deps.persistImage } : {}),
-      ...(deps.submitImageJob ? { submitImageJob: deps.submitImageJob } : {}),
-    }),
-    createVideoGenerateTool({
-      ...(deps.submitVideoJob ? { submitVideoJob: deps.submitVideoJob } : {}),
-    }),
-    createPersistSandboxFileTool({
+    createManipulateCanvasTool({
       createUserClient: deps.createUserClient,
-      ...(deps.sandboxDir ? { sandboxDir: deps.sandboxDir } : {}),
+      ...(deps.destructiveConfirmationService
+        ? {
+            destructiveConfirmationService: deps.destructiveConfirmationService,
+          }
+        : {}),
     }),
-    // execute 工具由 deepagents FilesystemMiddleware 自动注入，
-    // 因为 CompositeBackend 的 default backend 是 LocalShellBackend。
-    // 不需要在这里手动注册。
   ];
+  if (deps.designTools) tools.push(...createDesignTools(deps.designTools));
+  if (
+    deps.availableImageModels === undefined ||
+    deps.availableImageModels.length > 0
+  ) {
+    tools.push(
+      createImageGenerateTool({
+        ...(deps.destructiveConfirmationService
+          ? { confirmationService: deps.destructiveConfirmationService }
+          : {}),
+        ...(deps.persistImage ? { persistImage: deps.persistImage } : {}),
+        ...(deps.submitImageJob ? { submitImageJob: deps.submitImageJob } : {}),
+        ...(deps.availableImageModels
+          ? { availableModels: deps.availableImageModels }
+          : {}),
+      }),
+    );
+  }
+  if (
+    deps.availableVideoModels === undefined ||
+    deps.availableVideoModels.length > 0
+  ) {
+    tools.push(
+      createVideoGenerateTool({
+        ...(deps.submitVideoJob ? { submitVideoJob: deps.submitVideoJob } : {}),
+        ...(deps.availableVideoModels
+          ? { availableModels: deps.availableVideoModels }
+          : {}),
+      }),
+    );
+  }
+  // execute 工具由 deepagents FilesystemMiddleware 自动注入，
+  // 因为 CompositeBackend 的 default backend 是 LocalShellBackend。
+  // 不需要在这里手动注册。
+  if (deps.destructiveConfirmationService) {
+    tools.push(
+      createImageGenerationConfirmationTool({
+        confirmationService: deps.destructiveConfirmationService,
+      }),
+    );
+  }
+  // This tool reads a host path and is only safe when a real isolated/dev
+  // sandbox directory is present. Never expose it with the production
+  // StateBackend, where an arbitrary host path would otherwise be accepted.
+  if (deps.sandboxDir) {
+    tools.push(
+      createPersistSandboxFileTool({
+        createUserClient: deps.createUserClient,
+        sandboxDir: deps.sandboxDir,
+      }),
+    );
+  }
   if (deps.brandKitId) {
     tools.push(createBrandKitTool(deps, deps.brandKitId));
   }
   if (deps.connectionManager) {
-    tools.push(createScreenshotCanvasTool({
-      connectionManager: deps.connectionManager,
-      ...(deps.persistImage ? { persistImage: deps.persistImage } : {}),
-    }));
+    tools.push(
+      createScreenshotCanvasTool({
+        connectionManager: deps.connectionManager,
+        ...(deps.persistImage ? { persistImage: deps.persistImage } : {}),
+      }),
+    );
   }
   return tools;
 }
 
 /** @deprecated Use createMainAgentTools + sub-agents instead */
-export function createPhaseATools(backend: BackendProtocol | BackendFactory) {
+export function createPhaseATools(
+  backend: AnyBackendProtocol | SyncBackendFactory,
+) {
   return [
     createProjectSearchTool(backend),
     createImageGenerateTool(),

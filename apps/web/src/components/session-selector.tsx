@@ -107,9 +107,9 @@ export function SessionSelector({
   );
 
   return (
-    <div className="flex items-center gap-1.5">
+    <div className="flex min-w-0 flex-1 items-center gap-1.5">
       {/* History toggle */}
-      <div className="relative" ref={panelRef}>
+      <div className="relative min-w-0 flex-1" ref={panelRef}>
         <button
           type="button"
           onClick={() => {
@@ -117,10 +117,10 @@ export function SessionSelector({
             setConfirmingId(null);
             setSearch("");
           }}
-          className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
+          className="inline-flex max-w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
         >
           <HistoryIcon className="h-3.5 w-3.5" />
-          <span className="max-w-[140px] truncate">
+          <span className="min-w-0 flex-1 truncate">
             {activeSession?.title ?? "History"}
           </span>
           <svg
@@ -232,7 +232,7 @@ export function SessionSelector({
       <button
         type="button"
         onClick={onNewChat}
-        className="inline-flex items-center justify-center rounded-md p-1 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
+        className="inline-flex shrink-0 items-center justify-center rounded-md p-1 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
         title="New Chat"
       >
         <NewChatIcon className="h-5 w-5" />

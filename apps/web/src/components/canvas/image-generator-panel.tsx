@@ -4,21 +4,27 @@ import { ImageUp, Lock, Zap } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
-import type { ImageModelInfo } from "../../lib/server-api";
-import { fetchImageModels, generateImageDirect } from "../../lib/server-api";
 import { useGenerationErrorHandler } from "../../hooks/use-generation-error-handler";
-import {
-  updateImageGeneratorElement,
-  resizeImageGeneratorElement,
-  type ImageGeneratorData,
-} from "../../lib/canvas-image-generator";
 import {
   createExcalidrawImageElement,
   fetchAsDataURL,
 } from "../../lib/canvas-elements";
+import {
+  type ImageGeneratorData,
+  resizeImageGeneratorElement,
+  updateImageGeneratorElement,
+} from "../../lib/canvas-image-generator";
+import type { ImageModelInfo } from "../../lib/server-api";
+import {
+  createImageGenerationJob,
+  fetchImageModels,
+  fetchJob,
+  generateImageDirect,
+} from "../../lib/server-api";
 
 type ImageGeneratorPanelProps = {
   elementId: string;
+  canvasId: string;
   elementBounds: { x: number; y: number; width: number; height: number };
   data: ImageGeneratorData;
   excalidrawApi: any;
@@ -42,6 +48,7 @@ function generateId(): string {
 
 export function ImageGeneratorPanel({
   elementId,
+  canvasId,
   elementBounds,
   data,
   excalidrawApi,
@@ -53,13 +60,17 @@ export function ImageGeneratorPanel({
   const [model, setModel] = useState(data.model);
   const [aspectRatio, setAspectRatio] = useState(data.aspectRatio);
   const [quality, setQuality] = useState(data.quality);
-  const [loading, setLoading] = useState(data.status === "generating");
+  const [loading, setLoading] = useState(
+    data.status === "generating" && Boolean(data.jobId),
+  );
   const [error, setError] = useState<string | null>(data.errorMessage ?? null);
   const [models, setModels] = useState<ImageModelInfo[]>([]);
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   const [showRatioDropdown, setShowRatioDropdown] = useState(false);
   const [showQualityDropdown, setShowQualityDropdown] = useState(false);
-  const [refImages, setRefImages] = useState<Array<{ id: string; dataUrl: string; file: File }>>([]);
+  const [refImages, setRefImages] = useState<
+    Array<{ id: string; dataUrl: string; file: File }>
+  >([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const refInputRef = useRef<HTMLInputElement>(null);
@@ -72,15 +83,29 @@ export function ImageGeneratorPanel({
   // Fetch available models with error logging
   useEffect(() => {
     let cancelled = false;
-    fetchImageModels()
+    fetchImageModels(accessTokenRef.current)
       .then((r) => {
-        if (!cancelled) setModels(r.models);
+        if (cancelled) return;
+        setModels(r.models);
+        setModel((current) => {
+          if (r.models.length === 0 || r.models.some((m) => m.id === current)) {
+            return current;
+          }
+          const fallback = r.models[0];
+          if (!fallback) return current;
+          updateImageGeneratorElement(excalidrawApi, elementId, {
+            model: fallback.id,
+          });
+          return fallback.id;
+        });
       })
       .catch((err) => {
         console.warn("[image-gen] Failed to fetch models:", err);
       });
-    return () => { cancelled = true; };
-  }, []);
+    return () => {
+      cancelled = true;
+    };
+  }, [excalidrawApi, elementId]);
 
   // Close dropdowns when clicking outside the panel
   useEffect(() => {
@@ -113,8 +138,7 @@ export function ImageGeneratorPanel({
   // Calculate panel screen position from canvas coordinates
   const { scrollX, scrollY, zoom } = canvasScrollZoom;
   const screenX = (elementBounds.x + scrollX) * zoom;
-  const screenY =
-    (elementBounds.y + elementBounds.height + scrollY) * zoom + 8;
+  const screenY = (elementBounds.y + elementBounds.height + scrollY) * zoom + 8;
 
   const currentModel = models.find((m) => m.id === model);
 
@@ -187,6 +211,7 @@ export function ImageGeneratorPanel({
           dataURL,
           mimeType: result.mimeType,
           created: Date.now(),
+          assetId: result.assetId,
         },
       ]);
 
@@ -197,15 +222,21 @@ export function ImageGeneratorPanel({
         width: elementBounds.width,
         height: elementBounds.height,
         title: prompt.trim().slice(0, 60),
+        source: "generated",
+        storageUrl: result.url,
+        assetId: result.assetId,
+        mimeType: result.mimeType,
+        prompt: prompt.trim(),
+        model,
+        originalWidth: result.width,
+        originalHeight: result.height,
       });
 
       // Replace: delete placeholder, add image
-      const elements = excalidrawApi
-        .getSceneElements()
-        .map((el: any) => {
-          if (el.id === elementId) return { ...el, isDeleted: true };
-          return el;
-        });
+      const elements = excalidrawApi.getSceneElements().map((el: any) => {
+        if (el.id === elementId) return { ...el, isDeleted: true };
+        return el;
+      });
       excalidrawApi.updateScene({
         elements: [...elements, imageElement],
         captureUpdate: "IMMEDIATELY",
@@ -362,7 +393,11 @@ export function ImageGeneratorPanel({
                 reader.onload = () => {
                   setRefImages((prev) => [
                     ...prev,
-                    { id: generateId(), dataUrl: reader.result as string, file },
+                    {
+                      id: generateId(),
+                      dataUrl: reader.result as string,
+                      file,
+                    },
                   ]);
                 };
                 reader.readAsDataURL(file);
@@ -374,7 +409,9 @@ export function ImageGeneratorPanel({
             type="button"
             onClick={() => refInputRef.current?.click()}
             className={`flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-muted ${
-              refImages.length > 0 ? "text-foreground" : "text-muted-foreground hover:text-foreground"
+              refImages.length > 0
+                ? "text-foreground"
+                : "text-muted-foreground hover:text-foreground"
             }`}
             title="Add reference image"
           >
@@ -392,7 +429,11 @@ export function ImageGeneratorPanel({
                   />
                   <button
                     type="button"
-                    onClick={() => setRefImages((prev) => prev.filter((r) => r.id !== img.id))}
+                    onClick={() =>
+                      setRefImages((prev) =>
+                        prev.filter((r) => r.id !== img.id),
+                      )
+                    }
                     className="absolute -top-1 -right-1 hidden group-hover:flex h-3.5 w-3.5 items-center justify-center rounded-full bg-primary text-primary-foreground text-[8px]"
                   >
                     x

@@ -75,7 +75,7 @@ export async function registerUploadRoutes(
           : undefined;
 
       const result = await options.uploadService.uploadFile(user, {
-        bucket: "project-assets",
+        bucket: "workspace-assets",
         fileName: file.filename,
         fileBuffer,
         mimeType,
@@ -83,9 +83,7 @@ export async function registerUploadRoutes(
         ...(projectId ? { projectId } : {}),
       });
 
-      return reply
-        .code(201)
-        .send(uploadResponseSchema.parse(result));
+      return reply.code(201).send(uploadResponseSchema.parse(result));
     } catch (error) {
       return sendUploadError(error, reply);
     }
@@ -113,6 +111,33 @@ export async function registerUploadRoutes(
     },
   );
 
+  // Stream an authorized asset through a stable URL. Canvas clients use the
+  // preview variant so large canvases do not retain full-resolution PNGs as
+  // base64 strings for every visible image.
+  app.get<{
+    Params: { assetId: string };
+    Querystring: { preview?: string };
+  }>("/api/uploads/:assetId/content", async (request, reply) => {
+    try {
+      const user = await options.auth.authenticate(request);
+      if (!user) return sendUnauthorized(reply);
+
+      const content = await options.uploadService.getAssetContent(
+        user,
+        request.params.assetId,
+        { preview: request.query.preview === "1" },
+      );
+      return reply
+        .header("content-type", content.mimeType)
+        .header("content-length", String(content.buffer.length))
+        .header("cache-control", "private, max-age=900")
+        .code(200)
+        .send(content.buffer);
+    } catch (error) {
+      return sendUploadError(error, reply);
+    }
+  });
+
   // Delete an asset
   app.delete<{ Params: { assetId: string } }>(
     "/api/uploads/:assetId",
@@ -121,10 +146,7 @@ export async function registerUploadRoutes(
         const user = await options.auth.authenticate(request);
         if (!user) return sendUnauthorized(reply);
 
-        await options.uploadService.deleteAsset(
-          user,
-          request.params.assetId,
-        );
+        await options.uploadService.deleteAsset(user, request.params.assetId);
 
         return reply.code(200).send({ ok: true });
       } catch (error) {

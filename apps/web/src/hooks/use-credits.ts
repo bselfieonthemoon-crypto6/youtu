@@ -60,6 +60,21 @@ export function useCredits(): UseCreditsReturn {
     return () => document.removeEventListener("visibilitychange", handler);
   }, [refresh]);
 
+  // Generation tools return a server-authoritative post-transaction balance.
+  // Applying that value immediately keeps every mounted balance badge in sync
+  // without reproducing pricing logic in the browser.
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const balance = (event as CustomEvent<{ balance?: unknown }>).detail?.balance;
+      if (typeof balance !== "number" || !Number.isFinite(balance)) return;
+      setData((current) =>
+        current ? { ...current, balance } : current,
+      );
+    };
+    window.addEventListener("loomic:credits-updated", handler);
+    return () => window.removeEventListener("loomic:credits-updated", handler);
+  }, []);
+
   const claimDaily = useCallback(async (): Promise<boolean> => {
     const token = accessTokenRef.current;
     if (!token) return false;

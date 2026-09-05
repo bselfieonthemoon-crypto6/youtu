@@ -2,34 +2,47 @@ import type { FastifyInstance } from "fastify";
 
 import { type ModelInfo, modelListResponseSchema } from "@loomic/shared";
 import type { ServerEnv } from "../config/env.js";
+import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
+import type { WorkspaceModelCatalogService } from "../features/providers/index.js";
+import type { RequestAuthenticator } from "../supabase/user.js";
 
-const OPENAI_MODELS: ModelInfo[] = [
-  { id: "openai:az_sre/gpt-5.4", name: "GPT-5.4", provider: "openai" },
-  { id: "openai:gpt-5.4", name: "OpenAI GPT-5.4", provider: "openai" },
-  { id: "openai:gpt-5.2", name: "OpenAI GPT-5.2", provider: "openai" },
-  { id: "openai:gpt-5.4-mini", name: "GPT-5.4 Mini", provider: "openai" },
-  { id: "openai:gpt-4.1", name: "GPT-4.1", provider: "openai" },
-  { id: "openai:gpt-4o", name: "GPT-4o", provider: "openai" },
-  { id: "openai:gpt-4o-mini", name: "GPT-4o Mini", provider: "openai" },
-  { id: "openai:o3-mini", name: "o3 Mini", provider: "openai" },
-];
-
-const GOOGLE_MODELS: ModelInfo[] = [
-  // Gemini 3 series (Preview)
-  { id: "google:gemini-3.1-pro-preview", name: "Gemini 3.1 Pro", provider: "google" },
-  { id: "google:gemini-3-flash-preview", name: "Gemini 3 Flash", provider: "google" },
-  { id: "google:gemini-3.1-flash-lite-preview", name: "Gemini 3.1 Flash Lite", provider: "google" },
-  // Gemini 2.5 series (GA)
-  { id: "google:gemini-2.5-pro", name: "Gemini 2.5 Pro", provider: "google" },
-  { id: "google:gemini-2.5-flash", name: "Gemini 2.5 Flash", provider: "google" },
-  { id: "google:gemini-2.5-flash-lite", name: "Gemini 2.5 Flash Lite", provider: "google" },
-];
-
-export async function registerModelRoutes(app: FastifyInstance, env: ServerEnv) {
-  app.get("/api/models", async (_request, reply) => {
+export async function registerModelRoutes(
+  app: FastifyInstance,
+  _env: ServerEnv,
+  options?: {
+    auth: RequestAuthenticator;
+    viewerService: ViewerService;
+    workspaceModelCatalogService: WorkspaceModelCatalogService;
+  },
+) {
+  app.get("/api/models", async (request, reply) => {
     const models: ModelInfo[] = [];
-    if (env.openAIApiKey) models.push(...OPENAI_MODELS);
-    if (env.googleApiKey || env.googleVertexProject) models.push(...GOOGLE_MODELS);
+
+    if (options) {
+      try {
+        const user = await options.auth.authenticate(request);
+        if (user) {
+          const viewer = await options.viewerService.ensureViewer(user);
+          const entries = await options.workspaceModelCatalogService.listPublished(
+            user,
+            viewer.workspace.id,
+          );
+          for (const entry of entries) {
+            if (entry.model.modality !== "text") continue;
+            models.push({
+              id: entry.model.id,
+              name: entry.model.displayName,
+              provider: entry.model.providerDisplayName,
+              providerDisplayName: entry.model.providerDisplayName,
+              source: "workspace",
+              capabilities: entry.model.capabilities,
+            });
+          }
+        }
+      } catch {
+        // Catalog lookup is best-effort; anonymous/invalid sessions see no models.
+      }
+    }
     return reply.code(200).send(modelListResponseSchema.parse({ models }));
   });
 }

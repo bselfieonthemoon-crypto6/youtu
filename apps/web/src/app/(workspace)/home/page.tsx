@@ -1,6 +1,6 @@
 "use client";
 
-import type { ImageGenerationPreference, ProjectSummary, VideoGenerationPreference } from "@loomic/shared";
+import type { AgentExecutionMode, ImageGenerationPreference, ProjectSummary, VideoGenerationPreference } from "@loomic/shared";
 import type { ReadyAttachment } from "@/hooks/use-image-attachments";
 import { motion } from "framer-motion";
 import Link from "next/link";
@@ -177,6 +177,7 @@ export default function HomePage() {
       imageGenerationPreference?: ImageGenerationPreference,
       videoGenerationPreference?: VideoGenerationPreference,
       model?: string,
+      executionMode?: AgentExecutionMode,
     ) => {
       setSelectedExample(null);
       clearAttachments();
@@ -190,6 +191,7 @@ export default function HomePage() {
           ? { videoGenerationPreference }
           : {}),
         ...(model ? { model } : {}),
+        ...(executionMode ? { executionMode } : {}),
       });
     },
     [createNewProject, clearAttachments],
@@ -206,7 +208,7 @@ export default function HomePage() {
 
   const handleDiscoverySelect = useCallback(
     (selection: HomeDiscoverySelection) => {
-      createNewProject({ prompt: selection.prompt });
+      createNewProject({ prompt: selection.prompt, executionMode: "thinking" });
     },
     [createNewProject],
   );
@@ -257,6 +259,7 @@ export default function HomePage() {
         <motion.div variants={fadeUp} custom={3} className="w-full">
           <HomePrompt
             ref={promptRef}
+            accessToken={session?.access_token}
             onSubmit={handlePromptSubmit}
             disabled={creating}
             attachments={imageAttachments}

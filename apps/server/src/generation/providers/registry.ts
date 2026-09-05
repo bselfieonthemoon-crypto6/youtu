@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import type {
   ImageProvider,
   ModelInfo,
@@ -8,6 +10,19 @@ import { GenerationError } from "../utils.js";
 
 const imageProviders = new Map<string, ImageProvider>();
 const videoProviders = new Map<string, VideoProvider>();
+const scopedProviders = new AsyncLocalStorage<GenerationProviderScope>();
+
+export type GenerationProviderScope = {
+  imageProvider?: ImageProvider;
+  videoProvider?: VideoProvider;
+};
+
+export function runWithGenerationProviderScope<T>(
+  scope: GenerationProviderScope,
+  fn: () => T,
+): T {
+  return scopedProviders.run(scope, fn);
+}
 
 export function registerImageProvider(provider: ImageProvider): void {
   imageProviders.set(provider.name, provider);
@@ -18,6 +33,8 @@ export function registerVideoProvider(provider: VideoProvider): void {
 }
 
 export function getImageProvider(name: string): ImageProvider {
+  const scoped = scopedProviders.getStore()?.imageProvider;
+  if (scoped?.name === name) return scoped;
   const provider = imageProviders.get(name);
   if (!provider) {
     throw new GenerationError(
@@ -30,6 +47,8 @@ export function getImageProvider(name: string): ImageProvider {
 }
 
 export function getVideoProvider(name: string): VideoProvider {
+  const scoped = scopedProviders.getStore()?.videoProvider;
+  if (scoped?.name === name) return scoped;
   const provider = videoProviders.get(name);
   if (!provider) {
     throw new GenerationError(
@@ -66,6 +85,8 @@ export function getAvailableVideoModels(): AvailableVideoModel[] {
 
 /** Resolves the provider name that handles a given image model ID. */
 export function resolveImageProviderName(modelId: string): string {
+  const scoped = scopedProviders.getStore()?.imageProvider;
+  if (scoped?.models.some((model) => model.id === modelId)) return scoped.name;
   for (const provider of imageProviders.values()) {
     if (provider.models.some((m) => m.id === modelId)) {
       return provider.name;
@@ -80,6 +101,8 @@ export function resolveImageProviderName(modelId: string): string {
 
 /** Resolves the provider name that handles a given video model ID. */
 export function resolveVideoProviderName(modelId: string): string {
+  const scoped = scopedProviders.getStore()?.videoProvider;
+  if (scoped?.models.some((model) => model.id === modelId)) return scoped.name;
   for (const provider of videoProviders.values()) {
     if (provider.models.some((m) => m.id === modelId)) {
       return provider.name;

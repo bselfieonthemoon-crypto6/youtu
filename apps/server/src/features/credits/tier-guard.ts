@@ -17,6 +17,33 @@ import {
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 
+/**
+ * Master switch for every commercial generation gate. It is intentionally
+ * disabled during product validation. Switching this one value back to true
+ * restores model tiers, resolution limits, concurrency limits and credit
+ * charging together.
+ */
+export const COMMERCIALIZATION_ENFORCEMENT_ENABLED = [
+  "1",
+  "true",
+  "yes",
+  "on",
+].includes(
+  (process.env.LOOMIC_COMMERCIALIZATION_ENABLED ?? "false")
+    .trim()
+    .toLowerCase(),
+);
+
+export function isModelAccessible(
+  plan: SubscriptionPlan | null,
+  modelId: string,
+): boolean {
+  return (
+    !COMMERCIALIZATION_ENFORCEMENT_ENABLED ||
+    (plan !== null && canAccessModel(plan, modelId))
+  );
+}
+
 // ── Error ────────────────────────────────────────────────────
 
 export type TierGuardErrorCode = Exclude<BillingErrorCode, "insufficient_credits">;
@@ -61,7 +88,7 @@ export function createTierGuard(options: {
 }): TierGuard {
   return {
     checkModelAccess(plan, modelId) {
-      if (!canAccessModel(plan, modelId)) {
+      if (!isModelAccessible(plan, modelId)) {
         throw new TierGuardError(
           "model_not_accessible",
           `Your ${plan} plan does not have access to model "${modelId}". Please upgrade your plan.`,
@@ -71,6 +98,7 @@ export function createTierGuard(options: {
     },
 
     checkResolution(plan, quality) {
+      if (!COMMERCIALIZATION_ENFORCEMENT_ENABLED) return;
       if (!canUseResolution(plan, quality)) {
         throw new TierGuardError(
           "resolution_not_allowed",
@@ -81,6 +109,7 @@ export function createTierGuard(options: {
     },
 
     checkVideoResolution(plan, resolution) {
+      if (!COMMERCIALIZATION_ENFORCEMENT_ENABLED) return;
       if (!canUseVideoResolution(plan, resolution)) {
         throw new TierGuardError(
           "resolution_not_allowed",
@@ -91,6 +120,7 @@ export function createTierGuard(options: {
     },
 
     async checkConcurrency(workspaceId, plan) {
+      if (!COMMERCIALIZATION_ENFORCEMENT_ENABLED) return;
       const admin = options.getAdminClient();
       const maxConcurrent = PLAN_CONFIGS[plan].maxConcurrentJobs;
 
@@ -120,6 +150,7 @@ export function createTierGuard(options: {
     },
 
     calculateCreditCost(modelId, jobType, params) {
+      if (!COMMERCIALIZATION_ENFORCEMENT_ENABLED) return 0;
       if (jobType === "image_generation") {
         const quality: ImageQualityLevel = params?.quality ?? "hd";
         return getImageCreditCost(modelId, quality);

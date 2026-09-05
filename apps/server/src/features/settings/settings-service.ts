@@ -2,7 +2,7 @@ import type { WorkspaceSettings } from "@loomic/shared";
 
 import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
 
-const FALLBACK_MODEL = "gpt-5.4-mini";
+const FALLBACK_MODEL = "apiyi:gemini-3.1-flash-lite";
 
 export class SettingsServiceError extends Error {
   readonly statusCode: number;
@@ -61,19 +61,21 @@ export function createSettingsService(options: {
         );
       }
 
-      return {
-        defaultModel: data?.default_model ?? defaultModel,
-      };
+      return { defaultModel: normalizeDefaultModel(data?.default_model, defaultModel) };
     },
 
     async updateWorkspaceSettings(user, workspaceId, settings) {
       const client = options.createUserClient(user.accessToken);
+      const normalizedSettings = {
+        ...settings,
+        defaultModel: normalizeDefaultModel(settings.defaultModel, defaultModel),
+      };
       const { error } = await client
         .from("workspace_settings")
         .upsert(
           {
             workspace_id: workspaceId,
-            default_model: settings.defaultModel,
+            default_model: normalizedSettings.defaultModel,
           },
           { onConflict: "workspace_id" },
         );
@@ -86,7 +88,12 @@ export function createSettingsService(options: {
         );
       }
 
-      return settings;
+      return normalizedSettings;
     },
   };
+}
+
+function normalizeDefaultModel(model: string | null | undefined, fallback: string): string {
+  if (model?.startsWith("apiyi:") || model?.startsWith("workspace:")) return model;
+  return fallback;
 }

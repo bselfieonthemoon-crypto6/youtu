@@ -1,17 +1,10 @@
 // @credits-system — Image model list with tier annotations, credit costs, and accessibility flags
 import type { FastifyInstance } from "fastify";
 
-import {
-  canAccessModel,
-  getImageCreditCost,
-  MODEL_MIN_TIER,
-  type SubscriptionPlan,
-} from "@loomic/shared";
-
 import type { CreditService } from "../features/credits/credit-service.js";
-import { getAvailableImageModels } from "../generation/providers/registry.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
+import type { WorkspaceModelCatalogService } from "../features/providers/index.js";
 
 export async function registerImageModelRoutes(
   app: FastifyInstance,
@@ -19,36 +12,37 @@ export async function registerImageModelRoutes(
     auth: RequestAuthenticator;
     creditService: CreditService;
     viewerService: ViewerService;
+    workspaceModelCatalogService?: WorkspaceModelCatalogService;
   },
 ) {
   app.get("/api/image-models", async (request, reply) => {
-    const models = getAvailableImageModels();
-
-    // Try to authenticate — unauthenticated users still see models
-    let userPlan: SubscriptionPlan | null = null;
+    let workspaceModels: Awaited<ReturnType<WorkspaceModelCatalogService["listPublished"]>> = [];
     try {
       const user = await options.auth.authenticate(request);
       if (user) {
         const viewer = await options.viewerService.ensureViewer(user);
-        const balance = await options.creditService.getBalance(
-          viewer.workspace.id,
-        );
-        userPlan = balance.plan;
+        workspaceModels = options.workspaceModelCatalogService
+          ? await options.workspaceModelCatalogService.listPublished(user, viewer.workspace.id)
+          : [];
       }
     } catch {
-      // Auth failure is non-fatal — just show models as inaccessible
+      // Auth failure is non-fatal — no workspace catalog is returned.
     }
-
-    const annotated = models.map((m) => ({
-      id: m.id,
-      displayName: m.displayName,
-      description: m.description,
-      iconUrl: m.iconUrl,
-      provider: m.provider,
-      accessible: userPlan !== null && canAccessModel(userPlan, m.id),
-      creditCost: getImageCreditCost(m.id, "hd"),
-      minTier: MODEL_MIN_TIER[m.id] ?? "pro",
-    }));
+    const annotated = [] as Array<Record<string, unknown>>;
+    for (const entry of workspaceModels) {
+      if (entry.model.modality !== "image") continue;
+      annotated.push({
+        id: entry.model.id,
+        displayName: entry.model.displayName,
+        supportsExact2K: entry.upstreamModelId === "gpt-image-2",
+        description: "工作区供应商计费",
+        provider: entry.model.providerDisplayName,
+        accessible: true,
+        source: "workspace",
+        providerDisplayName: entry.model.providerDisplayName,
+        capabilities: entry.model.capabilities,
+      });
+    }
 
     return reply.code(200).send({ models: annotated });
   });

@@ -1,6 +1,7 @@
 import { z } from "zod";
-import { streamEventSchema } from "./events.js";
 import { runCreateRequestSchema } from "./contracts.js";
+import { designSyncEventSchema } from "./design-contracts.js";
+import { streamEventSchema } from "./events.js";
 
 // --- Server → Client: Push Event (replaces SSE) ---
 
@@ -40,6 +41,30 @@ export const wsCancelCommandSchema = z.object({
   payload: z.object({ runId: z.string().min(1) }),
 });
 
+export const wsConfirmActionCommandSchema = z
+  .object({
+    type: z.literal("command"),
+    action: z.literal("agent.confirm_action"),
+    payload: z
+      .object({
+        confirmationId: z.string().uuid(),
+        decision: z.enum(["confirm", "cancel"]),
+      })
+      .strict(),
+  })
+  .strict();
+
+export const wsRetryToolCommandSchema = z.object({
+  type: z.literal("command"),
+  action: z.literal("agent.retry_tool"),
+  payload: z
+    .object({
+      toolExecutionId: z.string().uuid(),
+      requestId: z.string().uuid(),
+    })
+    .strict(),
+});
+
 export const wsResumeCommandSchema = z.object({
   type: z.literal("command"),
   action: z.literal("canvas.resume"),
@@ -52,6 +77,8 @@ export const wsResumeCommandSchema = z.object({
 export const wsCommandSchema = z.discriminatedUnion("action", [
   wsRunCommandSchema,
   wsCancelCommandSchema,
+  wsConfirmActionCommandSchema,
+  wsRetryToolCommandSchema,
   wsResumeCommandSchema,
 ]);
 
@@ -72,16 +99,19 @@ export const wsRpcResponseSchema = z.object({
 export const wsClientMessageSchema = z.union([
   wsRunCommandSchema,
   wsCancelCommandSchema,
+  wsConfirmActionCommandSchema,
+  wsRetryToolCommandSchema,
   wsResumeCommandSchema,
   wsRpcResponseSchema,
 ]);
 
 // --- Union: Server → Client ---
 
-export const wsServerMessageSchema = z.discriminatedUnion("type", [
+export const wsServerMessageSchema = z.union([
   wsServerEventSchema,
   wsRpcRequestSchema,
   wsCommandAckSchema,
+  designSyncEventSchema,
 ]);
 
 // --- Type exports ---
@@ -91,6 +121,10 @@ export type WsRpcRequest = z.infer<typeof wsRpcRequestSchema>;
 export type WsCommandAck = z.infer<typeof wsCommandAckSchema>;
 export type WsRunCommand = z.infer<typeof wsRunCommandSchema>;
 export type WsCancelCommand = z.infer<typeof wsCancelCommandSchema>;
+export type WsConfirmActionCommand = z.infer<
+  typeof wsConfirmActionCommandSchema
+>;
+export type WsRetryToolCommand = z.infer<typeof wsRetryToolCommandSchema>;
 export type WsResumeCommand = z.infer<typeof wsResumeCommandSchema>;
 export type WsCommand = z.infer<typeof wsCommandSchema>;
 export type WsRpcResponse = z.infer<typeof wsRpcResponseSchema>;

@@ -39,6 +39,12 @@ function input(
 
 describe("runVideoGenerate capability enforcement", () => {
   it("does not send the schema's audio default to a model without audio capability", async () => {
+    const billing = {
+      estimate: 51,
+      charged: 51,
+      balanceAfter: 49,
+      currency: "credits" as const,
+    };
     const submit = vi.fn<SubmitVideoJobFn>().mockResolvedValue({
       jobId: "job-1",
       videoUrl: "https://cdn.example/video.mp4",
@@ -46,12 +52,14 @@ describe("runVideoGenerate capability enforcement", () => {
       height: 768,
       durationSeconds: 5,
       mimeType: "video/mp4",
+      billing,
     });
 
-    await runVideoGenerate(input(), submit, [metasoModel]);
+    const result = await runVideoGenerate(input(), submit, [metasoModel]);
 
     expect(submit).toHaveBeenCalledOnce();
     expect(submit.mock.calls[0]?.[0]).not.toHaveProperty("enableAudio");
+    expect(result.billing).toEqual(billing);
   });
 
   it("rejects unsupported reference video and excess images before job submission", async () => {

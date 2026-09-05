@@ -20,6 +20,7 @@ import { JobServiceError } from "../features/jobs/job-service.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { UploadService } from "../features/uploads/upload-service.js";
 import type { AuthenticatedUser, RequestAuthenticator } from "../supabase/user.js";
+import { safeDownload } from "../security/safe-download.js";
 
 const generateImageRequestSchema = z.object({
   prompt: z.string().min(1),
@@ -62,6 +63,10 @@ export async function registerGenerateRoutes(
     }
 
     let payload: z.infer<typeof generateImageRequestSchema>;
+    let billingJobId: string | null = null;
+    let billingWorkspaceId: string | null = null;
+    let chargedAmount = 0;
+
     try {
       payload = generateImageRequestSchema.parse(request.body);
     } catch {
@@ -75,11 +80,12 @@ export async function registerGenerateRoutes(
       );
     }
 
-    const model = payload.model ?? "black-forest-labs/flux-kontext-pro";
+    const model = payload.model ?? "gpt-image-2-all";
 
     try {
       // ── Tier guard + credit checks ──
       const viewer = await options.viewerService.ensureViewer(user);
+      billingWorkspaceId = viewer.workspace.id;
       let creditsCost = 0;
 
       if (options.creditService && options.tierGuard) {
@@ -91,12 +97,47 @@ export async function registerGenerateRoutes(
         await options.tierGuard.checkConcurrency(viewer.workspace.id, sub.plan);
         creditsCost = options.tierGuard.calculateCreditCost(model, "image_generation", { quality });
 
-        // Deduct credits before generation
+        // Even this legacy synchronous route uses a durable job as the billing
+        // identity. It is never published to PGMQ; this request owns execution.
         if (creditsCost > 0) {
-          await options.creditService.deductCredits(
-            viewer.workspace.id, user.id, creditsCost, undefined,
+          if (!options.jobService) {
+            throw new JobServiceError(
+              "job_create_failed",
+              "Generation billing is temporarily unavailable.",
+              503,
+            );
+          }
+          const job = await options.jobService.createJob(user, {
+            workspaceId: viewer.workspace.id,
+            jobType: "image_generation",
+            payload: {
+              prompt: payload.prompt,
+              model,
+              aspectRatio: payload.aspectRatio ?? "1:1",
+              quality: payload.quality ?? "hd",
+            },
+            deferEnqueue: true,
+            providerBilling: {
+              creditsCost,
+              pricingVersion: "credits-v1",
+              unit: "image",
+            },
+          });
+          billingJobId = job.id;
+          const txId = await options.creditService.deductCredits(
+            viewer.workspace.id, user.id, creditsCost, job.id,
             `Direct image generation: ${model}`,
           );
+          chargedAmount = creditsCost;
+          await options.jobService.setCreditsInfo(job.id, creditsCost, txId);
+          const claimed = await options.jobService.markRunning(job.id);
+          if (!claimed) {
+            throw new JobServiceError(
+              "job_create_failed",
+              "Generation job could not be started.",
+              409,
+            );
+          }
         }
       }
 
@@ -117,6 +158,16 @@ export async function registerGenerateRoutes(
         options,
       );
 
+      if (billingJobId && options.jobService) {
+        await options.jobService.markSucceeded(billingJobId, {
+          url: signedUrl,
+          assetId,
+          mimeType: result.mimeType,
+          width: result.width,
+          height: result.height,
+        });
+      }
+
       return reply.code(200).send({
         url: signedUrl,
         assetId,
@@ -126,6 +177,23 @@ export async function registerGenerateRoutes(
         height: result.height,
       });
     } catch (error) {
+      if (billingJobId && options.jobService) {
+        await options.jobService.cancelJob(user, billingJobId).catch(() => {});
+        if (
+          chargedAmount > 0 &&
+          billingWorkspaceId &&
+          options.creditService
+        ) {
+          await options.creditService.refundCredits(
+            billingWorkspaceId,
+            user.id,
+            chargedAmount,
+            billingJobId,
+            "Auto-refund: direct image generation failed",
+          ).catch(() => {});
+        }
+      }
+
       // Handle tier/credit errors
       if (error instanceof TierGuardError) {
         return reply.code(error.statusCode).send(
@@ -135,6 +203,13 @@ export async function registerGenerateRoutes(
         );
       }
       if (error instanceof CreditServiceError) {
+        return reply.code(error.statusCode).send(
+          applicationErrorResponseSchema.parse({
+            error: { code: error.code, message: error.message },
+          }),
+        );
+      }
+      if (error instanceof JobServiceError) {
         return reply.code(error.statusCode).send(
           applicationErrorResponseSchema.parse({
             error: { code: error.code, message: error.message },
@@ -408,11 +483,17 @@ async function downloadAndUpload(
   user: AuthenticatedUser,
   deps: { uploadService: UploadService; viewerService: ViewerService },
 ): Promise<{ signedUrl: string; assetId: string }> {
-  const response = await fetch(sourceUrl);
-  if (!response.ok) {
-    throw new Error(`Failed to download generated image: ${response.status}`);
-  }
-  const buffer = Buffer.from(await response.arrayBuffer());
+  const downloaded = await safeDownload(sourceUrl, {
+    kind: "image",
+    maxBytes: 30 * 1024 * 1024,
+    timeoutMs: 60_000,
+    maxRedirects: 2,
+    allowDataUri: true,
+    expectedMimeType: mimeType,
+    allowedMimeTypes: ["image/png", "image/jpeg", "image/webp", "image/avif"],
+  });
+  const buffer = downloaded.buffer;
+  mimeType = downloaded.mimeType;
 
   const ext = mimeType === "image/webp" ? "webp" : "png";
   const slug = prompt.slice(0, 40).replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-|-$/g, "");
@@ -421,7 +502,7 @@ async function downloadAndUpload(
   const viewer = await deps.viewerService.ensureViewer(user);
 
   const result = await deps.uploadService.uploadFile(user, {
-    bucket: "project-assets",
+    bucket: "workspace-assets",
     fileName,
     fileBuffer: buffer,
     mimeType,

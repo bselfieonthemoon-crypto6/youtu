@@ -14,12 +14,14 @@ export function ImageModelPreferencePopover({
   open,
   onClose,
   anchorRef,
+  accessToken,
 }: {
   open: boolean;
   onClose: () => void;
   anchorRef: React.RefObject<HTMLElement | null>;
+  accessToken?: string | undefined;
 }) {
-  const { preference, setMode, toggleModel } = useImageModelPreference();
+  const { preference, setPreference, setMode, toggleModel } = useImageModelPreference();
   const [models, setModels] = useState<ImageModelInfo[]>([]);
   const [activeTab, setActiveTab] = useState<"image" | "video">("image");
   const videoPreference = useVideoModelPreference();
@@ -29,13 +31,27 @@ export function ImageModelPreferencePopover({
 
   useEffect(() => {
     if (!open) return;
-    fetchImageModels()
-      .then((data) => setModels(data.models))
+    fetchImageModels(accessToken)
+      .then((data) => {
+        setModels(data.models);
+        const available = new Set(data.models.map((model) => model.id));
+        const selected = preference.models.filter((model) => available.has(model));
+        if (selected.length !== preference.models.length) {
+          setPreference({ mode: selected.length > 0 ? preference.mode : "auto", models: selected });
+        }
+      })
       .catch(() => {});
-    fetchVideoModels()
-      .then((data) => setVideoModels(data.models))
+    fetchVideoModels(accessToken)
+      .then((data) => {
+        setVideoModels(data.models);
+        const available = new Set(data.models.map((model) => model.id));
+        const selected = videoPreference.preference.models.filter((model) => available.has(model));
+        if (selected.length !== videoPreference.preference.models.length) {
+          videoPreference.setPreference({ mode: selected.length > 0 ? videoPreference.preference.mode : "auto", models: selected });
+        }
+      })
       .catch(() => {});
-  }, [open]);
+  }, [open, accessToken]);
 
   // Calculate position — auto-detect direction based on available space
   useLayoutEffect(() => {

@@ -1,17 +1,35 @@
-import type { BaseCheckpointSaver, BaseStore } from "@langchain/langgraph-checkpoint";
 import type { BaseLanguageModel } from "@langchain/core/language_models/base";
-import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
-import { ChatVertexAI } from "@langchain/google-vertexai";
-import { ChatOpenAI } from "@langchain/openai";
+import type {
+  BaseCheckpointSaver,
+  BaseStore,
+} from "@langchain/langgraph-checkpoint";
+import type { AgentExecutionMode } from "@loomic/shared";
 import { createDeepAgent } from "deepagents";
 
-import { DEFAULT_AGENT_MODEL, DEFAULT_GOOGLE_AGENT_MODEL, type ServerEnv } from "../config/env.js";
+import { DEFAULT_APIYI_AGENT_MODEL, type ServerEnv } from "../config/env.js";
+import type { DestructiveConfirmationService } from "../features/agent-actions/destructive-confirmation-service.js";
+import type {
+  AvailableModel,
+  AvailableVideoModel,
+} from "../generation/providers/registry.js";
 import type { ConnectionManager } from "../ws/connection-manager.js";
-import { createAgentBackend, type AgentBackendResult } from "./backends/index.js";
-import { LOOMIC_SYSTEM_PROMPT } from "./prompts/loomic-main.js";
+import {
+  type AgentBackendResult,
+  createAgentBackend,
+} from "./backends/index.js";
+import { OpenAICompatibleChatModel } from "./openai-compatible-chat-model.js";
+import {
+  LOOMIC_FAST_MODE_PROMPT,
+  LOOMIC_SYSTEM_PROMPT,
+  LOOMIC_THINKING_MODE_PROMPT,
+} from "./prompts/loomic-main.js";
 import { createVideoSubAgent } from "./sub-agents.js";
+import type { DesignToolDependencies } from "./tools/design-tools.js";
+import type {
+  PersistImageFn,
+  SubmitImageJobFn,
+} from "./tools/image-generate.js";
 import { createMainAgentTools } from "./tools/index.js";
-import type { PersistImageFn, SubmitImageJobFn } from "./tools/image-generate.js";
 import type { SubmitVideoJobFn } from "./tools/video-generate.js";
 import type { WorkspaceSkillEntry } from "./workspace-skills.js";
 
@@ -27,6 +45,9 @@ export type LoomicAgentFactory = (options: {
   checkpointer?: BaseCheckpointSaver;
   connectionManager?: ConnectionManager;
   createUserClient?: (accessToken: string) => any;
+  destructiveConfirmationService?: DestructiveConfirmationService;
+  designTools?: DesignToolDependencies;
+  executionMode?: AgentExecutionMode;
   env: ServerEnv;
   model?: BaseLanguageModel | string;
   persistImage?: PersistImageFn;
@@ -35,6 +56,8 @@ export type LoomicAgentFactory = (options: {
   submitVideoJob?: SubmitVideoJobFn;
   store?: BaseStore;
   workspaceSkills?: WorkspaceSkillEntry[];
+  availableImageModels?: AvailableModel[];
+  availableVideoModels?: AvailableVideoModel[];
 }) => LoomicAgent;
 
 export function createLoomicDeepAgent(options: {
@@ -44,6 +67,9 @@ export function createLoomicDeepAgent(options: {
   checkpointer?: BaseCheckpointSaver;
   connectionManager?: ConnectionManager;
   createUserClient?: (accessToken: string) => any;
+  destructiveConfirmationService?: DestructiveConfirmationService;
+  designTools?: DesignToolDependencies;
+  executionMode?: AgentExecutionMode;
   env: ServerEnv;
   model?: BaseLanguageModel | string;
   persistImage?: PersistImageFn;
@@ -52,16 +78,17 @@ export function createLoomicDeepAgent(options: {
   submitVideoJob?: SubmitVideoJobFn;
   store?: BaseStore;
   workspaceSkills?: WorkspaceSkillEntry[];
+  availableImageModels?: AvailableModel[];
+  availableVideoModels?: AvailableVideoModel[];
 }): LoomicAgent {
   const backendResult =
     options.backendResult ?? createAgentBackend(options.env, options.canvasId);
 
-  applyOpenAICompatEnv(options.env);
-
+  const executionMode = options.executionMode ?? "thinking";
   const modelSpec = options.model ?? createDefaultModelSpecifier(options.env);
   const resolvedModel =
     typeof modelSpec === "string"
-      ? createStreamingChatModel(modelSpec)
+      ? createStreamingChatModel(modelSpec, executionMode)
       : modelSpec;
 
   const createUserClient =
@@ -76,6 +103,12 @@ export function createLoomicDeepAgent(options: {
     ? LOOMIC_SYSTEM_PROMPT +
       "\n\n当前项目已绑定品牌套件。在进行设计相关工作时，请先使用 get_brand_kit 工具查询品牌信息，确保设计符合品牌规范。"
     : LOOMIC_SYSTEM_PROMPT;
+
+  systemPrompt += `\n\n${
+    executionMode === "thinking"
+      ? LOOMIC_THINKING_MODE_PROMPT
+      : LOOMIC_FAST_MODE_PROMPT
+  }`;
 
   // Inject enabled skills (both system and user-created) into the system prompt.
   // All skills are loaded from the database via loadWorkspaceSkills() in runtime.ts.
@@ -107,17 +140,40 @@ export function createLoomicDeepAgent(options: {
     model: resolvedModel,
     name: "loomic",
     ...(options.store ? { store: options.store } : {}),
-    subagents: [createVideoSubAgent()],
+    subagents: options.submitVideoJob
+      ? [createVideoSubAgent(options.submitVideoJob)]
+      : [],
     systemPrompt,
     tools: createMainAgentTools(backendResult.factory, {
       createUserClient,
+      ...(options.destructiveConfirmationService
+        ? {
+            destructiveConfirmationService:
+              options.destructiveConfirmationService,
+          }
+        : {}),
+      ...(options.designTools ? { designTools: options.designTools } : {}),
       ...(options.brandKitId != null ? { brandKitId: options.brandKitId } : {}),
-      ...(options.connectionManager ? { connectionManager: options.connectionManager } : {}),
+      ...(options.connectionManager
+        ? { connectionManager: options.connectionManager }
+        : {}),
       ...(options.persistImage ? { persistImage: options.persistImage } : {}),
-      ...(backendResult.sandboxDir ? { sandboxDir: backendResult.sandboxDir } : {}),
+      ...(backendResult.sandboxDir
+        ? { sandboxDir: backendResult.sandboxDir }
+        : {}),
 
-      ...(options.submitImageJob ? { submitImageJob: options.submitImageJob } : {}),
-      ...(options.submitVideoJob ? { submitVideoJob: options.submitVideoJob } : {}),
+      ...(options.submitImageJob
+        ? { submitImageJob: options.submitImageJob }
+        : {}),
+      ...(options.submitVideoJob
+        ? { submitVideoJob: options.submitVideoJob }
+        : {}),
+      ...(options.availableImageModels
+        ? { availableImageModels: options.availableImageModels }
+        : {}),
+      ...(options.availableVideoModels
+        ? { availableVideoModels: options.availableVideoModels }
+        : {}),
     }),
   });
 }
@@ -125,68 +181,61 @@ export function createLoomicDeepAgent(options: {
 /**
  * Create a streaming chat model from a `<provider>:<model-id>` specifier.
  *
- * Supported providers:
- * - `openai` (default) — uses ChatOpenAI with `streamUsage: false` to work
- *   around the one-api proxy stripping `delta.role` from chunks.
- * - `google` — uses ChatGoogleGenerativeAI (Google AI Studio, API Key) or
- *   ChatVertexAI (Vertex AI, service account) depending on available config.
+ * All environment-backed text models use APIYI's OpenAI-compatible endpoint.
+ * Workspace provider models are resolved separately from immutable snapshots.
  */
-function createStreamingChatModel(specifier: string): BaseLanguageModel {
+export function createStreamingChatModel(
+  specifier: string,
+  _executionMode: AgentExecutionMode,
+): BaseLanguageModel {
   const colonIdx = specifier.indexOf(":");
-  let provider = colonIdx > 0 ? specifier.slice(0, colonIdx) : "openai";
+  let provider = colonIdx > 0 ? specifier.slice(0, colonIdx) : "apiyi";
   let modelName = colonIdx > 0 ? specifier.slice(colonIdx + 1) : specifier;
+  const hasApiYi = !!process.env.APIYI_API_KEY;
 
-  const hasGoogleApiKey = !!process.env.GOOGLE_API_KEY;
-  const hasVertexAI = !!(process.env.GOOGLE_VERTEX_PROJECT && process.env.GOOGLE_VERTEX_LOCATION);
-  const hasGoogle = hasGoogleApiKey || hasVertexAI;
-
-  // Provider availability fallback
-  if (provider === "google" && !hasGoogle) {
-    console.warn(`[model] Google unavailable (no GOOGLE_API_KEY or Vertex AI config), falling back to OpenAI for: ${specifier}`);
-    provider = "openai";
-    modelName = DEFAULT_AGENT_MODEL;
+  if (!hasApiYi) {
+    throw new Error(
+      "APIYI_API_KEY is required for environment-backed text models.",
+    );
   }
-  if (provider === "openai" && !process.env.OPENAI_API_KEY && hasGoogle) {
-    console.warn(`[model] OpenAI unavailable (no OPENAI_API_KEY), falling back to Google for: ${specifier}`);
-    provider = "google";
-    modelName = DEFAULT_GOOGLE_AGENT_MODEL;
+  if (provider !== "apiyi") {
+    console.warn(
+      `[model] Replacing legacy provider ${provider} with APIYI for: ${specifier}`,
+    );
+    provider = "apiyi";
+    modelName = DEFAULT_APIYI_AGENT_MODEL;
   }
 
-  switch (provider) {
-    case "google":
-      // Prefer Vertex AI (service account) when configured; fall back to Developer API key
-      if (hasVertexAI) {
-        const vertexProject = process.env.GOOGLE_VERTEX_PROJECT!;
-        const vertexLocation = process.env.GOOGLE_VERTEX_LOCATION!;
-        console.log(`[model] Using Vertex AI for: ${modelName} (project=${vertexProject}, location=${vertexLocation})`);
-        return new ChatVertexAI({
-          model: modelName,
-          location: vertexLocation,
-          authOptions: { projectId: vertexProject },
-          streaming: true,
-        });
-      }
-      return new ChatGoogleGenerativeAI({
-        model: modelName,
-        apiKey: process.env.GOOGLE_API_KEY!,
-        streaming: true,
-        thinkingConfig: {
-          includeThoughts: true,
-          thinkingBudget: -1, // dynamic — let the model decide
-        },
-      });
-    case "openai":
-    default:
-      return new ChatOpenAI({
-        model: modelName,
-        streaming: true,
-        streamUsage: false,
-      });
-  }
+  return new OpenAICompatibleChatModel({
+    model: modelName,
+    apiKey: process.env.APIYI_API_KEY,
+    configuration: {
+      baseURL: process.env.APIYI_API_BASE ?? "https://api.apiyi.com/v1",
+    },
+    streaming: true,
+    streamUsage: false,
+  });
 }
 
-/** Known model-name prefixes that map to Google Gemini. */
-const GOOGLE_MODEL_PREFIXES = ["gemini-"];
+export function getGoogleThinkingConfig(
+  executionMode: AgentExecutionMode,
+  modelName: string,
+): { includeThoughts: boolean; thinkingBudget?: number } {
+  const includeThoughts = executionMode === "thinking";
+
+  // Gemini 2.5 Flash and Flash-Lite explicitly support 0 (disabled) and -1
+  // (dynamic). Gemini 2.5 Pro cannot disable thinking, while Gemini 3 uses
+  // thinkingLevel semantics. For those and unknown future models, leave the
+  // native thinking policy untouched and rely on the execution-mode prompt.
+  if (/^gemini-2\.5-flash(?:-lite)?(?:$|-)/.test(modelName)) {
+    return {
+      includeThoughts,
+      thinkingBudget: includeThoughts ? -1 : 0,
+    };
+  }
+
+  return { includeThoughts };
+}
 
 export function createDefaultModelSpecifier(
   env: Pick<ServerEnv, "agentModel">,
@@ -194,21 +243,5 @@ export function createDefaultModelSpecifier(
   const model = env.agentModel;
   // Already has an explicit provider prefix — pass through as-is.
   if (model.includes(":")) return model;
-  // Auto-detect Google models by name prefix.
-  if (GOOGLE_MODEL_PREFIXES.some((p) => model.startsWith(p)))
-    return `google:${model}`;
-  return `openai:${model}`;
-}
-
-export function applyOpenAICompatEnv(
-  env: Pick<ServerEnv, "openAIApiBase" | "openAIApiKey">,
-  target: NodeJS.ProcessEnv = process.env,
-) {
-  if (env.openAIApiKey) {
-    target.OPENAI_API_KEY = env.openAIApiKey;
-  }
-
-  if (env.openAIApiBase) {
-    target.OPENAI_BASE_URL = env.openAIApiBase;
-  }
+  return `apiyi:${model}`;
 }

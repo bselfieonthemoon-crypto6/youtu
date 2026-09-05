@@ -1,7 +1,7 @@
 import { mkdirSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
-  type BackendFactory,
   type StateAndStore,
   CompositeBackend,
   FilesystemBackend,
@@ -10,11 +10,11 @@ import {
 } from "deepagents";
 
 import type { ServerEnv } from "../../config/env.js";
-import type { AgentBackendResult } from "./index.js";
+import type { AgentBackendResult, SyncBackendFactory } from "./index.js";
 
 type AgentBackendEnv = Pick<ServerEnv, "agentFilesRoot" | "skillsRoot">;
 
-const DEFAULT_DEV_SANDBOX_ROOT = "/tmp/loomic-sandbox-dev";
+const DEFAULT_DEV_SANDBOX_ROOT = join(tmpdir(), "loomic-sandbox-dev");
 
 /**
  * Create a development backend with local sandbox execution.
@@ -62,7 +62,7 @@ export function createDevelopmentBackend(
     virtualMode: true,
   });
 
-  const factory: BackendFactory = (stateAndStore: StateAndStore) => {
+  const factory: SyncBackendFactory = (stateAndStore: StateAndStore) => {
     const routes: Record<string, FilesystemBackend | StoreBackend> = {
       "/workspace/": workspaceBackend,
       "/skills/": skillsBackend,

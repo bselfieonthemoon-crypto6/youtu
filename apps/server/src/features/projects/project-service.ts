@@ -13,7 +13,7 @@ import type {
   UserSupabaseClient,
 } from "../../supabase/user.js";
 
-const THUMBNAIL_BUCKET = "project-assets";
+const THUMBNAIL_BUCKET = "workspace-assets";
 const PROJECT_QUERY_FAILED_MESSAGE = "Unable to load projects.";
 const PROJECT_CREATE_FAILED_MESSAGE = "Unable to create project.";
 const PROJECT_DELETE_FAILED_MESSAGE = "Unable to delete project.";
@@ -252,7 +252,7 @@ export function createProjectService(options: {
       );
 
       // Generate public thumbnail URLs for projects that have them
-      const thumbnailUrls = generateThumbnailUrls(
+      const thumbnailUrls = await generateThumbnailUrls(
         client,
         projects.filter((p) => p.thumbnail_path),
       );
@@ -318,11 +318,18 @@ export function createProjectService(options: {
         );
       }
 
-      const { data: urlData } = client.storage
+      const { data: urlData, error: urlError } = await client.storage
         .from(THUMBNAIL_BUCKET)
-        .getPublicUrl(objectPath);
+        .createSignedUrl(objectPath, 900);
+      if (urlError || !urlData?.signedUrl) {
+        throw new ProjectServiceError(
+          "project_create_failed",
+          "Failed to create thumbnail URL.",
+          500,
+        );
+      }
 
-      return { thumbnailUrl: urlData.publicUrl };
+      return { thumbnailUrl: urlData.signedUrl };
     },
 
     async updateProject(user, projectId, input) {
@@ -489,19 +496,19 @@ function slugify(value: string) {
   return base ? `${base}-${suffix}` : `project-${suffix}`;
 }
 
-function generateThumbnailUrls(
+async function generateThumbnailUrls(
   client: UserSupabaseClient,
   projects: Array<{ id: string; thumbnail_path: string | null }>,
-): Map<string, string> {
+): Promise<Map<string, string>> {
   const urlMap = new Map<string, string>();
   if (projects.length === 0) return urlMap;
 
   for (const project of projects) {
     if (!project.thumbnail_path) continue;
-    const { data } = client.storage
-      .from(THUMBNAIL_BUCKET)
-      .getPublicUrl(project.thumbnail_path);
-    urlMap.set(project.id, data.publicUrl);
+      const { data } = await client.storage
+        .from(THUMBNAIL_BUCKET)
+        .createSignedUrl(project.thumbnail_path, 900);
+      if (data?.signedUrl) urlMap.set(project.id, data.signedUrl);
   }
 
   return urlMap;

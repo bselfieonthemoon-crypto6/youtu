@@ -4,6 +4,7 @@ import { toolArtifactSchema } from "./artifacts.js";
 import {
   conversationIdSchema,
   messageIdSchema,
+  planStepSchema,
   runIdSchema,
   sessionIdSchema,
   timestampSchema,
@@ -30,24 +31,45 @@ export const messageDeltaEventSchema = z.object({
   timestamp: timestampSchema,
 });
 
+const toolPlanLinkFields = {
+  planId: z.string().min(1).optional(),
+  planStepId: z.string().min(1).optional(),
+};
+
+function hasPairedPlanLink(value: {
+  planId?: string | undefined;
+  planStepId?: string | undefined;
+}) {
+  return (value.planId === undefined) === (value.planStepId === undefined);
+}
+
 export const toolStartedEventSchema = z.object({
   type: z.literal("tool.started"),
   runId: runIdSchema,
+  toolExecutionId: z.string().uuid().optional(),
   toolCallId: toolCallIdSchema,
   toolName: z.string().min(1),
   input: z.record(z.unknown()).optional(),
+  retryable: z.boolean().optional(),
+  ...toolPlanLinkFields,
   timestamp: timestampSchema,
+}).refine(hasPairedPlanLink, {
+  message: "planId and planStepId must appear together",
 });
 
 export const toolCompletedEventSchema = z.object({
   type: z.literal("tool.completed"),
   runId: runIdSchema,
+  toolExecutionId: z.string().uuid().optional(),
   toolCallId: toolCallIdSchema,
   toolName: z.string().min(1),
   output: z.record(z.unknown()).optional(),
   outputSummary: z.string().optional(),
   artifacts: z.array(toolArtifactSchema).optional(),
+  ...toolPlanLinkFields,
   timestamp: timestampSchema,
+}).refine(hasPairedPlanLink, {
+  message: "planId and planStepId must appear together",
 });
 
 export const runCompletedEventSchema = z.object({
@@ -75,6 +97,28 @@ export const thinkingDeltaEventSchema = z.object({
   messageId: messageIdSchema,
   delta: z.string(),
   timestamp: timestampSchema,
+});
+
+export const planUpdatedEventSchema = z.object({
+  type: z.literal("plan.updated"),
+  runId: runIdSchema,
+  planId: z.string().min(1),
+  revision: z.number().int().positive(),
+  timestamp: timestampSchema,
+  steps: z.array(planStepSchema),
+});
+
+export const toolFailedEventSchema = z.object({
+  type: z.literal("tool.failed"),
+  runId: runIdSchema,
+  toolExecutionId: z.string().uuid().optional(),
+  toolCallId: toolCallIdSchema,
+  toolName: z.string().min(1),
+  error: loomicErrorSchema,
+  ...toolPlanLinkFields,
+  timestamp: timestampSchema,
+}).refine(hasPairedPlanLink, {
+  message: "planId and planStepId must appear together",
 });
 
 export const canvasSyncEventSchema = z.object({
@@ -105,12 +149,14 @@ export const billingErrorEventSchema = z.object({
   dailyClaimed: z.boolean().optional(),
 });
 
-export const streamEventSchema = z.discriminatedUnion("type", [
+export const streamEventSchema = z.union([
   runStartedEventSchema,
   messageDeltaEventSchema,
   thinkingDeltaEventSchema,
+  planUpdatedEventSchema,
   toolStartedEventSchema,
   toolCompletedEventSchema,
+  toolFailedEventSchema,
   runCanceledEventSchema,
   runCompletedEventSchema,
   runFailedEventSchema,

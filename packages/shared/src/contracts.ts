@@ -71,6 +71,8 @@ export const videoGenerationPreferenceSchema = z.object({
   models: z.array(z.string().min(1)),
 });
 
+export const agentExecutionModeSchema = z.enum(["fast", "thinking"]);
+
 export const runCreateRequestSchema = z.object({
   sessionId: sessionIdSchema,
   conversationId: conversationIdSchema,
@@ -82,6 +84,7 @@ export const runCreateRequestSchema = z.object({
   mentions: z.array(messageMentionSchema).optional(),
   accessToken: z.string().optional(),
   model: z.string().optional(),
+  executionMode: agentExecutionModeSchema.optional(),
 });
 
 export const runCreateResponseSchema = z.object({
@@ -139,6 +142,7 @@ export const canvasDetailSchema = z.object({
   id: canvasIdSchema,
   name: z.string().min(1),
   projectId: projectIdSchema,
+  revision: z.number().int().nonnegative(),
   content: canvasContentSchema,
 });
 
@@ -154,6 +158,9 @@ export const modelInfoSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
   provider: z.string().min(1),
+  source: z.enum(["environment", "workspace"]).optional(),
+  providerDisplayName: z.string().min(1).optional(),
+  capabilities: z.array(z.enum(["text", "vision_input", "image_generation", "video_generation"])).optional(),
 });
 
 export const chatSessionIdSchema = identifierSchema;
@@ -184,16 +191,44 @@ export const thinkingBlockSchema = z.object({
   thinking: z.string(),
 });
 
+export const planStepStatusSchema = z.enum([
+  "pending",
+  "in_progress",
+  "completed",
+  "failed",
+]);
+
+export const planStepSchema = z.object({
+  id: z.string().min(1),
+  title: z.string().min(1),
+  status: planStepStatusSchema,
+});
+
+export const planBlockSchema = z.object({
+  type: z.literal("plan"),
+  planId: z.string().min(1),
+  revision: z.number().int().positive(),
+  steps: z.array(planStepSchema),
+});
+
 export const toolBlockSchema = z.object({
   type: z.literal("tool"),
+  toolExecutionId: z.string().uuid().optional(),
   toolCallId: z.string().min(1),
   toolName: z.string().min(1),
-  status: z.enum(["running", "completed"]),
+  status: z.enum(["running", "completed", "failed", "canceled"]),
   input: z.record(z.unknown()).optional(),
   output: z.record(z.unknown()).optional(),
   outputSummary: z.string().optional(),
   artifacts: z.array(toolArtifactSchema).optional(),
-});
+  retryable: z.boolean().optional(),
+  planId: z.string().min(1).optional(),
+  planStepId: z.string().min(1).optional(),
+}).refine(
+  (value) =>
+    (value.planId === undefined) === (value.planStepId === undefined),
+  { message: "planId and planStepId must appear together" },
+);
 
 export const imageBlockSchema = z.object({
   type: z.literal("image"),
@@ -238,6 +273,7 @@ export const mentionBlockSchema = z.union([
 export const contentBlockSchema = z.union([
   textBlockSchema,
   thinkingBlockSchema,
+  planBlockSchema,
   toolBlockSchema,
   imageBlockSchema,
   mentionBlockSchema,
@@ -259,7 +295,11 @@ export const chatMessageCreateRequestSchema = z.object({
   contentBlocks: z.array(contentBlockSchema).nullable().optional(),
 });
 
-export const assetBucketSchema = z.enum(["project-assets", "user-avatars"]);
+export const assetBucketSchema = z.enum([
+  "project-assets",
+  "workspace-assets",
+  "user-avatars",
+]);
 
 export const assetObjectSchema = z.object({
   id: identifierSchema,
@@ -277,6 +317,9 @@ export type AssetObject = z.infer<typeof assetObjectSchema>;
 
 export type TextBlock = z.infer<typeof textBlockSchema>;
 export type ThinkingBlock = z.infer<typeof thinkingBlockSchema>;
+export type PlanStepStatus = z.infer<typeof planStepStatusSchema>;
+export type PlanStep = z.infer<typeof planStepSchema>;
+export type PlanBlock = z.infer<typeof planBlockSchema>;
 export type ToolBlock = z.infer<typeof toolBlockSchema>;
 export type ImageBlock = z.infer<typeof imageBlockSchema>;
 export type MessageMention = z.infer<typeof messageMentionSchema>;
@@ -288,6 +331,7 @@ export type ImageGenerationPreference = z.infer<
 export type VideoGenerationPreference = z.infer<
   typeof videoGenerationPreferenceSchema
 >;
+export type AgentExecutionMode = z.infer<typeof agentExecutionModeSchema>;
 export type ContentBlock = z.infer<typeof contentBlockSchema>;
 export type ChatSessionSummary = z.infer<typeof chatSessionSummarySchema>;
 export type ChatMessage = z.infer<typeof chatMessageSchema>;

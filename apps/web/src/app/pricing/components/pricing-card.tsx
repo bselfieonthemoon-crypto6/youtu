@@ -14,7 +14,10 @@ interface PricingCardProps {
   billingPeriod: BillingPeriod;
   index: number;
   currentPlan?: string | null | undefined;
-  onCheckout?: (plan: string, billingPeriod: BillingPeriod) => Promise<void> | undefined;
+  onCheckout?: (
+    plan: string,
+    billingPeriod: BillingPeriod,
+  ) => Promise<void> | undefined;
 }
 
 export function PricingCard({
@@ -105,14 +108,14 @@ export function PricingCard({
           ? "shadow-card-hover z-10 scale-[1.02] border-2"
           : "shadow-card hover:shadow-card-hover border"
       }`}
-      style={
-        tier.highlighted
-          ? {
+      {...(tier.highlighted
+        ? {
+            style: {
               borderColor: "oklch(0.90 0.17 115)",
               boxShadow: "0 0 20px oklch(0.90 0.17 115 / 0.15)",
-            }
-          : undefined
-      }
+            },
+          }
+        : {})}
     >
       {/* Badge */}
       {tier.badge && (
@@ -138,9 +141,7 @@ export function PricingCard({
             transition={{ duration: 0.25 }}
             className="flex items-baseline gap-1"
           >
-            <span className="text-foreground text-4xl font-bold">
-              ${price}
-            </span>
+            <span className="text-foreground text-4xl font-bold">${price}</span>
             <span className="text-muted-foreground text-sm">/month</span>
           </motion.div>
         </AnimatePresence>

@@ -49,6 +49,13 @@ const EyeIcon = ({ className }: { className?: string }) => (
   </svg>
 );
 
+const EyeOffIcon = ({ className }: { className?: string }) => (
+  <svg viewBox="0 0 16 16" fill="none" className={className}>
+    <path d="M2 2l12 12" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+    <path d="M6.1 4.3A7.8 7.8 0 0 1 8 4c4 0 6.5 4 6.5 4a10 10 0 0 1-1.8 2.2M9.8 11.7A7.8 7.8 0 0 1 8 12c-4 0-6.5-4-6.5-4a10 10 0 0 1 1.8-2.2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
+
 const CloseIcon = ({ className }: { className?: string }) => (
   <svg viewBox="0 0 16 16" fill="none" className={className}>
     <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
@@ -77,6 +84,70 @@ function elThumbnailIcon(el: ExcalidrawEl): string {
   if (el.type === "line") return "\u2500";
   if (el.type === "arrow") return "\u2192";
   return "\u25C6";
+}
+
+function withLayerRevision(el: ExcalidrawEl, updates: Record<string, unknown>): ExcalidrawEl {
+  return {
+    ...el,
+    ...updates,
+    version: ((el.version as number | undefined) ?? 1) + 1,
+    versionNonce: Math.floor(Math.random() * 2_000_000_000),
+    updated: Date.now(),
+  };
+}
+
+export function toggleCanvasLayerLock(excalidrawApi: any, elementId: string): void {
+  const elements = excalidrawApi.getSceneElements().map((el: ExcalidrawEl) => {
+    if (el.id !== elementId) return el;
+    const hidden = el.customData?.loomicLayerHidden === true;
+    if (hidden) {
+      return withLayerRevision(el, {
+        customData: {
+          ...el.customData,
+          loomicLayerRestoreLocked: !el.customData?.loomicLayerRestoreLocked,
+        },
+      });
+    }
+    return withLayerRevision(el, { locked: !el.locked });
+  });
+  excalidrawApi.updateScene({ elements, captureUpdate: "IMMEDIATELY" });
+}
+
+export function toggleCanvasLayerVisibility(excalidrawApi: any, elementId: string): void {
+  let hiding = false;
+  const elements = excalidrawApi.getSceneElements().map((el: ExcalidrawEl) => {
+    if (el.id !== elementId) return el;
+    const hidden = el.customData?.loomicLayerHidden === true;
+    if (hidden) {
+      return withLayerRevision(el, {
+        opacity: typeof el.customData?.loomicLayerRestoreOpacity === "number"
+          ? el.customData.loomicLayerRestoreOpacity
+          : 100,
+        locked: el.customData?.loomicLayerRestoreLocked === true,
+        customData: { ...el.customData, loomicLayerHidden: false },
+      });
+    }
+
+    hiding = true;
+    return withLayerRevision(el, {
+      opacity: 0,
+      locked: true,
+      customData: {
+        ...el.customData,
+        loomicLayerHidden: true,
+        loomicLayerRestoreOpacity: typeof el.opacity === "number" ? el.opacity : 100,
+        loomicLayerRestoreLocked: el.locked === true,
+      },
+    });
+  });
+
+  const scene: Record<string, unknown> = { elements, captureUpdate: "IMMEDIATELY" };
+  if (hiding) {
+    const selectedElementIds = { ...(excalidrawApi.getAppState()?.selectedElementIds ?? {}) };
+    delete selectedElementIds[elementId];
+    scene.appState = { selectedElementIds };
+  }
+  excalidrawApi.updateScene(scene);
 }
 
 /* -- Thumbnail component -- */
@@ -119,48 +190,69 @@ const LayerRow = memo(function LayerRow({
   files,
   selected,
   onSelect,
+  onToggleLock,
+  onToggleVisibility,
 }: {
   el: ExcalidrawEl;
   files: Record<string, any>;
   selected: boolean;
   onSelect: (id: string) => void;
+  onToggleLock: (id: string) => void;
+  onToggleVisibility: (id: string) => void;
 }) {
   const handleClick = useCallback(() => onSelect(el.id), [onSelect, el.id]);
+  const hidden = el.customData?.loomicLayerHidden === true;
+  const locked = hidden
+    ? el.customData?.loomicLayerRestoreLocked === true
+    : el.locked === true;
 
   return (
     <div style={{ contentVisibility: "auto", containIntrinsicSize: "auto 44px" }}>
-      <button
-        type="button"
+      <div
         className={`group/layer flex h-11 w-full items-center gap-2.5 rounded-lg px-2 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 ${
           selected
             ? "bg-muted"
             : "hover:bg-muted"
         }`}
-        onClick={handleClick}
       >
-        <LayerThumbnail el={el} files={files} />
-        <span className="flex-1 truncate text-[11px] text-foreground min-w-0">
-          {elLabel(el)}
-        </span>
+        <button
+          type="button"
+          className="flex min-w-0 flex-1 items-center gap-2.5 text-left outline-none"
+          onClick={handleClick}
+          aria-label={`选择图层：${elLabel(el)}`}
+        >
+          <LayerThumbnail el={el} files={files} />
+          <span className="flex-1 truncate text-[11px] text-foreground min-w-0">
+            {elLabel(el)}
+          </span>
+        </button>
         <div className="flex items-center gap-0.5">
           <button
             type="button"
-            className="invisible flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:text-foreground group-hover/layer:visible cursor-pointer outline-none focus-visible:visible focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
-            aria-label="Lock layer"
-            onClick={(e) => e.stopPropagation()}
+            className={`${locked ? "visible text-foreground" : "invisible text-muted-foreground group-hover/layer:visible"} flex h-6 w-6 items-center justify-center rounded hover:text-foreground cursor-pointer outline-none focus-visible:visible focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1`}
+            aria-label={locked ? "解锁图层" : "锁定图层"}
+            title={locked ? "解锁图层" : "锁定图层"}
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggleLock(el.id);
+            }}
           >
             <LockIcon className="h-4 w-4" />
           </button>
           <button
             type="button"
-            className="invisible flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:text-foreground group-hover/layer:visible cursor-pointer outline-none focus-visible:visible focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
-            aria-label="Toggle layer visibility"
-            onClick={(e) => e.stopPropagation()}
+            className={`${hidden ? "visible text-foreground" : "invisible text-muted-foreground group-hover/layer:visible"} flex h-6 w-6 items-center justify-center rounded hover:text-foreground cursor-pointer outline-none focus-visible:visible focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1`}
+            aria-label={hidden ? "显示图层" : "隐藏图层"}
+            title={hidden ? "显示图层" : "隐藏图层"}
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggleVisibility(el.id);
+            }}
           >
-            <EyeIcon className="h-4 w-4" />
+            {hidden ? <EyeOffIcon className="h-4 w-4" /> : <EyeIcon className="h-4 w-4" />}
           </button>
         </div>
-      </button>
+      </div>
     </div>
   );
 });
@@ -228,6 +320,16 @@ export function CanvasLayersPanel({
     [excalidrawApi],
   );
 
+  const toggleLock = useCallback(
+    (id: string) => toggleCanvasLayerLock(excalidrawApi, id),
+    [excalidrawApi],
+  );
+
+  const toggleVisibility = useCallback(
+    (id: string) => toggleCanvasLayerVisibility(excalidrawApi, id),
+    [excalidrawApi],
+  );
+
   if (!open) return null;
 
   return (
@@ -267,6 +369,8 @@ export function CanvasLayersPanel({
               files={files}
               selected={!!selectedIds[el.id]}
               onSelect={selectElement}
+              onToggleLock={toggleLock}
+              onToggleVisibility={toggleVisibility}
             />
           ))
         )}

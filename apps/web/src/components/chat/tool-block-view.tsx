@@ -4,7 +4,9 @@ import { motion } from "framer-motion";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
-import type { ToolBlock } from "@loomic/shared";
+import type { BackgroundJob, ImageArtifact, ToolBlock } from "@loomic/shared";
+import { readGenerationJobElementId } from "../../hooks/use-job-fallback-polling";
+import type { RestoreJobToCanvasResponse } from "../../lib/server-api";
 import { ChatImage } from "./image-lightbox";
 import {
   formatModelDisplayName,
@@ -137,15 +139,38 @@ function findSidebarRect(el: HTMLElement | null): DOMRect | null {
 
 export const ToolBlockView = React.memo(function ToolBlockView({
   block,
+  onConfirmAction,
+  highlighted = false,
+  onWaitGeneration,
+  onRestoreGeneration,
+  onRetryRead,
+  onOpenDesign,
 }: {
   block: ToolBlock;
+  highlighted?: boolean;
+  onConfirmAction?: (
+    confirmationId: string,
+    decision: "confirm" | "cancel",
+    kind?: ConfirmationDetails["kind"],
+  ) => Promise<{ status: string; message?: string }> | undefined;
+  onWaitGeneration?: (jobId: string) => Promise<BackgroundJob>;
+  onRestoreGeneration?: (jobId: string) => Promise<RestoreJobToCanvasResponse>;
+  onRetryRead?: (
+    toolExecutionId: string,
+  ) => Promise<{ status: string; message?: string }>;
+  onOpenDesign?: (designId: string) => void;
 }) {
   const [panelOpen, setPanelOpen] = useState(false);
   const [panelRight, setPanelRight] = useState(416);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const config = getToolConfig(block.toolName);
-  const isCompleted = block.status === "completed";
+  const status = block.status as
+    | "running"
+    | "completed"
+    | "failed"
+    | "canceled";
+  const isCompleted = status === "completed";
   const hasOutput = block.output && Object.keys(block.output).length > 0;
   const hasInput = block.input && Object.keys(block.input).length > 0;
   const hasDetails = hasOutput || hasInput;
@@ -155,28 +180,154 @@ export const ToolBlockView = React.memo(function ToolBlockView({
       ? block.outputSummary
       : config.label;
 
-  const previewLines = hasOutput
-    ? formatOutputPreview(block.output!)
-    : [];
+  const previewLines = block.output ? formatOutputPreview(block.output) : [];
   const showCard =
-    config.showCard &&
-    isCompleted &&
-    (block.outputSummary || hasOutput);
+    config.showCard && isCompleted && (block.outputSummary || hasOutput);
 
   // Extract artifacts for generate_image / generate_video inline preview
-  const imageArtifact = block.artifacts?.find((a: { type: string }) => a.type === "image");
-  const isImageTool = block.toolName === "generate_image";
+  const imageArtifact = block.artifacts?.find(
+    (artifact): artifact is ImageArtifact => artifact.type === "image",
+  );
+  const isImageProposalTool = block.toolName === "generate_image";
+  const isImageTool =
+    isImageProposalTool || block.toolName === "confirm_image_generation";
   const isVideoTool = block.toolName === "generate_video";
   const isMediaTool = isImageTool || isVideoTool;
   const mediaError =
     isMediaTool && isCompleted && !imageArtifact
-      ? ((block.output as Record<string, unknown> | undefined)
-          ?.error as string | undefined)
+      ? ((block.output as Record<string, unknown> | undefined)?.error as
+          | string
+          | undefined)
       : undefined;
   const inputData = block.input as Record<string, unknown> | undefined;
   const modelName = inputData?.model as string | undefined;
   const aspectRatio =
     (inputData?.aspectRatio as string) ?? (isVideoTool ? "16:9" : "1:1");
+  const isConversationalImageProposal = Boolean(
+    isImageProposalTool &&
+      isCompleted &&
+      ((block.output as Record<string, unknown> | undefined)?.status ===
+        "awaiting_confirmation" ||
+        (block.output as Record<string, unknown> | undefined)?.error ===
+          "confirmation_required"),
+  );
+  const isInternalImageConfirmation =
+    block.toolName === "confirm_image_generation" &&
+    (block.status === "failed" ||
+      (block.output as Record<string, unknown> | undefined)?.status ===
+        "awaiting_ui_confirmation");
+  const confirmation = readConfirmation(block);
+  const designResult = readDesignToolResult(block);
+  const generatedDesignTarget = readGeneratedDesignTarget(block);
+  const displayStatus =
+    designResult?.status === "failed" || designResult?.status === "conflict"
+      ? "failed"
+      : status;
+  const billing = readBillingSummary(block.output);
+  const generation = readGenerationRecovery(block);
+  const [observedJob, setObservedJob] = useState<BackgroundJob | null>(null);
+  const [recoveryState, setRecoveryState] = useState<
+    "idle" | "waiting" | "restoring" | "restored" | "error"
+  >("idle");
+  const [recoveryError, setRecoveryError] = useState<string | null>(null);
+  const [readRetryState, setReadRetryState] = useState<
+    "idle" | "retrying" | "completed" | "failed"
+  >("idle");
+  const [readRetryError, setReadRetryError] = useState<string | null>(null);
+  const canRetryRead = Boolean(
+    block.toolName === "inspect_canvas" &&
+      block.status === "failed" &&
+      block.retryable === true &&
+      block.toolExecutionId &&
+      onRetryRead,
+  );
+
+  const handleRetryRead = useCallback(async () => {
+    if (!canRetryRead || !block.toolExecutionId || !onRetryRead) return;
+    if (readRetryState === "retrying" || readRetryState === "completed") return;
+    setReadRetryState("retrying");
+    setReadRetryError(null);
+    try {
+      const result = await onRetryRead(block.toolExecutionId);
+      if (result.status === "completed") {
+        setReadRetryState("completed");
+      } else {
+        setReadRetryState("failed");
+        setReadRetryError(result.message ?? "重新读取失败");
+      }
+    } catch (error) {
+      setReadRetryState("failed");
+      setReadRetryError(
+        error instanceof Error ? error.message : "重新读取失败",
+      );
+    }
+  }, [block.toolExecutionId, canRetryRead, onRetryRead, readRetryState]);
+
+  useEffect(() => {
+    setObservedJob(null);
+    setRecoveryState("idle");
+    setRecoveryError(null);
+  }, [generation.jobId]);
+
+  const observedElementId = observedJob
+    ? readGenerationJobElementId(observedJob)
+    : null;
+  const effectiveElementId =
+    recoveryState === "restored"
+      ? generation.jobId
+      : (observedElementId ?? generation.elementId);
+  const terminalFailure = observedJob
+    ? ["failed", "dead_letter", "canceled"].includes(observedJob.status)
+    : generation.terminalFailure;
+  const succeeded = observedJob?.status === "succeeded" || generation.succeeded;
+  const showContinueWaiting = Boolean(
+    isMediaTool &&
+      generation.jobId &&
+      !effectiveElementId &&
+      !terminalFailure &&
+      !succeeded &&
+      generation.canContinue,
+  );
+  const showRestore = Boolean(
+    isMediaTool &&
+      generation.jobId &&
+      succeeded &&
+      !effectiveElementId &&
+      !terminalFailure,
+  );
+
+  const handleContinueWaiting = useCallback(async () => {
+    if (!generation.jobId || !onWaitGeneration || recoveryState !== "idle")
+      return;
+    setRecoveryState("waiting");
+    setRecoveryError(null);
+    try {
+      const job = await onWaitGeneration(generation.jobId);
+      setObservedJob(job);
+      setRecoveryState("idle");
+    } catch (error) {
+      setRecoveryError(
+        error instanceof Error ? error.message : "等待生成结果失败",
+      );
+      setRecoveryState("error");
+    }
+  }, [generation.jobId, onWaitGeneration, recoveryState]);
+
+  const handleRestore = useCallback(async () => {
+    if (!generation.jobId || !onRestoreGeneration) return;
+    if (recoveryState === "restoring" || recoveryState === "restored") return;
+    setRecoveryState("restoring");
+    setRecoveryError(null);
+    try {
+      await onRestoreGeneration(generation.jobId);
+      setRecoveryState("restored");
+    } catch (error) {
+      setRecoveryError(
+        error instanceof Error ? error.message : "恢复到画布失败",
+      );
+      setRecoveryState("error");
+    }
+  }, [generation.jobId, onRestoreGeneration, recoveryState]);
 
   const handleOpenPanel = useCallback(() => {
     const rect = findSidebarRect(containerRef.current);
@@ -187,28 +338,72 @@ export const ToolBlockView = React.memo(function ToolBlockView({
   }, []);
 
   const handleClosePanel = useCallback(() => setPanelOpen(false), []);
+  const handleRefreshImage = useCallback(async () => {
+    if (!imageArtifact?.jobId || !onWaitGeneration) return null;
+    const job = await onWaitGeneration(imageArtifact.jobId);
+    const refreshedUrl = job.result?.signed_url;
+    return typeof refreshedUrl === "string" && refreshedUrl
+      ? refreshedUrl
+      : null;
+  }, [imageArtifact?.jobId, onWaitGeneration]);
+
+  // Image preparation is intentionally represented by the assistant's natural
+  // language reply. Hiding the internal tool block avoids presenting a proposal
+  // as a failed generation or as a technical parameter card.
+  if (isConversationalImageProposal || isInternalImageConfirmation) return null;
 
   return (
-    <div ref={containerRef} className="space-y-1.5">
+    <div
+      ref={containerRef}
+      className={`space-y-1.5 rounded-lg transition-[box-shadow,background-color] ${
+        highlighted ? "bg-accent/10 shadow-[0_0_0_2px_hsl(var(--accent))]" : ""
+      }`}
+    >
       {/* Layer 1: Status line */}
       <div className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
-        {block.status === "running" ? (
-          <div className="h-3.5 w-3.5 animate-spin rounded-full border-[1.5px] border-muted-foreground/30 border-t-muted-foreground" />
-        ) : (
-          <svg
-            className="h-3.5 w-3.5 text-muted-foreground"
-            viewBox="0 0 16 16"
-            fill="currentColor"
-          >
-            <path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z" />
-          </svg>
-        )}
+        <ToolStatusIcon status={displayStatus} />
         <span className="font-medium text-muted-foreground truncate">
           {isMediaTool && modelName
             ? formatModelDisplayName(modelName)
             : config.label}
+          {designResult?.status === "conflict"
+            ? " · 冲突"
+            : status === "failed"
+              ? " · 失败"
+              : status === "canceled"
+                ? " · 已取消"
+                : ""}
         </span>
       </div>
+
+      {confirmation && (
+        <ConfirmationCard
+          confirmation={confirmation}
+          {...(onConfirmAction ? { onConfirmAction } : {})}
+        />
+      )}
+
+      {canRetryRead && (
+        <div className="rounded-lg border border-border bg-muted/40 px-3 py-2">
+          {readRetryState === "completed" ? (
+            <p className="text-xs font-medium text-emerald-700">
+              已重新读取画布
+            </p>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void handleRetryRead()}
+              disabled={readRetryState === "retrying"}
+              className="rounded-md border border-border bg-background px-2.5 py-1.5 text-xs font-medium text-foreground disabled:opacity-50"
+            >
+              {readRetryState === "retrying" ? "正在重新读取…" : "重新读取"}
+            </button>
+          )}
+          {readRetryError && (
+            <p className="mt-1 text-xs text-red-600">{readRetryError}</p>
+          )}
+        </div>
+      )}
 
       {/* Layer 2a: Media generation shimmer placeholder */}
       {isMediaTool && !isCompleted && (
@@ -221,20 +416,23 @@ export const ToolBlockView = React.memo(function ToolBlockView({
 
       {/* Layer 2b-err: Media generation failed */}
       {isMediaTool && isCompleted && !imageArtifact && mediaError && (
-        <MediaErrorCard
-          isVideoTool={isVideoTool}
-          error={mediaError}
-        />
+        <MediaErrorCard isVideoTool={isVideoTool} error={mediaError} />
       )}
 
       {/* Layer 2b: Image generation card with inline preview */}
-      {isImageTool && isCompleted && imageArtifact ? (
+      {designResult && !confirmation ? (
+        <DesignToolResultCard
+          result={designResult}
+          {...(onOpenDesign ? { onOpenDesign } : {})}
+        />
+      ) : isImageTool && isCompleted && imageArtifact ? (
         <ImageArtifactCard
           artifact={imageArtifact}
           cardTitle={cardTitle}
           modelName={modelName}
           hasDetails={!!hasDetails}
           onOpenPanel={handleOpenPanel}
+          onRefreshImage={handleRefreshImage}
         />
       ) : showCard ? (
         /* Layer 2: Generic output card (non-image tools) */
@@ -268,11 +466,7 @@ export const ToolBlockView = React.memo(function ToolBlockView({
               onClick={handleOpenPanel}
               className="mt-2 flex items-center gap-0.5 text-[12px] text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
             >
-              <svg
-                className="h-3 w-3"
-                viewBox="0 0 16 16"
-                fill="currentColor"
-              >
+              <svg className="h-3 w-3" viewBox="0 0 16 16" fill="currentColor">
                 <path d="M9.78 11.78a.75.75 0 0 1-1.06 0l-3.5-3.5a.75.75 0 0 1 0-1.06l3.5-3.5a.75.75 0 0 1 1.06 1.06L6.56 8l3.22 3.22a.75.75 0 0 1 0 1.06Z" />
               </svg>
               查看详情
@@ -280,6 +474,51 @@ export const ToolBlockView = React.memo(function ToolBlockView({
           )}
         </div>
       ) : null}
+
+      {isMediaTool && billing && <BillingSummary billing={billing} />}
+
+      {generatedDesignTarget ? (
+        <GeneratedDesignTargetCard
+          target={generatedDesignTarget}
+          {...(onOpenDesign ? { onOpenDesign } : {})}
+        />
+      ) : null}
+
+      {(showContinueWaiting ||
+        showRestore ||
+        recoveryState === "restoring") && (
+        <div className="rounded-lg border border-border bg-muted/40 p-2.5">
+          <button
+            type="button"
+            onClick={() =>
+              void (showRestore ? handleRestore() : handleContinueWaiting())
+            }
+            disabled={
+              recoveryState === "waiting" ||
+              recoveryState === "restoring" ||
+              (showRestore ? !onRestoreGeneration : !onWaitGeneration)
+            }
+            className="w-full rounded-lg bg-foreground px-3 py-2 text-xs font-medium text-background transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {recoveryState === "waiting"
+              ? "等待生成结果…"
+              : recoveryState === "restoring"
+                ? "正在恢复到画布…"
+                : showRestore
+                  ? "恢复到画布"
+                  : "继续等待"}
+          </button>
+        </div>
+      )}
+
+      {recoveryState === "restored" && (
+        <p className="text-xs font-medium text-emerald-700">已恢复到画布</p>
+      )}
+      {recoveryError && (
+        <p role="alert" className="text-xs text-red-600">
+          {recoveryError}
+        </p>
+      )}
 
       {/* Floating detail panel */}
       {panelOpen &&
@@ -295,6 +534,749 @@ export const ToolBlockView = React.memo(function ToolBlockView({
     </div>
   );
 });
+
+const DESIGN_TOOL_NAMES = new Set([
+  "inspect_design",
+  "get_design_objects",
+  "manipulate_design",
+  "search_design_resources",
+  "apply_design_template",
+  "export_design",
+]);
+
+type DesignToolResultDetails = {
+  toolName: string;
+  status: "completed" | "conflict" | "failed" | "queued";
+  title: string;
+  detail: string | null;
+  designId: string | null;
+};
+
+function readDesignToolResult(
+  block: ToolBlock,
+): DesignToolResultDetails | null {
+  if (!DESIGN_TOOL_NAMES.has(block.toolName) || block.status === "running")
+    return null;
+  const output = block.output ?? {};
+  const outputStatus = readNonEmptyString(output.status);
+  const nestedDesign = readRecord(output.design) ?? output;
+  const designId =
+    readNonEmptyString(output.design_id) ??
+    readNonEmptyString(nestedDesign?.id) ??
+    readNonEmptyString(block.input?.design_id) ??
+    null;
+  const revision =
+    readFiniteNumber(output.revision) ??
+    readFiniteNumber(output.latest_revision) ??
+    readFiniteNumber(output.current_revision) ??
+    readFiniteNumber(nestedDesign?.revision);
+  const message = readNonEmptyString(output.message);
+
+  // Confirmation is still pending. The inline confirmation card is the only
+  // source of truth until the server returns a later applied result.
+  if (outputStatus === "confirmation_required") return null;
+
+  if (
+    outputStatus === "conflict" ||
+    output.code === "design_conflict" ||
+    output.code === "design_revision_conflict" ||
+    output.code === "design_object_version_conflict" ||
+    output.code === "template_revision_conflict"
+  ) {
+    const conflicts = Array.isArray(output.conflict_object_ids)
+      ? output.conflict_object_ids.length
+      : 0;
+    return {
+      toolName: block.toolName,
+      status: "conflict",
+      title: "设计版本冲突",
+      detail: `服务器已是版本 ${revision ?? "更新版本"}${conflicts > 0 ? ` · ${conflicts} 个对象冲突` : ""}。请让 Agent 重新读取设计后再修改。`,
+      designId,
+    };
+  }
+
+  if (
+    block.status === "failed" ||
+    outputStatus === "failed" ||
+    outputStatus === "dead_letter" ||
+    outputStatus === "error"
+  ) {
+    return {
+      toolName: block.toolName,
+      status: "failed",
+      title: "设计操作失败",
+      detail: message ?? "设计工具未完成，请重试。",
+      designId,
+    };
+  }
+
+  if (block.toolName === "inspect_design") {
+    const summary = readRecord(output.summary);
+    const count =
+      readFiniteNumber(output.object_count) ??
+      readFiniteNumber(summary?.object_count);
+    const size =
+      readFiniteNumber(nestedDesign?.width) !== undefined &&
+      readFiniteNumber(nestedDesign?.height) !== undefined
+        ? `${nestedDesign?.width} × ${nestedDesign?.height}`
+        : null;
+    return {
+      toolName: block.toolName,
+      status: "completed",
+      title: `已读取设计${readNonEmptyString(nestedDesign?.name) ? `「${readNonEmptyString(nestedDesign?.name)}」` : ""}`,
+      detail:
+        [
+          revision !== undefined ? `版本 ${revision}` : null,
+          size,
+          count !== undefined ? `${count} 个对象` : null,
+        ]
+          .filter(Boolean)
+          .join(" · ") || null,
+      designId,
+    };
+  }
+
+  if (block.toolName === "get_design_objects") {
+    const count = Array.isArray(output.objects) ? output.objects.length : null;
+    return {
+      toolName: block.toolName,
+      status: "completed",
+      title: "已读取设计对象",
+      detail:
+        [
+          revision !== undefined ? `版本 ${revision}` : null,
+          count !== null ? `本页 ${count} 个对象` : null,
+        ]
+          .filter(Boolean)
+          .join(" · ") || null,
+      designId,
+    };
+  }
+
+  if (block.toolName === "manipulate_design") {
+    const changed = Array.isArray(output.changed_object_ids)
+      ? output.changed_object_ids.length
+      : null;
+    return {
+      toolName: block.toolName,
+      status: "completed",
+      title: output.replayed === true ? "设计修改已安全重放" : "设计修改完成",
+      detail:
+        [
+          revision !== undefined ? `版本 ${revision}` : null,
+          changed !== null ? `${changed} 个对象已更新` : null,
+          output.replayed === true ? "未重复执行" : null,
+        ]
+          .filter(Boolean)
+          .join(" · ") || null,
+      designId,
+    };
+  }
+
+  if (block.toolName === "search_design_resources") {
+    const count = Array.isArray(output.items) ? output.items.length : 0;
+    return {
+      toolName: block.toolName,
+      status: "completed",
+      title: `找到 ${count} 个可用资源`,
+      detail: output.next_cursor ? "还有更多结果" : "已显示本次搜索结果",
+      designId: null,
+    };
+  }
+
+  if (block.toolName === "export_design") {
+    const exportState = outputStatus ?? "queued";
+    const exportTitle =
+      exportState === "succeeded"
+        ? "设计导出完成"
+        : exportState === "canceled"
+          ? "设计导出已取消"
+          : exportState === "running"
+            ? "正在导出设计"
+            : "设计导出已排队";
+    return {
+      toolName: block.toolName,
+      status:
+        exportState === "queued" || exportState === "running"
+          ? "queued"
+          : "completed",
+      title: exportTitle,
+      detail:
+        [
+          readNonEmptyString(output.job_id)
+            ? `任务 ${readNonEmptyString(output.job_id)}`
+            : null,
+          revision !== undefined ? `版本 ${revision}` : null,
+          output.replayed === true ? "未重复创建任务" : null,
+        ]
+          .filter(Boolean)
+          .join(" · ") || null,
+      designId,
+    };
+  }
+
+  return {
+    toolName: block.toolName,
+    status: "completed",
+    title: "设计模板已套用",
+    detail: revision !== undefined ? `当前版本 ${revision}` : null,
+    designId,
+  };
+}
+
+function DesignToolResultCard({
+  result,
+  onOpenDesign,
+}: {
+  result: DesignToolResultDetails;
+  onOpenDesign?: (designId: string) => void;
+}) {
+  const isProblem = result.status === "conflict" || result.status === "failed";
+  const openableDesignId = result.designId;
+  return (
+    <div
+      role={isProblem ? "alert" : undefined}
+      className={`rounded-xl border p-3 ${
+        result.status === "conflict"
+          ? "border-amber-300 bg-amber-50"
+          : result.status === "failed"
+            ? "border-red-300 bg-red-50"
+            : "border-border bg-card"
+      }`}
+    >
+      <div className="flex items-start gap-3">
+        <div className="mt-0.5 shrink-0 rounded-lg bg-muted p-1.5 text-muted-foreground">
+          <ToolIcon
+            type={getToolConfig(result.toolName).icon}
+            className="h-4 w-4"
+          />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-semibold text-foreground">
+            {result.title}
+          </div>
+          {result.detail ? (
+            <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+              {result.detail}
+            </p>
+          ) : null}
+        </div>
+      </div>
+      {openableDesignId && onOpenDesign ? (
+        <button
+          type="button"
+          onClick={() => onOpenDesign(openableDesignId)}
+          className="mt-2 rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted"
+        >
+          打开设计
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function readRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function readNonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function readFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
+}
+
+type GeneratedDesignTarget = {
+  designId: string;
+  objectId: string | null;
+  revision: number | null;
+};
+
+function readGeneratedDesignTarget(
+  block: ToolBlock,
+): GeneratedDesignTarget | null {
+  if (
+    block.status !== "completed" ||
+    (block.toolName !== "generate_image" &&
+      block.toolName !== "confirm_image_generation")
+  )
+    return null;
+  const output = block.output;
+  if (!output) return null;
+  const finalization = readRecord(output.finalization);
+  const result = readRecord(output.result);
+  const designId =
+    readNonEmptyString(output.design_id) ??
+    readNonEmptyString(output.designId) ??
+    readNonEmptyString(finalization?.design_id) ??
+    readNonEmptyString(finalization?.designId) ??
+    readNonEmptyString(result?.design_id) ??
+    readNonEmptyString(result?.designId);
+  if (!designId) return null;
+  return {
+    designId,
+    objectId:
+      readNonEmptyString(output.object_id) ??
+      readNonEmptyString(output.objectId) ??
+      readNonEmptyString(finalization?.object_id) ??
+      readNonEmptyString(result?.object_id) ??
+      null,
+    revision:
+      readFiniteNumber(output.revision) ??
+      readFiniteNumber(finalization?.revision) ??
+      readFiniteNumber(result?.revision) ??
+      null,
+  };
+}
+
+function GeneratedDesignTargetCard({
+  target,
+  onOpenDesign,
+}: {
+  target: GeneratedDesignTarget;
+  onOpenDesign?: (designId: string) => void;
+}) {
+  return (
+    <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3">
+      <div className="text-sm font-semibold text-emerald-950">
+        图片已插入设计
+      </div>
+      <p className="mt-1 text-[11px] text-emerald-800">
+        {[
+          target.revision !== null ? `版本 ${target.revision}` : null,
+          target.objectId ? `对象 ${target.objectId}` : null,
+        ]
+          .filter(Boolean)
+          .join(" · ") || "设计已通过服务端同步更新"}
+      </p>
+      {onOpenDesign ? (
+        <button
+          type="button"
+          onClick={() => onOpenDesign(target.designId)}
+          className="mt-2 rounded-lg border border-emerald-200 bg-white px-3 py-1.5 text-xs font-medium text-emerald-950 transition-colors hover:bg-emerald-100"
+        >
+          打开设计
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+type GenerationRecoveryDetails = {
+  jobId: string | null;
+  elementId: string | null;
+  canContinue: boolean;
+  succeeded: boolean;
+  terminalFailure: boolean;
+};
+
+function readGenerationRecovery(block: ToolBlock): GenerationRecoveryDetails {
+  const output = block.output as Record<string, unknown> | undefined;
+  const jobId =
+    typeof output?.jobId === "string" && output.jobId ? output.jobId : null;
+  const elementId =
+    typeof output?.elementId === "string" && output.elementId
+      ? output.elementId
+      : null;
+  const error = typeof output?.error === "string" ? output.error : "";
+  const reportedStatus =
+    typeof output?.jobStatus === "string"
+      ? output.jobStatus
+      : typeof output?.status === "string"
+        ? output.status
+        : null;
+  const terminalFailure =
+    reportedStatus === "failed" ||
+    reportedStatus === "dead_letter" ||
+    reportedStatus === "canceled";
+  const hasGeneratedMedia =
+    typeof output?.imageUrl === "string" ||
+    typeof output?.videoUrl === "string";
+  const succeeded =
+    reportedStatus === "succeeded" || (hasGeneratedMedia && !error);
+  return {
+    jobId,
+    elementId,
+    canContinue:
+      block.status === "running" ||
+      error.toLowerCase().includes("timed out") ||
+      error.toLowerCase().includes("still being generated"),
+    succeeded,
+    terminalFailure,
+  };
+}
+
+type BillingDetails = {
+  estimate: number;
+  charged: number;
+  balanceAfter: number;
+  currency: "credits";
+};
+
+function readBillingSummary(
+  output: Record<string, unknown> | undefined,
+): BillingDetails | null {
+  if (!output) return null;
+  const raw = output.billing;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+
+  const billing = raw as Record<string, unknown>;
+  if (
+    typeof billing.estimate !== "number" ||
+    !Number.isFinite(billing.estimate) ||
+    typeof billing.charged !== "number" ||
+    !Number.isFinite(billing.charged) ||
+    typeof billing.balanceAfter !== "number" ||
+    !Number.isFinite(billing.balanceAfter) ||
+    billing.currency !== "credits"
+  ) {
+    return null;
+  }
+
+  return {
+    estimate: billing.estimate,
+    charged: billing.charged,
+    balanceAfter: billing.balanceAfter,
+    currency: "credits",
+  };
+}
+
+function BillingSummary({ billing }: { billing: BillingDetails }) {
+  return (
+    <div
+      aria-label="生成积分明细"
+      className="flex flex-wrap gap-x-3 gap-y-1 rounded-lg bg-muted/60 px-3 py-2 text-[11px] text-muted-foreground"
+    >
+      <span>预计 {billing.estimate} 积分</span>
+      <span className="font-medium text-foreground">
+        已扣 {billing.charged} 积分
+      </span>
+      <span>余额 {billing.balanceAfter}</span>
+    </div>
+  );
+}
+
+export type ToolConfirmationKind =
+  | "delete"
+  | "image_generation"
+  | "design_mutation"
+  | "design_template_apply";
+
+type ConfirmationDetails = {
+  confirmationId: string;
+  kind: ToolConfirmationKind;
+  details: Record<string, unknown>;
+  targets: unknown[];
+};
+
+function readConfirmation(block: ToolBlock): ConfirmationDetails | null {
+  const output = block.output;
+  if (!output) return null;
+  if (
+    output.error !== "confirmation_required" &&
+    output.status !== "confirmation_required"
+  )
+    return null;
+  const raw = output.confirmation;
+  const structured = readRecord(raw);
+  const confirmationId =
+    readNonEmptyString(structured?.confirmationId) ??
+    readNonEmptyString(output.confirmation_id);
+  if (typeof confirmationId !== "string" || !confirmationId) return null;
+  const targets = structured?.targets;
+  const rawKind = readNonEmptyString(structured?.kind);
+  const kind =
+    rawKind === "image_generation"
+      ? "image_generation"
+      : block.toolName === "apply_design_template"
+        ? "design_template_apply"
+        : block.toolName === "manipulate_design"
+          ? "design_mutation"
+          : "delete";
+  const details = structured?.details ?? output;
+  return {
+    confirmationId,
+    kind,
+    details:
+      details && typeof details === "object" && !Array.isArray(details)
+        ? (details as Record<string, unknown>)
+        : {},
+    targets: Array.isArray(targets) ? targets : [],
+  };
+}
+
+function ToolStatusIcon({
+  status,
+}: { status: "running" | "completed" | "failed" | "canceled" }) {
+  if (status === "running") {
+    return (
+      <span
+        aria-label="执行中"
+        className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-[1.5px] border-muted-foreground/30 border-t-muted-foreground"
+      />
+    );
+  }
+  if (status === "failed") {
+    return (
+      <svg
+        aria-label="失败"
+        className="h-3.5 w-3.5 shrink-0 text-red-600"
+        viewBox="0 0 16 16"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={1.8}
+      >
+        <path d="m4 4 8 8m0-8-8 8" />
+      </svg>
+    );
+  }
+  if (status === "canceled") {
+    return (
+      <svg
+        aria-label="已取消"
+        className="h-3.5 w-3.5 shrink-0 text-muted-foreground"
+        viewBox="0 0 16 16"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={1.8}
+      >
+        <circle cx="8" cy="8" r="5.5" />
+        <path d="M5 8h6" />
+      </svg>
+    );
+  }
+  return (
+    <svg
+      aria-label="已完成"
+      className="h-3.5 w-3.5 shrink-0 text-emerald-600"
+      viewBox="0 0 16 16"
+      fill="currentColor"
+    >
+      <path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z" />
+    </svg>
+  );
+}
+
+function ConfirmationCard({
+  confirmation,
+  onConfirmAction,
+}: {
+  confirmation: ConfirmationDetails;
+  onConfirmAction?: (
+    confirmationId: string,
+    decision: "confirm" | "cancel",
+    kind?: ConfirmationDetails["kind"],
+  ) => Promise<{ status: string; message?: string }> | undefined;
+}) {
+  const [confirmationStatus, setConfirmationStatus] = useState<
+    "pending" | "submitting" | "applied" | "canceled" | "failed"
+  >("pending");
+  const [failureMessage, setFailureMessage] = useState<string | null>(null);
+  const isImageGeneration = confirmation.kind === "image_generation";
+  const isDesignConfirmation =
+    confirmation.kind === "design_mutation" ||
+    confirmation.kind === "design_template_apply";
+
+  const submitDecision = async (decision: "confirm" | "cancel") => {
+    if (!onConfirmAction || confirmationStatus !== "pending") return;
+    setConfirmationStatus("submitting");
+    const result = await (isDesignConfirmation
+      ? onConfirmAction(
+          confirmation.confirmationId,
+          decision,
+          confirmation.kind,
+        )
+      : onConfirmAction(confirmation.confirmationId, decision));
+    const status = result?.status;
+    if (status === "accepted" || status === "applied") {
+      setConfirmationStatus("applied");
+    } else if (status === "canceled") setConfirmationStatus("canceled");
+    else {
+      setConfirmationStatus("failed");
+      setFailureMessage(result?.message ?? "操作未执行，请重新发起。 ");
+    }
+  };
+
+  return (
+    <div
+      className={`rounded-xl border p-3 ${
+        isImageGeneration || isDesignConfirmation
+          ? "border-amber-300 bg-amber-50 text-amber-950"
+          : "border-red-300 bg-red-50 text-red-950"
+      }`}
+    >
+      <div className="text-sm font-semibold">
+        {isImageGeneration
+          ? "生成前确认"
+          : confirmation.kind === "design_template_apply"
+            ? "确认套用设计模板"
+            : confirmation.kind === "design_mutation"
+              ? "确认修改设计"
+              : "需要确认危险操作"}
+      </div>
+      <p
+        className={`mt-1 text-xs leading-5 ${
+          isImageGeneration || isDesignConfirmation
+            ? "text-amber-800"
+            : "text-red-800"
+        }`}
+      >
+        {isImageGeneration
+          ? "请检查下面的图片描述与生成参数。只有点击确认后才会调用图片模型。"
+          : confirmation.kind === "design_template_apply"
+            ? "套用模板会替换当前设计场景。确认后由服务端按当前版本执行，并保留审计记录。"
+            : confirmation.kind === "design_mutation"
+              ? "此操作会删除或替换设计内容。确认后由服务端按当前版本执行。"
+              : "将删除下列画布内容。新生成结果不会覆盖旧内容；只有点击确认后才会执行删除。"}
+      </p>
+      {isImageGeneration ? (
+        <ImageGenerationConfirmationDetails details={confirmation.details} />
+      ) : isDesignConfirmation ? (
+        <DesignConfirmationDetails
+          kind={confirmation.kind}
+          details={confirmation.details}
+        />
+      ) : confirmation.targets.length > 0 ? (
+        <div className="mt-2 max-h-24 overflow-y-auto rounded-lg bg-white/70 px-2 py-1.5 text-[11px] text-red-800">
+          {confirmation.targets.slice(0, 5).map((target, index) => (
+            <div key={index} className="truncate">
+              {formatConfirmationTarget(target)}
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {confirmationStatus === "applied" ? (
+        <p className="mt-3 text-xs font-medium text-emerald-700">
+          {isImageGeneration
+            ? "已确认，图片生成任务已提交"
+            : isDesignConfirmation
+              ? "已确认，正在应用设计更改"
+              : "已确认并删除"}
+        </p>
+      ) : confirmationStatus === "canceled" ? (
+        <p className="mt-3 text-xs font-medium text-muted-foreground">
+          {isImageGeneration
+            ? "已取消，未生成图片"
+            : isDesignConfirmation
+              ? "已取消，设计未修改"
+              : "已取消，画布未修改"}
+        </p>
+      ) : confirmationStatus === "failed" ? (
+        <p className="mt-3 text-xs font-medium text-red-700">
+          {failureMessage}
+        </p>
+      ) : null}
+      {(confirmationStatus === "pending" ||
+        confirmationStatus === "submitting") && (
+        <div className="mt-3 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={() => void submitDecision("cancel")}
+            disabled={!onConfirmAction || confirmationStatus === "submitting"}
+            className={`rounded-lg border bg-white px-3 py-1.5 text-xs font-medium disabled:opacity-50 ${
+              isImageGeneration || isDesignConfirmation
+                ? "border-amber-200"
+                : "border-red-200"
+            }`}
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            onClick={() => void submitDecision("confirm")}
+            disabled={!onConfirmAction || confirmationStatus === "submitting"}
+            className={`rounded-lg px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50 ${
+              isImageGeneration || isDesignConfirmation
+                ? "bg-amber-600"
+                : "bg-red-600"
+            }`}
+          >
+            {isImageGeneration
+              ? "确认生成"
+              : confirmation.kind === "design_template_apply"
+                ? "确认套用"
+                : confirmation.kind === "design_mutation"
+                  ? "确认修改"
+                  : "确认删除"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ImageGenerationConfirmationDetails({
+  details,
+}: {
+  details: Record<string, unknown>;
+}) {
+  const rows = [
+    ["标题", details.title],
+    ["详细描述", details.description],
+    ["模型", details.model],
+    ["画面比例", details.aspectRatio],
+    ["质量", details.quality],
+    ["格式", details.outputFormat],
+    ["参考图数量", details.referenceImageCount],
+  ].filter((row) => row[1] !== undefined && row[1] !== null);
+
+  return (
+    <div className="mt-2 max-h-56 space-y-2 overflow-y-auto rounded-lg bg-white/75 px-3 py-2 text-[11px] text-amber-900">
+      {rows.map(([label, value]) => (
+        <div key={String(label)}>
+          <div className="font-semibold">{String(label)}</div>
+          <div className="mt-0.5 whitespace-pre-wrap break-words leading-5">
+            {String(value)}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DesignConfirmationDetails({
+  kind,
+  details,
+}: {
+  kind: ToolConfirmationKind;
+  details: Record<string, unknown>;
+}) {
+  const designId = readNonEmptyString(details.design_id);
+  const templateId = readNonEmptyString(details.template_id);
+  const revision = readFiniteNumber(details.expected_revision);
+  const actions = Array.isArray(details.actions)
+    ? details.actions.filter(
+        (action): action is string => typeof action === "string",
+      )
+    : [];
+  return (
+    <div className="mt-2 space-y-1 rounded-lg bg-white/75 px-3 py-2 text-[11px] text-amber-900">
+      <div>
+        {kind === "design_template_apply" ? "替换当前设计场景" : "修改设计内容"}
+      </div>
+      {revision !== undefined ? <div>基于版本 {revision}</div> : null}
+      {actions.length > 0 ? <div>操作：{actions.join("、")}</div> : null}
+      {designId ? <div className="truncate">设计：{designId}</div> : null}
+      {templateId ? <div className="truncate">模板：{templateId}</div> : null}
+    </div>
+  );
+}
+
+function formatConfirmationTarget(target: unknown): string {
+  if (typeof target === "string") return target;
+  if (!target || typeof target !== "object" || Array.isArray(target))
+    return "未知画布元素";
+  const record = target as Record<string, unknown>;
+  const label = typeof record.label === "string" ? record.label : null;
+  const type = typeof record.type === "string" ? record.type : "元素";
+  const id = typeof record.elementId === "string" ? record.elementId : null;
+  return label ?? (id ? `${type} · ${id}` : type);
+}
 
 /* ------------------------------------------------------------------ */
 /*  MediaShimmer — shimmer placeholder during media generation         */
@@ -349,7 +1331,9 @@ const MediaShimmer = React.memo(function MediaShimmer({
       </div>
       <div className="px-3 py-2">
         <div className="text-[12px] font-medium text-muted-foreground/70">
-          {isVideoTool ? "\u89c6\u9891\u751f\u6210\u4e2d..." : "\u56fe\u7247\u751f\u6210\u4e2d..."}
+          {isVideoTool
+            ? "\u89c6\u9891\u751f\u6210\u4e2d..."
+            : "\u56fe\u7247\u751f\u6210\u4e2d..."}
         </div>
         {modelName && (
           <div className="mt-0.5 text-[11px] text-muted-foreground truncate">
@@ -388,7 +1372,9 @@ const MediaErrorCard = React.memo(function MediaErrorCard({
         </div>
         <div className="min-w-0 flex-1">
           <div className="text-sm font-semibold text-foreground">
-            {isVideoTool ? "\u89c6\u9891\u751f\u6210\u5931\u8d25" : "\u56fe\u7247\u751f\u6210\u5931\u8d25"}
+            {isVideoTool
+              ? "\u89c6\u9891\u751f\u6210\u5931\u8d25"
+              : "\u56fe\u7247\u751f\u6210\u5931\u8d25"}
           </div>
           <div className="mt-0.5 text-[12px] text-muted-foreground line-clamp-2">
             {error}
@@ -409,13 +1395,33 @@ const ImageArtifactCard = React.memo(function ImageArtifactCard({
   modelName,
   hasDetails,
   onOpenPanel,
+  onRefreshImage,
 }: {
-  artifact: { url: string; title?: string; type: string };
+  artifact: ImageArtifact;
   cardTitle: string;
   modelName: string | undefined;
   hasDetails: boolean;
   onOpenPanel: () => void;
+  onRefreshImage?: () => Promise<string | null>;
 }) {
+  const [imageUrl, setImageUrl] = useState(artifact.url);
+  const refreshAttemptedRef = useRef(false);
+
+  useEffect(() => {
+    setImageUrl(artifact.url);
+    refreshAttemptedRef.current = false;
+  }, [artifact.url]);
+
+  const handleImageError = useCallback(() => {
+    if (!onRefreshImage || refreshAttemptedRef.current) return;
+    refreshAttemptedRef.current = true;
+    void onRefreshImage()
+      .then((refreshedUrl) => {
+        if (refreshedUrl) setImageUrl(refreshedUrl);
+      })
+      .catch(() => {});
+  }, [onRefreshImage]);
+
   const handleDownload = useCallback(
     (e: React.MouseEvent) => {
       e.stopPropagation();
@@ -441,10 +1447,11 @@ const ImageArtifactCard = React.memo(function ImageArtifactCard({
       {/* Image preview */}
       <div className="relative aspect-square max-h-[280px] w-full overflow-hidden bg-muted">
         <img
-          src={artifact.url}
+          src={imageUrl}
           alt={artifact.title ?? "Generated image"}
           className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-[1.03]"
           loading="lazy"
+          onError={handleImageError}
         />
         {/* Gradient overlay with download button */}
         <div className="absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-black/40 to-transparent opacity-0 group-hover:opacity-100 transition-opacity">
@@ -623,7 +1630,7 @@ function ToolDetailPanel({
                 附件
               </div>
               <div className="flex flex-wrap gap-2">
-                {block.artifacts.map((artifact: { type: string; url: string; title?: string }) =>
+                {block.artifacts.map((artifact) =>
                   artifact.type === "image" ? (
                     <ChatImage
                       key={artifact.url}
@@ -691,9 +1698,7 @@ function ToolOutputRenderer({
   // Complex objects / arrays -- formatted JSON
   return (
     <div>
-      <div className="text-xs font-medium text-muted-foreground mb-2">
-        输出
-      </div>
+      <div className="text-xs font-medium text-muted-foreground mb-2">输出</div>
       <div className="rounded-xl bg-muted px-4 py-3 overflow-x-auto max-h-[360px] overflow-y-auto">
         <pre className="text-[12px] leading-5 text-muted-foreground whitespace-pre-wrap break-all font-mono">
           {JSON.stringify(output, null, 2)}

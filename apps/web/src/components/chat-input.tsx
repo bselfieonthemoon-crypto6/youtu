@@ -12,8 +12,12 @@ import { ImageAttachmentBar } from "./image-attachment-bar";
 import { ImageModelPreferencePopover } from "./image-model-preference";
 
 type ChatInputProps = {
+  accessToken?: string | undefined;
   onSend: (message: string) => void;
   disabled?: boolean;
+  running?: boolean;
+  canceling?: boolean;
+  onCancel?: () => void;
   attachments?: ImageAttachmentState[];
   onAddFiles?: (files: File[]) => void;
   onRemoveAttachment?: (id: string) => void;
@@ -28,11 +32,17 @@ type ChatInputProps = {
 export type ChatInputHandle = {
   /** Remove the @query text from input after picker selection */
   clearAtQuery: () => void;
+  focus: () => void;
+  setValue: (value: string) => void;
 };
 
 export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput({
+  accessToken,
   onSend,
   disabled,
+  running,
+  canceling,
+  onCancel,
   attachments,
   onAddFiles,
   onRemoveAttachment,
@@ -58,6 +68,13 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
         if (lastAtIdx === -1) return prev;
         return prev.slice(0, lastAtIdx);
       });
+    },
+    focus() {
+      textareaRef.current?.focus();
+    },
+    setValue(nextValue: string) {
+      setValue(nextValue);
+      requestAnimationFrame(() => textareaRef.current?.focus());
     },
   }));
 
@@ -296,7 +313,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
               </>
             )}
             {/* Agent model selector */}
-            <AgentModelSelector compact />
+            <AgentModelSelector compact accessToken={accessToken} />
             {/* Model preference button */}
             <div className="relative">
               <button
@@ -318,26 +335,46 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
                 open={modelPopoverOpen}
                 onClose={() => setModelPopoverOpen(false)}
                 anchorRef={modelBtnRef}
+                accessToken={accessToken}
               />
             </div>
           </div>
-          <button
-            onClick={handleSubmit}
-            disabled={disabled || !hasContent || isUploading}
-            className="flex h-8 min-w-8 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition-colors hover:bg-primary/80 active:bg-primary/90 disabled:opacity-20 disabled:cursor-not-allowed"
-          >
-            <svg
-              className="h-[14px] w-[14px]"
-              viewBox="0 0 14 14"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth={1.6}
-              strokeLinecap="round"
+          {running ? (
+            <button
+              type="button"
+              onClick={onCancel}
+              disabled={canceling || !onCancel}
+              aria-label={canceling ? "正在停止" : "停止生成"}
+              title={canceling ? "正在停止" : "停止生成"}
+              className="flex h-8 min-w-8 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition-colors hover:bg-primary/80 disabled:cursor-wait disabled:opacity-60"
             >
-              <path d="M7 11.5V2.5" />
-              <path d="M3 6.5L7 2.5L11 6.5" />
-            </svg>
-          </button>
+              {canceling ? (
+                <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-primary-foreground/30 border-t-primary-foreground" />
+              ) : (
+                <span className="h-2.5 w-2.5 rounded-[2px] bg-current" />
+              )}
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleSubmit}
+              disabled={disabled || !hasContent || isUploading}
+              aria-label="发送消息"
+              className="flex h-8 min-w-8 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition-colors hover:bg-primary/80 active:bg-primary/90 disabled:opacity-20 disabled:cursor-not-allowed"
+            >
+              <svg
+                className="h-[14px] w-[14px]"
+                viewBox="0 0 14 14"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={1.6}
+                strokeLinecap="round"
+              >
+                <path d="M7 11.5V2.5" />
+                <path d="M3 6.5L7 2.5L11 6.5" />
+              </svg>
+            </button>
+          )}
         </div>
       </div>
     </div>

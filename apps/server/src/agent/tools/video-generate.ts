@@ -7,8 +7,9 @@ import {
   resolveVideoProviderName,
 } from "../../generation/providers/registry.js";
 import { generateVideo } from "../../generation/video-generation.js";
+import type { GenerationBillingSummary } from "./image-generate.js";
 
-const DEFAULT_MODEL = "wan-video/wan-2.6";
+const DEFAULT_MODEL = "veo-3.1-fast-generate-preview";
 
 // ── Submit function type ───────────────────────────────────────────────────
 
@@ -30,6 +31,7 @@ export type SubmitVideoJobFn = (input: {
   durationSeconds?: number;
   mimeType?: string;
   error?: string;
+  billing?: GenerationBillingSummary;
 }>;
 
 // ── Dynamic schema builder ─────────────────────────────────────────────────
@@ -152,6 +154,7 @@ type VideoGenerateResult = {
   error?: string;
   jobId?: string;
   jobType?: "video_generation";
+  billing?: GenerationBillingSummary;
 };
 
 // ── Run function ───────────────────────────────────────────────────────────
@@ -233,6 +236,7 @@ export async function runVideoGenerate(
           // (worker may still succeed after agent poll timeout)
           jobId: jobResult.jobId,
           jobType: "video_generation" as const,
+          ...(jobResult.billing ? { billing: jobResult.billing } : {}),
         };
       }
       lap("job_complete", { jobId: jobResult.jobId });
@@ -251,6 +255,7 @@ export async function runVideoGenerate(
         ...(jobResult.durationSeconds != null
           ? { durationSeconds: jobResult.durationSeconds }
           : {}),
+        ...(jobResult.billing ? { billing: jobResult.billing } : {}),
       };
       if (input.placementX != null && input.placementY != null) {
         result.placement = {

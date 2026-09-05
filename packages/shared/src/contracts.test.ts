@@ -5,6 +5,8 @@ import type { ZodType } from "zod";
 
 import {
   type Database,
+  canvasDetailSchema,
+  canvasSaveResponseSchema,
   errorCodeValues,
   healthResponseSchema,
   runCancelResponseSchema,
@@ -343,8 +345,10 @@ describe("@loomic/shared contracts", () => {
     const eventTypes = [
       "run.started",
       "message.delta",
+      "plan.updated",
       "tool.started",
       "tool.completed",
+      "tool.failed",
       "run.canceled",
       "run.completed",
       "run.failed",
@@ -371,6 +375,27 @@ describe("@loomic/shared contracts", () => {
               timestamp: "2026-03-23T12:00:00.000Z",
             });
             break;
+          case "plan.updated":
+            streamEventSchema.parse({
+              type,
+              runId: "run_123",
+              planId: "plan_run_123",
+              revision: 1,
+              steps: [
+                {
+                  id: "step_1",
+                  title: "Inspect the canvas",
+                  status: "in_progress",
+                },
+                {
+                  id: "step_2",
+                  title: "Create the design",
+                  status: "pending",
+                },
+              ],
+              timestamp: "2026-03-23T12:00:00.000Z",
+            });
+            break;
           case "tool.started":
             streamEventSchema.parse({
               type,
@@ -387,6 +412,16 @@ describe("@loomic/shared contracts", () => {
               toolCallId: "tool_123",
               toolName: "example_tool",
               outputSummary: "done",
+              timestamp: "2026-03-23T12:00:00.000Z",
+            });
+            break;
+          case "tool.failed":
+            streamEventSchema.parse({
+              type,
+              runId: "run_123",
+              toolCallId: "tool_123",
+              toolName: "example_tool",
+              error: { code: "tool_failed", message: "failed" },
               timestamp: "2026-03-23T12:00:00.000Z",
             });
             break;
@@ -420,6 +455,127 @@ describe("@loomic/shared contracts", () => {
         }
       }).not.toThrow();
     }
+  });
+
+  it("exposes the authoritative Canvas revision required by design CAS", () => {
+    expect(
+      canvasDetailSchema.parse({
+        id: "canvas-1",
+        name: "Main Canvas",
+        projectId: "project-1",
+        revision: 7,
+        content: { elements: [], appState: {}, files: {} },
+      }).revision,
+    ).toBe(7);
+    expect(() =>
+      canvasDetailSchema.parse({
+        id: "canvas-1",
+        name: "Main Canvas",
+        projectId: "project-1",
+        content: { elements: [], appState: {}, files: {} },
+      }),
+    ).toThrow();
+  });
+
+  it("returns the new authoritative revision after a Canvas save", () => {
+    expect(canvasSaveResponseSchema.parse({ ok: true, revision: 8 })).toEqual({
+      ok: true,
+      revision: 8,
+    });
+    expect(() => canvasSaveResponseSchema.parse({ ok: true })).toThrow();
+  });
+
+  it("accepts only the closed Fast/Thinking execution modes", () => {
+    const base = {
+      sessionId: "session-1",
+      conversationId: "conv-1",
+      prompt: "Hello",
+    };
+
+    expect(runCreateRequestSchema.parse({ ...base, executionMode: "fast" }))
+      .toMatchObject({ executionMode: "fast" });
+    expect(
+      runCreateRequestSchema.parse({ ...base, executionMode: "thinking" }),
+    ).toMatchObject({ executionMode: "thinking" });
+    expect(() =>
+      runCreateRequestSchema.parse({ ...base, executionMode: "ultra" }),
+    ).toThrow();
+    expect(runCreateRequestSchema.parse(base).executionMode).toBeUndefined();
+  });
+
+  it("validates plan blocks and expanded tool terminal statuses", () => {
+    const plan = sharedExports.contentBlockSchema.parse({
+      type: "plan",
+      planId: "plan_run_123",
+      revision: 2,
+      steps: [
+        { id: "step_1", title: "Inspect", status: "completed" },
+        { id: "step_2", title: "Render", status: "failed" },
+      ],
+    });
+
+    expect(plan.type).toBe("plan");
+    expect(() =>
+      sharedExports.contentBlockSchema.parse({
+        type: "tool",
+        toolCallId: "tool_123",
+        toolName: "generate_image",
+        status: "canceled",
+      }),
+    ).not.toThrow();
+    expect(() =>
+      sharedExports.contentBlockSchema.parse({
+        type: "tool",
+        toolCallId: "tool_456",
+        toolName: "generate_image",
+        status: "failed",
+      }),
+    ).not.toThrow();
+    expect(() =>
+      sharedExports.contentBlockSchema.parse({
+        type: "tool",
+        toolCallId: "tool_linked",
+        toolName: "inspect_canvas",
+        status: "running",
+        planId: "plan_run_123",
+        planStepId: "step_1",
+      }),
+    ).not.toThrow();
+    expect(() =>
+      sharedExports.contentBlockSchema.parse({
+        type: "tool",
+        toolCallId: "tool_half_linked",
+        toolName: "inspect_canvas",
+        status: "running",
+        planStepId: "step_1",
+      }),
+    ).toThrow();
+  });
+
+  it("requires plan links on tool events to appear as a pair", () => {
+    const base = {
+      runId: "run_123",
+      toolCallId: "tool_123",
+      toolName: "inspect_canvas",
+      timestamp: "2026-03-23T12:00:00.000Z",
+    };
+    expect(() => streamEventSchema.parse({
+      ...base,
+      type: "tool.started",
+      planId: "plan_run_123",
+      planStepId: "step_1",
+    })).not.toThrow();
+    expect(() => streamEventSchema.parse({
+      ...base,
+      type: "tool.completed",
+      planId: "plan_run_123",
+    })).toThrow();
+    expect(() => streamEventSchema.parse({
+      ...base,
+      type: "tool.failed",
+      planStepId: "step_1",
+      error: { code: "tool_failed", message: "failed" },
+    })).toThrow();
   });
 
   it("keeps stable messageId and toolCallId correlation fields", () => {

@@ -57,7 +57,15 @@ EXPOSE 3001
 RUN apt-get update && \
     apt-get install -y --no-install-recommends python3 python3-pip && \
     pip3 install --no-cache-dir --break-system-packages pillow reportlab && \
+    pip3 install --no-cache-dir --break-system-packages torch torchvision --index-url https://download.pytorch.org/whl/cpu && \
+    pip3 install --no-cache-dir --break-system-packages -r /app/apps/server/requirements-feynobg.txt && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Self-hosted Apache-2.0 background-removal checkpoint. Override its location
+# with LOOMIC_FEYNOBG_MODEL_DIR when mounting model storage at runtime.
+COPY models/feynobg/ /app/models/feynobg/
+COPY models/lama/ /app/models/lama/
+COPY models/sam2.1-hiera-tiny/ /app/models/sam2.1-hiera-tiny/
 
 # Copy skills (fonts + SKILL.md) to /opt/loomic/skills/
 COPY skills/ /opt/loomic/skills/

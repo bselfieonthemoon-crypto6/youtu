@@ -7,6 +7,7 @@ import { AgentSection } from "@/components/agent-section";
 import { BillingSection } from "@/components/billing-section";
 import { CreditUsageHistory } from "@/components/credits/credit-usage-history";
 import { ProfileSection } from "@/components/profile-section";
+import { ProviderSettingsSection } from "@/components/settings/provider-settings-section";
 import { SettingsSkeleton } from "@/components/skeletons/settings-skeleton";
 import { useAuth } from "@/lib/auth-context";
 import {
@@ -18,9 +19,9 @@ import {
   updateWorkspaceSettings,
 } from "@/lib/server-api";
 
-type SettingsTab = "profile" | "agent" | "billing" | "usage";
+type SettingsTab = "profile" | "agent" | "providers" | "billing" | "usage";
 
-const tabs: Array<{ id: SettingsTab; label: string }> = [
+const baseTabs: Array<{ id: SettingsTab; label: string }> = [
   { id: "profile", label: "Profile" },
   { id: "agent", label: "Agent" },
   { id: "billing", label: "Billing" },
@@ -33,13 +34,18 @@ export default function SettingsPage() {
 
   const initialTab = (searchParams.get("tab") as SettingsTab) ?? "profile";
   const [activeTab, setActiveTab] = useState<SettingsTab>(
-    tabs.some((t) => t.id === initialTab) ? initialTab : "profile",
+    [...baseTabs.map((tab) => tab.id), "providers"].includes(initialTab)
+      ? initialTab
+      : "profile",
   );
+  const [workspaceRole, setWorkspaceRole] = useState<
+    "owner" | "admin" | "member" | null
+  >(null);
   const [profile, setProfile] = useState<{
     displayName: string;
     email: string;
   } | null>(null);
-  const [defaultModel, setDefaultModel] = useState<string>("gpt-5.4-mini");
+  const [defaultModel, setDefaultModel] = useState<string>("apiyi:gemini-3.1-flash-lite");
   const [pageLoading, setPageLoading] = useState(true);
 
   // Ref pattern: prevent token refresh from cascading through dependency arrays
@@ -64,6 +70,14 @@ export default function SettingsPage() {
         displayName: viewer.profile.displayName,
         email: viewer.profile.email,
       });
+      setWorkspaceRole(viewer.membership.role);
+      if (
+        initialTab === "providers" &&
+        viewer.membership.role !== "owner" &&
+        viewer.membership.role !== "admin"
+      ) {
+        setActiveTab("profile");
+      }
       setDefaultModel(settings.settings.defaultModel);
     } catch (err) {
       if (err instanceof ApiAuthError) {
@@ -73,7 +87,7 @@ export default function SettingsPage() {
     } finally {
       setPageLoading(false);
     }
-  }, [getToken]);
+  }, [getToken, initialTab]);
 
   useEffect(() => {
     if (hasInitialized.current) return;
@@ -107,13 +121,23 @@ export default function SettingsPage() {
     [getToken],
   );
 
-  const stableFetchModels = useCallback(() => fetchModels(), []);
+  const stableFetchModels = useCallback(() => fetchModels(getToken()), [getToken]);
 
   if (pageLoading) {
     return <SettingsSkeleton />;
   }
 
   if (!profile) return null;
+
+  const canManageProviders =
+    workspaceRole === "owner" || workspaceRole === "admin";
+  const tabs = canManageProviders
+    ? [
+        ...baseTabs.slice(0, 2),
+        { id: "providers" as const, label: "供应商" },
+        ...baseTabs.slice(2),
+      ]
+    : baseTabs;
 
   return (
     <div className="px-4 py-6 sm:px-6 md:p-8">
@@ -154,6 +178,8 @@ export default function SettingsPage() {
             onSave={handleAgentSave}
             fetchModels={stableFetchModels}
           />
+        ) : activeTab === "providers" && canManageProviders ? (
+          <ProviderSettingsSection accessToken={getToken() ?? ""} />
         ) : activeTab === "usage" ? (
           <CreditUsageHistory />
         ) : (

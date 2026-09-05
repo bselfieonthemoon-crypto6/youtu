@@ -6,7 +6,6 @@ import {
   creditBalanceResponseSchema,
   creditTransactionsResponseSchema,
   claimDailyResponseSchema,
-  setPlanRequestSchema,
   applicationErrorResponseSchema,
   unauthenticatedErrorResponseSchema,
 } from "@loomic/shared";
@@ -110,45 +109,6 @@ export async function registerCreditRoutes(
     }
   });
 
-  // POST /api/credits/admin/set-plan — dev-only plan change
-  app.post("/api/credits/admin/set-plan", async (request, reply) => {
-    try {
-      const user = await options.auth.authenticate(request);
-      if (!user) return sendUnauthenticated(reply);
-
-      const body = setPlanRequestSchema.parse(request.body);
-      const viewer = await options.viewerService.ensureViewer(user);
-
-      await options.creditService.updatePlan(viewer.workspace.id, body.plan);
-
-      // Return refreshed balance info
-      const balance = await options.creditService.getBalance(
-        viewer.workspace.id,
-      );
-      const config = PLAN_CONFIGS[balance.plan];
-
-      return reply.code(200).send(
-        creditBalanceResponseSchema.parse({
-          balance: balance.balance,
-          plan: balance.plan,
-          dailyClaimed: balance.dailyClaimed,
-          limits: {
-            maxConcurrentJobs: config.maxConcurrentJobs,
-            maxResolution: config.maxResolution,
-            monthlyCredits: config.monthlyCredits,
-            dailyCredits: config.dailyCredits,
-          },
-        }),
-      );
-    } catch (error) {
-      if (isZodError(error)) {
-        return reply
-          .code(400)
-          .send({ issues: error.issues, message: "Invalid request body" });
-      }
-      return sendCreditError(error, reply, "credit_plan_update_failed");
-    }
-  });
 }
 
 // ── Helpers ──────────────────────────────────────────────────
@@ -193,13 +153,3 @@ function sendCreditError(
   );
 }
 
-function isZodError(
-  error: unknown,
-): error is { issues: unknown[]; name: string } {
-  return (
-    error instanceof Error &&
-    error.name === "ZodError" &&
-    "issues" in error &&
-    Array.isArray(error.issues)
-  );
-}

@@ -1,14 +1,34 @@
 "use client";
 
 import { motion } from "framer-motion";
-import React, { useMemo } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
-import type { ContentBlock, ToolArtifact, ToolBlock } from "@loomic/shared";
+import type {
+  BackgroundJob,
+  ContentBlock,
+  ToolArtifact,
+  ToolBlock,
+} from "@loomic/shared";
+import type { RestoreJobToCanvasResponse } from "../lib/server-api";
+import {
+  AgentPlanView,
+  getToolExecutionAnchorId,
+  type AgentPlanBlock,
+} from "./chat/agent-plan-view";
 import { ImagePill } from "./chat/image-lightbox";
 import { MarkdownRenderer } from "./chat/markdown-renderer";
 import { MentionPill } from "./chat/mention-pill";
 import { ThinkingBlockView } from "./chat/thinking-block-view";
-import { ToolBlockView } from "./chat/tool-block-view";
+import {
+  ToolBlockView,
+  type ToolConfirmationKind,
+} from "./chat/tool-block-view";
 
 // Re-export types for backward compatibility with existing consumers
 export type { ContentBlock, ToolArtifact };
@@ -24,6 +44,17 @@ type ChatMessageProps = {
   role: "user" | "assistant";
   contentBlocks: ContentBlock[];
   isStreaming?: boolean;
+  onConfirmAction?: (
+    confirmationId: string,
+    decision: "confirm" | "cancel",
+    kind?: ToolConfirmationKind,
+  ) => Promise<{ status: string; message?: string }> | undefined;
+  onWaitGeneration?: (jobId: string) => Promise<BackgroundJob>;
+  onRestoreGeneration?: (jobId: string) => Promise<RestoreJobToCanvasResponse>;
+  onRetryRead?: (
+    toolExecutionId: string,
+  ) => Promise<{ status: string; message?: string }>;
+  onOpenDesign?: (designId: string) => void;
 };
 
 /**
@@ -42,6 +73,11 @@ export const ChatMessage = React.memo(
     role,
     contentBlocks,
     isStreaming,
+    onConfirmAction,
+    onWaitGeneration,
+    onRestoreGeneration,
+    onRetryRead,
+    onOpenDesign,
   }: ChatMessageProps) {
     const isUser = role === "user";
 
@@ -53,6 +89,11 @@ export const ChatMessage = React.memo(
       <AssistantMessage
         contentBlocks={contentBlocks}
         isStreaming={isStreaming ?? false}
+        {...(onConfirmAction ? { onConfirmAction } : {})}
+        {...(onWaitGeneration ? { onWaitGeneration } : {})}
+        {...(onRestoreGeneration ? { onRestoreGeneration } : {})}
+        {...(onRetryRead ? { onRetryRead } : {})}
+        {...(onOpenDesign ? { onOpenDesign } : {})}
       />
     );
   },
@@ -62,7 +103,12 @@ export const ChatMessage = React.memo(
     return (
       prev.role === next.role &&
       prev.contentBlocks === next.contentBlocks &&
-      prev.isStreaming === next.isStreaming
+      prev.isStreaming === next.isStreaming &&
+      prev.onConfirmAction === next.onConfirmAction &&
+      prev.onWaitGeneration === next.onWaitGeneration &&
+      prev.onRestoreGeneration === next.onRestoreGeneration &&
+      prev.onRetryRead === next.onRetryRead &&
+      prev.onOpenDesign === next.onOpenDesign
     );
   },
 );
@@ -134,10 +180,7 @@ const UserMessage = React.memo(function UserMessage({
                 <ImagePill
                   key={idx}
                   src={(block as { url: string }).url}
-                  name={
-                    (block as { name?: string }).name ??
-                    `image-${idx + 1}`
-                  }
+                  name={(block as { name?: string }).name ?? `image-${idx + 1}`}
                 />
               ))}
             </span>
@@ -163,9 +206,7 @@ const UserMessage = React.memo(function UserMessage({
             <ImagePill
               key={idx}
               src={(block as { url: string }).url}
-              name={
-                (block as { name?: string }).name ?? `image-${idx + 1}`
-              }
+              name={(block as { name?: string }).name ?? `image-${idx + 1}`}
             />
           ))}
         </div>
@@ -181,10 +222,73 @@ const UserMessage = React.memo(function UserMessage({
 const AssistantMessage = React.memo(function AssistantMessage({
   contentBlocks,
   isStreaming,
+  onConfirmAction,
+  onWaitGeneration,
+  onRestoreGeneration,
+  onRetryRead,
+  onOpenDesign,
 }: {
   contentBlocks: ContentBlock[];
   isStreaming: boolean;
+  onConfirmAction?: (
+    confirmationId: string,
+    decision: "confirm" | "cancel",
+    kind?: ToolConfirmationKind,
+  ) => Promise<{ status: string; message?: string }> | undefined;
+  onWaitGeneration?: (jobId: string) => Promise<BackgroundJob>;
+  onRestoreGeneration?: (jobId: string) => Promise<RestoreJobToCanvasResponse>;
+  onRetryRead?: (
+    toolExecutionId: string,
+  ) => Promise<{ status: string; message?: string }>;
+  onOpenDesign?: (designId: string) => void;
 }) {
+  const toolRefs = useRef(new Map<string, HTMLDivElement>());
+  const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [highlightedToolCallId, setHighlightedToolCallId] = useState<
+    string | null
+  >(null);
+
+  useEffect(
+    () => () => {
+      if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+    },
+    [],
+  );
+
+  const toolsByPlanStep = useMemo(() => {
+    const result = new Map<string, Map<string, ToolBlock[]>>();
+    for (const block of contentBlocks) {
+      if (block.type !== "tool") continue;
+      const linked = block as ToolBlock & {
+        planId?: string;
+        planStepId?: string;
+      };
+      if (!linked.planId || !linked.planStepId) continue;
+      let byStep = result.get(linked.planId);
+      if (!byStep) {
+        byStep = new Map();
+        result.set(linked.planId, byStep);
+      }
+      const tools = byStep.get(linked.planStepId) ?? [];
+      tools.push(block);
+      byStep.set(linked.planStepId, tools);
+    }
+    return result;
+  }, [contentBlocks]);
+
+  const locateTool = useCallback((toolCallId: string) => {
+    const target = toolRefs.current.get(toolCallId);
+    if (!target) return;
+    target.scrollIntoView({ behavior: "smooth", block: "center" });
+    setHighlightedToolCallId(toolCallId);
+    if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+    highlightTimerRef.current = setTimeout(() => {
+      setHighlightedToolCallId((current) =>
+        current === toolCallId ? null : current,
+      );
+    }, 1800);
+  }, []);
+
   // Find the last text block index for streaming cursor placement
   const lastTextIdx = useMemo(() => {
     for (let i = contentBlocks.length - 1; i >= 0; i--) {
@@ -199,6 +303,7 @@ const AssistantMessage = React.memo(function AssistantMessage({
       contentBlocks.some(
         (b) =>
           (b.type === "text" && b.text.length > 0) ||
+          b.type === "plan" ||
           b.type === "tool" ||
           b.type === "thinking",
       ),
@@ -232,14 +337,27 @@ const AssistantMessage = React.memo(function AssistantMessage({
         </div>
       )}
       {contentBlocks.map((block, idx) => {
+        if ((block as { type: string }).type === "plan") {
+          return (
+            <AgentPlanView
+              key={`plan-${(block as unknown as AgentPlanBlock).planId}`}
+              block={block as unknown as AgentPlanBlock}
+              toolsByStepId={
+                toolsByPlanStep.get(
+                  (block as unknown as AgentPlanBlock).planId,
+                ) ?? new Map()
+              }
+              onLocateTool={locateTool}
+            />
+          );
+        }
+
         if (block.type === "thinking") {
           return (
             <ThinkingBlockView
               key={`thinking-${idx}`}
               thinking={block.thinking}
-              isStreaming={
-                isStreaming && idx === contentBlocks.length - 1
-              }
+              isStreaming={isStreaming && idx === contentBlocks.length - 1}
             />
           );
         }
@@ -257,7 +375,27 @@ const AssistantMessage = React.memo(function AssistantMessage({
 
         if (block.type === "tool") {
           return (
-            <ToolBlockView key={block.toolCallId} block={block} />
+            <div
+              key={block.toolCallId}
+              id={getToolExecutionAnchorId(block.toolCallId)}
+              ref={(node) => {
+                if (node) toolRefs.current.set(block.toolCallId, node);
+                else toolRefs.current.delete(block.toolCallId);
+              }}
+              data-plan-step-id={
+                (block as ToolBlock & { planStepId?: string }).planStepId
+              }
+            >
+              <ToolBlockView
+                block={block}
+                highlighted={highlightedToolCallId === block.toolCallId}
+                {...(onConfirmAction ? { onConfirmAction } : {})}
+                {...(onWaitGeneration ? { onWaitGeneration } : {})}
+                {...(onRestoreGeneration ? { onRestoreGeneration } : {})}
+                {...(onRetryRead ? { onRetryRead } : {})}
+                {...(onOpenDesign ? { onOpenDesign } : {})}
+              />
+            </div>
           );
         }
 

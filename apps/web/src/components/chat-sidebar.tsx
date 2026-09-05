@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useBreakpoint } from "../hooks/use-breakpoint";
 import type {
   ContentBlock,
+  AgentExecutionMode,
   ImageArtifact,
   ImageGenerationPreference,
   MessageMention,
@@ -13,22 +14,35 @@ import type {
   VideoGenerationPreference,
 } from "@loomic/shared";
 import { useAgentModel } from "../hooks/use-agent-model";
-import { mapServerMessages, useChatSessions } from "../hooks/use-chat-sessions";
+import {
+  mapServerMessages,
+  type Message,
+  useChatSessions,
+} from "../hooks/use-chat-sessions";
 import { useChatStream } from "../hooks/use-chat-stream";
 import {
   INITIAL_AGENT_MODEL_KEY,
   INITIAL_ATTACHMENTS_KEY,
+  INITIAL_EXECUTION_MODE_KEY,
   INITIAL_IMAGE_GENERATION_PREFERENCE_KEY,
 } from "../hooks/use-create-project";
 import type { ReadyAttachment } from "../hooks/use-image-attachments";
 import { useImageAttachments } from "../hooks/use-image-attachments";
 import { useImageModelPreference } from "../hooks/use-image-model-preference";
 import { useVideoModelPreference } from "../hooks/use-video-model-preference";
+import { waitForGenerationJob } from "../hooks/use-job-fallback-polling";
 import type { WebSocketHandle } from "../hooks/use-websocket";
 import { fetchBrandKit } from "../lib/brand-kit-api";
 import { claimDailyCredits } from "../lib/credits-api";
-import { fetchImageModels, fetchWorkspaceSkills, saveMessage } from "../lib/server-api";
+import { preserveChatCopy } from "../lib/chat-clipboard";
+import {
+  fetchImageModels,
+  fetchWorkspaceSkills,
+  restoreJobToCanvas,
+  saveMessage,
+} from "../lib/server-api";
 import type { CanvasSelectedElement } from "./canvas-editor";
+import type { CanvasImageChatCommand } from "./canvas/image-toolbar-types";
 import {
   type BrandKitMentionItem,
   type CanvasImageItem,
@@ -45,6 +59,17 @@ import { useTierLimitToast } from "./credits/tier-limit-toast";
 import { useToast } from "./toast";
 import { ErrorBoundary } from "./error-boundary";
 import { SessionSelector } from "./session-selector";
+import { RunHistoryPanel } from "./chat/run-history-panel";
+import type { ToolConfirmationKind } from "./chat/tool-block-view";
+import {
+  ClarificationDialog,
+  ConfirmationDialog,
+  parseClarificationQuestions,
+  parseConfirmationRequest,
+  parseToolConfirmationRequest,
+  type ClarificationQuestion,
+  type ConfirmationRequest,
+} from "./chat/clarification-dialog";
 
 type ChatSidebarProps = {
   accessToken: string;
@@ -63,7 +88,42 @@ type ChatSidebarProps = {
   currentBrandKitId?: string | null;
   ws: WebSocketHandle;
   selectedCanvasElements?: CanvasSelectedElement[];
+  imageChatCommand?: CanvasImageChatCommand | null;
+  onOpenDesign?: (designId: string) => void;
 };
+
+const HANDLED_CONFIRMATION_STORAGE_PREFIX = "loomic:handled-confirmation:";
+
+function wasConfirmationHandled(confirmationId: string): boolean {
+  try {
+    return (
+      window.localStorage.getItem(
+        `${HANDLED_CONFIRMATION_STORAGE_PREFIX}${confirmationId}`,
+      ) === "1"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function markConfirmationHandled(confirmationId: string): void {
+  try {
+    window.localStorage.setItem(
+      `${HANDLED_CONFIRMATION_STORAGE_PREFIX}${confirmationId}`,
+      "1",
+    );
+  } catch {
+    // The in-memory message guard still prevents the dialog from reopening
+    // when storage is unavailable (for example, in a restricted browser).
+  }
+}
+
+function isExplicitImageConfirmationMessage(text: string): boolean {
+  const normalized = text.trim().replace(/[，。！？!?,.\s]/g, "");
+  return /^(确认|确认生成|可以|可以生成|好|好的|没问题|开始生成|继续生成|确认请按上述方案继续执行并生成预览)$/.test(
+    normalized,
+  );
+}
 
 export function ChatSidebar({
   accessToken,
@@ -81,6 +141,8 @@ export function ChatSidebar({
   currentBrandKitId,
   ws,
   selectedCanvasElements,
+  imageChatCommand,
+  onOpenDesign,
 }: ChatSidebarProps) {
   const breakpoint = useBreakpoint();
   const isOverlay = breakpoint !== "desktop";
@@ -134,15 +196,64 @@ export function ChatSidebar({
     dailyClaimed: boolean;
   } | null>(null);
   const chatInputRef = useRef<import("./chat-input").ChatInputHandle>(null);
+  const chatSidebarRef = useRef<HTMLDivElement>(null);
 
   const initialPromptSent = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const abortRef = useRef(false);
+  const activeRunIdRef = useRef<string | null>(null);
+  const [cancelRequested, setCancelRequested] = useState(false);
+  const [runHistoryOpen, setRunHistoryOpen] = useState(false);
+  const [clarificationQuestions, setClarificationQuestions] = useState<
+    ClarificationQuestion[]
+  >([]);
+  const [confirmationRequest, setConfirmationRequest] =
+    useState<ConfirmationRequest | null>(null);
+  const [confirmedGenerationPending, setConfirmedGenerationPending] =
+    useState(false);
+  const [floatingDialogClearance, setFloatingDialogClearance] = useState(0);
+  const handledClarificationMessageIdsRef = useRef(new Set<string>());
+  const cancelRequestedRef = useRef(false);
   const messageMentionsRef = useRef(messageMentions);
   messageMentionsRef.current = messageMentions;
   const selectedCanvasElementsRef = useRef(selectedCanvasElements);
   selectedCanvasElementsRef.current = selectedCanvasElements;
   const prevConnectedRef = useRef(false);
+  const consumedImageCommandRef = useRef<string | null>(null);
+  const canvasSyncTimersRef = useRef<number[]>([]);
+  const completedConfirmationIdsRef = useRef(new Set<string>());
+
+  const scheduleCanvasSyncBurst = useCallback(() => {
+    if (!onCanvasSync) return;
+    for (const timer of canvasSyncTimersRef.current) window.clearTimeout(timer);
+    canvasSyncTimersRef.current = [];
+    onCanvasSync();
+    // The confirmation ACK intentionally arrives before the durable job and
+    // placeholder. Retry a few bounded refreshes so a missed websocket event
+    // cannot leave the canvas blank while generation continues.
+    for (const delay of [400, 1_200, 3_000, 8_000, 20_000, 60_000]) {
+      canvasSyncTimersRef.current.push(
+        window.setTimeout(() => onCanvasSync(), delay),
+      );
+    }
+  }, [onCanvasSync]);
+
+  useEffect(
+    () => () => {
+      for (const timer of canvasSyncTimersRef.current)
+        window.clearTimeout(timer);
+      canvasSyncTimersRef.current = [];
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const handleCopy = (event: ClipboardEvent) => {
+      const root = chatSidebarRef.current;
+      if (root) preserveChatCopy(event, root);
+    };
+    document.addEventListener("copy", handleCopy, true);
+    return () => document.removeEventListener("copy", handleCopy, true);
+  }, []);
 
   const {
     attachments: imageAttachments,
@@ -236,7 +347,9 @@ export function ChatSidebar({
         document.removeEventListener("touchcancel", handleTouchEnd);
       };
 
-      document.addEventListener("touchmove", handleTouchMove, { passive: false });
+      document.addEventListener("touchmove", handleTouchMove, {
+        passive: false,
+      });
       document.addEventListener("touchend", handleTouchEnd);
       document.addEventListener("touchcancel", handleTouchEnd);
     },
@@ -266,11 +379,42 @@ export function ChatSidebar({
     scrollToBottom();
   }, [messages, scrollToBottom]);
 
+  // The guided prompt remains visually floating above the composer, but its
+  // height is mirrored as scrollable clearance so it never hides the tail of
+  // the assistant's proposal.
+  useEffect(() => {
+    const dialog = chatSidebarRef.current?.querySelector<HTMLElement>(
+      "[data-chat-floating-dialog]",
+    );
+    if (!dialog) {
+      setFloatingDialogClearance(0);
+      return;
+    }
+
+    const updateClearance = () => {
+      setFloatingDialogClearance(
+        Math.ceil(dialog.getBoundingClientRect().height) + 24,
+      );
+    };
+    updateClearance();
+
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(updateClearance);
+    observer.observe(dialog);
+    return () => observer.disconnect();
+  }, [clarificationQuestions.length, confirmationRequest]);
+
+  useEffect(() => {
+    if (floatingDialogClearance <= 0) return;
+    const frame = requestAnimationFrame(scrollToBottom);
+    return () => cancelAnimationFrame(frame);
+  }, [floatingDialogClearance, scrollToBottom]);
+
   // ── Fetch image models for @mention picker ──
   useEffect(() => {
     let cancelled = false;
 
-    fetchImageModels()
+    fetchImageModels(accessToken)
       .then((data) => {
         if (cancelled) return;
         setImageModelMentionItems(
@@ -290,7 +434,7 @@ export function ChatSidebar({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [accessToken]);
 
   // Fetch enabled workspace skills for @ mention
   useEffect(() => {
@@ -302,7 +446,9 @@ export function ChatSidebar({
         if (cancelled) return;
         const allSkills = data.skills ?? [];
         const enabledSkills = allSkills.filter((s) => s.enabled);
-        console.log(`[chat-sidebar] Workspace skills loaded: ${allSkills.length} total, ${enabledSkills.length} enabled`);
+        console.log(
+          `[chat-sidebar] Workspace skills loaded: ${allSkills.length} total, ${enabledSkills.length} enabled`,
+        );
         setSkillMentionItems(
           enabledSkills.map((s) => ({
             kind: "skill" as const,
@@ -335,7 +481,7 @@ export function ChatSidebar({
       .then((kit) => {
         if (cancelled) return;
         setBrandKitMentionItems(
-          kit.assets.map((asset: { id: string; display_name: string; asset_type: string; text_content?: string; file_url?: string }) => ({
+          kit.assets.map((asset) => ({
             kind: "brand-kit-asset" as const,
             id: asset.id,
             label: asset.display_name,
@@ -358,6 +504,332 @@ export function ChatSidebar({
     };
   }, [currentBrandKitId, accessTokenRef]);
 
+  const clearActiveRun = useCallback(() => {
+    activeRunIdRef.current = null;
+    cancelRequestedRef.current = false;
+    setCancelRequested(false);
+  }, []);
+
+  const handleCancelRun = useCallback(() => {
+    if (!streaming || cancelRequestedRef.current) return;
+    cancelRequestedRef.current = true;
+    setCancelRequested(true);
+    if (activeRunIdRef.current) {
+      ws.cancelRun(activeRunIdRef.current);
+    }
+  }, [streaming, ws]);
+
+  const handleNewChatClick = useCallback(() => {
+    handleCancelRun();
+    setClarificationQuestions([]);
+    setConfirmationRequest(null);
+    void handleNewChat();
+  }, [handleCancelRun, handleNewChat]);
+
+  const handleConfirmAction = useCallback(
+    (
+      confirmationId: string,
+      decision: "confirm" | "cancel",
+      confirmationKind: ToolConfirmationKind = "delete",
+    ) => {
+      // During the initial session load React state can already contain the
+      // visible session while the ref observed by this callback is one render
+      // behind. Fall back to state so an auto-confirmed image proposal still
+      // gets its optimistic chat placeholder immediately.
+      const confirmationSessionId =
+        activeSessionIdRef.current ?? activeSessionId;
+      return new Promise<{ status: string; message?: string }>((resolve) => {
+        const timeout = window.setTimeout(
+          () =>
+            resolve({
+              status: "failed",
+              message: "确认请求超时，请重新发起。",
+            }),
+          10_000,
+        );
+        ws.confirmAction(confirmationId, decision, (ack) => {
+          window.clearTimeout(timeout);
+          const payload = ack.payload as {
+            status?: unknown;
+            message?: unknown;
+            result?: unknown;
+          };
+          const result =
+            payload.result &&
+            typeof payload.result === "object" &&
+            !Array.isArray(payload.result)
+              ? (payload.result as Record<string, unknown>)
+              : null;
+          if (
+            payload.status === "accepted" ||
+            payload.status === "applied" ||
+            payload.status === "canceled"
+          ) {
+            markConfirmationHandled(confirmationId);
+          }
+          if (
+            decision === "confirm" &&
+            (payload.status === "accepted" || payload.status === "applied")
+          ) {
+            scheduleCanvasSyncBurst();
+          }
+          if (
+            decision === "confirm" &&
+            confirmationKind === "image_generation"
+          ) {
+            if (payload.status === "accepted") {
+              setConfirmedGenerationPending(true);
+              if (confirmationSessionId) {
+                const appendPendingMessage = (
+                  previous: Message[],
+                ): Message[] => {
+                  const optimisticId = `confirmation-pending-${confirmationId}`;
+                  if (previous.some((message) => message.id === optimisticId)) {
+                    return previous;
+                  }
+                  return [
+                    ...previous,
+                    {
+                      id: optimisticId,
+                      role: "assistant",
+                      contentBlocks: [
+                        {
+                          type: "tool",
+                          toolCallId: optimisticId,
+                          toolName: "generate_image",
+                          status: "running",
+                          output: { status: "submitting" },
+                          outputSummary: "正在生成图片",
+                        },
+                      ],
+                    },
+                  ];
+                };
+                updateSessionMessages(
+                  confirmationSessionId,
+                  appendPendingMessage,
+                );
+                // Keep the currently rendered list in lockstep as well. The
+                // session cache can briefly lag during initial auto-confirm.
+                if (
+                  activeSessionIdRef.current === confirmationSessionId ||
+                  activeSessionId === confirmationSessionId
+                ) {
+                  setMessages(appendPendingMessage);
+                }
+                window.setTimeout(
+                  () => void reloadMessages(confirmationSessionId),
+                  8_000,
+                );
+              }
+            } else if (
+              payload.status === "applied" ||
+              payload.status === "failed" ||
+              payload.status === "canceled"
+            ) {
+              setConfirmedGenerationPending(false);
+            }
+          }
+          if (
+            decision === "confirm" &&
+            payload.status === "applied" &&
+            !completedConfirmationIdsRef.current.has(confirmationId)
+          ) {
+            if (
+              result &&
+              typeof result.imageUrl === "string" &&
+              result.imageUrl &&
+              typeof result.width === "number" &&
+              typeof result.height === "number"
+            ) {
+              completedConfirmationIdsRef.current.add(confirmationId);
+              const artifact: ImageArtifact = {
+                type: "image",
+                url: result.imageUrl,
+                mimeType:
+                  typeof result.mimeType === "string"
+                    ? result.mimeType
+                    : "image/png",
+                width: result.width,
+                height: result.height,
+                ...(typeof result.title === "string"
+                  ? { title: result.title }
+                  : {}),
+                ...(typeof result.jobId === "string"
+                  ? { jobId: result.jobId }
+                  : {}),
+                ...(result.placement &&
+                typeof result.placement === "object" &&
+                !Array.isArray(result.placement)
+                  ? {
+                      placement: result.placement as ImageArtifact["placement"],
+                    }
+                  : {}),
+              };
+              const completionBlocks: ContentBlock[] = [
+                {
+                  type: "tool",
+                  toolCallId: `confirmation-${confirmationId}`,
+                  toolName: "generate_image",
+                  status: "completed",
+                  output: {
+                    status: "succeeded",
+                    ...(artifact.jobId ? { jobId: artifact.jobId } : {}),
+                    ...(typeof result.design_id === "string"
+                      ? { design_id: result.design_id }
+                      : typeof result.designId === "string"
+                        ? { design_id: result.designId }
+                        : {}),
+                    ...(typeof result.object_id === "string"
+                      ? { object_id: result.object_id }
+                      : typeof result.objectId === "string"
+                        ? { object_id: result.objectId }
+                        : {}),
+                    ...(typeof result.revision === "number"
+                      ? { revision: result.revision }
+                      : {}),
+                    ...(result.finalization &&
+                    typeof result.finalization === "object" &&
+                    !Array.isArray(result.finalization)
+                      ? { finalization: result.finalization }
+                      : {}),
+                    ...(result.billing &&
+                    typeof result.billing === "object" &&
+                    !Array.isArray(result.billing)
+                      ? { billing: result.billing }
+                      : {}),
+                  },
+                  outputSummary: "图片生成完成",
+                  artifacts: [artifact],
+                },
+              ];
+              if (
+                confirmationSessionId &&
+                activeSessionIdRef.current === confirmationSessionId
+              ) {
+                updateSessionMessages(confirmationSessionId, (previous) => [
+                  ...previous.filter(
+                    (message) =>
+                      message.id !== `confirmation-pending-${confirmationId}`,
+                  ),
+                  {
+                    id: `confirmation-result-${confirmationId}`,
+                    role: "assistant",
+                    contentBlocks: completionBlocks,
+                  },
+                ]);
+              }
+              if (confirmationSessionId) {
+                window.setTimeout(
+                  () => void reloadMessages(confirmationSessionId),
+                  1_000,
+                );
+              }
+            }
+          }
+          if (
+            decision === "confirm" &&
+            payload.status === "failed" &&
+            result &&
+            typeof result.jobId === "string" &&
+            result.jobId
+          ) {
+            // The agent-side wait can time out while the durable worker is
+            // retrying. Keep following that same paid job instead of leaving
+            // the chat and canvas on a permanent loading placeholder.
+            setConfirmedGenerationPending(true);
+            void waitForGenerationJob(accessTokenRef.current, result.jobId)
+              .then((job) => {
+                setConfirmedGenerationPending(false);
+                if (job.status !== "succeeded") return;
+                scheduleCanvasSyncBurst();
+                if (confirmationSessionId) {
+                  for (const delay of [500, 1_500, 4_000]) {
+                    window.setTimeout(
+                      () => void reloadMessages(confirmationSessionId),
+                      delay,
+                    );
+                  }
+                }
+              })
+              .catch((error) => {
+                setConfirmedGenerationPending(false);
+                console.error(
+                  "[chat] Failed to follow image job retry:",
+                  error,
+                );
+              });
+          }
+          resolve({
+            status:
+              typeof payload.status === "string" ? payload.status : "failed",
+            ...(typeof payload.message === "string"
+              ? { message: payload.message }
+              : {}),
+          });
+        });
+      });
+    },
+    [
+      accessTokenRef,
+      activeSessionId,
+      activeSessionIdRef,
+      scheduleCanvasSyncBurst,
+      reloadMessages,
+      setMessages,
+      updateSessionMessages,
+      ws,
+    ],
+  );
+
+  const handleRetryRead = useCallback(
+    (toolExecutionId: string) =>
+      new Promise<{ status: string; message?: string }>((resolve) => {
+        const requestId = crypto.randomUUID();
+        const timeout = window.setTimeout(
+          () =>
+            resolve({
+              status: "failed",
+              message: "重新读取请求超时，请稍后再试。",
+            }),
+          15_000,
+        );
+        ws.retryTool(toolExecutionId, requestId, (ack) => {
+          window.clearTimeout(timeout);
+          const payload = ack.payload as {
+            status?: unknown;
+          };
+          const status =
+            typeof payload.status === "string" ? payload.status : "failed";
+          if (status === "completed") {
+            const sessionId = activeSessionIdRef.current;
+            if (sessionId) void reloadMessages(sessionId);
+          }
+          resolve({
+            status,
+            ...(status === "failed"
+              ? { message: "重新读取失败，请稍后再试。" }
+              : {}),
+          });
+        });
+      }),
+    [activeSessionIdRef, reloadMessages, ws],
+  );
+
+  const handleWaitGeneration = useCallback(
+    (jobId: string) => waitForGenerationJob(accessToken, jobId),
+    [accessToken],
+  );
+
+  const handleRestoreGeneration = useCallback(
+    async (jobId: string) => {
+      const restored = await restoreJobToCanvas(accessToken, jobId);
+      await onCanvasSync?.();
+      return restored;
+    },
+    [accessToken, onCanvasSync],
+  );
+
   // ── Send message ──
   const handleSend = useCallback(
     async (
@@ -365,6 +837,7 @@ export function ChatSidebar({
       attachmentsOverride?: ReadyAttachment[],
       imageGenerationPreferenceOverride?: ImageGenerationPreference,
       mentionsOverride?: MessageMention[],
+      executionModeOverride?: AgentExecutionMode,
     ) => {
       const currentSessionId = activeSessionIdRef.current;
       if (streaming || !currentSessionId) return;
@@ -379,13 +852,13 @@ export function ChatSidebar({
       if (selectedImageEls.length > 0 && !attachmentsOverride) {
         const existingIds = new Set(currentAttachments.map((a) => a.assetId));
         const selectionAttachments: ReadyAttachment[] = selectedImageEls
-          .filter((el) => !existingIds.has(el.id))
+          .filter((el) => !existingIds.has(el.assetId ?? el.id))
           .map((el) => ({
-            assetId: el.id,
+            assetId: el.assetId ?? el.id,
             url: el.storageUrl ?? el.dataUrl!,
-            mimeType: "image/png",
+            mimeType: el.mimeType ?? "image/png",
             source: "canvas-ref" as const,
-            name: `Canvas selection ${el.id.slice(0, 6)}`,
+            name: el.name ?? `Canvas selection ${el.id.slice(0, 6)}`,
           }));
         if (selectionAttachments.length > 0) {
           currentAttachments = [...currentAttachments, ...selectionAttachments];
@@ -397,6 +870,11 @@ export function ChatSidebar({
       const currentVideoGenerationPreference =
         activeVideoGenerationPreferenceRef.current;
       const currentMentions = mentionsOverride ?? messageMentionsRef.current;
+      // The product now has one execution policy: always use the deliberate
+      // Thinking path. Keep the optional argument only for call compatibility
+      // with older stored home-page payloads, but never let it downgrade a run.
+      void executionModeOverride;
+      const currentExecutionMode: AgentExecutionMode = "thinking";
 
       // Add user message locally
       const imageBlocks: ContentBlock[] = currentAttachments.map((a) => ({
@@ -407,28 +885,38 @@ export function ChatSidebar({
         source: a.source,
         ...(a.name ? { name: a.name } : {}),
       }));
-      const mentionBlocks: ContentBlock[] = currentMentions.map((mention) =>
-        mention.mentionType === "image-model"
-          ? {
-              type: "mention" as const,
-              mentionType: "image-model" as const,
-              id: mention.id,
-              label: mention.label,
-            }
-          : {
-              type: "mention" as const,
-              mentionType: "brand-kit-asset" as const,
-              id: mention.id,
-              label: mention.label,
-              assetType: mention.assetType,
-              ...(mention.textContent !== undefined
-                ? { textContent: mention.textContent }
-                : {}),
-              ...(mention.fileUrl !== undefined
-                ? { fileUrl: mention.fileUrl }
-                : {}),
-            },
-      );
+      const mentionBlocks: ContentBlock[] = currentMentions.map((mention) => {
+        if (mention.mentionType === "image-model") {
+          return {
+            type: "mention" as const,
+            mentionType: "image-model" as const,
+            id: mention.id,
+            label: mention.label,
+          };
+        }
+        if (mention.mentionType === "skill") {
+          return {
+            type: "mention" as const,
+            mentionType: "skill" as const,
+            id: mention.id,
+            label: mention.label,
+            slug: mention.slug,
+          };
+        }
+        return {
+          type: "mention" as const,
+          mentionType: "brand-kit-asset" as const,
+          id: mention.id,
+          label: mention.label,
+          assetType: mention.assetType,
+          ...(mention.textContent !== undefined
+            ? { textContent: mention.textContent }
+            : {}),
+          ...(mention.fileUrl !== undefined
+            ? { fileUrl: mention.fileUrl }
+            : {}),
+        };
+      });
       const userMsg = {
         id: `user-${Date.now()}`,
         role: "user" as const,
@@ -463,7 +951,7 @@ export function ChatSidebar({
         { id: assistantId, role: "assistant" as const, contentBlocks: [] },
       ]);
       setStreaming(true);
-      abortRef.current = false;
+      clearActiveRun();
 
       try {
         const perf = {
@@ -481,10 +969,6 @@ export function ChatSidebar({
 
         const cleanup = ws.onEvent((event) => {
           if (!runIdRef.current || event.runId !== runIdRef.current) return;
-          if (abortRef.current) {
-            resolveStream();
-            return;
-          }
 
           // Track first token timing
           if (!perf.gotFirstToken && event.type === "message.delta") {
@@ -520,9 +1004,11 @@ export function ChatSidebar({
 
           // Fire canvas insertion callbacks for image/video artifacts.
           // Skip if the backend already inserted the element (elementId in output).
-          const backendInserted = event.type === "tool.completed"
-            && event.output
-            && typeof (event.output as Record<string, unknown>).elementId === "string";
+          const backendInserted =
+            event.type === "tool.completed" &&
+            event.output &&
+            typeof (event.output as Record<string, unknown>).elementId ===
+              "string";
           if (
             event.type === "tool.completed" &&
             event.artifacts &&
@@ -559,6 +1045,7 @@ export function ChatSidebar({
             event.type === "run.failed" ||
             event.type === "run.canceled"
           ) {
+            clearActiveRun();
             resolveStream();
           }
         });
@@ -596,6 +1083,7 @@ export function ChatSidebar({
               ...(agentModelRef.current
                 ? { model: agentModelRef.current }
                 : {}),
+              executionMode: currentExecutionMode,
             },
             (ack) => {
               clearTimeout(timeout);
@@ -605,6 +1093,8 @@ export function ChatSidebar({
               );
               const id = ack.payload.runId as string;
               runIdRef.current = id;
+              activeRunIdRef.current = id;
+              if (cancelRequestedRef.current) ws.cancelRun(id);
               resolve(id);
             },
           );
@@ -631,6 +1121,7 @@ export function ChatSidebar({
         );
       } finally {
         setStreaming(false);
+        clearActiveRun();
       }
     },
     [
@@ -648,7 +1139,151 @@ export function ChatSidebar({
       autoTitleSession,
       accessTokenRef,
       activeSessionIdRef,
+      clearActiveRun,
     ],
+  );
+
+  // Explicit commands from the selected-image toolbar survive deselection.
+  // Agent actions pass an attachment override directly, avoiding a state race
+  // between adding the attachment pill and starting the run.
+  useEffect(() => {
+    if (
+      !imageChatCommand ||
+      consumedImageCommandRef.current === imageChatCommand.id
+    )
+      return;
+    if (
+      imageChatCommand.mode === "run-agent" &&
+      (!activeSessionId || streaming)
+    )
+      return;
+    consumedImageCommandRef.current = imageChatCommand.id;
+    const attachment: ReadyAttachment = {
+      assetId: imageChatCommand.image.assetId,
+      url: imageChatCommand.image.url,
+      mimeType: imageChatCommand.image.mimeType,
+      source: "canvas-ref",
+      ...(imageChatCommand.image.name
+        ? { name: imageChatCommand.image.name }
+        : {}),
+    };
+    if (imageChatCommand.mode === "attach") {
+      addCanvasRef(imageChatCommand.image);
+      chatInputRef.current?.focus();
+      return;
+    }
+    if (imageChatCommand.prompt) {
+      void handleSend(imageChatCommand.prompt, [attachment]);
+    }
+  }, [activeSessionId, addCanvasRef, handleSend, imageChatCommand, streaming]);
+
+  // Turn settled, numbered assistant questions into a guided answer dialog.
+  useEffect(() => {
+    if (streaming || clarificationQuestions.length > 0 || confirmationRequest)
+      return;
+    const lastMessage = messages[messages.length - 1];
+    if (!lastMessage || lastMessage.role !== "assistant") return;
+    if (handledClarificationMessageIdsRef.current.has(lastMessage.id)) return;
+
+    const text = lastMessage.contentBlocks
+      .filter(
+        (block): block is Extract<ContentBlock, { type: "text" }> =>
+          block.type === "text",
+      )
+      .map((block) => block.text)
+      .join("");
+    const questions = parseClarificationQuestions(text);
+    const confirmation =
+      questions.length === 0
+        ? (parseToolConfirmationRequest(lastMessage.contentBlocks) ??
+          parseConfirmationRequest(text))
+        : null;
+    if (questions.length === 0 && !confirmation) return;
+    if (
+      confirmation?.confirmationId &&
+      wasConfirmationHandled(confirmation.confirmationId)
+    ) {
+      handledClarificationMessageIdsRef.current.add(lastMessage.id);
+      return;
+    }
+    if (
+      confirmation?.kind === "design_mutation" ||
+      confirmation?.kind === "design_template_apply"
+    ) {
+      // Design confirmations are rendered inside their exact tool result so
+      // users can review the target revision and action without a duplicate
+      // floating dialog. The card sends the real product confirmation command.
+      handledClarificationMessageIdsRef.current.add(lastMessage.id);
+      return;
+    }
+
+    const previousMessage = messages[messages.length - 2];
+    const previousText =
+      previousMessage?.contentBlocks
+        .filter(
+          (block): block is Extract<ContentBlock, { type: "text" }> =>
+            block.type === "text",
+        )
+        .map((block) => block.text)
+        .join("") ?? "";
+    if (
+      confirmation?.confirmationId &&
+      previousMessage?.role === "user" &&
+      isExplicitImageConfirmationMessage(previousText)
+    ) {
+      handledClarificationMessageIdsRef.current.add(lastMessage.id);
+      void handleConfirmAction(
+        confirmation.confirmationId,
+        "confirm",
+        confirmation.kind ?? "delete",
+      ).then((result) => {
+        if (result.status !== "accepted" && result.status !== "applied") {
+          setConfirmationRequest(confirmation);
+        }
+      });
+      return;
+    }
+
+    handledClarificationMessageIdsRef.current.add(lastMessage.id);
+    if (questions.length > 0) setClarificationQuestions(questions);
+    else setConfirmationRequest(confirmation);
+  }, [
+    clarificationQuestions.length,
+    confirmationRequest,
+    handleConfirmAction,
+    messages,
+    streaming,
+  ]);
+
+  const clarificationDialogEl = clarificationQuestions.length > 0 && (
+    <ClarificationDialog
+      questions={clarificationQuestions}
+      onClose={() => setClarificationQuestions([])}
+      onSubmit={(answer) => {
+        setClarificationQuestions([]);
+        void handleSend(answer);
+      }}
+    />
+  );
+  const confirmationDialogEl = confirmationRequest && (
+    <ConfirmationDialog
+      request={confirmationRequest}
+      onClose={() => setConfirmationRequest(null)}
+      {...(confirmationRequest.confirmationId
+        ? {
+            onConfirmAction: () =>
+              handleConfirmAction(
+                confirmationRequest.confirmationId!,
+                "confirm",
+                confirmationRequest.kind ?? "delete",
+              ),
+          }
+        : {})}
+      onSubmit={(answer) => {
+        setConfirmationRequest(null);
+        void handleSend(answer);
+      }}
+    />
   );
 
   // ── Mention picker ──
@@ -674,9 +1309,18 @@ export function ChatSidebar({
       setMessageMentions((prev) => {
         let nextMention: MessageMention;
         if (item.kind === "image-model") {
-          nextMention = { mentionType: "image-model", id: item.id, label: item.label };
+          nextMention = {
+            mentionType: "image-model",
+            id: item.id,
+            label: item.label,
+          };
         } else if (item.kind === "skill") {
-          nextMention = { mentionType: "skill", id: item.id, label: item.label, slug: item.slug };
+          nextMention = {
+            mentionType: "skill",
+            id: item.id,
+            label: item.label,
+            slug: item.slug,
+          };
         } else {
           nextMention = {
             mentionType: "brand-kit-asset",
@@ -686,9 +1330,7 @@ export function ChatSidebar({
             ...(item.textContent !== undefined
               ? { textContent: item.textContent }
               : {}),
-            ...(item.fileUrl !== undefined
-              ? { fileUrl: item.fileUrl }
-              : {}),
+            ...(item.fileUrl !== undefined ? { fileUrl: item.fileUrl } : {}),
           };
         }
 
@@ -751,6 +1393,9 @@ export function ChatSidebar({
         storedAgentModel = modelRaw;
         sessionStorage.removeItem(INITIAL_AGENT_MODEL_KEY);
       }
+
+      // Discard legacy mode state now that every run uses Thinking.
+      sessionStorage.removeItem(INITIAL_EXECUTION_MODE_KEY);
     } catch {
       // Malformed JSON or unavailable storage
     }
@@ -766,6 +1411,8 @@ export function ChatSidebar({
         initialPrompt,
         storedAttachments,
         storedImageGenerationPreference,
+        undefined,
+        "thinking",
       );
     }, 0);
 
@@ -804,6 +1451,9 @@ export function ChatSidebar({
           .activeRunId;
         if (activeRunId && typeof activeRunId === "string") {
           setStreaming(true);
+          activeRunIdRef.current = activeRunId;
+          cancelRequestedRef.current = false;
+          setCancelRequested(false);
 
           const assistantId = `resumed_${activeRunId}`;
           // Must use updateSessionMessages (not setMessages) so the placeholder
@@ -832,9 +1482,11 @@ export function ChatSidebar({
 
             // Fire canvas insertion callbacks for artifacts arriving after reconnect.
             // Skip if the backend already inserted the element (elementId in output).
-            const wsBackendInserted = evt.type === "tool.completed"
-              && evt.output
-              && typeof (evt.output as Record<string, unknown>).elementId === "string";
+            const wsBackendInserted =
+              evt.type === "tool.completed" &&
+              evt.output &&
+              typeof (evt.output as Record<string, unknown>).elementId ===
+                "string";
             if (
               evt.type === "tool.completed" &&
               evt.artifacts &&
@@ -860,6 +1512,7 @@ export function ChatSidebar({
               evt.type === "run.failed" ||
               evt.type === "run.canceled"
             ) {
+              clearActiveRun();
               setStreaming(false);
               unsub();
             }
@@ -882,6 +1535,7 @@ export function ChatSidebar({
     updateSessionMessages,
     setStreaming,
     initialPrompt,
+    clearActiveRun,
   ]);
 
   // ── Collapsed state ──
@@ -924,7 +1578,7 @@ export function ChatSidebar({
     <>
       {/* Header */}
       <div className="flex min-h-[48px] items-center justify-between pl-4 pr-2">
-        <div className="flex items-center gap-1 min-w-0">
+        <div className="flex min-w-0 flex-1 items-center gap-1">
           <h2 className="text-sm font-semibold text-foreground shrink-0">
             Loomic Agent
           </h2>
@@ -933,24 +1587,48 @@ export function ChatSidebar({
               sessions={sessions}
               activeSessionId={activeSessionId}
               onSelect={handleSelectSession}
-              onNewChat={handleNewChat}
+              onNewChat={handleNewChatClick}
               onDelete={handleDeleteSession}
             />
           )}
         </div>
-        <button
-          type="button"
-          onClick={onToggle}
-          className="rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors shrink-0"
-          title="Collapse panel"
-        >
-          <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none">
-            <path
-              d="M4 3.25a.75.75 0 0 1 .75.75v16a.75.75 0 0 1-1.5 0V4A.75.75 0 0 1 4 3.25m9.47 2.22a.75.75 0 0 1 1.06 0l6 6a.75.75 0 0 1 0 1.06l-6 6a.75.75 0 1 1-1.06-1.06l4.72-4.72H8a.75.75 0 0 1 0-1.5h10.19l-4.72-4.72a.75.75 0 0 1 0-1.06"
-              fill="currentColor"
-            />
-          </svg>
-        </button>
+        <div className="flex shrink-0 items-center gap-0.5">
+          <button
+            type="button"
+            onClick={() => setRunHistoryOpen(true)}
+            className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            title="运行历史"
+            aria-label="打开运行历史"
+          >
+            <svg
+              className="size-4"
+              viewBox="0 0 24 24"
+              fill="none"
+              aria-hidden="true"
+            >
+              <path
+                d="M3 12a9 9 0 1 0 3-6.7M3 4v5h5m4-3v6l4 2"
+                stroke="currentColor"
+                strokeWidth="1.7"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+          </button>
+          <button
+            type="button"
+            onClick={onToggle}
+            className="rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors shrink-0"
+            title="Collapse panel"
+          >
+            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none">
+              <path
+                d="M4 3.25a.75.75 0 0 1 .75.75v16a.75.75 0 0 1-1.5 0V4A.75.75 0 0 1 4 3.25m9.47 2.22a.75.75 0 0 1 1.06 0l6 6a.75.75 0 0 1 0 1.06l-6 6a.75.75 0 1 1-1.06-1.06l4.72-4.72H8a.75.75 0 0 1 0-1.5h10.19l-4.72-4.72a.75.75 0 0 1 0-1.06"
+                fill="currentColor"
+              />
+            </svg>
+          </button>
+        </div>
       </div>
 
       {/* Disconnected banner */}
@@ -969,7 +1647,11 @@ export function ChatSidebar({
           console.error("[chat-sidebar] message area render crashed:", err)
         }
       >
-        <div className="flex-1 overflow-y-auto overflow-x-hidden flex flex-col gap-6 px-4 py-4" aria-live="polite" aria-relevant="additions">
+        <div
+          className="flex-1 overflow-y-auto overflow-x-hidden flex flex-col gap-6 px-4 py-4"
+          aria-live="polite"
+          aria-relevant="additions"
+        >
           {sessionsLoading || messagesLoading ? (
             <div className="flex h-full items-center justify-center">
               <div className="h-5 w-5 animate-spin rounded-full border-2 border-border border-t-foreground" />
@@ -987,8 +1669,47 @@ export function ChatSidebar({
                   msg.role === "assistant" &&
                   msg === messages[messages.length - 1]
                 }
+                onConfirmAction={handleConfirmAction}
+                onWaitGeneration={handleWaitGeneration}
+                onRestoreGeneration={handleRestoreGeneration}
+                onRetryRead={handleRetryRead}
+                {...(onOpenDesign ? { onOpenDesign } : {})}
               />
             ))
+          )}
+          {confirmedGenerationPending &&
+            !messages.some((message) =>
+              message.contentBlocks.some(
+                (block) =>
+                  block.type === "tool" &&
+                  block.toolName === "generate_image" &&
+                  block.status === "running",
+              ),
+            ) && (
+              <ChatMessage
+                role="assistant"
+                contentBlocks={[
+                  {
+                    type: "tool",
+                    toolCallId: "confirmed-generation-pending",
+                    toolName: "generate_image",
+                    status: "running",
+                    output: { status: "submitting" },
+                    outputSummary: "正在生成图片",
+                  },
+                ]}
+                onWaitGeneration={handleWaitGeneration}
+                onRestoreGeneration={handleRestoreGeneration}
+                {...(onOpenDesign ? { onOpenDesign } : {})}
+              />
+            )}
+          {floatingDialogClearance > 0 && (
+            <div
+              data-chat-dialog-clearance
+              aria-hidden="true"
+              className="shrink-0"
+              style={{ height: floatingDialogClearance }}
+            />
           )}
           <div ref={messagesEndRef} />
         </div>
@@ -996,6 +1717,8 @@ export function ChatSidebar({
 
       {/* Input */}
       <div className="relative">
+        {clarificationDialogEl}
+        {confirmationDialogEl}
         {atQuery !== null && mentionPickerItems.length > 0 && (
           <MessageMentionPicker
             items={mentionPickerItems}
@@ -1010,8 +1733,12 @@ export function ChatSidebar({
         )}
         <ChatInput
           ref={chatInputRef}
+          accessToken={accessToken}
           onSend={handleSend}
-          disabled={streaming || sessionsLoading}
+          disabled={streaming || sessionsLoading || messagesLoading}
+          running={streaming}
+          canceling={cancelRequested}
+          onCancel={handleCancelRun}
           attachments={imageAttachments}
           onAddFiles={addFiles}
           onRemoveAttachment={removeAttachment}
@@ -1023,6 +1750,13 @@ export function ChatSidebar({
           {...(selectedCanvasElements ? { selectedCanvasElements } : {})}
         />
       </div>
+      {runHistoryOpen && (
+        <RunHistoryPanel
+          accessToken={accessToken}
+          sessionId={activeSessionId}
+          onClose={() => setRunHistoryOpen(false)}
+        />
+      )}
     </>
   );
 
@@ -1052,6 +1786,7 @@ export function ChatSidebar({
         />
         {/* Chat panel — full screen on mobile, fixed-width drawer on tablet */}
         <div
+          ref={chatSidebarRef}
           className={
             breakpoint === "mobile"
               ? "fixed inset-0 z-50 flex flex-col bg-card animate-in slide-in-from-right duration-250"
@@ -1069,6 +1804,7 @@ export function ChatSidebar({
   // ── Desktop: inline side-by-side with resize handle ──
   return (
     <div
+      ref={chatSidebarRef}
       className="flex h-full shrink-0"
       style={{ width: sidebarWidth }}
       {...eventIsolationProps}
@@ -1087,7 +1823,7 @@ export function ChatSidebar({
         onTouchStart={handleTouchStart}
         onKeyDown={handleResizeKeyDown}
       />
-      <div className="flex flex-1 flex-col bg-card min-w-0">
+      <div className="relative flex flex-1 flex-col bg-card min-w-0">
         {panelContent}
       </div>
       {creditDialogEl}

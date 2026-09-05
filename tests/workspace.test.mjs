@@ -50,7 +50,10 @@ test("vitest workspace config exists for later package-level adoption", async ()
   assert.match(workspaceConfig, /tests\/\*\*\/\*\.test\.mjs/);
 });
 
-for (const appName of ["web", "server", "desktop"]) {
+// Keep this list aligned with the applications that are actually present in
+// the workspace. The old desktop scaffold was removed, but this test still
+// tried to open its manifest and made every root test run fail with ENOENT.
+for (const appName of ["web", "server"]) {
   test(`${appName} app scripts perform real validation instead of placeholder logs`, async () => {
     const manifest = await readJson(`apps/${appName}/package.json`);
 

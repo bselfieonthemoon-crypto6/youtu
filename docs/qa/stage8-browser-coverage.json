@@ -1,0 +1,238 @@
+{
+  "schema_version": 1,
+  "prd": "docs/product/loomic-design-board-prd-2026-09-03.md#26-浏览器验收场景清单",
+  "updated_at": "2026-09-04",
+  "summary": {
+    "required_user_flows": 20,
+    "covered_user_flows": 20,
+    "supplemental_flows": 9,
+    "covered_supplemental_flows": 9
+  },
+  "scenarios": [
+    {
+      "id": "26.1",
+      "name": "登录并打开无限画布",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage3-design-board.spec.ts"]
+    },
+    {
+      "id": "26.2",
+      "name": "从图片图标旁打开设计画板",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage3-design-board.spec.ts"]
+    },
+    {
+      "id": "26.3",
+      "name": "创建自定义尺寸设计",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage3-design-board.spec.ts"]
+    },
+    {
+      "id": "26.4",
+      "name": "双击进入大浮层",
+      "status": "covered",
+      "evidence": [
+        "apps/web/e2e/stage3-design-board.spec.ts",
+        "apps/web/e2e/stage8-browser-release.spec.ts"
+      ]
+    },
+    {
+      "id": "26.5",
+      "name": "添加文字、图片和形状",
+      "status": "covered",
+      "evidence": [
+        "apps/web/e2e/stage5-design-resource.spec.ts",
+        "apps/web/e2e/stage8-browser-release.spec.ts"
+      ]
+    },
+    {
+      "id": "26.6",
+      "name": "修改文字样式",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage8-browser-release.spec.ts"],
+      "assertions": [
+        "strict design GET validates fontSize, fontStyle, textAlign and fill"
+      ]
+    },
+    {
+      "id": "26.7",
+      "name": "调整图层和对齐",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage8-browser-release.spec.ts"],
+      "assertions": ["strict design GET validates aligned x and top zIndex"]
+    },
+    {
+      "id": "26.8",
+      "name": "撤销和重做",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage3-design-board.spec.ts"]
+    },
+    {
+      "id": "26.9",
+      "name": "退出编辑并看到更新预览",
+      "status": "covered",
+      "evidence": [
+        "apps/web/e2e/stage3-design-board.spec.ts",
+        "apps/web/e2e/stage6-agent-design.spec.ts"
+      ]
+    },
+    {
+      "id": "26.10",
+      "name": "刷新后完整恢复",
+      "status": "covered",
+      "evidence": [
+        "apps/web/e2e/stage3-design-board.spec.ts",
+        "apps/web/e2e/stage5-design-resource.spec.ts"
+      ]
+    },
+    {
+      "id": "26.11",
+      "name": "从模板创建新设计",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage5-design-resource.spec.ts"]
+    },
+    {
+      "id": "26.12",
+      "name": "插入公共和工作区资源",
+      "status": "covered",
+      "evidence": [
+        "apps/web/e2e/stage5-design-resource.spec.ts",
+        "apps/web/e2e/stage8-browser-release.spec.ts"
+      ],
+      "assertions": ["strict design GET validates resourceId and assetObjectId"]
+    },
+    {
+      "id": "26.13",
+      "name": "上传并使用字体",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage5-design-resource.spec.ts"]
+    },
+    {
+      "id": "26.14",
+      "name": "让 Agent 查看设计",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage6-agent-design.spec.ts"]
+    },
+    {
+      "id": "26.15",
+      "name": "让 Agent 修改文字",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage6-agent-design.spec.ts"]
+    },
+    {
+      "id": "26.16",
+      "name": "让 Agent 生成图片并插入设计",
+      "status": "covered",
+      "expensive": true,
+      "evidence": ["apps/web/e2e/stage6-agent-design.spec.ts"]
+    },
+    {
+      "id": "26.17",
+      "name": "Agent 和用户并发修改冲突",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage6-agent-design.spec.ts"]
+    },
+    {
+      "id": "26.18",
+      "name": "导出 PNG、JPEG 和透明 PNG",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage8-browser-release.spec.ts"],
+      "assertions": [
+        "non-empty bytes and PNG/JPEG magic",
+        "decoded dimensions are exactly 640x360",
+        "transparent PNG contains an alpha value below 255"
+      ]
+    },
+    {
+      "id": "26.19",
+      "name": "多个设计节点保持单 Fabric 实例",
+      "status": "covered",
+      "evidence": [
+        "apps/web/e2e/stage3-design-board.spec.ts",
+        "apps/web/e2e/stage8-browser-release.spec.ts"
+      ]
+    },
+    {
+      "id": "26.20",
+      "name": "资源、字体和生成失败状态",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage8-browser-release.spec.ts"]
+    },
+    {
+      "id": "extra.illegal_dimensions",
+      "name": "非法设计尺寸",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage8-browser-release.spec.ts"]
+    },
+    {
+      "id": "extra.offline_dirty",
+      "name": "离线 dirty 保留与重试",
+      "status": "covered",
+      "evidence": [
+        "apps/web/e2e/stage8-browser-release.spec.ts",
+        "apps/web/test/design-editor-overlay.test.tsx"
+      ],
+      "assertions": ["refresh and reopen preserves background #223344"]
+    },
+    {
+      "id": "extra.dual_window_conflict",
+      "name": "双窗口冲突与恢复",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage8-browser-release.spec.ts"]
+    },
+    {
+      "id": "extra.design_copy",
+      "name": "设计复制且身份独立",
+      "status": "covered",
+      "evidence": [
+        "apps/web/e2e/stage3-design-board.spec.ts",
+        "apps/web/e2e/stage5-design-resource.spec.ts"
+      ]
+    },
+    {
+      "id": "extra.soft_delete",
+      "name": "画布节点软删除持久化",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage8-browser-release.spec.ts"]
+    },
+    {
+      "id": "extra.destroy_20",
+      "name": "设计编辑器 20 次创建销毁",
+      "status": "covered",
+      "evidence": [
+        "apps/web/e2e/stage3-design-board.spec.ts",
+        "apps/web/e2e/stage8-browser-release.spec.ts"
+      ]
+    },
+    {
+      "id": "extra.stress_1000_100",
+      "name": "1000 图片节点加 100 设计预览节点",
+      "status": "covered",
+      "evidence": ["apps/web/e2e/stage8-browser-release.spec.ts"]
+    },
+    {
+      "id": "extra.viewport_fps",
+      "name": "真实 viewport 平移不低于 30 FPS 且 Long Task 占比受控",
+      "status": "covered",
+      "evidence": [
+        "apps/web/e2e/stage8-browser-release.spec.ts#stage8-memory-evidence.json"
+      ],
+      "assertions": [
+        "trusted Playwright wheel input moves a tracked preview by more than 20px",
+        "rAF FPS is at least 30",
+        "Long Task time ratio is below 25%"
+      ]
+    },
+    {
+      "id": "extra.memory_split",
+      "name": "区分浏览器与 Next dev server 内存并检查持续增长",
+      "status": "covered",
+      "evidence": [
+        "apps/web/e2e/stage8-browser-release.spec.ts#stage8-memory-evidence.json"
+      ],
+      "assertions": [
+        "missing CDP metrics fail the release gate instead of becoming zero"
+      ]
+    }
+  ]
+}

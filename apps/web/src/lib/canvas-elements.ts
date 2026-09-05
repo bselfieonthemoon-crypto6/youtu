@@ -69,6 +69,12 @@ export function createExcalidrawImageElement(opts: {
   title?: string;
   source?: "generated" | "uploaded";
   storageUrl?: string;
+  assetId?: string;
+  mimeType?: string;
+  prompt?: string;
+  model?: string;
+  originalWidth?: number;
+  originalHeight?: number;
 }): Record<string, unknown> {
   const element: Record<string, unknown> = {
     type: "image",
@@ -102,11 +108,17 @@ export function createExcalidrawImageElement(opts: {
     scale: [1, 1],
     crop: null,
   };
-  if (opts.title || opts.source || opts.storageUrl) {
+  if (opts.title || opts.source || opts.storageUrl || opts.assetId) {
     element.customData = {
       ...(opts.title ? { title: opts.title } : {}),
       ...(opts.source ? { source: opts.source } : {}),
       ...(opts.storageUrl ? { storageUrl: opts.storageUrl } : {}),
+      ...(opts.assetId ? { assetId: opts.assetId } : {}),
+      ...(opts.mimeType ? { mimeType: opts.mimeType } : {}),
+      ...(opts.prompt ? { prompt: opts.prompt } : {}),
+      ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.originalWidth ? { originalWidth: opts.originalWidth } : {}),
+      ...(opts.originalHeight ? { originalHeight: opts.originalHeight } : {}),
     };
   }
   return element;
@@ -131,6 +143,52 @@ export async function fetchAsDataURL(url: string): Promise<string> {
       reject(new Error("Failed to convert image to data URL"));
     reader.readAsDataURL(blob);
   });
+}
+
+export async function fetchAssetAsDataURL(
+  accessToken: string,
+  assetId: string,
+  options: { preview?: boolean; signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<string> {
+  const blob = await fetchAssetBlob(accessToken, assetId, options);
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(new Error("Failed to convert asset to data URL"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+export async function fetchAssetBlob(
+  accessToken: string,
+  assetId: string,
+  options: { preview?: boolean; signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<Blob> {
+  const suffix = options.preview ? "?preview=1" : "";
+  const controller = new AbortController();
+  const abortFromParent = () => controller.abort(options.signal?.reason);
+  if (options.signal?.aborted) abortFromParent();
+  else options.signal?.addEventListener("abort", abortFromParent, { once: true });
+  const timeout = setTimeout(
+    () => controller.abort(new Error("Asset request timed out")),
+    options.timeoutMs ?? (options.preview ? 30_000 : 60_000),
+  );
+  try {
+    const response = await fetch(
+      `${getServerBaseUrl()}/api/uploads/${encodeURIComponent(assetId)}/content${suffix}`,
+      {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        signal: controller.signal,
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch asset: ${response.status}`);
+    }
+    return response.blob();
+  } finally {
+    clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", abortFromParent);
+  }
 }
 
 /**

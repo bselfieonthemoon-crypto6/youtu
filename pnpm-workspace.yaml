@@ -2,10 +2,41 @@ packages:
   - apps/*
   - packages/*
 
-ignoredBuiltDependencies:
-  - '@biomejs/biome'
-  - msw
+overrides:
+  '@langchain/core': 1.2.9
+  '@langchain/langgraph': 1.4.13
+  '@langchain/langgraph-checkpoint': 1.1.5
+  '@langchain/langgraph-sdk': 1.9.23
+  langchain: 1.5.10
+  langsmith: 0.7.1
+  '@hono/node-server@>=1.0.0 <1.19.15': 1.19.15
+  'browserslist@<4.28.7': 4.28.8
+  'body-parser@>=2.0.0 <2.3.0': 2.3.0
+  'fast-uri@>=3.0.0 <3.1.6': 3.1.6
+  'hono@<4.12.25': 4.13.5
+  'immutable@>=4.0.0-beta.1 <4.3.9': 4.3.9
+  'ip-address@<10.3.1': 10.3.1
+  'lodash-es@<4.18.1': 4.18.1
+  'nanoid@<3.3.18': 3.3.18
+  'nanoid@>=4.0.0 <5.1.16': 5.1.16
+  'path-to-regexp@<8.4.0': 8.4.2
+  'picomatch@<2.3.2': 2.3.2
+  'postcss@<8.5.18': 8.5.28
+  'protobufjs@>=7.0.0 <7.6.6': 7.6.6
+  'qs@>=6.0.0 <6.16.0': 6.16.0
+  'uuid@>=11.0.0 <11.1.1': 11.1.1
+  'ws@>=8.0.0 <8.21.3': 8.21.3
+
+allowBuilds:
+  '@biomejs/biome': true
+  esbuild: true
+  msw: true
+  protobufjs: true
+  sharp: true
 
 onlyBuiltDependencies:
+  - '@biomejs/biome'
   - esbuild
+  - msw
+  - protobufjs
   - sharp

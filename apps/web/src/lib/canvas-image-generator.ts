@@ -19,6 +19,7 @@ export type ImageGeneratorData = {
   aspectRatio: string;
   quality: string;
   inputImages?: string[];
+  jobId?: string;
   errorMessage?: string;
 };
 

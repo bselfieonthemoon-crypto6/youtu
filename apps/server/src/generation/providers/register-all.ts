@@ -2,79 +2,42 @@
  * Centralized provider registration.
  *
  * Both the HTTP server (app.ts) and the background worker (worker.ts) need the
- * same set of image/video generation providers. This module is the single
- * source of truth so that adding a new provider only requires a change here.
+ * same APIYI-backed image/video providers. This module is the single source
+ * of truth and intentionally ignores legacy provider credentials.
  */
 import type { ServerEnv } from "../../config/env.js";
-import { GoogleImageProvider } from "./google-image.js";
-import { GoogleVertexImageProvider } from "./google-vertex-image.js";
-import { GoogleVertexVideoProvider } from "./google-vertex-video.js";
-import { GoogleVideoProvider } from "./google-video.js";
-import { MetasoVideoProvider } from "./metaso-video.js";
-import { OpenAIImageProvider } from "./openai-image.js";
+import { ApiYiVideoProvider } from "./apiyi-video.js";
+import { APIYI_IMAGE_MODELS, OpenAIImageProvider } from "./openai-image.js";
 import { registerImageProvider, registerVideoProvider } from "./registry.js";
-import { ReplicateImageProvider } from "./replicate-image.js";
-import { ReplicateVideoProvider } from "./replicate-video.js";
-import { VolcesImageProvider } from "./volces-image.js";
+import type { ImageProvider, VideoProvider } from "../types.js";
 
-/**
- * Register all available generation providers based on the provided env config.
- *
- * Each provider is only registered when its required API key is present,
- * keeping the behaviour identical to the previous inline registration while
- * ensuring every process gets the full set.
- */
-export function registerAllProviders(env: ServerEnv): void {
-  // Metaso — MiniMax H3 V2 video
-  if (env.metasoApiKey) {
-    registerVideoProvider(
-      new MetasoVideoProvider(env.metasoApiKey, env.metasoApiBase),
-    );
-  }
+export type EnvironmentProviders = {
+  imageProviders: ImageProvider[];
+  videoProviders: VideoProvider[];
+};
 
-  // Replicate — image + video
-  if (env.replicateApiToken) {
-    registerImageProvider(new ReplicateImageProvider(env.replicateApiToken));
-    registerVideoProvider(new ReplicateVideoProvider(env.replicateApiToken));
-  }
+/** Build immutable env-backed provider instances without mutating the registry. */
+export function createEnvironmentProviders(env: ServerEnv): EnvironmentProviders {
+  const imageProviders: ImageProvider[] = [];
+  const videoProviders: VideoProvider[] = [];
 
-  // Google Developer API — image + video
-  if (env.googleApiKey) {
-    registerImageProvider(new GoogleImageProvider(env.googleApiKey));
-    registerVideoProvider(new GoogleVideoProvider(env.googleApiKey));
-  }
-
-  // Google Vertex AI — image + video (coexists with Developer API)
-  // Image/LLM models use the default location (global), while video models
-  // require a separate regional endpoint (us-central1).
-  if (env.googleVertexProject && env.googleVertexLocation) {
-    const vertexConfig = {
-      project: env.googleVertexProject,
-      location: env.googleVertexLocation,
-    };
-    registerImageProvider(new GoogleVertexImageProvider(vertexConfig));
-
-    const videoLocation =
-      env.googleVertexVideoLocation ?? env.googleVertexLocation;
-    registerVideoProvider(
-      new GoogleVertexVideoProvider({
-        project: env.googleVertexProject,
-        location: videoLocation,
+  if (env.apiYiApiKey && env.apiYiApiBase) {
+    imageProviders.push(
+      new OpenAIImageProvider(env.apiYiApiKey, env.apiYiApiBase, {
+        name: "apiyi",
+        models: APIYI_IMAGE_MODELS,
       }),
     );
+    videoProviders.push(new ApiYiVideoProvider(env.apiYiApiKey, env.apiYiApiBase));
   }
+  return { imageProviders, videoProviders };
+}
 
-  // OpenAI — image only
-  if (env.openAIApiKey) {
-    registerImageProvider(
-      new OpenAIImageProvider(env.openAIApiKey, env.openAIApiBase),
-    );
-  }
-
-  // Volces — image only
-  if (env.volcesApiKey) {
-    registerImageProvider(
-      new VolcesImageProvider(env.volcesApiKey, env.volcesBaseUrl),
-    );
-  }
+/**
+ * Register the single APIYI generation gateway when configured.
+ */
+export function registerAllProviders(env: ServerEnv): void {
+  const providers = createEnvironmentProviders(env);
+  for (const provider of providers.imageProviders) registerImageProvider(provider);
+  for (const provider of providers.videoProviders) registerVideoProvider(provider);
 }

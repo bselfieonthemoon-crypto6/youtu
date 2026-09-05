@@ -56,9 +56,16 @@ export type CreditService = {
     workspaceId: string,
     userId: string,
     amount: number,
-    jobId?: string,
+    jobId: string,
     description?: string,
   ): Promise<string>;
+  deductCreditsIdempotent(
+    workspaceId: string,
+    userId: string,
+    amount: number,
+    jobId: string,
+    description?: string,
+  ): Promise<{ transactionId: string; chargedNew: boolean }>;
   refundCredits(
     workspaceId: string,
     userId: string,
@@ -74,7 +81,6 @@ export type CreditService = {
     limit?: number,
   ): Promise<CreditTransaction[]>;
   getSubscription(workspaceId: string): Promise<SubscriptionInfo>;
-  updatePlan(workspaceId: string, plan: SubscriptionPlan): Promise<void>;
 };
 
 // ── Factory ──────────────────────────────────────────────────
@@ -122,13 +128,36 @@ export function createCreditService(options: {
     },
 
     async deductCredits(workspaceId, userId, amount, jobId, description) {
+      return (
+        await this.deductCreditsIdempotent(
+          workspaceId,
+          userId,
+          amount,
+          jobId,
+          description,
+        )
+      ).transactionId;
+    },
+
+    async deductCreditsIdempotent(
+      workspaceId,
+      userId,
+      amount,
+      jobId,
+      description,
+    ) {
       const admin = options.getAdminClient();
 
-      const { data, error } = await admin.rpc("deduct_credits", {
+      const { data, error } = await (
+        admin.rpc as unknown as (
+          name: string,
+          args: Record<string, unknown>,
+        ) => Promise<{ data: unknown; error: { message?: string } | null }>
+      )("loomic_deduct_credits_idempotent", {
         p_workspace_id: workspaceId,
         p_user_id: userId,
         p_amount: amount,
-        p_job_id: (jobId ?? null) as string,
+        p_job_id: jobId,
         p_description: (description ?? null) as string,
       });
 
@@ -142,12 +171,29 @@ export function createCreditService(options: {
         }
         throw new CreditServiceError(
           "credit_deduct_failed",
-          `Failed to deduct credits: ${error.message}`,
+          "Failed to deduct credits.",
           500,
         );
       }
 
-      return data as string;
+      const value = data as {
+        transaction_id?: unknown;
+        charged_new?: unknown;
+      };
+      if (
+        typeof value.transaction_id !== "string" ||
+        typeof value.charged_new !== "boolean"
+      ) {
+        throw new CreditServiceError(
+          "credit_deduct_failed",
+          "Failed to deduct credits.",
+          500,
+        );
+      }
+      return {
+        transactionId: value.transaction_id,
+        chargedNew: value.charged_new,
+      };
     },
 
     async refundCredits(workspaceId, userId, amount, jobId, description) {
@@ -157,14 +203,14 @@ export function createCreditService(options: {
         p_workspace_id: workspaceId,
         p_user_id: userId,
         p_amount: amount,
-        p_job_id: jobId ?? null,
-        p_description: description ?? null,
+        p_job_id: jobId,
+        ...(description !== undefined ? { p_description: description } : {}),
       });
 
       if (error) {
         throw new CreditServiceError(
           "credit_refund_failed",
-          `Failed to refund credits: ${error.message}`,
+          "Failed to refund credits.",
           500,
         );
       }
@@ -208,7 +254,7 @@ export function createCreditService(options: {
       if (claimError) {
         throw new CreditServiceError(
           "credit_claim_failed",
-          `Failed to claim daily credits: ${claimError.message}`,
+          "Failed to claim daily credits.",
           500,
         );
       }
@@ -282,28 +328,6 @@ export function createCreditService(options: {
         currentPeriodEnd: data?.current_period_end ?? null,
         canceledAt: data?.canceled_at ?? null,
       };
-    },
-
-    async updatePlan(workspaceId, plan) {
-      const admin = options.getAdminClient();
-      const config = PLAN_CONFIGS[plan];
-
-      // Atomic plan update + credit grant via RPC to avoid read-then-write race condition.
-      // The RPC uses FOR UPDATE row locking so concurrent deductions cannot be overwritten.
-      // TODO: Remove `as any` after running `supabase gen types` to regenerate database.ts
-      const { error } = await (admin.rpc as any)("grant_plan_credits", {
-        p_workspace_id: workspaceId,
-        p_plan: plan,
-        p_credits: config.monthlyCredits,
-      });
-
-      if (error) {
-        throw new CreditServiceError(
-          "credit_plan_update_failed",
-          `Failed to update plan: ${error.message}`,
-          500,
-        );
-      }
     },
   };
 }

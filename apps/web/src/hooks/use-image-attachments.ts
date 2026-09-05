@@ -19,6 +19,7 @@ export type ImageAttachmentState = {
 export type CanvasImageRef = {
   assetId: string;
   url: string;
+  previewUrl?: string;
   mimeType: string;
   name?: string;
 };
@@ -124,19 +125,23 @@ export function useImageAttachments(accessToken: string, projectId?: string) {
 
   const addCanvasRef = useCallback((ref: CanvasImageRef) => {
     const id = crypto.randomUUID();
-    setAttachments((prev) => [
-      ...prev,
-      {
+    setAttachments((prev) => {
+      if (prev.some((attachment) => attachment.assetId === ref.assetId && attachment.url === ref.url)) {
+        return prev;
+      }
+      return [...prev, {
         id,
-        preview: ref.url,
+        // Reuse the image already hydrated in Excalidraw when available. The
+        // durable storage URL remains separate for the agent/backend payload.
+        preview: ref.previewUrl ?? ref.url,
         uploading: false,
         assetId: ref.assetId,
         url: ref.url,
         mimeType: ref.mimeType,
         source: "canvas-ref",
         ...(ref.name ? { name: ref.name } : {}),
-      },
-    ]);
+      }];
+    });
   }, []);
 
   const retryUpload = useCallback(

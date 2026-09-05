@@ -1,3 +1,5 @@
+import { SafeDownloadError, safeDownload } from "../security/safe-download.js";
+
 const KNOWN_RATIOS: Record<string, { width: number; height: number }> = {
   "1:1": { width: 1024, height: 1024 },
   "16:9": { width: 1024, height: 576 },
@@ -38,44 +40,36 @@ export async function fetchAsBase64(
   providerName: string,
   url: string,
 ): Promise<{ data: string; mimeType: string }> {
-  // Already a data URI — extract inline.
-  if (url.startsWith("data:")) {
-    const match = url.match(/^data:([^;]+);base64,(.+)$/);
-    if (!match) {
-      throw new GenerationError(
-        providerName,
-        "input_fetch_error",
-        `Invalid data URI format: ${url.slice(0, 80)}`,
-      );
-    }
-    return { mimeType: match[1]!, data: match[2]! };
-  }
-
-  // HTTP(S) URL — fetch and convert.
-  let response: Response;
   try {
-    response = await fetch(url);
+    const downloaded = await safeDownload(url, {
+      kind: "image",
+      maxBytes: 20 * 1024 * 1024,
+      timeoutMs: 30_000,
+      maxRedirects: 2,
+      allowDataUri: true,
+      allowedMimeTypes: [
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+        "image/avif",
+        "image/bmp",
+        "image/tiff",
+      ],
+    });
+    return {
+      data: downloaded.buffer.toString("base64"),
+      mimeType: downloaded.mimeType,
+    };
   } catch (err) {
     throw new GenerationError(
       providerName,
       "input_fetch_error",
-      `Failed to fetch input: ${err instanceof Error ? err.message : String(err)}`,
+      err instanceof SafeDownloadError
+        ? `Input image rejected (${err.code}).`
+        : "Failed to fetch input image.",
     );
   }
-
-  if (!response.ok) {
-    throw new GenerationError(
-      providerName,
-      "input_fetch_error",
-      `Failed to fetch input (HTTP ${response.status}): ${url}`,
-    );
-  }
-
-  const buffer = await response.arrayBuffer();
-  const data = Buffer.from(buffer).toString("base64");
-  const mimeType = response.headers.get("content-type") ?? "application/octet-stream";
-
-  return { data, mimeType };
 }
 
 export class GenerationError extends Error {

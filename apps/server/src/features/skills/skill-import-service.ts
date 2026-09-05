@@ -10,6 +10,12 @@
 
 import yaml from "js-yaml";
 import { Parser as TarParser } from "tar";
+import { safeDownload } from "../../security/safe-download.js";
+
+const MAX_SKILL_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_TARBALL_BYTES = 25 * 1024 * 1024;
+const MAX_TARBALL_ENTRIES = 500;
+const MAX_TARBALL_EXPANDED_BYTES = 20 * 1024 * 1024;
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -408,18 +414,24 @@ async function listGitHubDirectory(
  * Download a file's text content from its download_url.
  */
 async function downloadGitHubFile(downloadUrl: string): Promise<string> {
-  const response = await fetch(downloadUrl, {
-    headers: { "User-Agent": "Loomic-Skill-Importer/1.0" },
-  });
-
-  if (!response.ok) {
+  try {
+    const downloaded = await safeDownload(downloadUrl, {
+      kind: "text",
+      maxBytes: MAX_SKILL_FILE_BYTES,
+      timeoutMs: 20_000,
+      maxRedirects: 1,
+      allowedHosts: ["raw.githubusercontent.com", "github.com"],
+      expectedMimeType: "text/plain",
+      allowedMimeTypes: ["text/plain", "text/markdown"],
+      headers: { "User-Agent": "Loomic-Skill-Importer/1.0" },
+    });
+    return downloaded.buffer.toString("utf8");
+  } catch (error) {
     throw new SkillImportError(
       "github_fetch_error",
-      `Failed to download file from GitHub: HTTP ${response.status} for ${downloadUrl}`,
+      `Failed to download file from GitHub: ${error instanceof Error ? error.message : "unknown error"}`,
     );
   }
-
-  return response.text();
 }
 
 /**
@@ -564,11 +576,37 @@ async function extractTarballEntries(buffer: Buffer): Promise<TarballEntry[]> {
   return new Promise((resolve, reject) => {
     const entries: TarballEntry[] = [];
     let rootPrefix: string | null = null;
+    let entryCount = 0;
+    let expandedBytes = 0;
+    let failed = false;
+
+    const fail = (message: string) => {
+      if (failed) return;
+      failed = true;
+      reject(new SkillImportError("tarball_extract_error", message));
+    };
 
     const parser = new TarParser({
       // Let tar auto-detect gzip compression
       onReadEntry(entry) {
+        if (failed) {
+          entry.resume();
+          return;
+        }
         const entryPath = entry.path;
+
+        entryCount += 1;
+        if (entryCount > MAX_TARBALL_ENTRIES) {
+          entry.resume();
+          fail("Tarball contains too many entries.");
+          return;
+        }
+        const normalizedParts = entryPath.replace(/\\/g, "/").split("/");
+        if (entryPath.startsWith("/") || normalizedParts.includes("..")) {
+          entry.resume();
+          fail("Tarball contains an unsafe path.");
+          return;
+        }
 
         // Skip directories
         if (entry.type === "Directory") {
@@ -586,12 +624,25 @@ async function extractTarballEntries(buffer: Buffer): Promise<TarballEntry[]> {
           return;
         }
 
+        if (entry.size > MAX_SKILL_FILE_BYTES) {
+          entry.resume();
+          fail("Tarball entry is too large.");
+          return;
+        }
+        expandedBytes += entry.size;
+        if (expandedBytes > MAX_TARBALL_EXPANDED_BYTES) {
+          entry.resume();
+          fail("Tarball expands beyond the allowed size.");
+          return;
+        }
+
         // Collect the entry's data chunks
         const chunks: Buffer[] = [];
         entry.on("data", (chunk: Buffer) => {
           chunks.push(chunk);
         });
         entry.on("end", () => {
+          if (failed) return;
           const fullContent = Buffer.concat(chunks);
 
           // Detect root prefix from first file if we haven't seen a directory
@@ -620,6 +671,7 @@ async function extractTarballEntries(buffer: Buffer): Promise<TarballEntry[]> {
     });
 
     parser.on("end", () => {
+      if (failed) return;
       // Strip root prefix from all paths if one was detected
       if (rootPrefix) {
         for (const entry of entries) {
@@ -647,19 +699,25 @@ async function extractTarballEntries(buffer: Buffer): Promise<TarballEntry[]> {
 export async function importFromTarballUrl(url: string): Promise<ImportedSkill> {
   console.log(`[skill-import] Downloading tarball: ${url}`);
 
-  const response = await fetch(url, {
-    headers: { "User-Agent": "Loomic-Skill-Importer/1.0" },
-  });
-
-  if (!response.ok) {
+  let buffer: Buffer;
+  try {
+    const downloaded = await safeDownload(url, {
+      kind: "archive",
+      maxBytes: MAX_TARBALL_BYTES,
+      timeoutMs: 60_000,
+      maxRedirects: 2,
+      allowedHosts: ["registry.npmjs.org", "codeload.github.com", "github.com"],
+      expectedMimeType: "application/gzip",
+      allowedMimeTypes: ["application/gzip", "application/x-gzip", "application/x-tar"],
+      headers: { "User-Agent": "Loomic-Skill-Importer/1.0" },
+    });
+    buffer = downloaded.buffer;
+  } catch (error) {
     throw new SkillImportError(
       "tarball_extract_error",
-      `Failed to download tarball: HTTP ${response.status} ${response.statusText} for ${url}`,
+      `Failed to download tarball: ${error instanceof Error ? error.message : "unknown error"}`,
     );
   }
-
-  const arrayBuffer = await response.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
 
   console.log(
     `[skill-import] Tarball downloaded: ${(buffer.length / 1024).toFixed(1)} KB, extracting...`,

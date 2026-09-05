@@ -11,7 +11,8 @@
     "test:packages": "turbo run test",
     "test": "pnpm run test:workspace && pnpm run test:packages",
     "seed": "node scripts/seed-test-accounts.mjs",
-    "typecheck": "turbo run typecheck"
+    "typecheck": "turbo run typecheck",
+    "model:feynobg:download": "python scripts/download-feynobg.py"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

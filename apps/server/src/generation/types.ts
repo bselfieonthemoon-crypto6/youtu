@@ -27,6 +27,9 @@ export interface ImageGenerateParams {
   inputImages?: string[];
   /** Semantic quality level, provider translates to model-specific resolution */
   quality?: ImageQuality;
+  /** Exact requested output dimensions for providers that support custom sizes. */
+  outputWidth?: number;
+  outputHeight?: number;
   /** Output format preference */
   outputFormat?: OutputFormat;
   metadata?: Record<string, unknown>;

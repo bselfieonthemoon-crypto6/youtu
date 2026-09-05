@@ -119,6 +119,8 @@ export const applicationErrorCodeSchema = z.enum([
   "variant_not_found",
   "checkout_failed",
   "generation_failed",
+  "provider_snapshot_invalid",
+  "provider_snapshot_unavailable",
 ]);
 
 export const applicationErrorResponseSchema = z.object({
@@ -138,6 +140,7 @@ export const canvasSaveRequestSchema = z.object({
 
 export const canvasSaveResponseSchema = z.object({
   ok: z.literal(true),
+  revision: z.number().int().nonnegative(),
 });
 
 export type HealthResponse = z.infer<typeof healthResponseSchema>;

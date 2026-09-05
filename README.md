@@ -285,7 +285,7 @@ The `Dockerfile` at `apps/server/Dockerfile` handles the multi-stage build.
 supabase db push
 
 # Generate TypeScript types (after schema changes)
-supabase gen types typescript --linked > packages/shared/src/supabase-types.ts
+supabase gen types typescript --linked --schema public,langgraph > packages/shared/src/supabase/database.ts
 ```
 
 ---
@@ -420,6 +420,20 @@ Loomic/
 | `WORKER_IMAGE_CONCURRENCY` | `3` | Image generation slots |
 | `WORKER_VIDEO_CONCURRENCY` | `2` | Video generation slots |
 | `GOOGLE_FONTS_API_KEY` | — | Google Fonts API (brand kit) |
+| `LOOMIC_FEYNOBG_MODEL_DIR` | `models/feynobg` | Local FeyNoBG model directory |
+| `LOOMIC_FEYNOBG_CPU_THREADS` | `2` on Windows | FeyNoBG CPU thread limit |
+| `LOOMIC_DESIGN_IMPORT_ROOT` | — | Optional, dedicated server-side design resource import root |
+
+The design-board server-directory importer also requires
+`NEXT_PUBLIC_LOOMIC_DESIGN_IMPORT_DIRECTORY_ENABLED=true` in the Web process.
+
+### Design Board documentation
+
+- [Architecture](docs/tech/design-board-architecture.md)
+- [Operations and release checks](docs/tech/design-board-operations.md)
+- [Resource import guide](docs/tech/design-board-import-guide.md)
+- [User guide](docs/product/design-board-user-guide.md)
+- [Stage 8 browser coverage](docs/qa/stage8-browser-coverage.md)
 
 ---
 

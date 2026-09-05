@@ -8,10 +8,18 @@
 
 # testing
 /coverage
+/apps/web/playwright-report/
+/apps/web/test-results/
 
 # next.js
 /.next/
 **/.next/
+**/.next-e2e-*/
+**/.next-*/
+/models/
+/artifacts/
+**/__pycache__/
+*.pyc
 /out/
 apps/web/out/
 supabase/.temp/

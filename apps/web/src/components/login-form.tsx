@@ -3,14 +3,14 @@
 import { AnimatePresence, motion } from "framer-motion";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState, type FormEvent } from "react";
+import { type FormEvent, useState } from "react";
 
+import { fetchViewer } from "../lib/server-api";
+import { getSupabaseBrowserClient } from "../lib/supabase-browser";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { Separator } from "./ui/separator";
-import { fetchViewer } from "../lib/server-api";
-import { getSupabaseBrowserClient } from "../lib/supabase-browser";
 
 const stagger = {
   hidden: {},
@@ -27,10 +27,12 @@ interface LoginFormProps {
 }
 
 export function LoginForm({ initialErrorMessage = null }: LoginFormProps) {
+  const googleAuthEnabled =
+    process.env.NEXT_PUBLIC_GOOGLE_AUTH_ENABLED === "true";
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [mode, setMode] = useState<"magic" | "password">("magic");
+  const [mode, setMode] = useState<"magic" | "password">("password");
   const [loading, setLoading] = useState(false);
   const [sent, setSent] = useState(false);
   const [error, setError] = useState<string | null>(initialErrorMessage);
@@ -126,10 +128,21 @@ export function LoginForm({ initialErrorMessage = null }: LoginFormProps) {
             <motion.div
               initial={{ scale: 0 }}
               animate={{ scale: 1 }}
-              transition={{ delay: 0.2, type: "spring", stiffness: 200, damping: 15 }}
+              transition={{
+                delay: 0.2,
+                type: "spring",
+                stiffness: 200,
+                damping: 15,
+              }}
               className="flex h-14 w-14 items-center justify-center rounded-full bg-foreground"
             >
-              <svg viewBox="0 0 24 24" className="h-6 w-6 text-background" fill="none" stroke="currentColor" strokeWidth={2.5}>
+              <svg
+                viewBox="0 0 24 24"
+                className="h-6 w-6 text-background"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={2.5}
+              >
                 <motion.path
                   d="M5 13l4 4L19 7"
                   initial={{ pathLength: 0 }}
@@ -155,7 +168,9 @@ export function LoginForm({ initialErrorMessage = null }: LoginFormProps) {
             className="space-y-6"
           >
             <motion.div variants={fadeIn} className="space-y-2 text-center">
-              <h2 className="text-2xl font-semibold tracking-tight">Welcome back</h2>
+              <h2 className="text-2xl font-semibold tracking-tight">
+                Welcome back
+              </h2>
               <p className="text-sm text-muted-foreground">
                 Sign in to your workspace
               </p>
@@ -207,8 +222,12 @@ export function LoginForm({ initialErrorMessage = null }: LoginFormProps) {
               )}
               <Button type="submit" className="w-full" disabled={loading}>
                 {loading
-                  ? mode === "password" ? "Signing in..." : "Sending..."
-                  : mode === "password" ? "Sign in" : "Send login link"}
+                  ? mode === "password"
+                    ? "Signing in..."
+                    : "Sending..."
+                  : mode === "password"
+                    ? "Sign in"
+                    : "Send login link"}
               </Button>
               <button
                 type="button"
@@ -218,30 +237,47 @@ export function LoginForm({ initialErrorMessage = null }: LoginFormProps) {
                 }}
                 className="w-full text-xs text-muted-foreground hover:text-foreground transition-colors"
               >
-                {mode === "password" ? "Use login link instead" : "Use password instead"}
+                {mode === "password"
+                  ? "Use login link instead"
+                  : "Use password instead"}
               </button>
             </motion.form>
 
-            <motion.div variants={fadeIn} className="flex items-center gap-4">
-              <Separator className="flex-1" />
-              <span className="text-xs text-muted-foreground uppercase">or</span>
-              <Separator className="flex-1" />
-            </motion.div>
+            {googleAuthEnabled && (
+              <>
+                <motion.div
+                  variants={fadeIn}
+                  className="flex items-center gap-4"
+                >
+                  <Separator className="flex-1" />
+                  <span className="text-xs text-muted-foreground uppercase">
+                    or
+                  </span>
+                  <Separator className="flex-1" />
+                </motion.div>
 
-            <motion.div variants={fadeIn}>
-              <Button
-                variant="outline"
-                className="w-full"
-                onClick={handleGoogle}
-                type="button"
-              >
-                Continue with Google
-              </Button>
-            </motion.div>
+                <motion.div variants={fadeIn}>
+                  <Button
+                    variant="outline"
+                    className="w-full"
+                    onClick={handleGoogle}
+                    type="button"
+                  >
+                    Continue with Google
+                  </Button>
+                </motion.div>
+              </>
+            )}
 
-            <motion.p variants={fadeIn} className="text-center text-sm text-muted-foreground">
+            <motion.p
+              variants={fadeIn}
+              className="text-center text-sm text-muted-foreground"
+            >
               Need an account?{" "}
-              <Link href="/register" className="font-medium text-foreground underline underline-offset-4">
+              <Link
+                href="/register"
+                className="font-medium text-foreground underline underline-offset-4"
+              >
                 Create one
               </Link>
             </motion.p>

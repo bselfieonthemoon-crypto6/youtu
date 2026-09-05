@@ -7,7 +7,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { ImageGenerationPreference, VideoGenerationPreference } from "@loomic/shared";
+import type { AgentExecutionMode, ImageGenerationPreference, VideoGenerationPreference } from "@loomic/shared";
 
 import type { ImageAttachmentState, ReadyAttachment } from "../hooks/use-image-attachments";
 import type { HomeExampleSelection } from "@/lib/home-example-seeds";
@@ -24,12 +24,14 @@ export type HomePromptHandle = {
 };
 
 type HomePromptProps = {
+  accessToken?: string | undefined;
   onSubmit: (
     prompt: string,
     attachments?: ReadyAttachment[],
     imageGenerationPreference?: ImageGenerationPreference,
     videoGenerationPreference?: VideoGenerationPreference,
     model?: string,
+    executionMode?: AgentExecutionMode,
   ) => void;
   disabled?: boolean;
   attachments?: ImageAttachmentState[];
@@ -63,6 +65,7 @@ export const HomePrompt = forwardRef<HomePromptHandle, HomePromptProps>(
   function HomePrompt(
     {
       onSubmit,
+      accessToken,
       disabled,
       attachments,
       onAddFiles,
@@ -143,6 +146,7 @@ export const HomePrompt = forwardRef<HomePromptHandle, HomePromptProps>(
           ? videoPreference
           : undefined,
         agentModel ?? undefined,
+        "thinking",
       );
       setValue("");
       if (textareaRef.current) {
@@ -301,7 +305,7 @@ export const HomePrompt = forwardRef<HomePromptHandle, HomePromptProps>(
           </div>
 
           <div className="flex items-center gap-2">
-            <AgentModelSelector />
+            <AgentModelSelector accessToken={accessToken} />
             <div className="flex items-center gap-0.5">
               {toolbarButtons.slice(1).map((btn) => {
                 if (btn.name === "Agent") {
@@ -332,6 +336,7 @@ export const HomePrompt = forwardRef<HomePromptHandle, HomePromptProps>(
                         open={modelPopoverOpen}
                         onClose={() => setModelPopoverOpen(false)}
                         anchorRef={agentBtnRef}
+                        accessToken={accessToken}
                       />
                     </div>
                   );

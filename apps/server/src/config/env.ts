@@ -1,24 +1,15 @@
 import { readFileSync } from "node:fs";
 
 export const DEFAULT_AGENT_BACKEND_MODE = "state";
-export const DEFAULT_AGENT_MODEL = "gpt-4.1";
-export const DEFAULT_GOOGLE_AGENT_MODEL = "gemini-2.5-flash";
+export const DEFAULT_APIYI_AGENT_MODEL = "gemini-3.1-flash-lite";
+export const DEFAULT_AGENT_MODEL = `apiyi:${DEFAULT_APIYI_AGENT_MODEL}`;
 export const DEFAULT_SERVER_PORT = 3001;
 export const DEFAULT_WEB_ORIGIN = "http://localhost:3000";
 
-/**
- * Resolve the default agent model based on available provider configuration.
- * When Google/Vertex is configured but OpenAI is not, defaults to Gemini 2.5 Flash.
- */
-export function resolveDefaultAgentModel(env: {
-  googleApiKey?: string | undefined;
-  googleVertexProject?: string | undefined;
-  openAIApiKey?: string | undefined;
+/** Resolve the single environment-backed text model through APIYI. */
+export function resolveDefaultAgentModel(_env: {
+  apiYiApiKey?: string | undefined;
 }): string {
-  const hasOpenAI = !!env.openAIApiKey;
-  const hasGoogle = !!(env.googleApiKey || env.googleVertexProject);
-
-  if (!hasOpenAI && hasGoogle) return DEFAULT_GOOGLE_AGENT_MODEL;
   return DEFAULT_AGENT_MODEL;
 }
 
@@ -27,7 +18,10 @@ export type AgentBackendMode = "filesystem" | "state";
 export type ServerEnv = {
   agentBackendMode: AgentBackendMode;
   agentFilesRoot?: string;
+  designImportRoot?: string;
   agentModel: string;
+  apiYiApiBase?: string;
+  apiYiApiKey?: string;
   googleApiKey?: string;
   googleApplicationCredentials?: string;
   googleFontsApiKey?: string;
@@ -77,10 +71,19 @@ export function loadServerEnv(
   const agentFilesRoot =
     overrides.agentFilesRoot ??
     parseAgentFilesRoot(source.LOOMIC_AGENT_FILES_ROOT);
+  const designImportRoot =
+    overrides.designImportRoot ??
+    normalizeOptionalString(source.LOOMIC_DESIGN_IMPORT_ROOT);
   const openAIApiBase =
     overrides.openAIApiBase ?? normalizeOptionalString(source.OPENAI_API_BASE);
   const openAIApiKey =
     overrides.openAIApiKey ?? normalizeOptionalString(source.OPENAI_API_KEY);
+  const apiYiApiBase =
+    overrides.apiYiApiBase ??
+    normalizeOptionalString(source.APIYI_API_BASE) ??
+    "https://api.apiyi.com/v1";
+  const apiYiApiKey =
+    overrides.apiYiApiKey ?? normalizeOptionalString(source.APIYI_API_KEY);
   const supabaseUrl =
     overrides.supabaseUrl ?? normalizeOptionalString(source.SUPABASE_URL);
   const supabaseAnonKey =
@@ -188,18 +191,12 @@ export function loadServerEnv(
       ? Number.parseInt(source.WORKER_MAX_BATCH_SIZE, 10)
       : undefined);
 
-  // Resolve default agent model based on available provider keys.
-  // Explicit LOOMIC_AGENT_MODEL always takes precedence; otherwise fall back
-  // to Gemini 2.5 Flash when only Google/Vertex is configured.
+  // Explicit LOOMIC_AGENT_MODEL takes precedence; the only environment-backed
+  // fallback is the APIYI text model.
   const explicitModel =
     overrides.agentModel ?? parseAgentModel(source.LOOMIC_AGENT_MODEL);
   const resolvedAgentModel =
-    explicitModel ??
-    resolveDefaultAgentModel({
-      googleApiKey,
-      googleVertexProject,
-      openAIApiKey,
-    });
+    explicitModel ?? resolveDefaultAgentModel({ apiYiApiKey });
 
   return {
     agentBackendMode:
@@ -211,10 +208,13 @@ export function loadServerEnv(
     webOrigin:
       overrides.webOrigin ?? source.LOOMIC_WEB_ORIGIN ?? DEFAULT_WEB_ORIGIN,
     ...(agentFilesRoot ? { agentFilesRoot } : {}),
+    ...(designImportRoot ? { designImportRoot } : {}),
     ...(googleApiKey ? { googleApiKey } : {}),
     ...(googleApplicationCredentials ? { googleApplicationCredentials } : {}),
     ...(openAIApiBase ? { openAIApiBase } : {}),
     ...(openAIApiKey ? { openAIApiKey } : {}),
+    ...(apiYiApiBase ? { apiYiApiBase } : {}),
+    ...(apiYiApiKey ? { apiYiApiKey } : {}),
     ...(supabaseUrl ? { supabaseUrl } : {}),
     ...(supabaseAnonKey ? { supabaseAnonKey } : {}),
     ...(supabaseDbUrl ? { supabaseDbUrl } : {}),

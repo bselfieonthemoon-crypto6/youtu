@@ -445,11 +445,6 @@ export const claimDailyResponseSchema = z.object({
 });
 export type ClaimDailyResponse = z.infer<typeof claimDailyResponseSchema>;
 
-export const setPlanRequestSchema = z.object({
-  plan: subscriptionPlanSchema,
-});
-export type SetPlanRequest = z.infer<typeof setPlanRequestSchema>;
-
 // ── Annotated model (returned by model list APIs) ────────────
 
 export const annotatedModelSchema = z.object({

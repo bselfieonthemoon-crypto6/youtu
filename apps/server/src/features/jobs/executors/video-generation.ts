@@ -1,18 +1,19 @@
 import { registerExecutor, type ExecutorContext } from "../job-executor.js";
 import { generateVideo } from "../../../generation/video-generation.js";
 import { resolveVideoProviderName } from "../../../generation/providers/registry.js";
+import { safeDownload } from "../../../security/safe-download.js";
+import { normalizePersistedGenerationJob } from "../design-target-normalizer.js";
 
 registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorContext) => {
   const t0 = Date.now();
 
   const admin = ctx.getAdminClient();
-  const { data: jobRow } = await admin
-    .from("background_jobs")
-    .select("created_by, workspace_id, canvas_id, session_id, payload")
-    .eq("id", jobId)
-    .single();
-
-  if (!jobRow) throw new Error(`Job ${jobId} not found in database`);
+  const jobRow = normalizePersistedGenerationJob(
+    await ctx.jobService.getJobAdmin(jobId),
+  );
+  if (jobRow.job_type !== "video_generation") {
+    throw new Error(`Job ${jobId} is not a video generation job`);
+  }
 
   // Build log tag with traceability context: jobId + sessionId (if available)
   const sessionShort = (jobRow.session_id as string)?.slice(0, 8) ?? "no-session";
@@ -20,16 +21,7 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
   const lap = (label: string) => console.log(`${tag} ${label} +${Date.now() - t0}ms`);
   lap("db_fetch");
 
-  const payload = (jobRow.payload ?? {}) as {
-    prompt: string;
-    model?: string;
-    duration?: number;
-    resolution?: string;
-    aspect_ratio?: string;
-    input_images?: string[];
-    input_video?: string;
-    enable_audio?: boolean;
-  };
+  const payload = jobRow.payload;
 
   if (!payload.prompt) throw new Error(`Job ${jobId} has no prompt in payload`);
 
@@ -60,30 +52,29 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
     });
     lap("replicate_call_done");
 
-    // Vertex AI returns inline base64 data URIs; Developer API returns HTTP URLs.
-    let buffer: Buffer;
-    if (generated.url.startsWith("data:")) {
-      const commaIdx = generated.url.indexOf(",");
-      if (commaIdx === -1) throw new Error("Invalid data URI: no comma separator");
-      buffer = Buffer.from(generated.url.slice(commaIdx + 1), "base64");
-    } else {
-      const response = await fetch(generated.url);
-      if (!response.ok) {
-        throw new Error(`Failed to download video: ${response.status} ${response.statusText}`);
-      }
-      const arrayBuffer = await response.arrayBuffer();
-      buffer = Buffer.from(arrayBuffer);
-    }
+    // Vertex AI can return inline data URIs; every path still gets the same
+    // byte, MIME and signature checks.
+    const downloaded = await safeDownload(generated.url, {
+      kind: "video",
+      maxBytes: 256 * 1024 * 1024,
+      timeoutMs: 180_000,
+      maxRedirects: 2,
+      allowDataUri: true,
+      expectedMimeType: generated.mimeType ?? "video/mp4",
+      allowedMimeTypes: ["video/mp4", "video/webm"],
+    });
+    const buffer = downloaded.buffer;
+    const outputMimeType = downloaded.mimeType;
     lap("video_download_done");
 
-    const ext = generated.mimeType === "video/webm" ? "webm" : "mp4";
+    const ext = outputMimeType === "video/webm" ? "webm" : "mp4";
     const timestamp = Date.now();
     const objectPath = `${workspaceId}/generated/${timestamp}-${jobId}.${ext}`;
 
     const { error: uploadError } = await admin.storage
-      .from("project-assets")
+      .from("workspace-assets")
       .upload(objectPath, buffer, {
-        contentType: generated.mimeType ?? "video/mp4",
+        contentType: outputMimeType,
         upsert: false,
       });
 
@@ -96,9 +87,9 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
       .from("asset_objects")
       .insert({
         workspace_id: workspaceId,
-        bucket: "project-assets",
+        bucket: "workspace-assets",
         object_path: objectPath,
-        mime_type: generated.mimeType ?? "video/mp4",
+        mime_type: outputMimeType,
         byte_size: buffer.length,
         ...(createdBy ? { created_by: createdBy } : {}),
       })
@@ -110,19 +101,22 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
     }
     lap("asset_record_done");
 
-    const { data: urlData } = admin.storage
-      .from("project-assets")
-      .getPublicUrl(objectPath);
+    const { data: urlData, error: urlError } = await admin.storage
+      .from("workspace-assets")
+      .createSignedUrl(objectPath, 900);
+    if (urlError || !urlData?.signedUrl) {
+      throw new Error("Failed to create a private video URL");
+    }
 
     lap("total");
     return {
       asset_id: (assetRow as { id: string }).id,
-      signed_url: urlData.publicUrl,
+      signed_url: urlData.signedUrl,
       object_path: objectPath,
       width: generated.width,
       height: generated.height,
       duration_seconds: generated.durationSeconds,
-      mime_type: generated.mimeType ?? "video/mp4",
+      mime_type: outputMimeType,
     };
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);

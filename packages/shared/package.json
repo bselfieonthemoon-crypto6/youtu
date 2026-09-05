@@ -14,9 +14,12 @@
   "dependencies": {
     "zod": "^3.24.2"
   },
+  "devDependencies": {
+    "vitest": "^3.2.4"
+  },
   "scripts": {
     "build": "tsc --build tsconfig.json --force",
-    "test": "vitest run src/contracts.test.ts src/credits.test.ts",
+    "test": "vitest run src/contracts.test.ts src/credits.test.ts src/job-contracts.test.ts src/ws-protocol.test.ts src/provider-config-contracts.test.ts src/workspace-member-contracts.test.ts src/design-contracts.test.ts src/design-template-variables.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   }
 }

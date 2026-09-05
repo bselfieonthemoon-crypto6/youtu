@@ -2,7 +2,7 @@
 
 import { useCallback } from "react";
 
-import type { StreamEvent, ToolBlock } from "@loomic/shared";
+import type { ContentBlock, StreamEvent, ToolBlock } from "@loomic/shared";
 import type { Message } from "./use-chat-sessions";
 
 type MessageUpdater = (
@@ -40,6 +40,54 @@ export function useChatStream(updateSessionMessages: MessageUpdater) {
 
       const update = (updater: (prev: Message[]) => Message[]) =>
         updateSessionMessages(sessionId, updater);
+
+      // Plans are first-class stream state, not ordinary tool history. Replace
+      // the matching plan in place so write_todos revisions do not produce a
+      // long stack of stale plan cards.
+      if ((event as { type: string }).type === "plan.updated") {
+        const planEvent = event as unknown as {
+          planId: string;
+          revision: number;
+          steps: Array<{
+            id: string;
+            title: string;
+            status: "pending" | "in_progress" | "completed" | "failed";
+          }>;
+        };
+        update((prev) =>
+          prev.map((message) => {
+            if (message.id !== assistantId) return message;
+            const planBlock = {
+              type: "plan" as const,
+              planId: planEvent.planId,
+              revision: planEvent.revision,
+              steps: planEvent.steps,
+            };
+            const planIndex = message.contentBlocks.findIndex(
+              (block) =>
+                (block as { type: string }).type === "plan" &&
+                (block as { planId?: string }).planId === planEvent.planId,
+            );
+            if (planIndex < 0) {
+              return {
+                ...message,
+                contentBlocks: [
+                  ...message.contentBlocks,
+                  planBlock as unknown as ContentBlock,
+                ],
+              };
+            }
+            const blocks = [...message.contentBlocks];
+            const currentRevision = (
+              blocks[planIndex] as unknown as { revision?: number }
+            ).revision ?? -1;
+            if (currentRevision > planEvent.revision) return message;
+            blocks[planIndex] = planBlock as unknown as ContentBlock;
+            return { ...message, contentBlocks: blocks };
+          }),
+        );
+        return;
+      }
 
       switch (event.type) {
         case "message.delta": {
@@ -90,6 +138,11 @@ export function useChatStream(updateSessionMessages: MessageUpdater) {
         }
 
         case "tool.started":
+          {
+          const relatedEvent = event as typeof event & {
+            planId?: string;
+            planStepId?: string;
+          };
           update((prev) =>
             prev.map((m) => {
               if (m.id !== assistantId) return m;
@@ -103,10 +156,20 @@ export function useChatStream(updateSessionMessages: MessageUpdater) {
               }
               const newBlock: ToolBlock = {
                 type: "tool",
+                ...(event.toolExecutionId
+                  ? { toolExecutionId: event.toolExecutionId }
+                  : {}),
                 toolCallId: event.toolCallId,
                 toolName: event.toolName,
                 status: "running",
                 ...(event.input ? { input: event.input } : {}),
+                ...(event.retryable !== undefined
+                  ? { retryable: event.retryable }
+                  : {}),
+                ...(relatedEvent.planId ? { planId: relatedEvent.planId } : {}),
+                ...(relatedEvent.planStepId
+                  ? { planStepId: relatedEvent.planStepId }
+                  : {}),
               };
               return {
                 ...m,
@@ -115,8 +178,15 @@ export function useChatStream(updateSessionMessages: MessageUpdater) {
             }),
           );
           break;
+          }
 
         case "tool.completed":
+          {
+          const relatedEvent = event as typeof event & {
+            planId?: string;
+            planStepId?: string;
+          };
+          publishAuthoritativeCreditBalance(event.output);
           update((prev) =>
             prev.map((m) => {
               if (m.id !== assistantId) return m;
@@ -129,11 +199,18 @@ export function useChatStream(updateSessionMessages: MessageUpdater) {
                   ) {
                     return {
                       ...block,
+                      ...(event.toolExecutionId
+                        ? { toolExecutionId: event.toolExecutionId }
+                        : {}),
                       status: "completed" as const,
                       output: event.output,
                       outputSummary: event.outputSummary,
                       ...(event.artifacts
                         ? { artifacts: event.artifacts }
+                        : {}),
+                      ...(relatedEvent.planId ? { planId: relatedEvent.planId } : {}),
+                      ...(relatedEvent.planStepId
+                        ? { planStepId: relatedEvent.planStepId }
                         : {}),
                     };
                   }
@@ -143,6 +220,40 @@ export function useChatStream(updateSessionMessages: MessageUpdater) {
             }),
           );
           break;
+          }
+
+        case "tool.failed":
+          {
+          const relatedEvent = event as typeof event & {
+            planId?: string;
+            planStepId?: string;
+          };
+          update((prev) =>
+            prev.map((m) => {
+              if (m.id !== assistantId) return m;
+              return {
+                ...m,
+                contentBlocks: m.contentBlocks.map((block) =>
+                  block.type === "tool" && block.toolCallId === event.toolCallId
+                    ? {
+                        ...block,
+                        ...(event.toolExecutionId
+                          ? { toolExecutionId: event.toolExecutionId }
+                          : {}),
+                        status: "failed" as const,
+                        outputSummary: event.error.message,
+                        ...(relatedEvent.planId ? { planId: relatedEvent.planId } : {}),
+                        ...(relatedEvent.planStepId
+                          ? { planStepId: relatedEvent.planStepId }
+                          : {}),
+                      }
+                    : block,
+                ),
+              };
+            }),
+          );
+          break;
+          }
 
         case "run.failed":
           console.error("[chat-stream] run.failed:", event.error);
@@ -152,7 +263,11 @@ export function useChatStream(updateSessionMessages: MessageUpdater) {
               // Mark all running tool blocks as completed so spinners stop
               const blocks = m.contentBlocks.map((block) =>
                 block.type === "tool" && block.status === "running"
-                  ? { ...block, status: "completed" as const, outputSummary: "\u5904\u7406\u5931\u8d25" }
+                  ? {
+                      ...block,
+                      status: "failed" as const,
+                      outputSummary: "处理失败",
+                    }
                   : block,
               );
               const hasText = blocks.some((b) => b.type === "text");
@@ -185,7 +300,11 @@ export function useChatStream(updateSessionMessages: MessageUpdater) {
                 ...m,
                 contentBlocks: m.contentBlocks.map((block) =>
                   block.type === "tool" && block.status === "running"
-                    ? { ...block, status: "completed" as const }
+                    ? {
+                        ...block,
+                        status: "canceled" as const,
+                        outputSummary: "已取消",
+                      }
                     : block,
                 ),
               };
@@ -203,4 +322,19 @@ export function useChatStream(updateSessionMessages: MessageUpdater) {
   );
 
   return { applyStreamEvent };
+}
+
+function publishAuthoritativeCreditBalance(
+  output: Record<string, unknown> | undefined,
+) {
+  if (typeof window === "undefined" || !output) return;
+  const billing = output.billing;
+  if (!billing || typeof billing !== "object" || Array.isArray(billing)) return;
+  const balanceAfter = (billing as Record<string, unknown>).balanceAfter;
+  if (typeof balanceAfter !== "number" || !Number.isFinite(balanceAfter)) return;
+  window.dispatchEvent(
+    new CustomEvent("loomic:credits-updated", {
+      detail: { balance: balanceAfter },
+    }),
+  );
 }

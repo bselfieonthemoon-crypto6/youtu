@@ -2,7 +2,7 @@
 
 import { useCallback, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import type { ImageGenerationPreference, VideoGenerationPreference } from "@loomic/shared";
+import type { AgentExecutionMode, ImageGenerationPreference, VideoGenerationPreference } from "@loomic/shared";
 
 import type { ReadyAttachment } from "@/hooks/use-image-attachments";
 import { useAuth } from "@/lib/auth-context";
@@ -16,6 +16,7 @@ export const INITIAL_IMAGE_GENERATION_PREFERENCE_KEY =
 export const INITIAL_VIDEO_GENERATION_PREFERENCE_KEY =
   "loomic:initial-video-generation-preference";
 export const INITIAL_AGENT_MODEL_KEY = "loomic:initial-agent-model";
+export const INITIAL_EXECUTION_MODE_KEY = "loomic:initial-execution-mode";
 
 /**
  * Shared hook for creating an Untitled project and navigating to its canvas.
@@ -39,13 +40,12 @@ export function useCreateProject() {
       imageGenerationPreference?: ImageGenerationPreference;
       videoGenerationPreference?: VideoGenerationPreference;
       model?: string;
+      executionMode?: AgentExecutionMode;
     }) => {
       const token = session?.access_token;
       if (!token || creating) return;
 
-      // Persist attachments in sessionStorage BEFORE window.open so the
-      // new tab's cloned sessionStorage already contains them.
-      // (sessionStorage is per-tab; new tabs get a snapshot at open time.)
+      // Persist the initial run payload before navigating to the canvas.
       if (opts?.attachments && opts.attachments.length > 0) {
         try {
           sessionStorage.setItem(
@@ -95,10 +95,18 @@ export function useCreateProject() {
         sessionStorage.removeItem(INITIAL_AGENT_MODEL_KEY);
       }
 
-      // Open the new tab synchronously within the user gesture so the
-      // browser popup-blocker doesn't intervene. We'll set the real URL
-      // once the API call returns.
-      const newTab = window.open("/loading-preview", "_blank");
+      if (opts?.executionMode) {
+        try {
+          sessionStorage.setItem(
+            INITIAL_EXECUTION_MODE_KEY,
+            opts.executionMode,
+          );
+        } catch {
+          // sessionStorage write failure is non-fatal
+        }
+      } else {
+        sessionStorage.removeItem(INITIAL_EXECUTION_MODE_KEY);
+      }
 
       setCreating(true);
       try {
@@ -109,16 +117,13 @@ export function useCreateProject() {
           ? `/canvas?id=${canvasId}&prompt=${encodeURIComponent(opts.prompt)}`
           : `/canvas?id=${canvasId}`;
 
-        if (newTab) {
-          newTab.location.href = url;
-        } else {
-          // Popup was blocked despite sync open — fallback to in-page navigation
-          routerRef.current.push(url);
-        }
+        // Keep project creation and canvas navigation in the same tab. Opening
+        // a placeholder tab before this request is unreliable in embedded
+        // browsers: the async handoff can lose its WindowProxy and leave an
+        // unreachable blank tab, especially during the first dev compilation.
+        routerRef.current.push(url);
         setCreating(false);
       } catch (err) {
-        // Close the blank tab on failure
-        newTab?.close();
         if (err instanceof ApiAuthError) {
           await signOutRef.current();
           routerRef.current.replace("/login");
