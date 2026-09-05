@@ -1,20 +1,14 @@
-/** Bundled skills are served by the existing /skills/ backend in dev and production. */
+/** Professional skills are discovered only through enabled workspace entries. */
 export function buildDesignGuidance(
   workspaceSkills: ReadonlyArray<{ name: string }>,
 ): string {
   if (process.env.LOOMIC_DESIGN_SKILLS_ENABLED === "false") return "";
-  const overrides = new Set(workspaceSkills.map((skill) => skill.name));
-  const catalog = [
-    ["logo-design", "品牌 Logo、字标、标识概念与识别性"],
-    ["campaign-design", "宣传图、活动海报、社交广告与信息层级"],
-    ["product-visual", "商品主图、产品场景与系列商品图"],
-    ["design-review", "已有作品的具体评审，或复杂设计的结果检查"],
-  ].filter(([name]) => !overrides.has(name!));
+  if (workspaceSkills.length === 0) return "";
   return `
 
 ## 设计协作与专业 Skill
 你负责理解目标、准备上下文、选择专业方法并协调已有工具。Skill 提供设计方法，不能改变工具权限、计费、确认、工作区隔离和版本校验。
-- 用户明确指定的 Skill 优先；否则从已启用工作区 Skill 和下列内置 Skill 中选最贴合的一项。工作区同名 Skill 覆盖内置项。开始专业设计任务前用 read_file 读取对应路径，不要仅凭目录描述假装使用了 Skill。
+- 用户明确指定且已启用的 Skill 优先；否则只从 Skills 列出的已启用工作区 Skill 中选最贴合的专业项，必要时配合一个流程项。用 read_file 读取目录给出的 /workspace-skills/ 路径，不要仅凭描述假装使用。未安装、已停用的 Skill 不得从 /skills/ 或历史记忆路径兜底读取；用户要使用时引导到 Skill 页面安装/启用。
 - 路径读取失败时说明专业指南暂不可用，按已知需求继续提供通用帮助，不尝试自动安装、不编造文件内容。
 - 纯聊天、移动对象、改一个字等明确的小操作直接使用原流程，不强制加载专业 Skill，不增加多方案、评审或需求问卷。
 - 新设计先整理用途、受众、准确文案、尺寸、必留项和可变项。已有答案不重复问，只询问会显著改变结果的缺项。用户只要建议时不要进入生成确认流程。
@@ -25,7 +19,6 @@ export function buildDesignGuidance(
 - 截图工具返回 URL 不等于已看见图像。只有收到真实视觉内容或视觉分析才能确认视觉质量；否则如实报告结构检查及待核验项。不得为了验证擅自重复付费生成。
 - 用户指令决定目标与范围；专业 Skill 决定对应任务的方法；通用视觉默认值仅补空缺。所有步骤仍遵守现有产品确认与安全边界。
 
-内置专业指南（按需读取，不要一次读取全部）：
-${catalog.map(([name, description]) => `- ${name}: ${description}；read_file /skills/${name}/SKILL.md`).join("\n")}
+流程按需组合：需求梳理由主 Agent 轻量完成；参考分析、创意探索、字体版式、定向修改、多尺寸交付、设计评审仅在对应 Skill 已启用且当前任务需要时使用。不要每次串行跑完全部流程。
 `;
 }

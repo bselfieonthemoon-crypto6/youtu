@@ -135,6 +135,7 @@ export function createLoomicDeepAgent(options: {
     systemPrompt += `\n\n## Skills\n\nThe following skills are enabled in this workspace:\n${skillsList}`;
   }
 
+  systemPrompt += "\n\nSkill 可用性以本轮 Skills 列表为准。不要继续加载已停用或已卸载的 Skill，也不要从 /skills/ 路径回退加载同名专业 Skill；历史对话中出现过不代表当前仍已启用。";
   systemPrompt += buildDesignGuidance(wsSkills);
 
   return createDeepAgent({
