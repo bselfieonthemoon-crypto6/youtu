@@ -10,6 +10,16 @@ Git 保存代码，不备份数据库、Storage、密钥或 models。九项 Skil
 本次为当前工作区安装九项，冲突时不覆盖已有启停选择。迁移只注册目录，不自动给所有工作区安装。
 启停会影响后续加载列表，不中断已执行中的调用，也不能抹除历史对话内容；提示词约束不是文件系统权限隔离。
 
+## 扩展设计 Skill（2026-09-06）
+
+新增 brand-consistency（品牌一致性）、resource-template-composition（素材与模板编排）、series-visual-design（系列视觉设计）、design-copywriting（设计文案策划）。迁移 20260908000002_design_extension_skills.sql 只注册这四项系统目录，不覆盖同名用户 Skill、不自动安装到全部工作区。
+
+已为当前画布所属工作区安装并启用新增四项，安装冲突时保留原启停选择。本次不修改主 Agent、生成执行、计费和工具权限代码。
+
+能力边界：get_brand_kit 读取已绑定套件；search_design_resources 返回已发布资源摘要，不保证提供模板修订号或原始资产；apply_design_template 是整场景替换，仍需真实修订号和产品确认。Skill 遇到缺失元数据时说明限制，不猜测标识或宣称操作完成。
+
+验证：四项 Skill 格式校验通过，真实数据库内容与源文件一致。真实 API 的目录和详情通过；逐项安装、停用、启用、卸载与 loadWorkspaceSkills 联动检查通过。使用一次性账号和项目，结束后清理。未调用付费生图，未进行设计质量对话评测。
+
 ## 快速关闭
 
 在 API 进程环境设置 LOOMIC_DESIGN_SKILLS_ENABLED=false 并重启 API。
