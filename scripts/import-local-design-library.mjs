@@ -2,7 +2,8 @@
 // Additive import: deterministic request/asset IDs, existing catalog lifecycle,
 // workspace-only pending review. Never executes code from the supplied plugin.
 import {createRequire} from 'node:module';
-import {readFile,realpath} from 'node:fs/promises';
+import {readFile,realpath,readdir,writeFile,mkdir} from 'node:fs/promises';
+import {normalizeLocalDesignFile} from './local-design-file-format.mjs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {inspectImportBuffer} from '../apps/server/src/features/design-resources/design-resource-import-service.ts';
@@ -12,6 +13,7 @@ const {Pool}=require('pg');const {createClient}=require('@supabase/supabase-js')
 const root='C:/Users/lenovo/Downloads/新建文件夹/画布插件/public';
 const apply=process.argv.includes('--apply');
 const phase=process.argv.find(a=>a.startsWith('--phase='))?.split('=')[1]??'all';
+if(!['all','materials','templates','files','extra-fonts'].includes(phase))throw Error('Unknown import phase');
 const limit=Number(process.argv.find(a=>a.startsWith('--limit='))?.split('=')[1]??Infinity);
 const db=new Pool({connectionString:process.env.SUPABASE_DB_URL,max:6});
 const admin=createClient(process.env.SUPABASE_URL,process.env.SUPABASE_SERVICE_ROLE_KEY,{auth:{persistSession:false,autoRefreshToken:false}});
@@ -36,9 +38,12 @@ async function asset(url,converted=false){
   if(!url.startsWith('/local-assets/')||url.includes('..'))throw Error('Non-local or unsafe asset path');
   const file=converted?path.resolve('../../artifacts/converted-fonts',path.basename(url,path.extname(url))+'.ttf'):await realpath(path.join(root,url));
   if(!converted&&!file.toLowerCase().startsWith((path.resolve(root)+path.sep).toLowerCase()))throw Error('Asset escapes source root');
-  const bytes=await readFile(file);
-  const ext=path.extname(file).toLowerCase();
-  const mime={'.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.webp':'image/webp','.svg':'image/svg+xml','.ttf':'font/ttf','.otf':'font/otf','.woff':'font/woff'}[ext];
+  const raw=await readFile(file);
+  // Leave the original import's payloads unchanged on replay.
+  const normalized=phase==='files'?normalizeLocalDesignFile(raw,path.extname(file).toLowerCase()):null;
+  const bytes=normalized?.bytes??raw;
+  const ext=normalized?.extension??path.extname(file).toLowerCase();
+  const mime=normalized?.mime??{'.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.webp':'image/webp','.svg':'image/svg+xml','.ttf':'font/ttf','.otf':'font/otf','.woff':'font/woff'}[ext];
   if(!mime)throw Error('Unsupported file '+ext);
   const inspected=await inspectImportBuffer(bytes,mime);
   const id=uuid(workspace+':asset:'+inspected.sha256),objectPath=`${workspace}/design-library-v1/${inspected.sha256}${ext}`;
@@ -87,20 +92,20 @@ try{
  const target=(await db.query('select w.id,w.owner_user_id from public.canvases c join public.projects p on p.id=c.project_id join public.workspaces w on w.id=p.workspace_id where c.id=$1',['0560072c-5c8a-4954-b037-9b476246a671'])).rows[0];
  if(!target)throw Error('Workspace missing');workspace=target.id;actor=target.owner_user_id;
  const lib=await json('content-libraries.json'),tmpl=await json('templates.json'),fontList=(await json('fonts.json')).fonts;
- if(phase!=='materials')for(const f of fontList)await attempt('fonts',f.name,async()=>{
+ if(['all','templates'].includes(phase))for(const f of fontList)await attempt('fonts',f.name,async()=>{
   if(fontsByFile.has(f.file)){fonts.set(f.name,fontsByFile.get(f.file));return;}
   const a=await asset(f.file,true);const family=await catalog('font_family','font-family:'+f.file,{name:f.name,...sourceInfo});
   const face=await catalog('font_face','font-face:'+f.file,{family_id:family.entity_id,asset_object_id:a.id,style:a.style,weight:a.weight,format:a.format,checksum_sha256:a.sha256,allow_web_embed:a.webEmbedAllowed});
   const mapping={id:face.entity_id,name:a.familyName};fonts.set(f.name,mapping);fontsByFile.set(f.file,mapping);
  });
  console.log('Fonts',JSON.stringify(counts),'failures',JSON.stringify(failures));
- if(phase!=='templates')await batch(lib.materials.slice(0,limit),async m=>attempt('materials',String(m.id),async()=>{
+ if(['all','materials'].includes(phase))await batch(lib.materials.slice(0,limit),async m=>attempt('materials',String(m.id),async()=>{
   const a=m.attributes;
   if(!a.img?.data?.attributes?.url)throw Error('Source catalog has no material asset URL');
   const media=await asset(a.img.data.attributes.url);
   await catalog('resource','material:'+m.id,{name:a.name,kind:media.kind==='svg'?'svg':'image',asset_object_id:media.id,preview_asset_object_id:media.id,width:media.width,height:media.height,checksum_sha256:media.sha256,...sourceInfo});
  }));
- if(phase!=='materials')await batch(tmpl.templates.slice(0,limit),async t=>attempt('templates',String(t.id),async()=>{
+ if(['all','templates'].includes(phase))await batch(tmpl.templates.slice(0,limit),async t=>attempt('templates',String(t.id),async()=>{
   const a=t.attributes,ws=a.json.objects.find(o=>o.id==='workspace');
   if(!ws)throw Error('Missing template canvas');
   const scene=loomicSceneV1Schema.parse({schemaVersion:1,engine:'fabric',canvas:{width:Math.round(ws.width*(ws.scaleX??1)),height:Math.round(ws.height*(ws.scaleY??1)),background:typeof ws.fill==='string'?ws.fill:null},objects:await objects(a.json.objects,'template:'+t.id)});
@@ -112,11 +117,44 @@ try{
    await catalog('template','template:'+t.id+':named',{...payload,name:a.name+' [本地 '+t.id+']'});
   }
  }));
- if(phase!=='materials')await batch([...lib.fontStyles,...await json('main-visual-presets.json')].slice(0,limit),async t=>attempt('text_presets',String(t.id),async()=>{
+ if(['all','templates'].includes(phase))await batch([...lib.fontStyles,...await json('main-visual-presets.json')].slice(0,limit),async t=>attempt('text_presets',String(t.id),async()=>{
   const a=t.attributes;
   const style=designTextPresetContentSchema.parse({schemaVersion:1,objects:await objects([a.json],'text:'+t.id)});
   const preview=a.img?.data?.attributes?.url?await asset(a.img.data.attributes.url):null;
   await catalog('text_preset','text:'+t.id,{name:a.name,style,preview_asset_object_id:preview?.id??null,...sourceInfo});
  }));
- console.log('FINAL',JSON.stringify({apply,counts,failures}));
+ if(phase==='extra-fonts'){
+  const listed=new Set(fontList.map(f=>f.file));
+  const entries=await readdir(path.join(root,'local-assets/fonts'),{recursive:true,withFileTypes:true});
+  for(const f of entries.filter(f=>f.isFile())){
+   const url='/'+path.relative(root,path.join(f.parentPath??f.path,f.name)).split(path.sep).join('/');
+   if(listed.has(url))continue;
+   await attempt('extra_fonts',url,async()=>{
+    const a=await asset(url);if(a.kind!=='font')throw Error('Not a font');
+    const family=await catalog('font_family','extra-font-family:'+url,{name:a.familyName+' [本地]',...sourceInfo});
+    await catalog('font_face','extra-font-face:'+url,{family_id:family.entity_id,asset_object_id:a.id,style:a.style,weight:a.weight,format:a.format,checksum_sha256:a.sha256,allow_web_embed:a.webEmbedAllowed});
+   });
+  }
+ }
+ if(phase==='files'){
+  const seen=new Set((await db.query('select checksum_sha256 from public.design_resources where workspace_id=$1 and deleted_at is null',[workspace])).rows.map(r=>r.checksum_sha256));
+  const files=await readdir(path.join(root,'local-assets'),{recursive:true,withFileTypes:true});
+  const entries=files.filter(f=>f.isFile()).map(f=>'/'+path.relative(root,path.join(f.parentPath??f.path,f.name)).split(path.sep).join('/')).sort();
+  counts.files_scanned=entries.length;
+  await batch(entries.slice(0,limit),async url=>attempt('files_processed',url,async()=>{
+   if(/\/\.DS_Store$/.test(url)){tally('system_files_ignored');return;}
+   if(/\.(woff2?|ttf|otf)$/i.test(url)||fontList.some(f=>f.file===url)){tally('font_files_handled_by_font_phase');return;}
+   const media=await asset(url);
+   if(seen.has(media.sha256)){tally('existing_or_duplicate');return;}
+   seen.add(media.sha256);
+   try{
+    await catalog('resource','file:'+media.sha256,{name:path.basename(url),kind:media.kind==='svg'?'svg':'image',asset_object_id:media.id,preview_asset_object_id:media.id,width:media.width,height:media.height,checksum_sha256:media.sha256,...sourceInfo});
+    tally('new_file_resources');
+   }catch(error){seen.delete(media.sha256);throw error;}
+  }));
+ }
+ const result={apply,phase,counts,failures};
+ const reportDir=path.resolve('../../artifacts');await mkdir(reportDir,{recursive:true});
+ await writeFile(path.join(reportDir,'local-design-import-'+phase+(apply?'-apply':'-dry')+'.json'),JSON.stringify(result,null,2));
+ console.log('FINAL',JSON.stringify(result));
 }finally{await db.end();}

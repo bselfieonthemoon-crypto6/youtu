@@ -28,6 +28,8 @@ python scripts/convert-local-fonts.py 'C:/Users/lenovo/Downloads/新建文件夹
 node --env-file=../../.env.local --import tsx ../../scripts/import-local-design-library.mjs
 node --env-file=../../.env.local --import tsx ../../scripts/import-local-design-library.mjs --apply --phase=materials
 node --env-file=../../.env.local --import tsx ../../scripts/import-local-design-library.mjs --apply --phase=templates
+node --env-file=../../.env.local --import tsx ../../scripts/import-local-design-library.mjs --apply --phase=files
+node --env-file=../../.env.local --import tsx ../../scripts/import-local-design-library.mjs --apply --phase=extra-fonts
 ```
 
 默认是 dry-run，但需要数据库读取目标工作区。`--limit=1` 可限定试导入条数。
@@ -53,3 +55,24 @@ node --env-file=../../.env.local --import tsx ../../scripts/import-local-design-
 尚未进行逐模板视觉一致性验收。资源处于待审核，因此正常画板面板（仅展示 published）暂时不显示；可在后台「设计资源」审核目录查看。授权确认、字体依赖发布及模板预览验收完成后再按目录流程发布。
 
 脚本输出的 `FINAL` 区分处理成功数与失败项；字体处理成功数包含来源别名，不代表独立字体文件数。
+
+## 全磁盘资源补入（第二批）
+
+用户要求把所有本地资源入库后，新增 `files` 阶段，递归扫描上述源目录的 `local-assets`，而不只处理 JSON 中已登记的素材。范围不包括用户其他目录或插件可执行代码。
+
+- 预检共 4,002 个文件：3,965 个图片/SVG、36 个字体文件（含 2 个扩展名为 `.bin` 的 WOFF2）以及 1 个忽略的 `.DS_Store`。
+- 原清单之外的模板配图、模板预览、文字预设预览也作为独立图片素材入库。预览不等于可编辑模板或文字预设。
+- `files` 阶段按实际文件签名处理误命名的 PNG/JPEG/WebP；SVG 只去除旧外部 DTD 声明、XML 声明和头部注释，不请求 DTD，不允许内部实体，不放宽现有 SVG 安全检查。只上传规范化副本，源文件不变。
+- 字体另行检查：原清单的字体由原阶段处理，6 个未列入清单的字体由 `extra-fonts` 阶段处理。字体权限不合格仍不会强制启用。
+- 每次运行在 `artifacts/local-design-import-<phase>-<apply|dry>.json` 保存结果报告。数据库、文件上传失败不会记作成功，重跑可以补偿；`files` 成功数包含已存在、去重、忽略和转交字体阶段项，须看 `new_file_resources` 确认本轮新建数。
+- 第二批仍全部为待审核，未发布；不改变生产运行代码或发布规则。
+
+规范化及安全回归测试：在 `apps/server` 执行 `node --import tsx --test ../../scripts/local-design-file-format.test.mjs`。
+
+第二批实际执行结果：新增 2,867 个图片/SVG 资源、5 款字体。云端总量为图片/SVG 3,965、可编辑模板 147、文字预设 9、字体家族/文件各 14，全部待审核。素材目录的 `asset_object_id` 缺失记录数为 0。抽查规范化后的 3 个 SVG 和 1 个误扩展名 PNG，云端 SHA-256 与入库记录一致，6 项格式/安全测试通过。
+
+最终全量 dry-run 重扫：4,002 个文件全部归类，3,965 个图片/SVG 全部命中已有目录哈希、36 个文件转交字体阶段、1 个系统文件忽略，新增候选 0、文件阶段失败 0。
+
+实际上传批次日志中 2 个 `.bin` 条目被记为格式失败；进一步按文件头确认它们是字体，已在原字体阶段检查且未通过嵌入权限。现已修正分类，后续文件阶段转交字体处理而不重复报图片格式错误。对全部 36 个字体文件再次读取 OS/2 元数据：14 个通过当前规则，22 个未通过。未伪造授权或删除权限元数据。
+
+边界：3,965 个图片/SVG 文件全部入素材目录，不代表 155 个模板及 58 个文字预设全部支持原生编辑。仍有 8 个模板、49 个文字预设不满足现有转换能力，原 JSON 留在源目录，相应本地预览文件已作为图片素材保存。100 条无资产地址的来源素材记录不能凭名称可靠恢复，但本地实际存在的图片文件均已覆盖。
