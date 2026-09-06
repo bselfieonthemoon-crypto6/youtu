@@ -112,6 +112,19 @@ export class OpenAIImageProvider implements ImageProvider {
   async generate(params: ImageGenerateParams): Promise<GeneratedImage> {
     const isApiYiAll = params.model === "gpt-image-2-all";
     const isGptImage2 = params.model === "gpt-image-2";
+    let prompt = params.prompt;
+    if (isApiYiAll) {
+      // This gateway branch omits native size fields. Carry the requested ratio
+      // into BOTH generation and editing instead of silently discarding it.
+      const ratio = params.aspectRatio ?? "1:1";
+      const parts = ratio.split(":");
+      const [w, h] = parts.map(Number);
+      if (parts.length !== 2 || !Number.isFinite(w) || !Number.isFinite(h) || !(w! > 0) || !(h! > 0)) {
+        throw new GenerationError(this.name, "invalid_input", "Invalid image aspect ratio.");
+      }
+      const shape = w === h ? "square" : w! > h! ? "landscape" : "portrait";
+      prompt += `\n\nOutput canvas requirement: aspect ratio ${w}:${h} (width:height), ${shape} image. Compose the complete image within this output ratio; do not substitute another ratio. This specifies the image canvas, not text to draw in the image.`;
+    }
     const { size, width, height } = resolveSize(params.aspectRatio, {
       ...(isGptImage2 && params.outputWidth && params.outputHeight
         ? { exactWidth: params.outputWidth, exactHeight: params.outputHeight }
@@ -131,7 +144,7 @@ export class OpenAIImageProvider implements ImageProvider {
       const response = params.inputImages?.length
         ? await this.client.images.edit({
             model: params.model,
-            prompt: params.prompt,
+            prompt,
             image: await Promise.all(
               params.inputImages.map(async (input, index) => {
                 const { data, mimeType } = await fetchAsBase64(
@@ -157,7 +170,7 @@ export class OpenAIImageProvider implements ImageProvider {
               : undefined)
         : await this.client.images.generate({
             model: params.model,
-            prompt: params.prompt,
+            prompt,
             ...(isApiYiAll
               ? { response_format: "url" as const }
               : {
