@@ -1445,11 +1445,11 @@ const ImageArtifactCard = React.memo(function ImageArtifactCard({
       onClick={onOpenPanel}
     >
       {/* Image preview */}
-      <div className="relative aspect-square max-h-[280px] w-full overflow-hidden bg-muted">
+      <div className="relative w-full overflow-hidden bg-muted">
         <img
           src={imageUrl}
           alt={artifact.title ?? "Generated image"}
-          className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-[1.03]"
+          className="block h-auto max-h-[280px] w-full object-contain"
           loading="lazy"
           onError={handleImageError}
         />
