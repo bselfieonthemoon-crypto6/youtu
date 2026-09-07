@@ -16,6 +16,22 @@ import { ToolBlockView } from "../src/components/chat/tool-block-view";
 afterEach(() => cleanup());
 
 describe("ToolBlockView", () => {
+  it("distinguishes proposal preparation from actual generation", () => {
+    render(
+      <ToolBlockView
+        block={{
+          type: "tool",
+          toolCallId: "proposal",
+          toolName: "generate_image",
+          status: "running",
+        }}
+      />,
+    );
+    expect(
+      screen.getByText("正在准备图片方案（尚未生成）"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("正在生成图片")).not.toBeInTheDocument();
+  });
   it.each([
     ["running", "执行中"],
     ["completed", "已完成"],

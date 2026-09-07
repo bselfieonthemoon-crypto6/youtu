@@ -20,6 +20,7 @@ import {
 } from "./image-generate.js";
 import { createImageGenerationConfirmationTool } from "./image-generation-confirmation.js";
 import { createInspectCanvasTool } from "./inspect-canvas.js";
+import { createDesignDiscoveryTool } from "./design-discovery.js";
 import { createManipulateCanvasTool } from "./manipulate-canvas.js";
 import { createPersistSandboxFileTool } from "./persist-sandbox-file.js";
 import { createProjectSearchTool } from "./project-search.js";
@@ -89,13 +90,54 @@ export function createMainAgentTools(
         : {}),
     }),
   ];
-  if (deps.designTools) tools.push(...createDesignTools(deps.designTools));
+  if (deps.designTools)
+    tools.push(
+      ...createDesignTools(deps.designTools),
+      createDesignDiscoveryTool({
+        ...deps.designTools,
+        createUserClient: deps.createUserClient,
+      }),
+    );
   if (
     deps.availableImageModels === undefined ||
     deps.availableImageModels.length > 0
   ) {
     tools.push(
       createImageGenerateTool({
+        ...(deps.designTools
+          ? {
+              validateDesignTarget: async (target, context) => {
+                const design = await deps.designTools!.designService.get(
+                  {
+                    id: context.user_id,
+                    accessToken: context.access_token,
+                    email: "",
+                    userMetadata: {},
+                  },
+                  target.design_id,
+                );
+                if (design.workspace_id !== context.workspace_id)
+                  throw new Error("画板不属于当前工作区");
+                const { data, error } = await deps
+                  .createUserClient(context.access_token)
+                  .from("design_nodes")
+                  .select("design_id")
+                  .eq("design_id", design.id)
+                  .eq("canvas_id", context.canvas_id)
+                  .eq("workspace_id", context.workspace_id)
+                  .is("deleted_at", null)
+                  .maybeSingle();
+                if (error || !data)
+                  throw new Error(
+                    "画板不属于当前画布，请先调用 list_designs 确定目标",
+                  );
+                if (design.revision !== target.expected_revision)
+                  throw new Error(
+                    "画板版本已改变，请重新 inspect_design 后生成方案",
+                  );
+              },
+            }
+          : {}),
         ...(deps.destructiveConfirmationService
           ? { confirmationService: deps.destructiveConfirmationService }
           : {}),

@@ -1,15 +1,99 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { createDestructiveConfirmationService } from "../../features/agent-actions/destructive-confirmation-service.js";
-import {
-  createImageGenerateTool,
-  runImageGenerate,
-} from "./image-generate.js";
+import { createImageGenerateTool, runImageGenerate } from "./image-generate.js";
 import { createImageGenerationConfirmationTool } from "./image-generation-confirmation.js";
 
 describe("generate_image confirmation boundary", () => {
+  it('keeps a timed-out wait recoverable without reporting provider failure',async()=>{
+    const result=await runImageGenerate({title:'test',prompt:'blue',model:'test'},undefined,async()=>({jobId:'existing-job',error:'Job timed out after 240s'}));
+    expect(result).toMatchObject({status:'processing',jobId:'existing-job'});
+    expect(result.error).toBeUndefined();
+  });
+  it("rejects invented design IDs before proposing or submitting", async () => {
+    const confirmationService = createDestructiveConfirmationService();
+    const propose = vi.spyOn(confirmationService, "proposeAction");
+    const submit = vi.fn();
+    const validate = vi.fn(async () => {});
+    const imageTool = createImageGenerateTool({
+      confirmationService,
+      submitImageJob: submit,
+      validateDesignTarget: validate,
+      availableModels: [],
+    });
+    const result = await imageTool.invoke(
+      {
+        title: "background",
+        prompt: "blue",
+        model: "test",
+        target: {
+          kind: "design",
+          design_id: "00000000-0000-0000-0000-000000000000",
+          expected_revision: 0,
+          idempotency_key: "30000000-0000-4000-8000-000000000001",
+          placement: { x: 0, y: 0, width: 600, height: 400 },
+        },
+      },
+      { configurable: { user_id: "user", canvas_id: "canvas" } },
+    );
+    expect(result).toMatchObject({ error: "design_target_invalid" });
+    expect(propose).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
+    expect(validate).not.toHaveBeenCalled();
+  });
+  it("revalidates the design at confirmation and never submits a stale target", async () => {
+    const confirmationService = createDestructiveConfirmationService();
+    const submit = vi.fn();
+    const validate = vi
+      .fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("画板版本已改变"));
+    const imageTool = createImageGenerateTool({
+      confirmationService,
+      submitImageJob: submit,
+      validateDesignTarget: validate,
+      availableModels: [],
+    });
+    const config = {
+      configurable: {
+        user_id: "user",
+        canvas_id: "canvas",
+        user_prompt: "确认生成",
+      },
+    };
+    const result = (await imageTool.invoke(
+      {
+        title: "background",
+        prompt: "blue",
+        model: "test",
+        target: {
+          kind: "design",
+          design_id: "20000000-0000-4000-8000-000000000001",
+          expected_revision: 2,
+          idempotency_key: "30000000-0000-4000-8000-000000000001",
+          placement: { x: 0, y: 0, width: 600, height: 400 },
+        },
+      },
+      config,
+    )) as any;
+    const confirm = createImageGenerationConfirmationTool({
+      confirmationService,
+    });
+    await confirm
+      .invoke(
+        {
+          confirmationId: result.confirmation.confirmationId,
+          decision: "confirm",
+        },
+        config,
+      )
+      .catch(() => {});
+    expect(validate).toHaveBeenCalledTimes(2);
+    expect(submit).not.toHaveBeenCalled();
+  });
   it("does not inject legacy canvas placement defaults into a native design target", async () => {
     const imageTool = createImageGenerateTool({
+      validateDesignTarget: vi.fn(async () => {}),
       confirmationService: createDestructiveConfirmationService(),
       submitImageJob: vi.fn(),
       availableModels: [
@@ -106,7 +190,10 @@ describe("generate_image confirmation boundary", () => {
       },
     )) as unknown as {
       status: string;
-      confirmation: { confirmationId: string; details: Record<string, unknown> };
+      confirmation: {
+        confirmationId: string;
+        details: Record<string, unknown>;
+      };
     };
 
     expect(prepared.status).toBe("awaiting_confirmation");

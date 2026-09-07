@@ -189,6 +189,12 @@ export const ToolBlockView = React.memo(function ToolBlockView({
     (artifact): artifact is ImageArtifact => artifact.type === "image",
   );
   const isImageProposalTool = block.toolName === "generate_image";
+  const isPreparingImageProposal =
+    isImageProposalTool &&
+    !isCompleted &&
+    !(block.output as Record<string, unknown> | undefined)?.jobId &&
+    (block.output as Record<string, unknown> | undefined)?.status !==
+      "submitting";
   const isImageTool =
     isImageProposalTool || block.toolName === "confirm_image_generation";
   const isVideoTool = block.toolName === "generate_video";
@@ -363,9 +369,11 @@ export const ToolBlockView = React.memo(function ToolBlockView({
       <div className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
         <ToolStatusIcon status={displayStatus} />
         <span className="font-medium text-muted-foreground truncate">
-          {isMediaTool && modelName
-            ? formatModelDisplayName(modelName)
-            : config.label}
+          {isPreparingImageProposal
+            ? "正在准备图片方案（尚未生成）"
+            : isMediaTool && modelName
+              ? formatModelDisplayName(modelName)
+              : config.label}
           {designResult?.status === "conflict"
             ? " · 冲突"
             : status === "failed"
@@ -406,7 +414,7 @@ export const ToolBlockView = React.memo(function ToolBlockView({
       )}
 
       {/* Layer 2a: Media generation shimmer placeholder */}
-      {isMediaTool && !isCompleted && (
+      {isMediaTool && !isCompleted && !isPreparingImageProposal && (
         <MediaShimmer
           isVideoTool={isVideoTool}
           aspectRatio={aspectRatio}
@@ -903,6 +911,8 @@ function readGenerationRecovery(block: ToolBlock): GenerationRecoveryDetails {
     jobId,
     elementId,
     canContinue:
+      reportedStatus === "processing" ||
+      reportedStatus === "queued" ||
       block.status === "running" ||
       error.toLowerCase().includes("timed out") ||
       error.toLowerCase().includes("still being generated"),

@@ -12,6 +12,7 @@ if (process.env.GLOBAL_AGENT_HTTP_PROXY) {
 
 import { randomUUID } from "node:crypto";
 import { loadServerEnv } from "./config/env.js";
+import {createBackgroundMaintenance} from './background-maintenance.js';
 import {
   type CreditService,
   createCreditService,
@@ -290,11 +291,12 @@ async function main() {
     }
   };
 
+  const maintenance=createBackgroundMaintenance(reconcileCanvases,error=>console.error(`${tag} Recovery scan failed:`,error));
   const pollQueue = async (queue: (typeof WORKER_QUEUES)[number]) => {
     while (running) {
       try {
         if (queue === "image_generation_jobs") {
-          await reconcileCanvases();
+          maintenance.trigger();
         }
         const inFlight = inFlightByQueue.get(queue);
         if (!inFlight) {
