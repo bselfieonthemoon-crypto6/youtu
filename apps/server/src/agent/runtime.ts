@@ -2167,6 +2167,13 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           }
 
           rlog.lap("stream_call_start");
+          if (run.activeDesignId) {
+            inputMessages.push(
+              new HumanMessage(
+                `当前用户正在原位编辑设计画板 ${run.activeDesignId}。本轮新设计操作以此画板为目标。先 inspect_design 读取最新尺寸、版本和图层，再调用工具；生图必须携带此画板的真实 target，不要放到无限画布。已冻结的确认方案仍按其原目标执行。`,
+              ),
+            );
+          }
           stream = agent.streamEvents(
             {
               messages: inputMessages,
@@ -2192,6 +2199,9 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                       run_id: run.runId,
                       ...(run.sessionId ? { session_id: run.sessionId } : {}),
                       ...(run.prompt ? { user_prompt: run.prompt } : {}),
+                      ...(run.activeDesignId
+                        ? { active_design_id: run.activeDesignId }
+                        : {}),
                       ...(Object.keys(attachmentDataMap).length > 0
                         ? { user_attachment_map: attachmentDataMap }
                         : {}),

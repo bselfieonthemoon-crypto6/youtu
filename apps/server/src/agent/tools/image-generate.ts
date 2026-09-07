@@ -485,6 +485,15 @@ export function createImageGenerateTool(deps?: {
       const userId = configurable?.user_id;
       const canvasId = configurable?.canvas_id;
       const runId = configurable?.run_id;
+      if (
+        configurable?.active_design_id &&
+        input.target?.design_id !== configurable.active_design_id
+      ) {
+        return {
+          error: "active_design_target_required",
+          summary: `当前编辑目标是画板 ${configurable.active_design_id}。请先 inspect_design，再携带该画板的 target 提交方案；未创建任务。`,
+        };
+      }
 
       if (
         (!deps?.confirmationService && !deps?.proposalStore) ||

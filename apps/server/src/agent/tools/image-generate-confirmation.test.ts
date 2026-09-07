@@ -5,9 +5,39 @@ import { createImageGenerateTool, runImageGenerate } from "./image-generate.js";
 import { createImageGenerationConfirmationTool } from "./image-generation-confirmation.js";
 
 describe("generate_image confirmation boundary", () => {
-  it('keeps a timed-out wait recoverable without reporting provider failure',async()=>{
-    const result=await runImageGenerate({title:'test',prompt:'blue',model:'test'},undefined,async()=>({jobId:'existing-job',error:'Job timed out after 240s'}));
-    expect(result).toMatchObject({status:'processing',jobId:'existing-job'});
+  it("rejects an omitted or different target while a design is active", async () => {
+    const submit = vi.fn();
+    const tool = createImageGenerateTool({
+      submitImageJob: submit,
+      availableModels: [],
+      confirmationService: createDestructiveConfirmationService(),
+    });
+    const result = await tool.invoke(
+      { title: "test", prompt: "blue", model: "test" },
+      {
+        configurable: {
+          user_id: "user",
+          canvas_id: "canvas",
+          active_design_id: "20000000-0000-4000-8000-000000000001",
+        },
+      },
+    );
+    expect(result).toMatchObject({ error: "active_design_target_required" });
+    expect(submit).not.toHaveBeenCalled();
+  });
+  it("keeps a timed-out wait recoverable without reporting provider failure", async () => {
+    const result = await runImageGenerate(
+      { title: "test", prompt: "blue", model: "test" },
+      undefined,
+      async () => ({
+        jobId: "existing-job",
+        error: "Job timed out after 240s",
+      }),
+    );
+    expect(result).toMatchObject({
+      status: "processing",
+      jobId: "existing-job",
+    });
     expect(result.error).toBeUndefined();
   });
   it("rejects invented design IDs before proposing or submitting", async () => {

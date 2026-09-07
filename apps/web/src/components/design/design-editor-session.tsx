@@ -65,6 +65,7 @@ import {
   type DesignResourceTab,
 } from "./design-resource-panel";
 import { DesignTemplateReplaceDialog } from "./design-template-replace-dialog";
+import { DesignInlineEditor } from "./design-inline-editor";
 import type {
   AddFabricObjectInput,
   FabricObjectCommandEvent,
@@ -73,6 +74,8 @@ import type {
 } from "./fabric-object-editor";
 
 type DesignEditorSessionProps = {
+  onBindAgentSave?: (save: (() => Promise<void>) | null) => void;
+  inline?: boolean;
   accessToken: string;
   designId: string;
   backgroundRoot: HTMLElement;
@@ -116,6 +119,8 @@ const INITIAL_HISTORY_STATE: DesignCommandHistoryState = {
 
 /** Owns the authoritative document, local Fabric adapter, and save history. */
 export function DesignEditorSession({
+  onBindAgentSave,
+  inline = false,
   accessToken,
   designId,
   backgroundRoot,
@@ -125,6 +130,8 @@ export function DesignEditorSession({
   const client = useMemo(() => createDesignApiClient(), []);
   const resourceClient = useMemo(() => createDesignResourceApiClient(), []);
   const editorRef = useRef<FabricObjectEditorApi | null>(null);
+  const draggedResourceRef = useRef<DesignResourceDto | null>(null);
+  const pendingResourceWorkRef = useRef<Promise<void>>(Promise.resolve());
   const historyRef = useRef<DesignCommandHistory | null>(null);
   const sceneRef = useRef<LoomicSceneV1 | null>(null);
   const editorCommandChainRef = useRef<Promise<void>>(Promise.resolve());
@@ -551,6 +558,7 @@ export function DesignEditorSession({
   );
 
   const flushAll = useCallback(async () => {
+    await pendingResourceWorkRef.current;
     const history = historyRef.current;
     if (!history) throw new Error("设计保存协调器尚未准备完成。");
     for (;;) {
@@ -562,6 +570,11 @@ export function DesignEditorSession({
       await history.flushNow();
     }
   }, []);
+
+  useEffect(() => {
+    onBindAgentSave?.(flushAll);
+    return () => onBindAgentSave?.(null);
+  }, [onBindAgentSave, flushAll]);
 
   const reloadAuthoritativeIfClean = useCallback(
     async (successMessage?: string) => {
@@ -1431,8 +1444,56 @@ export function DesignEditorSession({
     syncSelection();
   };
 
+  const EditorShell = inline ? DesignInlineEditor : DesignEditorOverlay;
   return (
-    <DesignEditorOverlay
+    <EditorShell
+      {...(inline
+        ? {
+            onDropResource: async (
+              resourceId: string,
+              point: { x: number; y: number },
+            ) => {
+              const resource = draggedResourceRef.current;
+              const editor = editorRef.current;
+              if (!resource || resource.id !== resourceId || !editor)
+                throw new Error("请从当前资源抽屉拖入素材。");
+              const work = pendingResourceWorkRef.current.then(async () => {
+                const source = await resourceClient.getResourceContent(
+                  accessToken,
+                  resource.id,
+                );
+                if (editorRef.current !== editor)
+                  throw new Error("画板已切换，请重新拖入。");
+                const input = {
+                  assetObjectId: resource.asset_object_id,
+                  resourceId: resource.id,
+                  source,
+                };
+                const id =
+                  resource.kind === "svg"
+                    ? await editor.addSvg(input)
+                    : await editor.addImage(input);
+                const inserted = editor
+                  .serializeScene()
+                  .objects.find((object) => object.objectId === id)!;
+                const scale = Math.min(
+                  1,
+                  (scene.canvas.width * 0.35) / inserted.width,
+                  (scene.canvas.height * 0.35) / inserted.height,
+                );
+                editor.updateObject(id, {
+                  ...point,
+                  width: inserted.width * scale,
+                  height: inserted.height * scale,
+                });
+                captureEditorScene();
+                draggedResourceRef.current = null;
+              });
+              pendingResourceWorkRef.current = work.catch(() => undefined);
+              return work;
+            },
+          }
+        : {})}
       open
       designId={document.id}
       name={document.name}
@@ -1528,6 +1589,13 @@ export function DesignEditorSession({
             </div>
           )}
           <DesignResourcePanel
+            {...(inline
+              ? {
+                  onResourceDrag: (resource: DesignResourceDto) => {
+                    draggedResourceRef.current = resource;
+                  },
+                }
+              : {})}
             accessToken={accessToken}
             workspaceId={document.workspace_id}
             activeTab={resourceTab}

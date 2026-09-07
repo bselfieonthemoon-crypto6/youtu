@@ -18,6 +18,7 @@ import type {
 } from "./fabric-object-editor";
 
 export type FabricDesignSurfaceProps = {
+  inlineSize?: { width: number; height: number };
   width: number;
   height: number;
   background: string | null;
@@ -45,6 +46,7 @@ export const FabricDesignSurface = forwardRef<
   FabricDesignSurfaceProps
 >(function FabricDesignSurface(
   {
+    inlineSize,
     width,
     height,
     background,
@@ -62,6 +64,8 @@ export const FabricDesignSurface = forwardRef<
   forwardedRef,
 ) {
   const canvasElementRef = useRef<HTMLCanvasElement>(null);
+  const inlineSizeRef = useRef(inlineSize);
+  inlineSizeRef.current = inlineSize;
   const viewportRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<FabricCanvas | null>(null);
   const editorRef = useRef<FabricObjectEditorApi | null>(null);
@@ -174,6 +178,7 @@ export const FabricDesignSurface = forwardRef<
       // never rewrite it when only the editor viewport changes.
       const { FabricObjectEditor } = await import("./fabric-object-editor");
       const editor = new FabricObjectEditor(mounted, {
+        topLeftOrigin: Boolean(inlineSizeRef.current),
         readOnly,
         logicalWidth: width,
         logicalHeight: height,
@@ -194,6 +199,12 @@ export const FabricDesignSurface = forwardRef<
         });
       }
       const fitToViewport = () => {
+        if (inlineSizeRef.current) {
+          mounted.setDimensions(inlineSizeRef.current, { cssOnly: true });
+          mounted.calcOffset();
+          mounted.requestRenderAll();
+          return;
+        }
         const availableWidth = Math.max(1, viewport.clientWidth - 64);
         const availableHeight = Math.max(1, viewport.clientHeight - 64);
         const scale = Math.min(
@@ -249,6 +260,14 @@ export const FabricDesignSurface = forwardRef<
   }, [height, readOnly, width]);
 
   useEffect(() => {
+    if (inlineSize && canvasRef.current) {
+      canvasRef.current.setDimensions(inlineSize, { cssOnly: true });
+      canvasRef.current.calcOffset();
+      canvasRef.current.requestRenderAll();
+    }
+  }, [inlineSize]);
+
+  useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || background === initialBackgroundRef.current) return;
     initialBackgroundRef.current = background;
@@ -259,7 +278,11 @@ export const FabricDesignSurface = forwardRef<
   return (
     <div
       ref={viewportRef}
-      className="flex h-full min-h-0 items-center justify-center overflow-hidden bg-muted/50 p-8"
+      className={
+        inlineSize
+          ? "h-full w-full overflow-hidden"
+          : "flex h-full min-h-0 items-center justify-center overflow-hidden bg-muted/50 p-8"
+      }
       data-testid="design-fabric-viewport"
     >
       <div className="relative overflow-hidden shadow-float ring-1 ring-foreground/10">

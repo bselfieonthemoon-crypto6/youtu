@@ -63,6 +63,10 @@ export type DesignResizeOptions = {
 };
 
 export type DesignEditorOverlayProps = {
+  onDropResource?: (
+    resourceId: string,
+    point: { x: number; y: number },
+  ) => Promise<void>;
   open: boolean;
   designId: string;
   name: string;

@@ -20,6 +20,7 @@ import { cn } from "../../lib/utils";
 export type DesignResourceTab = "templates" | "assets" | "text" | "fonts";
 
 export type DesignResourcePanelProps = {
+  onResourceDrag?: (resource: DesignResourceDto) => void;
   accessToken: string;
   workspaceId: string;
   disabled?: boolean;
@@ -40,6 +41,7 @@ const emptyPage = (): DesignCatalogPage<unknown> => ({
 });
 
 export function DesignResourcePanel({
+  onResourceDrag,
   accessToken,
   workspaceId,
   disabled = false,
@@ -310,6 +312,9 @@ export function DesignResourcePanel({
           {tab === "assets" &&
             (page.items as DesignResourceDto[]).map((resource) => (
               <ResourceCard
+                {...(onResourceDrag
+                  ? { onDrag: () => onResourceDrag(resource) }
+                  : {})}
                 key={resource.id}
                 resource={resource}
                 accessToken={accessToken}
@@ -396,6 +401,7 @@ export function DesignResourcePanel({
 }
 
 function ResourceCard(props: {
+  onDrag?: () => void;
   resource: DesignResourceDto;
   accessToken: string;
   busy: boolean;
@@ -413,6 +419,14 @@ function ResourceCard(props: {
         disabled={props.disabled || props.busy}
         className="block w-full text-left disabled:opacity-50"
         onClick={props.onInsert}
+        draggable={Boolean(props.onDrag) && !props.disabled && !props.busy}
+        onDragStart={(event) => {
+          event.dataTransfer.setData(
+            "application/x-loomic-design-resource",
+            resource.id,
+          );
+          props.onDrag?.();
+        }}
       >
         <LazyBlobImage load={props.loadPreview} alt="" />
         <span className="block truncate px-2 pt-1.5 text-xs font-medium">

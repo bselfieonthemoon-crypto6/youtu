@@ -90,6 +90,8 @@ type ChatSidebarProps = {
   selectedCanvasElements?: CanvasSelectedElement[];
   imageChatCommand?: CanvasImageChatCommand | null;
   onOpenDesign?: (designId: string) => void;
+  activeDesignId?: string;
+  beforeDesignSend?: () => Promise<void>;
 };
 
 const HANDLED_CONFIRMATION_STORAGE_PREFIX = "loomic:handled-confirmation:";
@@ -121,6 +123,8 @@ function markConfirmationHandled(confirmationId: string): void {
 import { isExplicitImageConfirmationMessage } from "@loomic/shared";
 
 export function ChatSidebar({
+  activeDesignId,
+  beforeDesignSend,
   accessToken,
   canvasId,
   open,
@@ -140,6 +144,8 @@ export function ChatSidebar({
   onOpenDesign,
 }: ChatSidebarProps) {
   const breakpoint = useBreakpoint();
+  const designSendRef = useRef({ activeDesignId, beforeDesignSend });
+  designSendRef.current = { activeDesignId, beforeDesignSend };
   const isOverlay = breakpoint !== "desktop";
 
   // ── Session & message management (extracted hook with LRU cache) ──
@@ -926,6 +932,7 @@ export function ChatSidebar({
       const currentSessionId = activeSessionIdRef.current;
       if (streaming || !currentSessionId) return;
       let executionFailed = false;
+      let designPreflightError: string | null = null;
 
       // Merge explicitly-attached images with auto-sensed canvas selection images
       let currentAttachments = attachmentsOverride ?? readyAttachments;
@@ -1045,6 +1052,25 @@ export function ChatSidebar({
           tFirstToken: 0,
           gotFirstToken: false,
         };
+        const designContext = designSendRef.current;
+        if (
+          designContext.activeDesignId &&
+          imageConfirmation?.decision !== "cancel"
+        ) {
+          try {
+            await designContext.beforeDesignSend?.();
+          } catch (e) {
+            designPreflightError =
+              e instanceof Error
+                ? e.message
+                : "画板保存失败，请先处理后再发送。";
+            throw e;
+          }
+        }
+        if (
+          designSendRef.current.activeDesignId !== designContext.activeDesignId
+        )
+          throw new Error("画板目标已切换，请重新发送。");
 
         let resolveStream: () => void;
         const streamDone = new Promise<void>((r) => {
@@ -1154,6 +1180,9 @@ export function ChatSidebar({
               sessionId: currentSessionId,
               conversationId: canvasId,
               prompt: text,
+              ...(designContext.activeDesignId
+                ? { activeDesignId: designContext.activeDesignId }
+                : {}),
               ...(imageConfirmation ? { imageConfirmation } : {}),
               canvasId,
               accessToken: accessTokenRef.current,
@@ -1208,7 +1237,10 @@ export function ChatSidebar({
               ...m,
               contentBlocks: [
                 ...m.contentBlocks,
-                { type: "text" as const, text: "Failed to get response." },
+                {
+                  type: "text" as const,
+                  text: designPreflightError ?? "Failed to get response.",
+                },
               ],
             };
           }),
@@ -1690,6 +1722,12 @@ export function ChatSidebar({
   // between overlay (mobile/tablet) and inline (desktop) render paths.
   const panelContent = (
     <>
+      {activeDesignId && (
+        <div className="border-b px-4 py-2 text-xs text-muted-foreground">
+          新设计目标：当前画板 · {activeDesignId.slice(0, 8)}
+          （确认按钮仍执行原方案）
+        </div>
+      )}
       {/* Header */}
       <div className="flex min-h-[48px] items-center justify-between pl-4 pr-2">
         <div className="flex min-w-0 flex-1 items-center gap-1">

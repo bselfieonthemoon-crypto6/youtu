@@ -66,7 +66,11 @@ describe("agent.run WebSocket execution mode", () => {
           executionMode: "fast",
           model: "google:gemini-test",
           prompt: "hello",
-          imageConfirmation: { confirmationId: "10000000-0000-4000-8000-000000000001", decision: "confirm" },
+          activeDesignId: "20000000-0000-4000-8000-000000000001",
+          imageConfirmation: {
+            confirmationId: "10000000-0000-4000-8000-000000000001",
+            decision: "confirm",
+          },
           sessionId: "session-1",
         },
       }),
@@ -79,7 +83,11 @@ describe("agent.run WebSocket execution mode", () => {
     expect(createRun).toHaveBeenCalledWith(
       expect.objectContaining({
         executionMode: "thinking",
-        imageConfirmation: { confirmationId: "10000000-0000-4000-8000-000000000001", decision: "confirm" },
+        activeDesignId: "20000000-0000-4000-8000-000000000001",
+        imageConfirmation: {
+          confirmationId: "10000000-0000-4000-8000-000000000001",
+          decision: "confirm",
+        },
         model: "google:gemini-test",
       }),
       expect.objectContaining({

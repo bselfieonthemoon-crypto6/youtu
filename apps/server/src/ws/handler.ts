@@ -189,7 +189,10 @@ async function authenticateAndBind(
             sessionId: p.sessionId,
             conversationId: p.conversationId,
             prompt: p.prompt,
-            ...(p.imageConfirmation ? { imageConfirmation: p.imageConfirmation } : {}),
+            ...(p.activeDesignId ? { activeDesignId: p.activeDesignId } : {}),
+            ...(p.imageConfirmation
+              ? { imageConfirmation: p.imageConfirmation }
+              : {}),
             ...(p.canvasId !== undefined ? { canvasId: p.canvasId } : {}),
             ...(p.attachments !== undefined
               ? { attachments: p.attachments }
@@ -688,7 +691,8 @@ async function handleRunCommand(
       if (!services.settingsService || !services.viewerService)
         return undefined;
       try {
-        const viewer = await services.viewerService.ensureViewer(authenticatedUser);
+        const viewer =
+          await services.viewerService.ensureViewer(authenticatedUser);
         const settingsWorkspaceId = workspaceId ?? viewer.workspace.id;
         workspaceId ??= settingsWorkspaceId;
         const settings = await services.settingsService.getWorkspaceSettings(

@@ -79,6 +79,7 @@ export type FabricObjectHistoryEdit = {
 };
 
 export type FabricObjectEditorOptions = {
+  topLeftOrigin?: boolean;
   readOnly?: boolean;
   logicalWidth?: number;
   logicalHeight?: number;
@@ -1080,6 +1081,8 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
       resolved.revoke?.();
     }
     runtime.set({ left: 40, top: 40 });
+    if (this.options.topLeftOrigin)
+      runtime.set({ originX: "left", originY: "top" });
     const durable = baseObject(
       type,
       objectId,
@@ -1206,6 +1209,8 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
   }
 
   private tag(runtime: FabricObject, object: DesignObject) {
+    if (this.options.topLeftOrigin)
+      runtime.set({ originX: "left", originY: "top" });
     (runtime as FabricObject & { data?: RuntimeMetadata }).data = {
       objectId: object.objectId,
       objectVersion: object.objectVersion,

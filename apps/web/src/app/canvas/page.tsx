@@ -75,6 +75,37 @@ function CanvasPageContent() {
     null,
   );
   const pageRootRef = useRef<HTMLDivElement>(null);
+  const agentDesignSaveRef = useRef<(() => Promise<void>) | null>(null);
+  const [designSwitchError, setDesignSwitchError] = useState<string | null>(
+    null,
+  );
+  const designSwitchBusy = useRef(false);
+  const openDesignSafely = async (target: { designId: string }) => {
+    if (designSwitchBusy.current || target.designId === activeDesign?.designId)
+      return;
+    designSwitchBusy.current = true;
+    try {
+      if (searchParams.get("inlineArtboard") === "1" && activeDesign) {
+        if (!agentDesignSaveRef.current)
+          throw new Error("画板尚未就绪，暂时不能切换。");
+        await agentDesignSaveRef.current();
+      }
+      setDesignSwitchError(null);
+      setActiveDesign(target);
+    } catch (e) {
+      setDesignSwitchError(
+        e instanceof Error ? e.message : "请先保存当前画板再切换。",
+      );
+    } finally {
+      designSwitchBusy.current = false;
+    }
+  };
+  const bindAgentDesignSave = useCallback(
+    (save: (() => Promise<void>) | null) => {
+      agentDesignSaveRef.current = save;
+    },
+    [],
+  );
   const canvasLoadGenerationRef = useRef(0);
   const canvasSyncGenerationRef = useRef(0);
   const canvasIdRef = useRef(canvasId);
@@ -245,7 +276,14 @@ function CanvasPageContent() {
     (sessionId: string) => {
       if (!canvasId) return;
       // Update URL: set session param, remove prompt param to prevent re-send on refresh
-      routerRef.current.replace(`/canvas?id=${canvasId}&session=${sessionId}`);
+      const inlineFlag =
+        new URLSearchParams(window.location.search).get("inlineArtboard") ===
+        "1"
+          ? "&inlineArtboard=1"
+          : "";
+      routerRef.current.replace(
+        `/canvas?id=${canvasId}&session=${sessionId}${inlineFlag}`,
+      );
     },
     [canvasId],
   );
@@ -370,6 +408,14 @@ function CanvasPageContent() {
 
   return (
     <div ref={pageRootRef} className="flex h-screen w-screen overflow-hidden">
+      {designSwitchError && (
+        <div
+          role="alert"
+          className="fixed bottom-24 left-4 z-50 rounded-xl border bg-background p-3 text-destructive"
+        >
+          {designSwitchError}
+        </div>
+      )}
       {/* Top-left navigation bar */}
       <div className="absolute top-3 left-3 z-20 flex items-center gap-1.5">
         <CanvasLogoMenu
@@ -413,7 +459,9 @@ function CanvasPageContent() {
           onImageChatCommand={handleImageChatCommand}
           onCanvasRefreshRequest={handleCanvasSync}
           onCanvasRevisionChange={handleCanvasRevisionChange}
-          onOpenDesign={setActiveDesign}
+          onOpenDesign={(target) => {
+            void openDesignSafely(target);
+          }}
         />
         <CanvasEmptyHint
           excalidrawApi={excalidrawApi}
@@ -439,6 +487,16 @@ function CanvasPageContent() {
         />
       </div>
       <ChatSidebar
+        {...(searchParams.get("inlineArtboard") === "1" && activeDesign
+          ? {
+              activeDesignId: activeDesign.designId,
+              beforeDesignSend: async () => {
+                if (!agentDesignSaveRef.current)
+                  throw new Error("画板尚未就绪，请稍后发送。");
+                await agentDesignSaveRef.current();
+              },
+            }
+          : {})}
         accessToken={accessToken}
         canvasId={canvasData.id}
         open={chatOpen}
@@ -455,10 +513,14 @@ function CanvasPageContent() {
         ws={ws}
         selectedCanvasElements={selectedCanvasElements}
         imageChatCommand={imageChatCommand}
-        onOpenDesign={(designId) => setActiveDesign({ designId })}
+        onOpenDesign={(designId) => {
+          void openDesignSafely({ designId });
+        }}
       />
       {activeDesign && pageRootRef.current && (
         <DesignEditorSession
+          onBindAgentSave={bindAgentDesignSave}
+          inline={searchParams.get("inlineArtboard") === "1"}
           accessToken={accessToken}
           designId={activeDesign.designId}
           backgroundRoot={pageRootRef.current}

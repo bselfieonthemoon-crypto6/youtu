@@ -74,6 +74,7 @@ export const videoGenerationPreferenceSchema = z.object({
 export const agentExecutionModeSchema = z.enum(["fast", "thinking"]);
 
 export const runCreateRequestSchema = z.object({
+  activeDesignId: z.string().uuid().optional(),
   sessionId: sessionIdSchema,
   conversationId: conversationIdSchema,
   prompt: z.string(),

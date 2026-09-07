@@ -725,6 +725,52 @@ describe("ChatSidebar", () => {
     expect(mockWs.cancelRun).toHaveBeenCalledWith("run_resumed");
   });
 
+  it("saves the active design before forwarding its explicit generation target", async () => {
+    const save = vi.fn(async () => {
+      expect(mockWs.startRun).not.toHaveBeenCalled();
+    });
+    render(
+      <ChatSidebar
+        accessToken="token_abc"
+        canvasId="canvas-1"
+        open
+        onToggle={() => {}}
+        ws={mockWs}
+        activeDesignId="20000000-0000-4000-8000-000000000001"
+        beforeDesignSend={save}
+      />,
+    );
+    const input = await screen.findByPlaceholderText(/start with an idea/i);
+    await userEvent.type(input, "生成背景{Enter}");
+    await waitFor(() => expect(mockWs.startRun).toHaveBeenCalled());
+    expect(save).toHaveBeenCalledOnce();
+    expect(vi.mocked(mockWs.startRun).mock.calls[0]?.[0]).toMatchObject({
+      activeDesignId: "20000000-0000-4000-8000-000000000001",
+    });
+  });
+
+  it("does not submit an Agent run when the active design cannot save", async () => {
+    render(
+      <ChatSidebar
+        accessToken="token_abc"
+        canvasId="canvas-1"
+        open
+        onToggle={() => {}}
+        ws={mockWs}
+        activeDesignId="20000000-0000-4000-8000-000000000001"
+        beforeDesignSend={async () => {
+          throw new Error("先处理画板冲突");
+        }}
+      />,
+    );
+    const input = await screen.findByPlaceholderText(/start with an idea/i);
+    await userEvent.type(input, "生成背景{Enter}");
+    await waitFor(() =>
+      expect(screen.getByText(/先处理画板冲突/)).toBeInTheDocument(),
+    );
+    expect(mockWs.startRun).not.toHaveBeenCalled();
+  });
+
   it("keeps a new conversation empty when the previous run emits late events", async () => {
     fetchMessagesMock.mockResolvedValueOnce({
       messages: [
