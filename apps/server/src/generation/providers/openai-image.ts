@@ -64,11 +64,13 @@ function resolveSize(
   const [width = 1, height = 1] = aspectRatio.split(":").map(Number);
   if (options.use2K) {
     if (width > height) {
-      const outputHeight = Math.max(16, Math.round((2048 * height / width) / 16) * 16);
+      // The configured native endpoint rejects ratios beyond 3:1. Round
+      // the minimum short edge UP to a 16px block so rounding cannot exceed it.
+      const outputHeight = Math.max(688, Math.round((2048 * height / width) / 16) * 16);
       return { size: `2048x${outputHeight}`, width: 2048, height: outputHeight };
     }
     if (height > width) {
-      const outputWidth = Math.max(16, Math.round((2048 * width / height) / 16) * 16);
+      const outputWidth = Math.max(688, Math.round((2048 * width / height) / 16) * 16);
       return { size: `${outputWidth}x2048`, width: outputWidth, height: 2048 };
     }
     return { size: "2048x2048", width: 2048, height: 2048 };

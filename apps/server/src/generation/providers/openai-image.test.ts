@@ -15,6 +15,11 @@ vi.mock("openai", () => ({
 import { OpenAIImageProvider } from "./openai-image.js";
 
 describe("OpenAIImageProvider API易 transport", () => {
+  it.each([["658:172", "2048x688"], ["172:658", "688x2048"], ["1:1", "2048x2048"]])("bounds native HD ratio %s without changing board geometry", async (aspectRatio, size) => {
+    const provider = new OpenAIImageProvider("key");
+    await provider.generate({ model: "gpt-image-2", prompt: "Ocean background", aspectRatio, quality: "hd" });
+    expect(generateMock.mock.calls[0]![0].size).toBe(size);
+  });
   beforeEach(() => {
     generateMock.mockReset();
     editMock.mockReset();
