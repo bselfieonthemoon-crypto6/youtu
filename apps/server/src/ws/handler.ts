@@ -189,6 +189,7 @@ async function authenticateAndBind(
             sessionId: p.sessionId,
             conversationId: p.conversationId,
             prompt: p.prompt,
+            ...(p.imageConfirmation ? { imageConfirmation: p.imageConfirmation } : {}),
             ...(p.canvasId !== undefined ? { canvasId: p.canvasId } : {}),
             ...(p.attachments !== undefined
               ? { attachments: p.attachments }

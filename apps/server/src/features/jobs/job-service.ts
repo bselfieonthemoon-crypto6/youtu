@@ -59,6 +59,8 @@ export class JobServiceError extends Error {
 }
 
 export type CreateJobInput = {
+  /** Internal durable image proposal ID, never sourced from an HTTP job payload. */
+  proposalId?: string;
   workspaceId: string;
   projectId?: string;
   canvasId?: string;
@@ -73,6 +75,7 @@ export type CreateJobInput = {
 };
 
 export type JobService = {
+  commitImageJob(user: AuthenticatedUser, jobId: string): Promise<void>;
   resolveDesignOperationTarget(
     user: AuthenticatedUser,
     target: DesignJobTarget,
@@ -271,6 +274,21 @@ export function createJobService(options: {
             ...(typeof input.payload.placeholder_element_id === "string"
               ? { element_id: input.payload.placeholder_element_id }
               : {}),
+            ...(typeof input.payload.placement_x === "number" &&
+            typeof input.payload.placement_y === "number"
+              ? {
+                  placement: {
+                    x: input.payload.placement_x,
+                    y: input.payload.placement_y,
+                    ...(typeof input.payload.placement_width === "number"
+                      ? { width: input.payload.placement_width }
+                      : {}),
+                    ...(typeof input.payload.placement_height === "number"
+                      ? { height: input.payload.placement_height }
+                      : {}),
+                  },
+                }
+              : {}),
           })
         : null;
       const explicitTarget =
@@ -311,6 +329,37 @@ export function createJobService(options: {
           ? explicitTarget.idempotency_key
           : null;
       const findReplay = async () => {
+        if (input.proposalId) {
+          const { data, error } = await client
+            .from("background_jobs")
+            .select(SELECT_COLS)
+            .eq("id", input.proposalId)
+            .eq("created_by", user.id)
+            .maybeSingle();
+          if (error)
+            throw new JobServiceError(
+              "job_query_failed",
+              "Failed to read confirmed image job.",
+              500,
+            );
+          if (!data) return null;
+          const existing = mapJobRow(
+            data as unknown as Record<string, unknown>,
+          );
+          if (
+            existing.workspace_id !== input.workspaceId ||
+            existing.session_id !== input.sessionId
+          )
+            throw new JobServiceError(
+              "job_create_failed",
+              "Image proposal context mismatch.",
+              409,
+            );
+          return {
+            job: existing,
+            billingCommitted: Boolean(data.credits_transaction_id),
+          };
+        }
         if (!designReplayKey || explicitTarget?.kind !== "design") return null;
         const { data, error } = await client
           .from("background_jobs")
@@ -357,9 +406,27 @@ export function createJobService(options: {
           billingCommitted: replay.billingCommitted,
         };
 
+      if (input.proposalId) {
+        const { error } = await options.getAdminClient().rpc(
+          "loomic_prepare_image_submission" as never,
+          {
+            p_id: input.proposalId,
+            p_user: user.id,
+            p_session: input.sessionId,
+            p_cost: input.providerBilling?.creditsCost ?? 0,
+          } as never,
+        );
+        if (error)
+          throw new JobServiceError(
+            "job_create_failed",
+            "Cannot prepare confirmed image submission.",
+            409,
+          );
+      }
       const { data: job, error } = await client
         .from("background_jobs")
         .insert({
+          ...(input.proposalId ? { id: input.proposalId } : {}),
           workspace_id: input.workspaceId,
           project_id: projectId,
           canvas_id: columns.canvasId,
@@ -456,6 +523,21 @@ export function createJobService(options: {
         replayed: false,
         billingCommitted: false,
       };
+    },
+
+    async commitImageJob(user, jobId) {
+      const job = await this.getJob(user, jobId);
+      if (job.created_by !== user.id)
+        throw new JobServiceError("job_not_found", "Job not found.", 404);
+      const { error } = await options
+        .getAdminClient()
+        .rpc("loomic_commit_image_job" as never, { p_job: jobId } as never);
+      if (error)
+        throw new JobServiceError(
+          "job_create_failed",
+          `Image submission not committed: ${error.message}`,
+          500,
+        );
     },
 
     async enqueueJob(user, jobId) {

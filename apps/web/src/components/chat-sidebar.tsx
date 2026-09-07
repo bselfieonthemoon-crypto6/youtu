@@ -118,12 +118,7 @@ function markConfirmationHandled(confirmationId: string): void {
   }
 }
 
-function isExplicitImageConfirmationMessage(text: string): boolean {
-  const normalized = text.trim().replace(/[，。！？!?,.\s]/g, "");
-  return /^(确认|确认生成|可以|可以生成|好|好的|没问题|开始生成|继续生成|确认请按上述方案继续执行并生成预览)$/.test(
-    normalized,
-  );
-}
+import { isExplicitImageConfirmationMessage } from "@loomic/shared";
 
 export function ChatSidebar({
   accessToken,
@@ -526,12 +521,30 @@ export function ChatSidebar({
     void handleNewChat();
   }, [handleCancelRun, handleNewChat]);
 
+  const imageConfirmationSenderRef = useRef<
+    | ((
+        id: string,
+        decision: "confirm" | "cancel",
+      ) => Promise<{ status: string; message?: string }>)
+    | null
+  >(null);
   const handleConfirmAction = useCallback(
     (
       confirmationId: string,
       decision: "confirm" | "cancel",
       confirmationKind: ToolConfirmationKind = "delete",
     ) => {
+      if (["image_generation"].includes(confirmationKind)) {
+        // Image confirmations are durable session-bound run commands. The
+        // legacy destructive-action endpoint stores closures and cannot replay them.
+        return (
+          imageConfirmationSenderRef.current?.(confirmationId, decision) ??
+          Promise.resolve({
+            status: "failed",
+            message: "对话尚未就绪，请稍后重试。",
+          })
+        );
+      }
       // During the initial session load React state can already contain the
       // visible session while the ref observed by this callback is one render
       // behind. Fall back to state so an auto-confirmed image proposal still
@@ -821,6 +834,73 @@ export function ChatSidebar({
     [accessToken],
   );
 
+  // Resume persisted queued jobs on refresh too; a completed Agent turn is not
+  // the completion of its background generation job.
+  const observedGenerationJobs = useRef(new Set<string>());
+  useEffect(() => {
+    if (!accessToken || !activeSessionId) return;
+    const session = activeSessionId;
+    for (const message of messages)
+      for (const block of message.contentBlocks ?? []) {
+        if (block.type !== "tool") continue;
+        const output = block.output as Record<string, unknown> | undefined;
+        const jobId = output?.jobId;
+        if (
+          typeof jobId !== "string" ||
+          !["processing", "queued"].includes(String(output?.status))
+        )
+          continue;
+        const key = `${session}:${jobId}`;
+        if (observedGenerationJobs.current.has(key)) continue;
+        observedGenerationJobs.current.add(key);
+        void waitForGenerationJob(accessToken, jobId)
+          .then(async (job) => {
+            if (job.status === "succeeded") {
+              if (activeSessionIdRef.current === session) {
+                await reloadMessages(session);
+                onCanvasSync?.();
+              } else {
+                observedGenerationJobs.current.delete(key);
+              }
+            } else {
+              updateSessionMessages(session, (previous) =>
+                previous.map((item) => ({
+                  ...item,
+                  contentBlocks:
+                    item.contentBlocks?.map((b) =>
+                      b.type === "tool" && b.output?.jobId === jobId
+                        ? {
+                            ...b,
+                            status: "failed" as const,
+                            output: {
+                              ...b.output,
+                              status: job.status,
+                              error: job.error_message ?? "生成任务未完成",
+                            },
+                            outputSummary:
+                              job.error_message ?? "生成任务未完成",
+                          }
+                        : b,
+                    ) ?? [],
+                })),
+              );
+            }
+          })
+          .catch(() => {
+            // Keep the saved job and the card's manual wait action; never regenerate.
+            observedGenerationJobs.current.delete(key);
+          });
+      }
+  }, [
+    accessToken,
+    activeSessionId,
+    messages,
+    activeSessionIdRef,
+    reloadMessages,
+    updateSessionMessages,
+    onCanvasSync,
+  ]);
+
   const handleRestoreGeneration = useCallback(
     async (jobId: string) => {
       const restored = await restoreJobToCanvas(accessToken, jobId);
@@ -838,9 +918,14 @@ export function ChatSidebar({
       imageGenerationPreferenceOverride?: ImageGenerationPreference,
       mentionsOverride?: MessageMention[],
       executionModeOverride?: AgentExecutionMode,
+      imageConfirmation?: {
+        confirmationId: string;
+        decision: "confirm" | "cancel";
+      },
     ) => {
       const currentSessionId = activeSessionIdRef.current;
       if (streaming || !currentSessionId) return;
+      let executionFailed = false;
 
       // Merge explicitly-attached images with auto-sensed canvas selection images
       let currentAttachments = attachmentsOverride ?? readyAttachments;
@@ -998,6 +1083,13 @@ export function ChatSidebar({
 
           // Apply event to messages (single source of truth — shared with reconnect)
           applyStreamEvent(event, assistantId, currentSessionId);
+          if (
+            imageConfirmation &&
+            (event.type === "run.failed" ||
+              (event.type === "tool.completed" &&
+                typeof event.output?.error === "string"))
+          )
+            executionFailed = true;
 
           // Forward event to parent for fallback job polling (timed-out generation recovery)
           onStreamEvent?.(event);
@@ -1062,6 +1154,7 @@ export function ChatSidebar({
               sessionId: currentSessionId,
               conversationId: canvasId,
               prompt: text,
+              ...(imageConfirmation ? { imageConfirmation } : {}),
               canvasId,
               accessToken: accessTokenRef.current,
               ...(currentAttachments.length > 0
@@ -1105,6 +1198,7 @@ export function ChatSidebar({
         await streamDone;
         cleanup();
       } catch {
+        executionFailed = true;
         updateSessionMessages(currentSessionId, (prev) =>
           prev.map((m) => {
             if (m.id !== assistantId) return m;
@@ -1123,6 +1217,7 @@ export function ChatSidebar({
         setStreaming(false);
         clearActiveRun();
       }
+      return { status: executionFailed ? "failed" : "accepted" };
     },
     [
       streaming,
@@ -1142,6 +1237,24 @@ export function ChatSidebar({
       clearActiveRun,
     ],
   );
+
+  imageConfirmationSenderRef.current = async (confirmationId, decision) => {
+    if (streaming || !ws.connected)
+      return {
+        status: "failed",
+        message: "请等待当前回复结束并确认连接正常。",
+      };
+    const result = await handleSend(
+      decision === "confirm" ? "确认生成" : "取消生成",
+      [],
+      undefined,
+      [],
+      undefined,
+      { confirmationId, decision },
+    );
+    if (result?.status === "accepted") markConfirmationHandled(confirmationId);
+    return result ?? { status: "failed", message: "确认未发送，请重试。" };
+  };
 
   // Explicit commands from the selected-image toolbar survive deselection.
   // Agent actions pass an attachment override directly, avoiding a state race
@@ -1228,6 +1341,7 @@ export function ChatSidebar({
         .join("") ?? "";
     if (
       confirmation?.confirmationId &&
+      confirmation.kind !== "image_generation" &&
       previousMessage?.role === "user" &&
       isExplicitImageConfirmationMessage(previousText)
     ) {

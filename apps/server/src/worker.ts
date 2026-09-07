@@ -292,10 +292,18 @@ async function main() {
   };
 
   const maintenance=createBackgroundMaintenance(reconcileCanvases,error=>console.error(`${tag} Recovery scan failed:`,error));
+  let lastSubmissionRecoveryAt = 0;
+  const submissionMaintenance = createBackgroundMaintenance(async () => {
+    if (Date.now() - lastSubmissionRecoveryAt < 30_000) return;
+    lastSubmissionRecoveryAt = Date.now();
+    const { error } = await getAdminClient().rpc("loomic_recover_image_submissions" as never);
+    if (error) throw new Error(error.message);
+  }, error => console.error(`${tag} Image submission recovery failed:`, error));
   const pollQueue = async (queue: (typeof WORKER_QUEUES)[number]) => {
     while (running) {
       try {
         if (queue === "image_generation_jobs") {
+          submissionMaintenance.trigger();
           maintenance.trigger();
         }
         const inFlight = inFlightByQueue.get(queue);

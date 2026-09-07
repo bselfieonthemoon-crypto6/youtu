@@ -1,5 +1,16 @@
 import { tool } from "langchain";
 import { z } from "zod";
+import {
+  isExplicitImageConfirmationMessage,
+  isExplicitImageCancellation,
+} from "@loomic/shared";
+import type { ImageProposalStore } from "../../features/agent-actions/image-proposal-store.js";
+import {
+  runImageGenerate,
+  type ImageGenerateInput,
+  type SubmitImageJobFn,
+  type PersistImageFn,
+} from "./image-generate.js";
 
 import {
   DestructiveConfirmationError,
@@ -7,20 +18,20 @@ import {
 } from "../../features/agent-actions/destructive-confirmation-service.js";
 
 function isExplicitDecision(prompt: unknown, decision: "confirm" | "cancel") {
-  if (typeof prompt !== "string") return false;
-  const text = prompt.trim().toLowerCase().replace(/[，。！？!?,.\s]/g, "");
-  if (!text || text.length > 50) return false;
-  if (decision === "cancel") {
-    return /取消|不生成|不要生成|先不|算了|不要了/.test(text);
-  }
-  return (
-    /确认|同意|开始生成|可以生成|就按.*生成|按这个.*生成/.test(text) ||
-    /^(可以|好的|好|没问题|继续)$/.test(text)
-  );
+  return decision === "cancel"
+    ? isExplicitImageCancellation(prompt)
+    : isExplicitImageConfirmationMessage(prompt);
 }
 
 export function createImageGenerationConfirmationTool(deps: {
   confirmationService: DestructiveConfirmationService;
+  proposalStore?: ImageProposalStore;
+  submitImageJob?: SubmitImageJobFn;
+  persistImage?: PersistImageFn;
+  validateDesignTarget?: (
+    target: NonNullable<ImageGenerateInput["target"]>,
+    context: any,
+  ) => Promise<void>;
 }) {
   return tool(
     async (
@@ -52,6 +63,50 @@ export function createImageGenerationConfirmationTool(deps: {
         };
       }
 
+      if (deps.proposalStore) {
+        try {
+          const proposal = await deps.proposalStore.decide(
+            configurable,
+            input.confirmationId,
+            input.decision,
+          );
+          if (input.decision === "cancel")
+            return {
+              status: "canceled",
+              summary: "已取消方案，没有提交生成。",
+            };
+          if (!deps.submitImageJob)
+            return {
+              error: "submission_unavailable",
+              summary: "任务服务不可用，未生成，请稍后重试确认。",
+            };
+          const existing = await deps.proposalStore.job(
+            configurable,
+            proposal.id,
+          );
+          if (!existing && proposal.input.target) {
+            if (!deps.validateDesignTarget)
+              throw new Error("画板校验服务不可用");
+            await deps.validateDesignTarget(
+              proposal.input.target,
+              configurable,
+            );
+          }
+          return await runImageGenerate(
+            { ...proposal.input, proposalId: proposal.id },
+            deps.persistImage,
+            deps.submitImageJob,
+          );
+        } catch (error) {
+          return {
+            error: "confirmation_unavailable",
+            summary:
+              error instanceof Error
+                ? error.message
+                : "无法确认方案，请重新创建方案。",
+          };
+        }
+      }
       if (input.decision === "cancel") {
         deps.confirmationService.cancel({
           confirmationId: input.confirmationId,
@@ -92,7 +147,8 @@ export function createImageGenerationConfirmationTool(deps: {
           error.code === "confirmation_requires_new_turn"
         ) {
           return {
-            summary: "确认操作已交由产品确认界面处理，请勿在当前 Agent 轮次重复确认。",
+            summary:
+              "确认操作已交由产品确认界面处理，请勿在当前 Agent 轮次重复确认。",
             status: "awaiting_ui_confirmation",
           };
         }
@@ -110,7 +166,9 @@ export function createImageGenerationConfirmationTool(deps: {
           .describe("The confirmationId returned by generate_image"),
         decision: z
           .enum(["confirm", "cancel"])
-          .describe("confirm only after explicit user approval; cancel when declined"),
+          .describe(
+            "confirm only after explicit user approval; cancel when declined",
+          ),
       }),
     },
   );

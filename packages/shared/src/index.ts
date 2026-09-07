@@ -13,3 +13,4 @@ export * from "./workspace-member-contracts.js";
 export * from "./skill-contracts.js";
 export * from "./ws-protocol.js";
 export * from "./design-contracts.js";
+export * from "./image-confirmation.js";

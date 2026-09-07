@@ -1,5 +1,7 @@
 import type { StructuredTool } from "@langchain/core/tools";
 import type { AnyBackendProtocol } from "deepagents";
+import { tool } from "langchain";
+import { z } from "zod";
 
 import type { DestructiveConfirmationService } from "../../features/agent-actions/destructive-confirmation-service.js";
 import type {
@@ -19,6 +21,8 @@ import {
   createImageGenerateTool,
 } from "./image-generate.js";
 import { createImageGenerationConfirmationTool } from "./image-generation-confirmation.js";
+import { createImageProposalStore } from "../../features/agent-actions/image-proposal-store.js";
+import { createDesignImageTargetValidator } from "./design-image-target.js";
 import { createInspectCanvasTool } from "./inspect-canvas.js";
 import { createDesignDiscoveryTool } from "./design-discovery.js";
 import { createManipulateCanvasTool } from "./manipulate-canvas.js";
@@ -78,6 +82,10 @@ export function createMainAgentTools(
     designTools?: DesignToolDependencies;
   },
 ) {
+  const proposalStore = deps.submitImageJob
+    ? createImageProposalStore(deps.createUserClient)
+    : undefined;
+  const validateDesignTarget = createDesignImageTargetValidator(deps);
   const tools: StructuredTool[] = [
     createProjectSearchTool(backend),
     createInspectCanvasTool(deps),
@@ -90,6 +98,29 @@ export function createMainAgentTools(
         : {}),
     }),
   ];
+  if (proposalStore)
+    tools.push(
+      tool(
+        async (_input, config) => {
+          const latest = await proposalStore.latest(
+            (config as any).configurable,
+          );
+          return latest
+            ? {
+                confirmationId: latest.id,
+                status: latest.status,
+                input: latest.input,
+              }
+            : { status: "no_proposal", summary: "当前对话尚无图片方案。" };
+        },
+        {
+          name: "get_image_proposal",
+          description:
+            "Read the latest persisted image proposal in this conversation. Always call before confirming or revising an image proposal; never guess the confirmation ID or target.",
+          schema: z.object({}),
+        },
+      ),
+    );
   if (deps.designTools)
     tools.push(
       ...createDesignTools(deps.designTools),
@@ -104,40 +135,8 @@ export function createMainAgentTools(
   ) {
     tools.push(
       createImageGenerateTool({
-        ...(deps.designTools
-          ? {
-              validateDesignTarget: async (target, context) => {
-                const design = await deps.designTools!.designService.get(
-                  {
-                    id: context.user_id,
-                    accessToken: context.access_token,
-                    email: "",
-                    userMetadata: {},
-                  },
-                  target.design_id,
-                );
-                if (design.workspace_id !== context.workspace_id)
-                  throw new Error("画板不属于当前工作区");
-                const { data, error } = await deps
-                  .createUserClient(context.access_token)
-                  .from("design_nodes")
-                  .select("design_id")
-                  .eq("design_id", design.id)
-                  .eq("canvas_id", context.canvas_id)
-                  .eq("workspace_id", context.workspace_id)
-                  .is("deleted_at", null)
-                  .maybeSingle();
-                if (error || !data)
-                  throw new Error(
-                    "画板不属于当前画布，请先调用 list_designs 确定目标",
-                  );
-                if (design.revision !== target.expected_revision)
-                  throw new Error(
-                    "画板版本已改变，请重新 inspect_design 后生成方案",
-                  );
-              },
-            }
-          : {}),
+        ...(proposalStore ? { proposalStore } : {}),
+        validateDesignTarget,
         ...(deps.destructiveConfirmationService
           ? { confirmationService: deps.destructiveConfirmationService }
           : {}),
@@ -169,6 +168,10 @@ export function createMainAgentTools(
     tools.push(
       createImageGenerationConfirmationTool({
         confirmationService: deps.destructiveConfirmationService,
+        ...(proposalStore ? { proposalStore } : {}),
+        validateDesignTarget,
+        ...(deps.submitImageJob ? { submitImageJob: deps.submitImageJob } : {}),
+        ...(deps.persistImage ? { persistImage: deps.persistImage } : {}),
       }),
     );
   }

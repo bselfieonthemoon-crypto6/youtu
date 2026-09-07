@@ -31,4 +31,36 @@ describe("waitForGenerationJob", () => {
     });
     expect(fetchJobMock).toHaveBeenCalledTimes(2);
   });
+  it("waits for canvas delivery after provider success", async () => {
+    vi.useFakeTimers();
+    fetchJobMock
+      .mockResolvedValueOnce({
+        job: { status: "succeeded", target_kind: "canvas", result: {} },
+      })
+      .mockResolvedValueOnce({
+        job: {
+          status: "succeeded",
+          target_kind: "canvas",
+          result: { canvas_element_id: "element" },
+        },
+      });
+    const waiting = waitForGenerationJob("token", "delivery-pending");
+    await vi.advanceTimersByTimeAsync(5000);
+    expect((await waiting).result?.canvas_element_id).toBe("element");
+    expect(fetchJobMock).toHaveBeenCalledTimes(2);
+  });
+  it("stops on submission failure even before the first provider attempt", async () => {
+    fetchJobMock.mockResolvedValue({
+      job: {
+        status: "failed",
+        error_code: "submission_failed",
+        attempt_count: 0,
+        max_attempts: 3,
+      },
+    });
+    expect(
+      (await waitForGenerationJob("token", "submission-failed")).status,
+    ).toBe("failed");
+    expect(fetchJobMock).toHaveBeenCalledTimes(1);
+  });
 });

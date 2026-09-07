@@ -40,7 +40,8 @@ export function readGenerationJobElementId(job: BackgroundJob): string | null {
   }
   const result = job.result;
   if (!result) return null;
-  const value = result.canvas_element_id ?? result.elementId ?? result.element_id;
+  const value =
+    result.canvas_element_id ?? result.elementId ?? result.element_id;
   return typeof value === "string" && value ? value : null;
 }
 
@@ -52,7 +53,8 @@ export function waitForGenerationJob(
   accessToken: string,
   jobId: string,
 ): Promise<BackgroundJob> {
-  const existing = sharedPolls.get(jobId);
+  const pollKey = `${accessToken}:${jobId}`;
+  const existing = sharedPolls.get(pollKey);
   if (existing) return existing.promise;
 
   const promise = (async () => {
@@ -60,8 +62,14 @@ export function waitForGenerationJob(
     while (Date.now() - startedAt <= MAX_POLL_DURATION_MS) {
       const { job } = await fetchJob(accessToken, jobId);
       if (
-        job.status === "succeeded" ||
+        (job.status === "succeeded" &&
+          (job.target_kind === "canvas"
+            ? Boolean(readGenerationJobElementId(job))
+            : job.target_kind === "design"
+              ? Boolean(job.result?.chat_finalized_at)
+              : true)) ||
         TERMINAL_FAILURE_STATUSES.has(job.status) ||
+        job.error_code === "submission_failed" ||
         (job.status === "failed" && job.attempt_count >= job.max_attempts)
       ) {
         return job;
@@ -70,10 +78,10 @@ export function waitForGenerationJob(
     }
     throw new Error("等待生成结果超时，请稍后再试。");
   })().finally(() => {
-    sharedPolls.delete(jobId);
+    sharedPolls.delete(pollKey);
   });
 
-  sharedPolls.set(jobId, { promise });
+  sharedPolls.set(pollKey, { promise });
   return promise;
 }
 
@@ -112,7 +120,11 @@ export function useJobFallbackPolling({
       void waitForGenerationJob(token, jobId)
         .then((job) => {
           if (job.status !== "succeeded") return;
-          const elementId = readGenerationJobElementId(job);
+          const elementId =
+            readGenerationJobElementId(job) ??
+            (job.target_kind === "design" && job.result?.chat_finalized_at
+              ? job.design_id
+              : null);
           if (elementId) {
             onJobSucceededRef.current(jobId, jobType, elementId);
           }
@@ -141,16 +153,18 @@ export function useJobFallbackPolling({
 
       // Only trigger fallback for timeout errors with a valid jobId
       if (
-        typeof error !== "string" ||
-        !error.toLowerCase().includes("timed out") ||
+        (!(
+          typeof error === "string" && error.toLowerCase().includes("timed out")
+        ) &&
+          output.status !== "processing" &&
+          output.status !== "queued") ||
         typeof jobId !== "string" ||
         !jobId
       ) {
         return;
       }
 
-      const resolvedJobType =
-        typeof jobType === "string" ? jobType : "unknown";
+      const resolvedJobType = typeof jobType === "string" ? jobType : "unknown";
       startPolling(jobId, resolvedJobType);
     },
     [startPolling],

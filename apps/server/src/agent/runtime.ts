@@ -26,9 +26,14 @@ import {
   type BillingErrorCode,
   type ImageQualityLevel,
   getPlanConfig,
+  isExplicitImageCancellation,
+  isExplicitImageConfirmationMessage,
 } from "@loomic/shared";
 import type { ServerEnv } from "../config/env.js";
 import type { DestructiveConfirmationService } from "../features/agent-actions/destructive-confirmation-service.js";
+import { createImageProposalStore } from "../features/agent-actions/image-proposal-store.js";
+import { createImageGenerationConfirmationTool } from "./tools/image-generation-confirmation.js";
+import { createDesignImageTargetValidator } from "./tools/design-image-target.js";
 import type { AgentRunMetadataService } from "../features/agent-runs/agent-run-service.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import {
@@ -577,6 +582,36 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             userMetadata: {},
           };
 
+          if (input.proposalId) {
+            const { data: existing, error } = await client
+              .from("background_jobs")
+              .select("id,status,error_message,session_id,workspace_id")
+              .eq("id", input.proposalId)
+              .maybeSingle();
+            if (error) throw new Error("读取已确认任务失败，请重试确认。");
+            if (existing) {
+              if (
+                existing.session_id !== sessionId ||
+                existing.workspace_id !== workspaceId
+              )
+                throw new Error("任务不属于当前对话");
+              if (
+                existing.status === "failed" ||
+                existing.status === "canceled" ||
+                existing.status === "dead_letter"
+              )
+                return {
+                  jobId: existing.id,
+                  error:
+                    existing.error_message ??
+                    "任务已取消，请重新创建方案后确认。",
+                };
+              if (existing.status === "queued")
+                await jobSvc.commitImageJob(user, existing.id);
+              return { jobId: existing.id, status: "processing" };
+            }
+          }
+
           // ── Tier guard + credit checks (same as HTTP route) ──
           const billingModel = await resolveWorkspaceBillingModel(
             options.workspaceModelCatalogService,
@@ -639,7 +674,9 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           if (run.controller.signal.aborted)
             throw new Error("Run was canceled");
           const placeholderElementId =
-            canvasId && !input.target ? createCanvasElementId() : undefined;
+            canvasId && !input.target
+              ? (input.proposalId ?? createCanvasElementId())
+              : undefined;
           const requestedPlacement =
             canvasId && input.placementX != null && input.placementY != null
               ? {
@@ -654,9 +691,9 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             job,
             replayed: jobReplayed,
             billingCommitted,
-          } =
-            await jobSvc.createJobWithReplay(user, {
+          } = await jobSvc.createJobWithReplay(user, {
             workspaceId,
+            ...(input.proposalId ? { proposalId: input.proposalId } : {}),
             ...(designTarget
               ? { target: designTarget }
               : canvasId
@@ -692,9 +729,9 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                 : {}),
               ...(input.inputImages ? { input_images: input.inputImages } : {}),
             },
-            });
+          });
 
-          if (sessionId) {
+          if (sessionId && !jobReplayed) {
             const pendingBlocks = [
               {
                 type: "tool",
@@ -711,7 +748,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                   jobId: job.id,
                   jobType: "image_generation",
                 },
-                outputSummary: "正在生成图片",
+                outputSummary: "图片任务正在提交或排队",
               },
             ];
             const { error: pendingChatError } = await client
@@ -721,7 +758,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                   id: job.id,
                   session_id: sessionId,
                   role: "assistant",
-                  content: "正在生成图片",
+                  content: "图片任务正在提交或排队",
                   content_blocks: pendingBlocks,
                 },
                 { onConflict: "id" },
@@ -734,7 +771,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             }
           }
 
-          if (canvasId && placeholderElementId) {
+          if (canvasId && placeholderElementId && !jobReplayed) {
             try {
               await insertImageGenerationPlaceholder(
                 client,
@@ -797,61 +834,69 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               }
             | undefined;
           let charged = false;
-          if (run.controller.signal.aborted) {
+          if (run.controller.signal.aborted && !jobReplayed) {
             await jobSvc.cancelJob(user, job.id).catch(() => {});
             await markPlaceholderFailed("生成已取消");
             return { jobId: job.id, error: "Run was canceled" };
           }
           try {
+            if (input.proposalId) {
+              await jobSvc.commitImageJob(user, job.id);
+              return { jobId: job.id, status: "processing" };
+            }
             if (jobReplayed && job.status !== "queued") {
               jobLap("job_replayed", { jobId: job.id });
             } else {
-            if (run.controller.signal.aborted)
-              throw new Error("Run was canceled");
-            if (
-              options.creditService &&
-              creditsCost > 0 &&
-              !billingCommitted
-            ) {
-              const deduction = options.creditService.deductCreditsIdempotent
-                ? await options.creditService.deductCreditsIdempotent(
-                    workspaceId,
-                    userId,
-                    creditsCost,
-                    job.id,
-                    `Image generation: ${input.model}`,
-                  )
-                : {
-                    transactionId:
-                      await options.creditService.deductCredits(
+              if (run.controller.signal.aborted)
+                throw new Error("Run was canceled");
+              if (
+                options.creditService &&
+                creditsCost > 0 &&
+                !billingCommitted
+              ) {
+                const deduction = options.creditService.deductCreditsIdempotent
+                  ? await options.creditService.deductCreditsIdempotent(
+                      workspaceId,
+                      userId,
+                      creditsCost,
+                      job.id,
+                      `Image generation: ${input.model}`,
+                    )
+                  : {
+                      transactionId: await options.creditService.deductCredits(
                         workspaceId,
                         userId,
                         creditsCost,
                         job.id,
                         `Image generation: ${input.model}`,
                       ),
-                    chargedNew: true,
-                  };
-              const txId = deduction.transactionId;
-              charged = deduction.chargedNew;
+                      chargedNew: true,
+                    };
+                const txId = deduction.transactionId;
+                charged = deduction.chargedNew;
+                if (run.controller.signal.aborted)
+                  throw new Error("Run was canceled");
+                await jobSvc.setCreditsInfo(job.id, creditsCost, txId);
+                const balanceAfter = (
+                  await options.creditService.getBalance(workspaceId)
+                ).balance;
+                billing = {
+                  estimate: creditsCost,
+                  charged: creditsCost,
+                  balanceAfter,
+                  currency: "credits",
+                };
+              }
               if (run.controller.signal.aborted)
                 throw new Error("Run was canceled");
-              await jobSvc.setCreditsInfo(job.id, creditsCost, txId);
-              const balanceAfter = (
-                await options.creditService.getBalance(workspaceId)
-              ).balance;
-              billing = {
-                estimate: creditsCost,
-                charged: creditsCost,
-                balanceAfter,
-                currency: "credits",
-              };
-            }
-            if (run.controller.signal.aborted)
-              throw new Error("Run was canceled");
-            await jobSvc.enqueueJob(user, job.id);
+              await jobSvc.enqueueJob(user, job.id);
             }
           } catch (billingOrEnqueueError) {
+            if (input.proposalId) {
+              // The RPC may have committed despite a lost response. Never cancel
+              // or refund an ambiguously acknowledged atomic submission.
+              return { jobId: job.id, status: "processing" };
+            }
             if (!jobReplayed)
               await jobSvc.cancelJob(user, job.id).catch(() => {});
             await markPlaceholderFailed(
@@ -1459,6 +1504,183 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
         };
       }
 
+      // Explicit generation approval is a product action, not another model
+      // planning turn. This path survives model outages and cannot rewrite the
+      // frozen proposal. Short ambiguous replies remain with the conversational Agent.
+      if (
+        submitImageJob &&
+        options.createUserClient &&
+        run.accessToken &&
+        run.sessionId &&
+        run.canvasId &&
+        !run.imageConfirmation &&
+        !isExplicitImageCancellation(run.prompt) &&
+        !isExplicitImageConfirmationMessage(run.prompt) &&
+        /改|换|调整|不要|取消|不同意|重新|再来|再做|增加|删除|去掉|尺寸|比例/.test(
+          run.prompt,
+        )
+      ) {
+        const { error } = await (
+          options.createUserClient(run.accessToken) as any
+        ).rpc("loomic_invalidate_image_proposals", {
+          p_session: run.sessionId,
+          p_canvas: run.canvasId,
+        });
+        if (error) {
+          const failure = new Error(
+            "旧图片方案无法作废，已停止本轮操作，请稍后重试。",
+          );
+          run.status = "failed";
+          await updatePersistedRunFailure(
+            options.agentRunMetadataService,
+            run,
+            now,
+            failure,
+          );
+          yield toFailedEvent(runId, now, failure);
+          return;
+        }
+      }
+      if (
+        submitImageJob &&
+        options.createUserClient &&
+        options.destructiveConfirmationService &&
+        run.accessToken &&
+        run.userId &&
+        run.sessionId &&
+        run.canvasId &&
+        (run.imageConfirmation ||
+          /^(确认生成|确认并生成|开始生成|继续生成|取消生成)[。！!\s]*$/.test(
+            run.prompt.trim(),
+          ))
+      ) {
+        const context = {
+          access_token: run.accessToken,
+          user_id: run.userId,
+          canvas_id: run.canvasId,
+          session_id: run.sessionId,
+          run_id: run.runId,
+          workspace_id: run.workspaceId,
+          user_prompt: run.prompt,
+        };
+        const store = createImageProposalStore(options.createUserClient);
+        try {
+          const latest = await store.latest(context);
+          if (latest || run.imageConfirmation) {
+            const toolCallId = randomUUID();
+            const toolInput = run.imageConfirmation ?? {
+              confirmationId: latest!.id,
+              decision: run.prompt.startsWith("取消")
+                ? ("cancel" as const)
+                : ("confirm" as const),
+            };
+            yield {
+              type: "run.started",
+              runId,
+              conversationId: run.conversationId,
+              sessionId: run.sessionId,
+              timestamp: now(),
+            };
+            yield {
+              type: "tool.started",
+              runId,
+              toolCallId,
+              toolName: "confirm_image_generation",
+              input: toolInput,
+              timestamp: now(),
+            };
+            const output = (await createImageGenerationConfirmationTool({
+              confirmationService: options.destructiveConfirmationService,
+              proposalStore: store,
+              submitImageJob,
+              validateDesignTarget: createDesignImageTargetValidator({
+                createUserClient: options.createUserClient,
+                ...(options.designTools
+                  ? { designTools: options.designTools }
+                  : {}),
+              }),
+            }).invoke(toolInput, { configurable: context })) as Record<
+              string,
+              unknown
+            >;
+            const summary =
+              typeof output.summary === "string"
+                ? output.summary
+                : "图片任务状态已更新";
+            const event: StreamEvent = {
+              type: "tool.completed",
+              runId,
+              toolCallId,
+              toolName: "confirm_image_generation",
+              output,
+              outputSummary: summary,
+              timestamp: now(),
+            };
+            await syncPersistedRunFromEvent(
+              options.agentRunMetadataService,
+              run,
+              event,
+              now,
+            );
+            yield event;
+            // The worker owns the job-result message; never overwrite it here.
+            const { error: chatError } = await (
+              options.createUserClient(run.accessToken) as UserSupabaseClient
+            )
+              .from("chat_messages")
+              .upsert(
+                {
+                  id: runId,
+                  session_id: run.sessionId,
+                  role: "assistant",
+                  content: summary,
+                  content_blocks: [
+                    {
+                      type: "tool",
+                      toolCallId,
+                      toolName: "confirm_image_generation",
+                      status: "completed",
+                      output,
+                      outputSummary: summary,
+                    },
+                  ] as any,
+                },
+                { onConflict: "id" },
+              );
+            if (chatError)
+              console.warn(
+                "[image-confirmation] Chat status persistence deferred:",
+                chatError.message,
+              );
+            const completed: StreamEvent = {
+              type: "run.completed",
+              runId,
+              timestamp: now(),
+            };
+            run.status = "completed";
+            await syncPersistedRunFromEvent(
+              options.agentRunMetadataService,
+              run,
+              completed,
+              now,
+            );
+            yield completed;
+            return;
+          }
+        } catch (error) {
+          const failed = toFailedEvent(runId, now, error);
+          run.status = "failed";
+          await updatePersistedRunFailure(
+            options.agentRunMetadataService,
+            run,
+            now,
+            error,
+          );
+          yield failed;
+          return;
+        }
+      }
+
       // Load workspace skills (user-installed skills from DB).
       // Done before backend creation so we know whether to add the
       // /workspace-skills/ Store route.
@@ -1968,6 +2190,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                         ? { workspace_id: run.workspaceId }
                         : {}),
                       run_id: run.runId,
+                      ...(run.sessionId ? { session_id: run.sessionId } : {}),
                       ...(run.prompt ? { user_prompt: run.prompt } : {}),
                       ...(Object.keys(attachmentDataMap).length > 0
                         ? { user_attachment_map: attachmentDataMap }

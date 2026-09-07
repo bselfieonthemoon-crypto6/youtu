@@ -446,7 +446,7 @@ describe("ChatSidebar", () => {
     });
   });
 
-  it("auto-confirms a structured proposal after the user already approved the text proposal", async () => {
+  it("requires review of the frozen image proposal and sends its exact ID through a session-bound run", async () => {
     fetchMessagesMock.mockResolvedValue({
       messages: [
         {
@@ -482,17 +482,6 @@ describe("ChatSidebar", () => {
       ],
     });
     const onCanvasSync = vi.fn();
-    let confirmationAck: ((ack: WsCommandAck) => void) | undefined;
-    vi.mocked(mockWs.confirmAction).mockImplementation(
-      (confirmationId, decision, onAck) => {
-        confirmationAck = onAck;
-        onAck?.({
-          type: "command.ack",
-          action: "agent.confirm_action",
-          payload: { confirmationId, status: "accepted", decision },
-        });
-      },
-    );
 
     render(
       <ChatSidebar
@@ -505,46 +494,36 @@ describe("ChatSidebar", () => {
       />,
     );
 
+    expect(
+      await screen.findByRole("heading", { name: "确认设计方案" }),
+    ).toBeInTheDocument();
+    expect(mockWs.startRun).not.toHaveBeenCalled();
+    await userEvent.click(
+      screen.getByRole("button", { name: /确认方案，继续生成/ }),
+    );
     await waitFor(() =>
-      expect(mockWs.confirmAction).toHaveBeenCalledWith(
-        "confirmation-1",
-        "confirm",
+      expect(mockWs.startRun).toHaveBeenCalledWith(
+        expect.objectContaining({
+          prompt: "确认生成",
+          imageConfirmation: {
+            confirmationId: "confirmation-1",
+            decision: "confirm",
+          },
+        }),
         expect.any(Function),
       ),
     );
-    expect(onCanvasSync).toHaveBeenCalled();
-    expect(await screen.findByText("图片生成中...")).toBeInTheDocument();
-    expect(
-      screen.queryByRole("heading", { name: "确认设计方案" }),
-    ).not.toBeInTheDocument();
-
-    confirmationAck?.({
-      type: "command.ack",
-      action: "agent.confirm_action",
-      payload: {
-        confirmationId: "confirmation-1",
-        status: "applied",
-        result: {
-          jobId: "job-1",
-          imageUrl: "https://example.com/generated.png",
-          mimeType: "image/png",
-          width: 1024,
-          height: 1024,
-          title: "Generated logo",
-        },
-      },
+    expect(mockWs.confirmAction).not.toHaveBeenCalled();
+    streamListener?.({
+      type: "run.completed",
+      runId: "run_123",
+      timestamp: new Date().toISOString(),
     });
     await waitFor(() =>
-      expect(screen.queryByText("图片生成中...")).not.toBeInTheDocument(),
+      expect(
+        screen.queryByRole("heading", { name: "确认设计方案" }),
+      ).not.toBeInTheDocument(),
     );
-    expect(await screen.findByText("Generated logo")).toBeInTheDocument();
-    expect(screen.getByRole("img", { name: "Generated logo" })).toHaveAttribute(
-      "src",
-      "https://example.com/generated.png",
-    );
-    // The worker owns durable persistence; the socket result is only used for
-    // immediate display and must not create a duplicate chat message.
-    expect(saveMessageMock).not.toHaveBeenCalled();
   });
 
   it("confirms a design template inline without showing an image generation placeholder", async () => {

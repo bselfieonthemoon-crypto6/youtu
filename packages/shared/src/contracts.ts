@@ -77,6 +77,13 @@ export const runCreateRequestSchema = z.object({
   sessionId: sessionIdSchema,
   conversationId: conversationIdSchema,
   prompt: z.string(),
+  imageConfirmation: z
+    .object({
+      confirmationId: z.string().uuid(),
+      decision: z.enum(["confirm", "cancel"]),
+    })
+    .strict()
+    .optional(),
   canvasId: canvasIdSchema.optional(),
   attachments: z.array(imageAttachmentSchema).optional(),
   imageGenerationPreference: imageGenerationPreferenceSchema.optional(),
@@ -160,7 +167,11 @@ export const modelInfoSchema = z.object({
   provider: z.string().min(1),
   source: z.enum(["environment", "workspace"]).optional(),
   providerDisplayName: z.string().min(1).optional(),
-  capabilities: z.array(z.enum(["text", "vision_input", "image_generation", "video_generation"])).optional(),
+  capabilities: z
+    .array(
+      z.enum(["text", "vision_input", "image_generation", "video_generation"]),
+    )
+    .optional(),
 });
 
 export const chatSessionIdSchema = identifierSchema;
@@ -211,24 +222,26 @@ export const planBlockSchema = z.object({
   steps: z.array(planStepSchema),
 });
 
-export const toolBlockSchema = z.object({
-  type: z.literal("tool"),
-  toolExecutionId: z.string().uuid().optional(),
-  toolCallId: z.string().min(1),
-  toolName: z.string().min(1),
-  status: z.enum(["running", "completed", "failed", "canceled"]),
-  input: z.record(z.unknown()).optional(),
-  output: z.record(z.unknown()).optional(),
-  outputSummary: z.string().optional(),
-  artifacts: z.array(toolArtifactSchema).optional(),
-  retryable: z.boolean().optional(),
-  planId: z.string().min(1).optional(),
-  planStepId: z.string().min(1).optional(),
-}).refine(
-  (value) =>
-    (value.planId === undefined) === (value.planStepId === undefined),
-  { message: "planId and planStepId must appear together" },
-);
+export const toolBlockSchema = z
+  .object({
+    type: z.literal("tool"),
+    toolExecutionId: z.string().uuid().optional(),
+    toolCallId: z.string().min(1),
+    toolName: z.string().min(1),
+    status: z.enum(["running", "completed", "failed", "canceled"]),
+    input: z.record(z.unknown()).optional(),
+    output: z.record(z.unknown()).optional(),
+    outputSummary: z.string().optional(),
+    artifacts: z.array(toolArtifactSchema).optional(),
+    retryable: z.boolean().optional(),
+    planId: z.string().min(1).optional(),
+    planStepId: z.string().min(1).optional(),
+  })
+  .refine(
+    (value) =>
+      (value.planId === undefined) === (value.planStepId === undefined),
+    { message: "planId and planStepId must appear together" },
+  );
 
 export const imageBlockSchema = z.object({
   type: z.literal("image"),
@@ -335,7 +348,9 @@ export type AgentExecutionMode = z.infer<typeof agentExecutionModeSchema>;
 export type ContentBlock = z.infer<typeof contentBlockSchema>;
 export type ChatSessionSummary = z.infer<typeof chatSessionSummarySchema>;
 export type ChatMessage = z.infer<typeof chatMessageSchema>;
-export type ChatMessageCreateRequest = z.infer<typeof chatMessageCreateRequestSchema>;
+export type ChatMessageCreateRequest = z.infer<
+  typeof chatMessageCreateRequestSchema
+>;
 export type ChatToolActivity = z.infer<typeof chatToolActivitySchema>;
 export type ProfileUpdateRequest = z.infer<typeof profileUpdateRequestSchema>;
 export type WorkspaceSettings = z.infer<typeof workspaceSettingsSchema>;

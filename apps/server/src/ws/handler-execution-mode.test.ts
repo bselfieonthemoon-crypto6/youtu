@@ -17,7 +17,7 @@ describe("agent.run WebSocket execution mode", () => {
     await Promise.all(apps.splice(0).map((app) => app.close()));
   });
 
-  it("normalizes legacy executionMode values to Thinking", async () => {
+  it("normalizes legacy executionMode and preserves the bound image confirmation", async () => {
     const createRun = vi.fn().mockReturnValue({
       conversationId: "conversation-1",
       runId: "run-1",
@@ -66,6 +66,7 @@ describe("agent.run WebSocket execution mode", () => {
           executionMode: "fast",
           model: "google:gemini-test",
           prompt: "hello",
+          imageConfirmation: { confirmationId: "10000000-0000-4000-8000-000000000001", decision: "confirm" },
           sessionId: "session-1",
         },
       }),
@@ -78,6 +79,7 @@ describe("agent.run WebSocket execution mode", () => {
     expect(createRun).toHaveBeenCalledWith(
       expect.objectContaining({
         executionMode: "thinking",
+        imageConfirmation: { confirmationId: "10000000-0000-4000-8000-000000000001", decision: "confirm" },
         model: "google:gemini-test",
       }),
       expect.objectContaining({
