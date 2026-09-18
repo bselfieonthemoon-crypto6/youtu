@@ -612,6 +612,54 @@ describe("Mastra real SDK stream bridge (synthetic transport, not provider E2E)"
       { totalBytes: 2_000, resultBytes: 1_200, argsBytes: 300 });
     expect(JSON.stringify(later)).toContain('"rows":[1,2]');
   });
+
+  it("never compacts away a Skill method the model deliberately loaded", () => {
+    // A guide read is the ONLY way method text reaches the model now that the
+    // runtime stopped preloading bodies, so an OLD guide read must survive even a
+    // budget tiny enough to drop newer non-guide calls. Dropping it would leave the
+    // model composing a prompt from a guide it can no longer see.
+    const call = (id: string, toolName: string, result: unknown) => ({
+      id: `message-${id}`, role: "assistant" as const, createdAt: new Date(),
+      content: { format: 2 as const, parts: [
+        { type: "tool-invocation" as const, toolInvocation: { toolCallId: id, toolName,
+          state: "result" as const, result } },
+      ] },
+    });
+    const projected = compactMastraStepToolContext([
+      call("guide", "use_skill", { status: "loaded", instructions: "GUIDE-METHOD" }),
+      call("canvas-1", "inspect_canvas", { rows: "x".repeat(5_000) }),
+      call("canvas-2", "inspect_canvas", { rows: "y".repeat(5_000) }),
+    ] as any, { totalBytes: 2_000, resultBytes: 1_200, argsBytes: 300 });
+    const kept = projected.flatMap(item => item.content.parts)
+      .filter((part: any) => part.type === "tool-invocation") as any[];
+    expect(kept.some(part => part.toolInvocation.toolCallId === "guide")).toBe(true);
+    expect(JSON.stringify(kept)).toContain("GUIDE-METHOD");
+  });
+
+  it("sizes the default result budget so a real guide composition arrives whole", () => {
+    const composed = {
+      status: "composed", authority: "method_suggestions_only", executed: false,
+      primary: { name: "game-promo-visuals", instructions: "主".repeat(2_600) },
+      helpers: [{ name: "product-visual", instructions: "助".repeat(1_000) }],
+    };
+    const message = {
+      id: "compose", role: "assistant" as const, createdAt: new Date(),
+      content: { format: 2 as const, parts: [
+        { type: "tool-invocation" as const, toolInvocation: { toolCallId: "c", toolName: "compose_skills",
+          state: "result" as const, result: composed } },
+      ] },
+    };
+    // The previous 10 000-byte cap replaced a composition of this size with a raw
+    // JSON slice: a half guide presented to the model as method text.
+    const underOldCap = JSON.stringify(compactMastraStepToolContext([message] as any,
+      { resultBytes: 10_000 }));
+    expect(underOldCap).toContain("truncated");
+    // The default budget must carry it whole, because a guide cannot be re-derived
+    // and re-reading burns a step.
+    const whole = JSON.stringify(compactMastraStepToolContext([message] as any));
+    expect(whole).toContain("助".repeat(1_000));
+    expect(whole).not.toContain("truncated");
+  });
   it("precompiles native generate/edit target schemas for the DeepSeek model identifier", async () => {
     const calls: any[] = [];
     const model = createOpenAICompatible({ name: "test", baseURL: "https://test.invalid/v1",

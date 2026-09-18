@@ -111,8 +111,32 @@ export function createMastraWorkspaceModel(snapshot: {
   }).chatModel(snapshot.upstreamModelId);
 }
 
-const DEFAULT_STEP_TOOL_CONTEXT_BYTES = 48_000;
-const DEFAULT_TOOL_RESULT_BYTES = 10_000;
+/**
+ * Tools whose RESULT is a Skill method the model deliberately loaded.
+ *
+ * This matters because a Skill guide now reaches the model ONLY as a tool result:
+ * the runtime stopped preloading bodies into the instructions, so `use_skill` /
+ * `compose_skills` are the single path by which method text arrives. The step
+ * compactor below keeps tool groups newest-first and DROPS the overflow, which used
+ * to be harmless (the routed bodies lived in the instructions and were never
+ * compacted) but would now silently take a loaded method away mid-run — the model
+ * would be left composing a prompt from a guide it can no longer see. These groups
+ * are therefore never dropped.
+ */
+const METHOD_READ_TOOL_NAMES = new Set(["use_skill", "compose_skills"]);
+
+/**
+ * Byte budgets for one step's tool context.
+ *
+ * `resultBytes` is sized so a real guide always arrives whole: the largest package
+ * body in this repo is 8318 bytes, and a normal primary + helpers composition runs
+ * to roughly 14 KB, both of which the previous 10 000-byte cap would have replaced
+ * with a raw JSON slice — a half guide presented as method text. `totalBytes` is
+ * raised with it so the never-drop rule above rarely forces anything else out, and
+ * the run's own context budget remains the real ceiling.
+ */
+const DEFAULT_STEP_TOOL_CONTEXT_BYTES = 72_000;
+const DEFAULT_TOOL_RESULT_BYTES = 24_000;
 const DEFAULT_TOOL_ARGS_BYTES = 3_000;
 
 /** Model-only projection. Raw tool events and UI artifacts remain untouched. */
@@ -145,21 +169,25 @@ export function compactMastraStepToolContext(
     },
   }));
 
-  const groups = new Map<string, { bytes: number; lastIndex: number }>();
+  const groups = new Map<string, { bytes: number; lastIndex: number; methodRead: boolean }>();
   let partIndex = 0;
   for (const message of projected) for (const part of message.content.parts) {
     partIndex += 1;
     if (!isMastraToolInvocationPart(part)) continue;
     const id = part.toolInvocation.toolCallId;
-    const current = groups.get(id) ?? { bytes: 0, lastIndex: partIndex };
+    const current = groups.get(id) ?? { bytes: 0, lastIndex: partIndex, methodRead: false };
     current.bytes += serializedBytes(part.toolInvocation);
     current.lastIndex = partIndex;
+    current.methodRead = current.methodRead || METHOD_READ_TOOL_NAMES.has(toolNameOf(part.toolInvocation));
     groups.set(id, current);
   }
   const keep = new Set<string>();
   let used = 0;
   const newestFirst = [...groups.entries()].sort((a, b) => b[1].lastIndex - a[1].lastIndex);
   for (const [id, group] of newestFirst) {
+    // A loaded method is never dropped, whatever the budget says: the model must
+    // not lose the guide it is working from. Everything else is newest-first.
+    if (group.methodRead) { keep.add(id); used += group.bytes; continue; }
     if (keep.size === 0 || used + group.bytes <= totalLimit) {
       keep.add(id);
       used += group.bytes;
@@ -171,6 +199,17 @@ export function compactMastraStepToolContext(
     if (parts.length === 0 && message.role === "assistant") return [];
     return [{ ...message, content: { ...message.content, parts } }];
   });
+}
+
+/**
+ * Tool name of an invocation part, read defensively: the SDK field is not part of
+ * this module's contract, and a missing name must degrade to "not a method read"
+ * rather than throw while compacting a live step.
+ */
+function toolNameOf(invocation: unknown): string {
+  const record = invocation as { toolName?: unknown; name?: unknown } | null | undefined;
+  return typeof record?.toolName === "string" ? record.toolName
+    : typeof record?.name === "string" ? record.name : "";
 }
 
 function isMastraToolInvocationPart(part: unknown): part is MastraToolInvocationPart {
