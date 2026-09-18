@@ -11,10 +11,10 @@ import type { ThreadService } from "./thread-service.js";
 
 export class ChatServiceError extends Error {
   readonly statusCode: number;
-  readonly code: "chat_error" | "session_not_found";
+  readonly code: "chat_error" | "session_not_found" | "chat_message_not_found";
 
   constructor(
-    code: "chat_error" | "session_not_found",
+    code: "chat_error" | "session_not_found" | "chat_message_not_found",
     message: string,
     statusCode: number,
   ) {
@@ -52,6 +52,18 @@ export type ChatService = {
     sessionId: string,
     input: ChatMessageCreateRequest,
   ): Promise<ChatMessage>;
+  /**
+   * Drop a message and every later message in the session.
+   *
+   * This is the server half of "edit and resend": the replacement turn must not
+   * leave the superseded attempt (its assistant reply, and any generation card
+   * inside it) visible above the new one. Returns how many rows were removed.
+   */
+  truncateFrom(
+    user: AuthenticatedUser,
+    sessionId: string,
+    fromMessageId: string,
+  ): Promise<{ deleted: number }>;
 };
 
 /**
@@ -282,6 +294,49 @@ export function createChatService(options: {
         contentBlocks,
         createdAt: data.created_at,
       };
+    },
+
+    async truncateFrom(user, sessionId, fromMessageId) {
+      const client = options.createUserClient(user.accessToken);
+      await requireVisibleRow(client, "chat_sessions", sessionId);
+      // Resolve the cut from conversation ORDER rather than a timestamp
+      // comparison: `now()` is stable inside a transaction, so two rows inserted
+      // by the same RPC can share created_at and a `>` filter would silently keep
+      // the superseded reply.
+      const { data, error } = await client
+        .from("chat_messages")
+        .select("id")
+        .eq("session_id", sessionId)
+        .order("created_at", { ascending: true })
+        .order("id", { ascending: true });
+      if (error) {
+        throw new ChatServiceError("chat_error", "Failed to read messages.", 500);
+      }
+      const ids = (data ?? []).map((row) => row.id);
+      const start = ids.indexOf(fromMessageId);
+      // RLS makes a foreign message indistinguishable from a missing one; keep
+      // that boundary instead of revealing whether it exists elsewhere.
+      if (start === -1) {
+        throw new ChatServiceError("chat_message_not_found", "Message not found.", 404);
+      }
+      const doomed = ids.slice(start);
+      // Chunk the id list: a long conversation would otherwise overflow the
+      // PostgREST URL, and a partial delete is worse than a retried one.
+      const CHUNK = 100;
+      let deleted = 0;
+      for (let index = 0; index < doomed.length; index += CHUNK) {
+        const { error: deleteError, count } = await client
+          .from("chat_messages")
+          .delete({ count: "exact" })
+          .in("id", doomed.slice(index, index + CHUNK));
+        const accessRace = writeAccessRace(deleteError);
+        if (accessRace) throw accessRace;
+        if (deleteError) {
+          throw new ChatServiceError("chat_error", "Failed to truncate messages.", 500);
+        }
+        deleted += count ?? 0;
+      }
+      return { deleted };
     },
   };
 }

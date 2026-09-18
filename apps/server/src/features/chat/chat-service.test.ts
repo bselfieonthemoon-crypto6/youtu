@@ -13,9 +13,12 @@ function query(result: unknown) {
   const value: any = {
     select: vi.fn(),
     eq: vi.fn(),
+    order: vi.fn(),
     maybeSingle: vi.fn(),
     insert: vi.fn(),
     update: vi.fn(),
+    delete: vi.fn(),
+    in: vi.fn(),
     single: vi.fn(),
   };
   for (const method of Object.keys(value)) value[method].mockReturnValue(value);
@@ -93,5 +96,86 @@ describe("ChatService write authorization", () => {
       statusCode: 404,
       message: "Chat target not found.",
     });
+  });
+});
+
+describe("ChatService.truncateFrom (edit and resend)", () => {
+  it("removes the edited message and every later one, keeping earlier history", async () => {
+    const fixture = serviceWith(
+      { data: { id: "session-1" }, error: null },
+      { data: [{ id: "m1" }, { id: "m2" }, { id: "m3" }, { id: "m4" }], error: null },
+      { error: null, count: 3 },
+    );
+
+    await expect(fixture.service.truncateFrom(user, "session-1", "m2")).resolves.toEqual({ deleted: 3 });
+    // m1 must survive: the cut starts AT the edited message, it is not a session wipe.
+    expect(fixture.from).toHaveBeenLastCalledWith("chat_messages");
+    expect(fixture.from).toHaveBeenCalledTimes(3);
+  });
+
+  it("deletes only the edited message when it is the last one", async () => {
+    const fixture = serviceWith(
+      { data: { id: "session-1" }, error: null },
+      { data: [{ id: "m1" }, { id: "m2" }], error: null },
+      { error: null, count: 1 },
+    );
+
+    await expect(fixture.service.truncateFrom(user, "session-1", "m2")).resolves.toEqual({ deleted: 1 });
+  });
+
+  it("chunks a long tail so one id list cannot overflow the request URL", async () => {
+    const rows = Array.from({ length: 250 }, (_, index) => ({ id: `m${index}` }));
+    const fixture = serviceWith(
+      { data: { id: "session-1" }, error: null },
+      { data: rows, error: null },
+      { error: null, count: 100 },
+      { error: null, count: 100 },
+      { error: null, count: 50 },
+    );
+
+    await expect(fixture.service.truncateFrom(user, "session-1", "m0")).resolves.toEqual({ deleted: 250 });
+    // 1 session check + 1 id read + 3 delete chunks
+    expect(fixture.from).toHaveBeenCalledTimes(5);
+  });
+
+  it("reports a message outside this session as not found and deletes nothing", async () => {
+    const fixture = serviceWith(
+      { data: { id: "session-1" }, error: null },
+      { data: [{ id: "m1" }], error: null },
+    );
+
+    await expect(fixture.service.truncateFrom(user, "session-1", "somewhere-else"))
+      .rejects.toMatchObject({ code: "chat_message_not_found", statusCode: 404 });
+    expect(fixture.from).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports an invisible session as not found", async () => {
+    const fixture = serviceWith({ data: null, error: null });
+
+    await expect(fixture.service.truncateFrom(user, "session-1", "m1"))
+      .rejects.toMatchObject({ code: "session_not_found", statusCode: 404 });
+    expect(fixture.from).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the RLS write-policy race indistinguishable from a missing session", async () => {
+    const fixture = serviceWith(
+      { data: { id: "session-1" }, error: null },
+      { data: [{ id: "m1" }], error: null },
+      { error: { code: "42501", message: "policy detail" } },
+    );
+
+    await expect(fixture.service.truncateFrom(user, "session-1", "m1"))
+      .rejects.toMatchObject({ code: "session_not_found", statusCode: 404 });
+  });
+
+  it("surfaces an ordinary delete failure as a server error", async () => {
+    const fixture = serviceWith(
+      { data: { id: "session-1" }, error: null },
+      { data: [{ id: "m1" }], error: null },
+      { error: { code: "XX000", message: "database detail" } },
+    );
+
+    await expect(fixture.service.truncateFrom(user, "session-1", "m1"))
+      .rejects.toMatchObject({ code: "chat_error", statusCode: 500 });
   });
 });

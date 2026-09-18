@@ -49,6 +49,7 @@ import {
   fetchImageModels,
   restoreJobToCanvas,
   saveMessage,
+  truncateMessagesFrom,
 } from "../lib/server-api";
 import type { CanvasSelectedElement } from "./canvas-editor";
 import type { CanvasImageChatCommand } from "./canvas/image-toolbar-types";
@@ -1349,11 +1350,21 @@ export function ChatSidebar({
     const references = messageResendReferences(message.contentBlocks);
     editingSendRef.current = true;
     try {
+      // "重新编辑" replaces this turn, not adds a parallel one. Drop this message
+      // and everything after it first, otherwise the superseded attempt — its
+      // assistant reply and any generation card inside it — stays visible above
+      // the replacement. The server resolves the cut by conversation order.
+      const token = accessTokenRef.current;
+      if (!token) throw new Error("登录状态已失效，请重新登录。");
+      await truncateMessagesFrom(token, sessionId, message.id);
+      // allowEmpty: truncating the first message leaves an empty session, and the
+      // default guard would keep the superseded turn on screen.
+      await reloadMessages(sessionId, { allowEmpty: true });
       const result = await handleSend(text, references.attachments, references.imageGenerationPreference,
         references.mentions, undefined, true);
       if (!result || result.status === "failed") throw new Error("请求未能完成，请查看错误提示后重试。");
     } finally { editingSendRef.current = false; }
-  }, [activeSessionIdRef, handleSend, streaming, ws.connected]);
+  }, [accessTokenRef, activeSessionIdRef, handleSend, reloadMessages, streaming, ws.connected]);
 
   // Explicit commands from the selected-image toolbar survive deselection.
   // Agent actions pass an attachment override directly, avoiding a state race

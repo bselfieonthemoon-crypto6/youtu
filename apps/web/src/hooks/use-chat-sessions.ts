@@ -347,7 +347,14 @@ export function useChatSessions({
   }, []);
 
   // ── Reload messages (for reconnection) ──
-  const reloadMessages = useCallback(async (sessionId: string) => {
+  /**
+   * `allowEmpty` is required by "edit and resend": truncating the FIRST message
+   * leaves an empty session, and the default guard below would keep the
+   * superseded turn on screen forever. Every other caller keeps the guard,
+   * because an empty result there means "nothing persisted yet" and the
+   * optimistic local list must win.
+   */
+  const reloadMessages = useCallback(async (sessionId: string, options?: { allowEmpty?: boolean }) => {
     if (!sessionId) {
       console.warn("[chat] reloadMessages called with empty sessionId, skipping");
       return;
@@ -363,8 +370,8 @@ export function useChatSessions({
       ) {
         return;
       }
-      if (msgRes.messages && msgRes.messages.length > 0) {
-        const mapped = mapServerMessages(msgRes.messages);
+      if ((msgRes.messages && msgRes.messages.length > 0) || options?.allowEmpty) {
+        const mapped = mapServerMessages(msgRes.messages ?? []);
         msgCacheRef.current.set(sessionId, mapped);
         // Only update React state if the session is still active
         // (user may have switched sessions during the async fetch)

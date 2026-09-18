@@ -418,8 +418,27 @@ export async function saveMessage(
   return (await response.json()) as MessageCreateResponse;
 }
 
-// --- Upload API ---
+/**
+ * Delete a message and every later message in the session.
+ *
+ * Used by "edit and resend" so the superseded attempt does not remain visible
+ * above the replacement turn. The server resolves the cut by conversation order
+ * and applies the session's own RLS delete policy.
+ */
+export async function truncateMessagesFrom(
+  accessToken: string,
+  sessionId: string,
+  messageId: string,
+): Promise<{ deleted: number }> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/sessions/${sessionId}/messages/${messageId}/tail`,
+    { method: "DELETE", headers: authHeaders(accessToken) },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as { deleted: number };
+}
 
+// --- Upload API ---
 export async function uploadFile(
   accessToken: string,
   file: File,

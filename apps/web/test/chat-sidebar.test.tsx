@@ -17,6 +17,7 @@ const {
   fetchMessagesMock,
   fetchSessionsMock,
   saveMessageMock,
+  truncateMessagesFromMock,
   updateSessionTitleMock,
   fetchSessionRunsMock,
 } = vi.hoisted(() => ({
@@ -25,6 +26,7 @@ const {
   fetchMessagesMock: vi.fn(),
   fetchSessionsMock: vi.fn(),
   saveMessageMock: vi.fn(),
+  truncateMessagesFromMock: vi.fn(),
   updateSessionTitleMock: vi.fn(),
   fetchSessionRunsMock: vi.fn(),
 }));
@@ -35,6 +37,7 @@ vi.mock("../src/lib/server-api", () => ({
   fetchMessages: fetchMessagesMock,
   fetchSessions: fetchSessionsMock,
   saveMessage: saveMessageMock,
+  truncateMessagesFrom: truncateMessagesFromMock,
   updateSessionTitle: updateSessionTitleMock,
   fetchImageModels: vi.fn().mockResolvedValue({ models: [] }),
   fetchModels: vi.fn().mockResolvedValue({ models: [] }),
@@ -148,6 +151,8 @@ describe("ChatSidebar", () => {
     deleteSessionMock.mockReset();
     fetchMessagesMock.mockReset();
     fetchMessagesMock.mockResolvedValue({ messages: [] });
+    truncateMessagesFromMock.mockReset();
+    truncateMessagesFromMock.mockResolvedValue({ deleted: 1 });
     fetchSessionsMock.mockReset();
     fetchSessionsMock.mockResolvedValue({
       sessions: [
@@ -189,12 +194,13 @@ describe("ChatSidebar", () => {
     expect(mockWs.startRun).not.toHaveBeenCalled();
   });
 
-  it("resends an inline edit with the original references, preserves history and composer draft", async () => {
-    fetchMessagesMock.mockResolvedValue({ messages: [{ id: "original-user", role: "user", content: "原始请求", contentBlocks: [
+  it("replaces the edited turn instead of appending a parallel one, keeping the composer draft", async () => {
+    // First load shows the original turn; the reload after truncation shows it gone.
+    fetchMessagesMock.mockResolvedValueOnce({ messages: [{ id: "original-user", role: "user", content: "原始请求", contentBlocks: [
       { type: "text", text: "原始请求" },
       { type: "image", assetId: "old-image", url: "https://example.com/original.png", mimeType: "image/png", source: "upload", name: "Original" },
       { type: "mention", mentionType: "image-model", id: "workspace:original-model", label: "gpt-image-2" },
-    ] }] });
+    ] }] }).mockResolvedValue({ messages: [] });
     render(<ChatSidebar accessToken="token_abc" canvasId="canvas-1" open onToggle={() => {}} ws={mockWs} />);
     await screen.findByText("原始请求");
     const composer = screen.getByRole("textbox");
@@ -203,6 +209,11 @@ describe("ChatSidebar", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "编辑消息" }), { target: { value: "修改尺寸为800*600" } });
     fireEvent.click(screen.getByRole("button", { name: "发送编辑后的消息" }));
     await waitFor(() => expect(mockWs.startRun).toHaveBeenCalledOnce());
+    // The edited turn must be removed BEFORE the replacement is sent, otherwise
+    // the superseded attempt (and its generation card) stays on screen.
+    expect(truncateMessagesFromMock).toHaveBeenCalledWith("token_abc", "session-real", "original-user");
+    expect(truncateMessagesFromMock.mock.invocationCallOrder[0]!)
+      .toBeLessThan(vi.mocked(mockWs.startRun).mock.invocationCallOrder[0]!);
     expect(mockWs.startRun).toHaveBeenCalledWith(expect.objectContaining({
       prompt: "修改尺寸为800*600", sessionId: "session-real",
       attachments: [expect.objectContaining({ assetId: "old-image" })],
@@ -211,7 +222,7 @@ describe("ChatSidebar", () => {
     }), expect.any(Function), expect.any(Function));
     await act(async () => streamListener?.({ type: "run.completed", runId: "run_123", timestamp: new Date().toISOString() }));
     await waitFor(() => expect(screen.queryByRole("textbox", { name: "编辑消息" })).not.toBeInTheDocument());
-    expect(screen.getByText("原始请求")).toBeInTheDocument();
+    expect(screen.queryByText("原始请求")).not.toBeInTheDocument();
     expect(composer).toHaveValue("未发送的草稿");
     expect(Element.prototype.scrollTo).toHaveBeenCalledWith(expect.objectContaining({ behavior: "smooth" }));
     expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();

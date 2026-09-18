@@ -175,6 +175,40 @@ export async function registerChatRoutes(
       }
     },
   );
+
+  // Drop a message and every later one. This is the server half of "edit and
+  // resend": the superseded attempt — and any generation card inside its
+  // assistant reply — must not stay visible above the replacement turn.
+  // The DB schema already supports it: agent_runs.request_message_id is
+  // ON DELETE SET NULL with a trigger that clears request_prompt.
+  app.delete<{ Params: { sessionId: string; messageId: string } }>(
+    "/api/sessions/:sessionId/messages/:messageId/tail",
+    async (request, reply) => {
+      try {
+        const user = await options.auth.authenticate(request);
+        if (!user) return sendUnauthorized(reply);
+
+        const result = await options.chatService.truncateFrom(
+          user,
+          request.params.sessionId,
+          request.params.messageId,
+        );
+
+        request.log.info(
+          { sessionId: request.params.sessionId, messageId: request.params.messageId,
+            deleted: result.deleted },
+          "chat.truncateFrom OK",
+        );
+        return reply.code(200).send({ deleted: result.deleted });
+      } catch (error) {
+        request.log.error(
+          { sessionId: request.params.sessionId, messageId: request.params.messageId, err: error },
+          "chat.truncateFrom FAILED",
+        );
+        return sendChatError(error, reply);
+      }
+    },
+  );
 }
 
 function sendUnauthorized(reply: FastifyReply) {
