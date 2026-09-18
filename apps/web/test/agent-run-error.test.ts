@@ -20,3 +20,38 @@ describe("public context recovery messages", () => {
     expect(agentContextErrorMessage({ code: "__proto__" })).toBeNull();
   });
 });
+
+describe("transient upstream failure copy", () => {
+  it("shows the server's status-specific text rather than the shorter local copy", () => {
+    const error = {
+      code: "run_failed",
+      message: "模型服务暂时不可用（502），系统已自动重试仍未成功。这通常是上游临时抖动，稍后重试即可；本轮没有提交任何生成任务，不会产生扣费。",
+      details: { reasonCode: "provider_unavailable", automaticRetry: false },
+    };
+    const shown = agentRunErrorMessage(error);
+    // The status is the whole point: the generic table copy cannot name it.
+    expect(shown).toContain("502");
+    expect(shown).toContain("稍后重试");
+    expect(shown).toContain("没有提交任何生成任务");
+    expect(shown).toBe(error.message);
+  });
+
+  it("still falls back to the local table when only a reason code arrives", () => {
+    expect(agentRunErrorMessage({ code: "run_failed", details: { reasonCode: "provider_rate_limited" } }))
+      .toContain("稍等");
+    expect(agentRunErrorMessage({ code: "run_failed", details: { reasonCode: "agent_context_budget_exceeded" } }))
+      .toContain("安全上下文预算");
+    // A non-display-ready payload must never be preferred over the table.
+    expect(agentRunErrorMessage({ code: "run_failed", message: "<html>502 Bad Gateway</html>", details: { reasonCode: "provider_unavailable" } }))
+      .toContain("模型服务暂时不可用");
+  });
+
+  it("keeps the single-toast gate for a transient failure", () => {
+    // chat-sidebar adds a second "switch model" toast only when this returns
+    // null. A transient upstream failure already has its own retry copy, so it
+    // must count as recognized and must not stack a second toast on top.
+    expect(agentContextErrorMessage({ code: "run_failed", message: "模型服务暂时不可用（502）" })).toBeNull();
+    expect(agentContextErrorMessage({ code: "run_failed", details: { reasonCode: "provider_unavailable" } }))
+      .toContain("稍后重试");
+  });
+});

@@ -30,13 +30,22 @@ export function agentContextErrorMessage(error: unknown): string | null {
   return null;
 }
 
+/**
+ * The server already rendered safe Chinese copy for this failure, so it can be
+ * shown verbatim. Anything else — an English provider string, a raw upstream
+ * body — is not display copy and must not reach the transcript.
+ */
+function isDisplayReady(message: string): boolean {
+  return message.length > 0 && message.length <= 600 && /^[\u3400-\u9fff]/u.test(message);
+}
+
 export function agentRunErrorMessage(error: { code?: string | undefined; message?: string | undefined; details?: Record<string, unknown> | undefined }): string {
-  const context = agentContextErrorMessage(error);
-  if (context) return context;
-  // Runtime messages are sanitized server-side. Keep useful Chinese network /
-  // authentication guidance, while replacing old English generic failures.
+  // The server authors the wording next to the decision it describes, and for a
+  // transient upstream failure it names the actual status (500 vs 502 vs 429),
+  // which this file cannot know. So prefer the server's own copy and keep the
+  // table below as the fallback for a payload that carries only a reason code.
   const message = error.message?.trim() ?? "";
-  return /^[\u3400-\u9fff]/u.test(message) && message.length <= 600
-    ? message
-    : "抱歉，处理过程中遇到问题，请重试。若已有生成任务，请先查看任务状态，避免重复提交。";
+  if (isDisplayReady(message)) return message;
+  return agentContextErrorMessage(error)
+    ?? "抱歉，处理过程中遇到问题，请重试。若已有生成任务，请先查看任务状态，避免重复提交。";
 }
