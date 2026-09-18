@@ -203,17 +203,19 @@ describe("describeDesignRouting — notice copy", () => {
       source: "deterministic", confidence: 1 })).toBeUndefined();
   });
 
-  it("names the selected Skill and the keywords that selected it", () => {
+  it("names the Skill the user's own words point at, and the keywords that matched", () => {
     const notice = describeDesignRouting({
       intent: "new_generation", reasonCode: "explicit_creation", source: "deterministic", confidence: 1,
       primarySkill: { name: "campaign-design", displayName: "活动海报与宣传图" },
       matchedKeywords: ["活动", "海报"],
     });
-    expect(notice?.summary).toBe("识别为：活动海报与宣传图（命中 活动/海报）");
+    // 候选, not 识别为: the runtime no longer selects, so the notice must not imply
+    // a decision the model has not made yet.
+    expect(notice?.summary).toBe("候选技能：活动海报与宣传图（命中 活动/海报）");
     expect(notice?.primarySkill).toBe("campaign-design");
   });
 
-  it("reports the model verdict, the helpers and the size enable", () => {
+  it("reports the model verdict, the helper candidates and the size enable", () => {
     const notice = describeDesignRouting({
       intent: "new_generation", reasonCode: "explicit_creation", source: "model", confidence: 0.88,
       primarySkill: { name: "campaign-design", displayName: "活动海报与宣传图" }, matchedKeywords: ["活动"],
@@ -221,9 +223,11 @@ describe("describeDesignRouting — notice copy", () => {
       nonstandardSizeSkill: { name: "nonstandard-image-size", displayName: "非标准尺寸" },
       seriesApplied: true,
     });
-    expect(notice?.summary).toBe("识别为：活动海报与宣传图（命中 活动）");
+    expect(notice?.summary).toBe("候选技能：活动海报与宣传图（命中 活动）");
     expect(notice?.detail).toContain("模型判定 · 置信度 88%");
-    expect(notice?.detail).toContain("已预载助手指南：海报文案");
+    // The runtime injects no guide text, so it must not claim a preload.
+    expect(notice?.detail).toContain("候选助手指南（需模型读取后生效）：海报文案");
+    expect(notice?.detail).not.toContain("已预载");
     expect(notice?.detail).toContain("已启用非标准尺寸技能：非标准尺寸");
     expect(notice?.detail).toContain("沿用会话中记住的风格与尺寸");
     expect(notice?.helperSkills).toEqual(["design-copywriting"]);
@@ -237,15 +241,15 @@ describe("describeDesignRouting — notice copy", () => {
     expect(fallback?.detail).toContain("模型不可用，沿用规则判定");
     const unmatched = describeDesignRouting({ intent: "new_generation", reasonCode: "unclear",
       source: "deterministic", confidence: 0.3 });
-    expect(unmatched?.summary).toBe("未匹配到交付物技能，由模型自行选择");
+    expect(unmatched?.summary).toBe("未匹配到候选技能，由模型从技能目录自行选择");
   });
 
-  it("still speaks up when only a helper guide matched a non-design turn", () => {
-    // A review request routes no deliverable but does preload a guide, which the
+  it("still speaks up when only a helper candidate matched a non-design turn", () => {
+    // A review request points at no deliverable but does name a guide, which the
     // user currently cannot see anywhere.
     const notice = describeDesignRouting({ intent: "non_design", reasonCode: "informational_question",
       source: "deterministic", confidence: 1, helperSkills: [{ name: "design-review", displayName: "设计评审" }] });
-    expect(notice?.detail).toContain("已预载助手指南：设计评审");
+    expect(notice?.detail).toContain("候选助手指南（需模型读取后生效）：设计评审");
   });
 });
 

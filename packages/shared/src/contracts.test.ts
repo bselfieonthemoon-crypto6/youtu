@@ -5,13 +5,16 @@ import type { ZodType } from "zod";
 
 import {
   type Database,
+  SKILL_WHEN_TO_USE_MAX_CHARS,
   canvasDetailSchema,
   canvasSaveResponseSchema,
   errorCodeValues,
   healthResponseSchema,
+  readSkillRuntimeMetadata,
   runCancelResponseSchema,
   runCreateRequestSchema,
   runCreateResponseSchema,
+  skillRuntimeMetadataSchema,
   streamEventSchema,
 } from "./index.js";
 import * as sharedExports from "./index.js";
@@ -726,6 +729,47 @@ describe("@loomic/shared contracts", () => {
     expect(databaseTypeSource).toMatch(/checkpoint_blobs:\s*{/);
     expect(databaseTypeSource).toMatch(/checkpoint_writes:\s*{/);
     expect(databaseTypeSource).toMatch(/store:\s*{/);
+  });
+});
+
+describe("skill runtime selection metadata", () => {
+  const baseMetadata = {
+    schemaVersion: 1,
+    execution: "guidance",
+    intents: ["probe"],
+    outputKinds: ["design-brief"],
+    requiredTools: [],
+    optionalTools: [],
+    models: [],
+    limitations: [],
+    examples: [],
+    sources: [],
+  };
+
+  it("accepts whenToUse as trimmed selection text that grants nothing", () => {
+    expect(skillRuntimeMetadataSchema.parse(baseMetadata)).not.toHaveProperty("whenToUse");
+    const parsed = skillRuntimeMetadataSchema.parse({ ...baseMetadata, whenToUse: "  用户要…时使用；…时不使用。  " });
+    expect(parsed.whenToUse).toBe("用户要…时使用；…时不使用。");
+    // Selection text is model-facing only: it must not add tools, models or authority.
+    expect(parsed).toMatchObject({ requiredTools: [], optionalTools: [], models: [], execution: "guidance" });
+  });
+
+  it("bounds whenToUse and keeps the strict object rejecting unknown keys", () => {
+    expect(SKILL_WHEN_TO_USE_MAX_CHARS).toBe(400);
+    expect(skillRuntimeMetadataSchema.parse({ ...baseMetadata, whenToUse: "x".repeat(SKILL_WHEN_TO_USE_MAX_CHARS) }).whenToUse)
+      .toHaveLength(SKILL_WHEN_TO_USE_MAX_CHARS);
+    expect(() => skillRuntimeMetadataSchema.parse({ ...baseMetadata, whenToUse: "x".repeat(SKILL_WHEN_TO_USE_MAX_CHARS + 1) })).toThrow();
+    expect(() => skillRuntimeMetadataSchema.parse({ ...baseMetadata, whenToUse: "   " })).toThrow();
+    expect(() => skillRuntimeMetadataSchema.parse({ ...baseMetadata, routing: undefined, whenToUse: "ok", grantsAuthority: true })).toThrow();
+  });
+
+  it("reads whenToUse through the metadata.loomic wrapper real manifests use", () => {
+    const manifest = (loomic: Record<string, unknown>) => ({ bundle: "loomic-design-skills-v2", loomic });
+    expect(readSkillRuntimeMetadata(manifest({ ...baseMetadata, whenToUse: "仅当用户明确接受近似尺寸时使用。" }))?.whenToUse)
+      .toBe("仅当用户明确接受近似尺寸时使用。");
+    // Third-party / older packages simply omit the field: absence is not a failure.
+    expect(readSkillRuntimeMetadata(manifest({ ...baseMetadata }))?.whenToUse).toBeUndefined();
+    expect(readSkillRuntimeMetadata(manifest({ ...baseMetadata, whenToUse: "ok", unexpected: true }))).toBeNull();
   });
 });
 

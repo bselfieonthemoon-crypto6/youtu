@@ -10,6 +10,7 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "whenToUse": "用户还在开放式探索、想要几条差异明显的创意方向或概念取舍，而不是直接出图时使用；已有明确方向、只做局部纠正或只需改字时不使用。",
       "routing": {
         "keywords": [
           "创意方向",

@@ -10,6 +10,7 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "whenToUse": "用户要做按阅读顺序排列的社交轮播或多页图片（如小红书、九宫格），并需统一视觉身份与逐页核对文案时使用；普通单张海报或非轮播的多图系列不使用。",
       "execution": "image",
       "routing": { "keywords": ["轮播", "多页", "多图", "九宫格", "carousel", "slides", "slide"], "priority": 50 },
       "intents": [

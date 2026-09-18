@@ -10,6 +10,7 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "whenToUse": "用户要把多张内容不同但身份一致的物料当作一个系列统一规划或生成时使用；单次尺寸适配、普通单张海报或不按系列处理的轮播不套用本技能。",
       "execution": "image",
       "routing": { "keywords": ["系列", "多张", "一套", "整套", "series"], "priority": 40 },
       "intents": [

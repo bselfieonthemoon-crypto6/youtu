@@ -10,6 +10,7 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "whenToUse": "用户要为品牌做新 Logo、图形标记或字标的概念，并需要检查识别度与小尺寸表现时使用；普通海报排版、活动主视觉或把已有 Logo 放进画面不使用本技能。",
       "execution": "image",
       "routing": { "keywords": ["logo", "logotype", "字标", "图形标记", "图形标志", "商标", "wordmark", "brand mark", "brandmark", "品牌标志", "标志设计"], "priority": 60 },
       "intents": [

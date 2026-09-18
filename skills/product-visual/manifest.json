@@ -10,6 +10,7 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "whenToUse": "用户要做商品主图、产品场景或卖点图片，并要求保护真实产品外形、包装与标识时使用；无真实参考来源时不宣称保真，纯 Logo、活动海报或系列多图改用对应技能。",
       "execution": "image",
       "routing": { "keywords": ["商品", "产品", "主图", "ecommerce", "product image", "product shot", "product visual"], "priority": 30 },
       "intents": [

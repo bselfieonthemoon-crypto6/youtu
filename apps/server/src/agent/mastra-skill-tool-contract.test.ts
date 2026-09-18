@@ -1,6 +1,8 @@
 import { readFile, readdir } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 
+import { SKILL_WHEN_TO_USE_MAX_CHARS, readSkillRuntimeMetadata } from "@loomic/shared";
+
 import { createPromptLibraryService } from "../features/prompt-library/prompt-library-service.js";
 import { createMastraImageTools } from "./mastra-image-tool.js";
 import { createMastraToolkit } from "./mastra-toolkit.js";
@@ -128,5 +130,24 @@ describe("installed Skill manifests against the real Mastra tool surface", () =>
       .map(([name]) => name)
       .sort();
     expect(unavailable).toEqual([...REMOVED_NATIVE_BOARD_SKILLS].sort());
+  });
+
+  it("declares model-facing whenToUse for every bundled package", async () => {
+    const skills = await installedManifestSkills();
+    expect(skills).not.toHaveLength(0);
+    for (const skill of skills) {
+      // The strict schema rejects unknown keys, so a null read means the package
+      // metadata no longer validates and its readiness silently degrades.
+      const runtime = readSkillRuntimeMetadata(skill.metadata);
+      if (!runtime) throw new Error(`${skill.slug} metadata.loomic no longer validates`);
+      const whenToUse = runtime.whenToUse;
+      expect(typeof whenToUse, `${skill.slug} must declare whenToUse`).toBe("string");
+      if (typeof whenToUse !== "string") continue;
+      expect(whenToUse.trim(), skill.slug).toBe(whenToUse);
+      expect(whenToUse.length, skill.slug).toBeGreaterThan(0);
+      expect(whenToUse.length, skill.slug).toBeLessThanOrEqual(SKILL_WHEN_TO_USE_MAX_CHARS);
+      // Selection text describes a situation; it is not a copy of the description.
+      expect(whenToUse, skill.slug).not.toBe(skill.description);
+    }
   });
 });

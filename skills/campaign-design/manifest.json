@@ -10,6 +10,7 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "whenToUse": "用户要做活动海报、促销宣传图、推广封面或头图等一次性宣传物料，并需要组织准确文案与主视觉时使用；已有定稿的小改、单纯尺寸适配或多图系列/轮播不使用本技能。",
       "execution": "image",
       "routing": { "keywords": ["活动", "促销", "海报", "宣传", "宣传图", "推广", "广告图", "封面", "头图", "banner", "poster", "promo", "cover", "key visual", "主视觉"], "priority": 10 },
       "intents": [

@@ -10,6 +10,7 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "whenToUse": "用户要对现有设计做有证据的版式、文字、品牌或用途点评与评审时使用；只改几个字、要求直接重做或要求写入修改时改用对应的设计与编辑技能。",
       "routing": {
         "keywords": [
           "评审",

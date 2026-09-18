@@ -26,8 +26,8 @@ function routedNotice(overrides: Partial<DesignRoutingEvent> = {}): DesignRoutin
     source: "deterministic",
     clamped: false,
     confidence: 1,
-    summary: "识别为：活动海报与宣传图（命中 活动/海报）",
-    detail: "判定依据：明确要求出图（新一轮生成）\n已预载助手指南：海报文案\n已启用非标准尺寸技能：非标准尺寸",
+    summary: "候选技能：活动海报与宣传图（命中 活动/海报）",
+    detail: "判定依据：明确要求出图（新一轮生成）\n候选助手指南（需模型读取后生效）：海报文案\n已启用非标准尺寸技能：非标准尺寸",
     primarySkill: "campaign-design",
     helperSkills: ["design-copywriting"],
     nonstandardSizeSkill: "nonstandard-image-size",
@@ -48,16 +48,16 @@ function renderHarness() {
 afterEach(cleanup);
 
 describe("useDesignRoutingNotice", () => {
-  it("shows the routed Skill, the reason and the hidden preloads once", () => {
+  it("shows the candidate Skill, the reason and the helper candidates once", () => {
     const notice = renderHarness();
     act(() => { notice()(routedNotice()); });
 
     const text = document.body.textContent ?? "";
-    expect(text).toContain("识别为：活动海报与宣传图（命中 活动/海报）");
-    expect(text).toContain("已预载助手指南：海报文案");
+    expect(text).toContain("候选技能：活动海报与宣传图（命中 活动/海报）");
+    expect(text).toContain("候选助手指南（需模型读取后生效）：海报文案");
     expect(text).toContain("已启用非标准尺寸技能：非标准尺寸");
     // One toast only: it never repeats per streaming chunk.
-    expect(screen.getAllByText(/识别为：活动海报与宣传图/)).toHaveLength(1);
+    expect(screen.getAllByText(/候选技能：活动海报与宣传图/)).toHaveLength(1);
   });
 
   it("shows a model-authored verdict with its confidence", () => {
@@ -75,17 +75,17 @@ describe("useDesignRoutingNotice", () => {
       notice()(routedNotice());
       notice()(routedNotice());
     });
-    expect(screen.getAllByText(/识别为：活动海报与宣传图/)).toHaveLength(1);
+    expect(screen.getAllByText(/候选技能：活动海报与宣传图/)).toHaveLength(1);
     // A different turn still gets its own notice.
-    act(() => { notice()(routedNotice({ runId: "run-2", summary: "识别为：品牌 Logo 设计（命中 logo）" })); });
-    expect(screen.getAllByText(/识别为：/)).toHaveLength(2);
+    act(() => { notice()(routedNotice({ runId: "run-2", summary: "候选技能：品牌 Logo 设计（命中 logo）" })); });
+    expect(screen.getAllByText(/候选技能：/)).toHaveLength(2);
   });
 
   it("stays silent when the runtime reported no routing decision", () => {
     // A turn with no design decision emits nothing server-side, so the client
     // has no notice to render. Nothing here may invent one.
     renderHarness();
-    expect(screen.queryByText(/识别为：/)).toBeNull();
+    expect(screen.queryByText(/候选技能：/)).toBeNull();
     expect(screen.queryByText(/判定依据：/)).toBeNull();
   });
 });

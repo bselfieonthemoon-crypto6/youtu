@@ -10,6 +10,7 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "whenToUse": "用户要把已核实的品牌与产品事实组织成标题、卖点或行动引导文案时使用；纯排版任务、执行用户已定稿的逐字文案，或需要编造未提供卖点时不使用。",
       "routing": {
         "keywords": [
           "文案",

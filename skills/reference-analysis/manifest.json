@@ -10,6 +10,7 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "whenToUse": "用户提供了实际参考图，要提取其构图、色彩角色、字体层级与素材关系时使用；只做点评走设计评审技能，没有视觉输入时不得凭 URL 编造细节。",
       "routing": {
         "keywords": [
           "分析这张图",

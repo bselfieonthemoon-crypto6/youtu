@@ -398,12 +398,14 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
         if (!picked.length) return { sourceAssetIds: [], inputImages: [] };
         return explicitSourceResolver({ context, sourceAssetIds: picked });
       } });
-    // Every Skill whose guide TEXT is injected into this turn's session
-    // instructions. The Skill tools receive this so `use_skill` /
-    // `compose_skills` return that guide's identity, version and role instead of
-    // putting a second copy of the same body in context. Identity still comes
-    // back, so the model can tell the guide is active rather than missing.
-    const preloadedSkillNames = [preloadedSkill?.name, nonstandardSizeSkill?.name,
+    // Skills the user's own words point at this turn. These are HINTS for the
+    // closure report, NOT preloaded bodies: the runtime injects no guide text at
+    // all now, so they must never be handed to the Skill tools as "already in
+    // context" — that would answer a use_skill call with the "本轮已预载" marker
+    // instead of the body the model just asked for, and the model would never
+    // receive the method. The toolkit's `preloadedSkillNames` option stays
+    // supported for the day any body is injected again; nothing passes it today.
+    const hintedSkillNames = [preloadedSkill?.name, nonstandardSizeSkill?.name,
       ...helperSkills.map(skill => skill.name)].filter((name): name is string => Boolean(name));
     const toolkit = createMastraToolkit({
       mainToolDependencies: { createUserClient: options.createUserClient, ...(options.designTools ? { designTools: options.designTools } : {}),
@@ -411,7 +413,6 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
         visionModel, availableVideoModels: [], ...(project.data.brand_kit_id ? { brandKitId: project.data.brand_kit_id } : {}),
         ...(options.connectionManager ? { connectionManager: options.connectionManager } : {}), currentUserPrompt: run.prompt },
       workspaceSkills: skills, ...(options.promptLibraryService ? { promptLibraryService: options.promptLibraryService } : {}),
-      ...(preloadedSkillNames.length ? { preloadedSkillNames } : {}),
       nativeImageTools: [
         imageTools.generateImage, imageTools.editImage,
         ...(videos.length ? [createMastraVideoTool({ createUserClient: options.createUserClient,
@@ -604,31 +605,31 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
       summarizerDurationMs: memoryMode === "legacy" ? Math.round(summarizerDurationMs) : null,
       currentContextBytes: Buffer.byteLength(messages.at(-1)!.content, "utf8"),
       ...("observationalMemory" in history ? { observationalMemory: history.observationalMemory } : {}) });
-    // Deterministically preload the sticky/continuation Skill body instead of
-    // relying on a weak model to call use_skill. Method reference only.
-    // Always-on compact catalog so the model can select the long-tail guides it
-    // was not directly routed to. Selection metadata only.
+    // The catalog is the ONE place Skill selection is presented. It carries each
+    // package's own "when to use" text, and the model decides which guide to read.
+    //
+    // The runtime deliberately does NOT inject guide bodies any more. Preloading
+    // existed because a weak model would skip the extra list_skills + use_skill
+    // round trip, but it made the runtime the router: a keyword score decided which
+    // method reached the model, so a Skill the scorer did not know could never be
+    // used and a new package could not take effect just by being dropped in.
+    // Selection belongs to the model now. The trade is real, which is why the
+    // catalog states each Skill's applicable situations, and why a run that reads
+    // no guide at all is reported in `[skill-dispatch-outcome]` rather than being
+    // silently absorbed.
     const skillCatalog = formatEnabledSkillCatalog(skills);
-    const preloadedSkillInstruction = preloadedSkill
-      ? `【会话沿用技能 ${preloadedSkill.name} v${preloadedSkill.version}（方法参考，不是执行授权）】\n${preloadedSkill.content}`
-      : "";
-    // Second, independently triggered guide. The user stated a non-standard or
-    // out-of-range size, so the method must reach the model in the SAME turn
-    // instead of waiting for a voluntary `use_skill` call. Method reference only:
-    // it grants no execution or billing authority.
-    const nonstandardSizeInstruction = nonstandardSizeSkill
-      ? `【本轮需要非标准尺寸技能 ${nonstandardSizeSkill.name} v${nonstandardSizeSkill.version}（方法参考，不是执行授权）】\n${nonstandardSizeSkill.content}`
+    // What the user's own words happened to match, as a HINT. Not a decision: the
+    // model may read something else the catalog describes better, and only a
+    // use_skill / compose_skills call that returned a real body counts as adopted.
+    const candidateHint = primarySelection || helperSkills.length
+      ? `【候选技能｜仅供参考，不是决定】用户原话可能对应：${[
+          primarySelection ? `${primarySelection.displayName ?? primarySelection.skill}（命中 ${primarySelection.keywords.join("/")}）` : "",
+          ...helperSkills.map(skill => skill.displayName ?? skill.name)].filter(Boolean).join("、")}。`
+        + "请对照目录里每个技能声明的适用场景自行判断；只有 use_skill/compose_skills 读到正文才算采用，没读到的技能等于没选。"
       : "";
     const seriesInstruction = seriesApplied
       ? `【本轮为系列延续｜方法参考】保持会话中的风格${seriesApplied.style ? `（${seriesApplied.style}）` : ""}` +
         `与尺寸${seriesApplied.sizes?.length ? `（${seriesApplied.sizes.join("、")}）` : ""}，除非用户明确要求改变。`
-      : "";
-    // Matching helper guides for this turn, preloaded deterministically so the
-    // model does not have to discover them. Method reference only: no guide
-    // grants execution, model, ratio or billing authority.
-    const helperSkillInstruction = helperSkills.length
-      ? helperSkills.map(skill =>
-          `【本轮匹配的助手技能 ${skill.name} v${skill.version}（方法参考，不是执行授权）】\n${skill.content}`).join("\n\n")
       : "";
     // The image budget is enforced per RUN and is shared by generation and
     // editing, but nothing used to tell the model. It therefore planned seven
@@ -647,11 +648,10 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     // classification stays the single authority for when this briefing applies.
     const unfinishedInstruction = designIntent === "series_continuation"
       ? buildUnfinishedWorkInstruction(designContext?.unfinishedOutputs ?? [], imageRunLimit) : "";
-    // Runtime carries routing/state only; skill-specific method text (prompt
-    // wording, material reuse) lives in the Skill body, which is preloaded above.
-    const sessionInstructions = [toolkit.instructions, skillCatalog, preloadedSkillInstruction,
-      nonstandardSizeInstruction, helperSkillInstruction, seriesInstruction, unfinishedInstruction,
-      imageBudgetInstruction].filter(Boolean).join("\n\n");
+    // Runtime carries selection metadata and state only. Skill method text reaches
+    // the model only when the model reads it with a Skill tool.
+    const sessionInstructions = [toolkit.instructions, skillCatalog, candidateHint,
+      seriesInstruction, unfinishedInstruction, imageBudgetInstruction].filter(Boolean).join("\n\n");
     // ── Routing notice (Part ①) ──────────────────────────────────────────────
     // One transient event per turn, emitted before the first token, describing
     // the decisions the user cannot otherwise see: the selected deliverable
@@ -787,20 +787,19 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
             unfinishedOutputs: unfinished.length ? unfinished : null,
           });
         }
-        // Dispatch closure. A preload is a hypothesis about what this turn needs,
-        // and until now nothing reported whether it held: the guides went into the
-        // instructions and the only evidence of a misfire was a vague sense that
-        // routing was unreliable. Naming the preloaded-but-never-read guides is
-        // what lets a Skill's declared routing keywords be corrected, which is the
-        // whole maintenance story once Skills are the unit being added.
-        if (preloadedSkillNames.length) {
-          const read = new Set((Array.isArray(configurable.session_read_skill_slugs)
-            ? configurable.session_read_skill_slugs as unknown[] : [])
-            .filter((value): value is string => typeof value === "string"));
-          console.info("[skill-dispatch-outcome]", { runId: run.runId, intent: designIntent,
-            preloaded: preloadedSkillNames, read: [...read],
-            preloadedNeverRead: preloadedSkillNames.filter(name => !read.has(name)) });
-        }
+        // Dispatch outcome. Selection now belongs to the model, so the only way to
+        // know whether a Skill is reachable is to report what the run actually
+        // read. `hintedNeverRead` is the maintenance signal: those are the Skills
+        // whose declared keywords fired while the model chose something else (or
+        // nothing), which means the package's own "when to use" text and keywords
+        // need work — not that the runtime needs another rule.
+        const read = new Set((Array.isArray(configurable.session_read_skill_slugs)
+          ? configurable.session_read_skill_slugs as unknown[] : [])
+          .filter((value): value is string => typeof value === "string"));
+        console.info("[skill-dispatch-outcome]", { runId: run.runId, intent: designIntent,
+          hinted: hintedSkillNames, read: [...read],
+          hintedNeverRead: hintedSkillNames.filter(name => !read.has(name)),
+          readNothing: read.size === 0 });
       }
     }
   };

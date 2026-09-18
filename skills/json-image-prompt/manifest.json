@@ -10,6 +10,7 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "whenToUse": "已确认确实要生成或编辑位图，需要把主体、保留项、构图与素材整理成可执行生图提示时使用；只改文字、排版或原生画板任务不使用，也不强制 JSON 格式。",
       "routing": {
         "keywords": [
           "提示词",

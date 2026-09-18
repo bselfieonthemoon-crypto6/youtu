@@ -10,6 +10,7 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "whenToUse": "用户要做游戏、棋牌、抽奖、礼包或充值类活动视觉，或按参考图风格复刻新活动图并支持自定义尺寸与可选文案、Logo、角色时使用；普通电商主图与非游戏活动海报不使用。",
       "execution": "image",
       "attachWorkspaceLibrary": true,
       "routing": { "keywords": ["游戏", "棋牌", "抽奖", "礼包", "充值", "bonus", "jackpot", "casino", "game promo", "game event"], "priority": 20 },

@@ -155,7 +155,7 @@ describe("runtime routing notice", () => {
     expect(found[0]).toMatchObject({ type: "design.routing", runId: ids.run, intent: "new_generation",
       reasonCode: "explicit_creation", source: "deterministic", clamped: false,
       primarySkill: "campaign-design" });
-    expect(found[0].summary).toBe("识别为：活动海报与宣传图（命中 活动/海报）");
+    expect(found[0].summary).toBe("候选技能：活动海报与宣传图（命中 活动/海报）");
     // A confidently resolved turn costs no model call at all.
     expect(classifierCalls()).toHaveLength(0);
     // The notice precedes the terminal event instead of trailing the answer.
@@ -163,12 +163,15 @@ describe("runtime routing notice", () => {
       .toBeLessThan(events.findIndex(event => event.type === "run.completed"));
   });
 
-  it("covers the preloaded helper guides and the non-standard-size enable", async () => {
+  it("covers the helper candidates and the non-standard-size enable", async () => {
     const events = await runTurn("做一张活动海报，再写一句文案，尺寸 658×176");
     const notice = notices(events)[0]!;
     expect(notice).toMatchObject({ primarySkill: "campaign-design",
       helperSkills: ["design-copywriting"], nonstandardSizeSkill: "nonstandard-image-size" });
-    expect(notice.detail).toContain("已预载助手指南：海报文案");
+    // The runtime injects no guide text any more, so the notice must not claim a
+    // preload: these are the guides the user's own words point at.
+    expect(notice.detail).toContain("候选助手指南（需模型读取后生效）：海报文案");
+    expect(notice.detail).not.toContain("已预载");
     expect(notice.detail).toContain("已启用非标准尺寸技能：非标准尺寸");
     expect(classifierCalls()).toHaveLength(0);
   });
@@ -196,12 +199,12 @@ describe("runtime routing notice", () => {
       primarySkill: "campaign-design" });
     expect(notice.detail).toContain("模型判定 · 置信度 88%");
 
-    // The same conflict resolved as an edit preloads no deliverable Skill.
+    // The same conflict resolved as an edit names no candidate Skill.
     captured.classifierReply = { intent: "local_edit", reasonCode: "property_edit", confidence: 0.66 };
     const edited = notices(await runTurn("做一版活动海报，把标题文字改成蓝色"))[0]!;
     expect(edited).toMatchObject({ source: "model", intent: "local_edit" });
     expect(edited).not.toHaveProperty("primarySkill");
-    expect(edited.summary).toBe("按局部修改处理，不预载交付物技能");
+    expect(edited.summary).toBe("按局部修改处理，未匹配候选技能");
   });
 
   it("clamps a model verdict that would revive a declined turn", async () => {

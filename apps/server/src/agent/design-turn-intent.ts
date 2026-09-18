@@ -943,12 +943,15 @@ export function describeDesignRouting(input: DesignRoutingNoticeInput): DesignRo
   const reason = REASON_LABELS[input.reasonCode];
 
   let summary: string;
-  if (skillLabel && keywords.length) summary = `识别为：${skillLabel}（命中 ${keywords.join("/")}）`;
-  else if (skillLabel) summary = `识别为：${skillLabel}（${reason}）`;
-  else if (input.intent === "new_generation") summary = "未匹配到交付物技能，由模型自行选择";
-  else if (input.intent === "series_continuation") summary = "沿用当前系列的方法与尺寸，未重新匹配交付物技能";
-  else if (input.intent === "local_edit") summary = "按局部修改处理，不预载交付物技能";
-  else summary = `未匹配到交付物技能（${reason}）`;
+  // The runtime no longer selects a Skill: it states what the user's own words
+  // point at, and the model decides from the catalog. The copy says 候选 rather
+  // than 识别为 so the notice cannot claim a decision nobody made.
+  if (skillLabel && keywords.length) summary = `候选技能：${skillLabel}（命中 ${keywords.join("/")}）`;
+  else if (skillLabel) summary = `候选技能：${skillLabel}（${reason}）`;
+  else if (input.intent === "new_generation") summary = "未匹配到候选技能，由模型从技能目录自行选择";
+  else if (input.intent === "series_continuation") summary = "沿用当前系列的方法与尺寸，未重新匹配候选技能";
+  else if (input.intent === "local_edit") summary = "按局部修改处理，未匹配候选技能";
+  else summary = `未匹配到候选技能（${reason}）`;
 
   const detail: string[] = [];
   // Why this verdict was reached, so a wrong routing is diagnosable by the user
@@ -960,7 +963,10 @@ export function describeDesignRouting(input: DesignRoutingNoticeInput): DesignRo
   else detail.push(`判定依据：${reason}（${INTENT_LABELS[input.intent]}）`);
   if (input.seriesApplied) detail.push("沿用会话中记住的风格与尺寸");
   if (helperSkills.length)
-    detail.push(`已预载助手指南：${helperSkills.map(skill => skill.displayName ?? skill.name).join("、")}`);
+    // NOT "已预载": the runtime injects no guide text any more, so claiming a
+    // preload here would be false. These are the guides the user's words point at,
+    // and the model adopts them only by reading them.
+    detail.push(`候选助手指南（需模型读取后生效）：${helperSkills.map(skill => skill.displayName ?? skill.name).join("、")}`);
   if (input.nonstandardSizeSkill)
     detail.push(`已启用非标准尺寸技能：${input.nonstandardSizeSkill.displayName ?? input.nonstandardSizeSkill.name}`);
 

@@ -13,7 +13,23 @@ export type SkillCompositionMetadata = z.infer<typeof skillCompositionMetadataSc
 export type SkillCompositionRole = SkillCompositionMetadata["role"];
 export type SkillCompositionStage = SkillCompositionMetadata["stages"][number];
 
-/** Dependency declarations describe a workflow, never grant execution authority. */
+/**
+ * Upper bound for `whenToUse`. The text is model-facing selection metadata that
+ * is reprinted in EVERY turn's always-on Skill catalog, so it is deliberately
+ * short: 400 characters is roughly twice the longest existing package
+ * description — enough for one "use this when …" sentence plus a short
+ * "do not use it when …" clause, while keeping the worst case per line
+ * (400 CJK characters ≈ 1200 UTF-8 bytes) bounded.
+ */
+export const SKILL_WHEN_TO_USE_MAX_CHARS = 400;
+
+/** Dependency declarations describe a workflow, never grant execution authority.
+ *
+ * STRICT, including this outer object: a Skill package is the unit users add, so a
+ * typo in its `metadata.loomic` block (`whentouse`, `outputKind`, `capability`)
+ * must fail loudly at parse time instead of being silently stripped — silently
+ * stripping it looks exactly like the field being absent, and the package then
+ * behaves as if its author never declared it. */
 export const skillRuntimeMetadataSchema = z.object({
   schemaVersion: z.literal(1),
   execution: z.enum(["native", "image", "hybrid", "guidance"]),
@@ -28,6 +44,16 @@ export const skillRuntimeMetadataSchema = z.object({
   capabilities: z.array(z.string().min(1).max(60)).max(20).optional(),
   /** The runtime attaches published workspace library references for this Skill. */
   attachWorkspaceLibrary: z.boolean().optional(),
+  /**
+   * Model-facing selection text: the situation in the user's own terms that
+   * makes this guide apply ("use this when …"), optionally with the contrasting
+   * case ("do not use it when …") that stops two guides from competing. It is
+   * what the always-on catalog shows so the model can select a Skill itself.
+   * Selection metadata only, exactly like `routing` and `capabilities`: it
+   * grants no tool, model, ratio, budget or execution authority, and it never
+   * loads the Skill body (that still requires use_skill/compose_skills).
+   */
+  whenToUse: z.string().trim().min(1).max(SKILL_WHEN_TO_USE_MAX_CHARS).optional(),
   /** Deliverable keywords used to auto-select this Skill as the primary one. */
   routing: z.object({
     keywords: z.array(z.string().min(1).max(60)).min(1).max(30),
@@ -55,7 +81,7 @@ export const skillRuntimeMetadataSchema = z.object({
     license: z.string().max(200).optional(),
     relation: z.enum(["inspired-by", "adapted-from"]),
   })).max(20),
-});
+}).strict();
 export type SkillRuntimeMetadata = z.infer<typeof skillRuntimeMetadataSchema>;
 
 export const skillReadinessSchema = z.object({

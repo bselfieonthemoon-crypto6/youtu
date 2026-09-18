@@ -10,6 +10,7 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "whenToUse": "用户要基于已有图片去掉背景、得到透明底 PNG，或新做一张透明背景素材时使用；画板透明导出、图片分层拆分或原生图层编辑不使用本技能。",
       "routing": {
         "keywords": [
           "去背景",

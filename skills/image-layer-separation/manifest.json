@@ -10,6 +10,7 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "whenToUse": "用户要把扁平图片拆成背景、主体、文字等分层，或调整已有原生设计图层的分组时使用；只做去背景透明图走背景去除技能，本技能也不承诺还原原始 PSD 或可编辑字体。",
       "routing": {
         "keywords": [
           "分层",

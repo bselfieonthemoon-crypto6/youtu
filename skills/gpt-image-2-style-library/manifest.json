@@ -10,6 +10,7 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "whenToUse": "开放式设计或用户要求优化生图提示时，需要跨现有图文库检索筛选构图、风格与场景参考时使用；原样执行的节点提示、单纯改字任务不使用，也不能替代专业设计技能。",
       "routing": {
         "keywords": [
           "风格参考",
