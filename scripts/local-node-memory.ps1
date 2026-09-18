@@ -1,5 +1,25 @@
-function Resolve-LocalNodeHeapLimit {
-  param(
+# Windows PowerShell 5.1's Start-Process rebuilds the child environment through a
+# case-insensitive dictionary. An environment that defines BOTH `NO_PROXY` and
+# `no_proxy` (common when proxy tooling writes the lowercase form) therefore makes
+# EVERY Start-Process call fail with:
+#   "Item has already been added. Key in dictionary: 'NO_PROXY'"
+# which silently breaks every launcher in this folder. Collapse the duplicates
+# once, here, so anything that dot-sources this module can start a service.
+function Remove-DuplicateProxyEnvironment {
+  foreach ($taskLowercaseName in @('no_proxy', 'http_proxy', 'https_proxy', 'all_proxy')) {
+    $taskValue = [Environment]::GetEnvironmentVariable($taskLowercaseName, 'Process')
+    if (-not $taskValue) { continue }
+    $taskUppercaseName = $taskLowercaseName.ToUpperInvariant()
+    # Keep the value: promote it only when the uppercase spelling is absent, then
+    # drop the lowercase duplicate that breaks Start-Process.
+    if (-not [Environment]::GetEnvironmentVariable($taskUppercaseName, 'Process')) {
+      [Environment]::SetEnvironmentVariable($taskUppercaseName, $taskValue, 'Process')
+    }
+    [Environment]::SetEnvironmentVariable($taskLowercaseName, $null, 'Process')
+  }
+}
+
+function Resolve-LocalNodeHeapLimit {  param(
     [Parameter(Mandatory)][string]$ServiceName,
     [Parameter(Mandatory)][int]$DefaultHeapLimitMB,
     [Nullable[int]]$ExplicitHeapLimitMB
@@ -39,3 +59,7 @@ function Set-LocalNodeHeapLimit {
   $env:NODE_OPTIONS = (($taskNodeOptions, "--max-old-space-size=$taskHeapLimitMB") | Where-Object { $_ }) -join ' '
   return $taskHeapLimitMB
 }
+
+# Applied on import so every launcher that dot-sources this module inherits the
+# fix without each one having to call it. See Remove-DuplicateProxyEnvironment.
+Remove-DuplicateProxyEnvironment
