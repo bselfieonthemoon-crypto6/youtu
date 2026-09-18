@@ -27,7 +27,7 @@ import { compileMastraMemoryContext } from "./mastra-memory-adapter.js";
 import { APIYI_VIDEO_MODELS } from "../generation/providers/apiyi-video.js";
 import { createMastraImageJobScopeQuery, createMastraImageStatusTools } from "./mastra-image-status-tools.js";
 import { createMastraLibraryTools, loadLibraryAssetRows, sampleRandom } from "./mastra-library-tools.js";
-import { classifyDesignTurnIntent, extractStyleHints, extractTargetSizes, mergeStyleHints, selectHelperSkills, selectPrimarySkill, shouldReplaceSessionSeries } from "./design-turn-intent.js";
+import { classifyDesignTurnIntent, extractStyleHints, extractTargetSizes, mergeStyleHints, selectHelperSkills, selectPrimarySkill, shouldReplaceSessionSeries, skillRoutesFromMetadata } from "./design-turn-intent.js";
 import { explicitNonstandardRatio } from "./image-ratio-intent.js";
 import { formatEnabledSkillCatalog } from "./design-skill-catalog.js";
 import { loadSessionDesignContext, saveSessionDesignContext, sessionSkillMemoryEnabled } from "./session-design-context.js";
@@ -243,8 +243,16 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     //     "必须精确不要近似" still revokes it.
     // A workspace without an enabled nonstandard-ratio Skill is unaffected.
     const nonstandardSizeSkill = explicitNonstandardRatio(run.prompt)
-      ? skills.find(skill => skillLoomicCapabilities(skill.metadata).includes("nonstandard-ratio"))
+      ? skills.find(skill => skillLoomicCapabilities(skill.metadata).includes("nonstandard-ratio")
+          // A Skill the catalog itself reports as unavailable must not have its
+          // method enabled or preloaded.
+          && skill.readiness?.status !== "unavailable")
       : undefined;
+    // Helper-tier slugs. They may be preloaded alongside the deliverable Skill,
+    // but they must never occupy the primary slot — including through the
+    // sticky-memory path below.
+    const helperSkillNames = new Set(skillRoutesFromMetadata(skills)
+      .filter(route => route.tier === "helper").map(route => route.skill));
     const configurable: Record<string, unknown> = { user_id: run.userId, workspace_id: run.workspaceId, canvas_id: run.canvasId,
       session_id: run.sessionId, run_id: run.runId, access_token: run.accessToken, user_prompt: run.prompt,
       user_attachment_map: attachmentMap, image_generation_model_constraint: constraint,
@@ -565,7 +573,12 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
         if (designIntent === "new_generation" || designIntent === "series_continuation") {
           const loadedSkillSlug = typeof configurable.session_loaded_skill_slug === "string"
             ? configurable.session_loaded_skill_slug : undefined;
-          const finalActiveSkill = loadedSkillSlug && enabledSkillSlugs.has(loadedSkillSlug) ? loadedSkillSlug : activeSkill;
+          // Only a deliverable Skill may become the sticky primary. A one-off
+          // `use_skill` on a workflow/reference/prompt helper (for example
+          // design-review) used to overwrite it, so the next "继续" preloaded the
+          // helper's guide instead of the deliverable's.
+          const finalActiveSkill = loadedSkillSlug && enabledSkillSlugs.has(loadedSkillSlug)
+            && !helperSkillNames.has(loadedSkillSlug) ? loadedSkillSlug : activeSkill;
           const finalSkill = finalActiveSkill ? skills.find(skill => skill.name === finalActiveSkill) : undefined;
           const materialAssetIds = Array.isArray(configurable.session_material_asset_ids)
             ? configurable.session_material_asset_ids.filter((item: unknown): item is string => typeof item === "string") : [];
