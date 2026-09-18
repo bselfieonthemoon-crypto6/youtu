@@ -1,23 +1,19 @@
-import type {
-  AIMessage,
-  AIMessageChunk,
-  ToolMessage,
-} from "@langchain/core/messages";
 import {
-  AIMessageChunk as AIMessageChunkClass,
-  AIMessage as AIMessageClass,
-  ToolMessage as ToolMessageClass,
-} from "@langchain/core/messages";
+  isAssistantStreamMessage,
+  isToolResultEnvelope,
+} from "./agent-message-shapes.js";
 
 import { imageArtifactSchema, videoArtifactSchema } from "@loomic/shared";
-import type { PlanStep, StreamEvent, ToolArtifact } from "@loomic/shared";
+import type { StreamEvent, ToolArtifact } from "@loomic/shared";
 
-import { sanitizeErrorForClient } from "../utils/error-sanitizer.js";
+import { sanitizeErrorForClient, sanitizeRunErrorForClient } from "../utils/error-sanitizer.js";
 
 /**
- * Shape of a LangChain v2 stream event from `streamEvents()`.
+ * Shape of a v2-style agent stream event yielded by the Mastra bridge
+ * (`mastra-agent.ts`): `on_chat_model_*`, `on_tool_*` and `on_custom_event`.
+ * This is a Loomic-local envelope, not a LangChain type.
  */
-type LangChainStreamEvent = {
+type AgentStreamEvent = {
   event: string;
   name?: string;
   data?: Record<string, unknown>;
@@ -26,42 +22,23 @@ type LangChainStreamEvent = {
   tags?: string[];
 };
 
-type AdaptDeepAgentStreamOptions = {
+type AdaptAgentStreamOptions = {
   conversationId: string;
   now?: () => string;
   runId: string;
   sessionId: string;
   signal?: AbortSignal;
-  stream: AsyncIterable<LangChainStreamEvent | unknown>;
+  stream: AsyncIterable<AgentStreamEvent | unknown>;
 };
 
-/**
- * Sub-agent parent tool names whose inner tools should have their
- * artifacts suppressed (the parent re-emits them with placement).
- */
-const SUB_AGENT_PARENT_TOOLS = new Set(["video_generate"]);
-/** Inner tools that may be suppressed when running inside a sub-agent. */
-const INNER_SUB_AGENT_TOOLS = new Set(["generate_video"]);
-
-export async function* adaptDeepAgentStream(
-  options: AdaptDeepAgentStreamOptions,
+export async function* adaptAgentStream(
+  options: AdaptAgentStreamOptions,
 ): AsyncGenerator<StreamEvent> {
   const now = options.now ?? (() => new Date().toISOString());
   const seenCompletedToolCalls = new Set<string>();
   const seenFailedToolCalls = new Set<string>();
   const seenStreamedMessageIds = new Set<string>();
   const seenStartedToolCalls = new Set<string>();
-  const planId = `plan_${options.runId}`;
-  let planRevision = 0;
-  let nextPlanStepOrdinal = 1;
-  let committedPlanSteps: PlanStep[] = [];
-  const pendingPlanDrafts = new Map<string, PlanStepDraft[]>();
-  const planLinkByToolCall = new Map<
-    string,
-    { planId: string; planStepId: string }
-  >();
-  /** Tracks active sub-agent parent runs so we can detect nested inner tools. */
-  const activeSubAgentRuns = new Set<string>();
 
   yield {
     conversationId: options.conversationId,
@@ -88,20 +65,52 @@ export async function* adaptDeepAgentStream(
       }
 
       const evt = rawEvent;
+      if (evt.tags?.includes("loomic-internal-expert")) continue;
+      if (evt.tags?.some(tag => tag === "loomic-context-summary" || tag === "loomic-intent-review")) continue;
+      // Vision preprocessing/review is a nested tool result, not the assistant's
+      // final answer. Its text is shown inside the verification result only.
+      if (evt.tags?.includes("loomic-internal-vision") && evt.event.startsWith("on_chat_model_")) continue;
+
+      // A terminal image failure is closed by server middleware, not another
+      // free-form model response. Its trusted receipt still needs to reach the
+      // normal text/persistence path even though no model tokens are emitted.
+      if (evt.event === "on_custom_event" && ["loomic.image_failure_receipt", "loomic.intent_clarification"].includes(evt.name ?? "")) {
+        const messageId = evt.data?.messageId;
+        const text = evt.data?.text;
+        const prefix = evt.name === "loomic.intent_clarification" ? "intent-clarification-" : "image-failure-receipt-";
+        if (typeof messageId !== "string" || !messageId.startsWith(prefix) ||
+            typeof text !== "string" || !text.trim() || seenStreamedMessageIds.has(messageId)) continue;
+        seenStreamedMessageIds.add(messageId);
+        yield { type: "message.delta", runId: options.runId, timestamp: now(), messageId, delta: text };
+        continue;
+      }
+
+      // A write denied by middleware never enters on_tool_start/on_tool_error.
+      // Expose that outcome without leaking reviewer content or raw arguments.
+      if (evt.event === "on_custom_event" && evt.name === "loomic.intent_write_blocked") {
+        const id = readString(evt.data?.toolCallId);
+        const toolName = readString(evt.data?.toolName);
+        if (!id || !toolName) continue;
+        const toolCallId = `intent-blocked-${id}`;
+        if (seenFailedToolCalls.has(toolCallId)) continue;
+        seenFailedToolCalls.add(toolCallId);
+        yield { type: "tool.failed", runId: options.runId, timestamp: now(), toolCallId, toolName,
+          error: { code: "tool_failed", message: "本次操作未执行：工具参数或目标未通过核对。" } };
+        continue;
+      }
 
       // Per-token streaming from the chat model
       if (evt.event === "on_chat_model_stream") {
         const chunk = evt.data?.chunk;
         if (!chunk) continue;
 
-        // Skip chunks that are tool calls (no text to emit)
+        // Skip chunks that are tool calls (no text to emit). Only a producer
+        // branded assistant message can carry parsed tool calls, so a value
+        // that merely happens to have a `content` field is never reclassified.
         if (
-          AIMessageChunkClass.isInstance(chunk) ||
-          AIMessageClass.isInstance(chunk)
-        ) {
-          const msg = chunk as AIMessageChunk | AIMessage;
-          if ((msg.tool_calls?.length ?? 0) > 0) continue;
-        }
+          isAssistantStreamMessage(chunk) &&
+          (chunk.tool_calls?.length ?? 0) > 0
+        ) continue;
 
         const messageId =
           (chunk as { id?: string }).id ?? `message_${options.runId}`;
@@ -172,18 +181,14 @@ export async function* adaptDeepAgentStream(
         const output = evt.data?.output;
         if (!output) continue;
 
-        if (
-          AIMessageClass.isInstance(output) ||
-          AIMessageChunkClass.isInstance(output)
-        ) {
-          const msg = output as AIMessage | AIMessageChunk;
-          const messageId = msg.id ?? `message_${options.runId}`;
+        if (isAssistantStreamMessage(output)) {
+          const messageId = output.id ?? `message_${options.runId}`;
 
           // Skip if this was a tool call message (tool lifecycle via on_tool_*)
-          if ((msg.tool_calls?.length ?? 0) > 0) continue;
+          if ((output.tool_calls?.length ?? 0) > 0) continue;
           if (seenStreamedMessageIds.has(messageId)) continue;
 
-          const delta = extractChunkText(msg);
+          const delta = extractChunkText(output);
           if (!delta) continue;
 
           yield {
@@ -213,33 +218,12 @@ export async function* adaptDeepAgentStream(
             ? (rawInput as Record<string, unknown>)
             : undefined;
 
-        // DeepAgents exposes its execution plan through the built-in
-        // write_todos tool. Stage the candidate here, then publish it only
-        // after the matching successful tool end.
-        if (toolName === "write_todos") {
-          const drafts = readPlanDrafts(toolInput);
-          if (drafts) pendingPlanDrafts.set(toolCallId, drafts);
-          continue;
-        }
-
-        // Track sub-agent parent tools so we can detect nested inner calls.
-        if (SUB_AGENT_PARENT_TOOLS.has(toolName)) {
-          activeSubAgentRuns.add(toolCallId);
-        }
-
-        const planLink = getUniqueInProgressPlanLink(
-          planId,
-          committedPlanSteps,
-        );
-        if (planLink) planLinkByToolCall.set(toolCallId, planLink);
-
         yield {
           runId: options.runId,
           timestamp: now(),
           toolCallId,
           toolName,
           ...(toolInput ? { input: toolInput } : {}),
-          ...(planLink ?? {}),
           type: "tool.started",
         };
         continue;
@@ -249,16 +233,11 @@ export async function* adaptDeepAgentStream(
       if (evt.event === "on_tool_error") {
         const toolName = evt.name ?? "unknown_tool";
         const toolCallId = readString(evt.run_id) ?? `tool_${Date.now()}`;
-        if (toolName === "write_todos") {
-          pendingPlanDrafts.delete(toolCallId);
-          continue;
-        }
         if (
           seenFailedToolCalls.has(toolCallId) ||
           seenCompletedToolCalls.has(toolCallId)
         ) continue;
         seenFailedToolCalls.add(toolCallId);
-        const planLink = planLinkByToolCall.get(toolCallId);
 
         yield {
           type: "tool.failed",
@@ -269,10 +248,8 @@ export async function* adaptDeepAgentStream(
             code: "tool_failed",
             message: sanitizeErrorForClient(evt.data?.error),
           },
-          ...(planLink ?? {}),
           timestamp: now(),
         };
-        planLinkByToolCall.delete(toolCallId);
         continue;
       }
 
@@ -282,42 +259,15 @@ export async function* adaptDeepAgentStream(
         // Use run_id for consistent pairing with on_tool_start
         const toolCallId = readString(evt.run_id) ?? `tool_${Date.now()}`;
 
-        if (toolName === "write_todos") {
-          const drafts = pendingPlanDrafts.get(toolCallId);
-          pendingPlanDrafts.delete(toolCallId);
-          if (drafts) {
-            committedPlanSteps = reconcilePlanSteps(
-              committedPlanSteps,
-              drafts,
-              () => `step_${nextPlanStepOrdinal++}`,
-            );
-            planRevision += 1;
-            yield {
-              type: "plan.updated",
-              runId: options.runId,
-              planId,
-              revision: planRevision,
-              timestamp: now(),
-              steps: committedPlanSteps,
-            } satisfies StreamEvent;
-          }
-          continue;
-        }
-
         if (
           seenCompletedToolCalls.has(toolCallId) ||
           seenFailedToolCalls.has(toolCallId)
         ) continue;
         seenCompletedToolCalls.add(toolCallId);
-        const planLink = planLinkByToolCall.get(toolCallId);
 
         const output = evt.data?.output;
 
-        // When an inner tool runs inside an active sub-agent parent,
-        // suppress its artifacts because the parent will re-emit them.
-        const isNestedInSubAgent =
-          INNER_SUB_AGENT_TOOLS.has(toolName) && activeSubAgentRuns.size > 0;
-        const extractedArtifacts = isNestedInSubAgent ? undefined : extractArtifacts(output);
+        const extractedArtifacts = extractArtifacts(output);
         const extractedOutput = extractOutput(output, (extractedArtifacts?.length ?? 0) > 0);
         yield {
           output: extractedOutput,
@@ -327,17 +277,10 @@ export async function* adaptDeepAgentStream(
           timestamp: now(),
           toolCallId,
           toolName,
-          ...(planLink ?? {}),
           type: "tool.completed",
         };
-        planLinkByToolCall.delete(toolCallId);
 
-        // Clean up sub-agent parent tracking after its tool.completed is emitted.
-        if (SUB_AGENT_PARENT_TOOLS.has(toolName)) {
-          activeSubAgentRuns.delete(toolCallId);
-        }
-
-        if (toolName === "manipulate_canvas") {
+        if (toolName === "manipulate_canvas" || toolName === "create_design_boards") {
           yield {
             type: "canvas.sync" as const,
             runId: options.runId,
@@ -353,17 +296,15 @@ export async function* adaptDeepAgentStream(
       return;
     }
 
-    // Log full error detail server-side
+    const publicError = sanitizeRunErrorForClient(error);
+    // Context failures can wrap raw source text; keep only stable public details.
     console.error(
       `[stream-adapter] Stream error for run ${options.runId}:`,
-      error,
+      publicError.details ? publicError : error,
     );
 
     yield {
-      error: {
-        code: "run_failed",
-        message: sanitizeErrorForClient(error),
-      },
+      error: publicError,
       runId: options.runId,
       timestamp: now(),
       type: "run.failed",
@@ -376,122 +317,6 @@ export async function* adaptDeepAgentStream(
     timestamp: now(),
     type: "run.completed",
   };
-}
-
-type PlanStepDraft = {
-  explicitId?: string;
-  title: string;
-  status: "pending" | "in_progress" | "completed";
-};
-
-function readPlanDrafts(
-  input: Record<string, unknown> | undefined,
-): PlanStepDraft[] | null {
-  if (!input || !Array.isArray(input.todos)) return null;
-
-  const steps: PlanStepDraft[] = [];
-
-  for (const todo of input.todos) {
-    if (!todo || typeof todo !== "object" || Array.isArray(todo)) continue;
-    const item = todo as Record<string, unknown>;
-    const title = typeof item.content === "string" ? item.content.trim() : "";
-    if (!title || !isTodoStatus(item.status)) continue;
-
-    steps.push({
-      ...(typeof item.id === "string" && item.id.trim()
-        ? { explicitId: item.id.trim() }
-        : {}),
-      title,
-      status: item.status,
-    });
-  }
-
-  return steps;
-}
-
-function reconcilePlanSteps(
-  previous: PlanStep[],
-  drafts: PlanStepDraft[],
-  nextId: () => string,
-): PlanStep[] {
-  const previousByTitle = groupByNormalizedTitle(previous);
-  const currentTitleCounts = countValues(
-    drafts.map((draft) => normalizePlanTitle(draft.title)),
-  );
-  const explicitIdCounts = countValues(
-    drafts
-      .map((draft) => draft.explicitId)
-      .filter((id): id is string => id !== undefined),
-  );
-  const usedIds = new Set<string>();
-
-  return drafts.map((draft) => {
-    let id: string | undefined;
-    if (
-      draft.explicitId &&
-      explicitIdCounts.get(draft.explicitId) === 1
-    ) {
-      const explicitCandidate = `todo_${draft.explicitId}`;
-      if (!usedIds.has(explicitCandidate)) id = explicitCandidate;
-    }
-
-    if (!id) {
-      const titleKey = normalizePlanTitle(draft.title);
-      const previousMatches = previousByTitle.get(titleKey) ?? [];
-      if (
-        currentTitleCounts.get(titleKey) === 1 &&
-        previousMatches.length === 1 &&
-        !usedIds.has(previousMatches[0]!.id)
-      ) {
-        id = previousMatches[0]!.id;
-      }
-    }
-
-    while (!id || usedIds.has(id)) id = nextId();
-    usedIds.add(id);
-    return { id, title: draft.title, status: draft.status };
-  });
-}
-
-function getUniqueInProgressPlanLink(
-  planId: string,
-  steps: PlanStep[],
-): { planId: string; planStepId: string } | undefined {
-  const active = steps.filter((step) => step.status === "in_progress");
-  return active.length === 1
-    ? { planId, planStepId: active[0]!.id }
-    : undefined;
-}
-
-function groupByNormalizedTitle(steps: PlanStep[]): Map<string, PlanStep[]> {
-  const result = new Map<string, PlanStep[]>();
-  for (const step of steps) {
-    const key = normalizePlanTitle(step.title);
-    result.set(key, [...(result.get(key) ?? []), step]);
-  }
-  return result;
-}
-
-function countValues(values: string[]): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const value of values) {
-    counts.set(value, (counts.get(value) ?? 0) + 1);
-  }
-  return counts;
-}
-
-function normalizePlanTitle(title: string): string {
-  return title.trim().replace(/\s+/g, " ");
-}
-
-function isTodoStatus(
-  value: unknown,
-): value is "pending" | "in_progress" | "completed" {
-  return (
-    value === "pending" ||
-    value === "in_progress" ||
-    value === "completed"
-  );
 }
 
 function canceledEvent(runId: string, now: () => string): StreamEvent {
@@ -537,17 +362,27 @@ const ARTIFACT_KEYS = new Set([
 ]);
 const OUTPUT_SIZE_LIMIT = 10240; // 10KB
 
+/** A cyclic or otherwise non-serializable tool result must not fail the run. */
+function safeStringify(value: unknown): string {
+  try {
+    const text = JSON.stringify(value);
+    return text ?? "";
+  } catch {
+    return "";
+  }
+}
+
 function extractOutput(
   output: unknown,
   hasArtifacts: boolean,
 ): Record<string, unknown> | undefined {
   let text = "";
-  if (ToolMessageClass.isInstance(output)) {
+  if (isToolResultEnvelope(output)) {
     text = extractChunkText(output);
   } else if (typeof output === "string") {
     text = output;
   } else if (output && typeof output === "object") {
-    text = JSON.stringify(output);
+    text = safeStringify(output);
   }
 
   const parsed = tryParseJson(text);
@@ -575,12 +410,12 @@ function extractOutput(
 
 function extractArtifacts(output: unknown): ToolArtifact[] | undefined {
   let text = "";
-  if (ToolMessageClass.isInstance(output)) {
+  if (isToolResultEnvelope(output)) {
     text = extractChunkText(output);
   } else if (typeof output === "string") {
     text = output;
   } else if (output && typeof output === "object") {
-    text = JSON.stringify(output);
+    text = safeStringify(output);
   }
 
   const parsed = tryParseJson(text);
@@ -688,7 +523,9 @@ function extractArtifacts(output: unknown): ToolArtifact[] | undefined {
 function extractChunkText(chunk: unknown): string {
   if (!chunk || typeof chunk !== "object") return "";
 
-  // AIMessageChunk / AIMessage with string content
+  // Text carried by an assistant chunk. This stays a field-level read: it
+  // extracts text from whatever chunk the producer emitted and never decides
+  // which message shape the value is.
   if ("content" in chunk) {
     const content = (chunk as { content: unknown }).content;
     if (typeof content === "string") return content;
@@ -715,7 +552,7 @@ function extractChunkText(chunk: unknown): string {
 }
 
 function summarizeOutput(output: unknown): string | undefined {
-  if (ToolMessageClass.isInstance(output)) {
+  if (isToolResultEnvelope(output)) {
     const textContent = extractChunkText(output);
     const parsed = tryParseJson(textContent);
     if (
@@ -730,7 +567,7 @@ function summarizeOutput(output: unknown): string | undefined {
   }
 
   if (output && typeof output === "object") {
-    const serialized = JSON.stringify(output);
+    const serialized = safeStringify(output);
     const parsed = tryParseJson(serialized);
     if (
       parsed &&
@@ -766,7 +603,7 @@ function isAbortError(error: unknown) {
   );
 }
 
-function isStreamEvent(value: unknown): value is LangChainStreamEvent {
+function isStreamEvent(value: unknown): value is AgentStreamEvent {
   return (
     value !== null &&
     typeof value === "object" &&

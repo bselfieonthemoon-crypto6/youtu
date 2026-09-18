@@ -14,8 +14,20 @@ const scopedProviders = new AsyncLocalStorage<GenerationProviderScope>();
 
 export type GenerationProviderScope = {
   imageProvider?: ImageProvider;
+  auxiliaryImageProviders?: ImageProvider[];
+  imageProviderAttempts?: readonly {
+    ordinal: number;
+    providerName: string;
+    modelId: string;
+    providerModelId?: string;
+    upstreamModelId: string;
+  }[];
   videoProvider?: VideoProvider;
 };
+
+export function getImageProviderAttempts() {
+  return scopedProviders.getStore()?.imageProviderAttempts;
+}
 
 export function runWithGenerationProviderScope<T>(
   scope: GenerationProviderScope,
@@ -35,6 +47,8 @@ export function registerVideoProvider(provider: VideoProvider): void {
 export function getImageProvider(name: string): ImageProvider {
   const scoped = scopedProviders.getStore()?.imageProvider;
   if (scoped?.name === name) return scoped;
+  const auxiliary = scopedProviders.getStore()?.auxiliaryImageProviders?.find(provider => provider.name === name);
+  if (auxiliary) return auxiliary;
   const provider = imageProviders.get(name);
   if (!provider) {
     throw new GenerationError(
@@ -63,6 +77,8 @@ export function getVideoProvider(name: string): VideoProvider {
 /** Model info enriched with its owning provider name. */
 export interface AvailableModel extends ModelInfo {
   provider: string;
+  /** Published provider model behind a workspace-scoped public alias. */
+  upstreamModelId?: string;
 }
 
 export interface AvailableVideoModel extends VideoModelInfo {
@@ -87,6 +103,8 @@ export function getAvailableVideoModels(): AvailableVideoModel[] {
 export function resolveImageProviderName(modelId: string): string {
   const scoped = scopedProviders.getStore()?.imageProvider;
   if (scoped?.models.some((model) => model.id === modelId)) return scoped.name;
+  const auxiliary = scopedProviders.getStore()?.auxiliaryImageProviders?.find(provider => provider.models.some(model => model.id === modelId));
+  if (auxiliary) return auxiliary.name;
   for (const provider of imageProviders.values()) {
     if (provider.models.some((m) => m.id === modelId)) {
       return provider.name;

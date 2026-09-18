@@ -11,6 +11,7 @@
 import yaml from "js-yaml";
 import { Parser as TarParser } from "tar";
 import { safeDownload } from "../../security/safe-download.js";
+import { isSafeSkillFilePath, skillCreateRequestSchema, SKILL_PACKAGE_LIMITS } from "@loomic/shared";
 
 const MAX_SKILL_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_TARBALL_BYTES = 25 * 1024 * 1024;
@@ -106,7 +107,7 @@ const EXTENSION_MIME_MAP: Record<string, string> = {
   ".env": "text/plain",
 };
 
-/** Binary extensions that should be skipped during text-based import */
+/** Binary attachments cannot be silently dropped from a complete package. */
 const BINARY_EXTENSIONS = new Set([
   ".png",
   ".jpg",
@@ -149,6 +150,18 @@ function isBinaryFile(filePath: string): boolean {
   return BINARY_EXTENSIONS.has(ext);
 }
 
+/** Image references are imported as base64 text; other binaries are rejected. */
+const IMAGE_MIME_BY_EXTENSION = new Map<string, string>([
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".webp", "image/webp"],
+  [".gif", "image/gif"],
+]);
+function imageMimeFor(filePath: string): string | undefined {
+  return IMAGE_MIME_BY_EXTENSION.get(filePath.slice(filePath.lastIndexOf(".")).toLowerCase());
+}
+
 // ── Frontmatter Parser ────────────────────────────────────────────────────
 
 /**
@@ -160,6 +173,9 @@ function isBinaryFile(filePath: string): boolean {
  * @throws SkillImportError if frontmatter is missing or invalid
  */
 export function parseSkillManifest(skillMdContent: string): SkillManifest {
+  if (Buffer.byteLength(skillMdContent, "utf8") > SKILL_PACKAGE_LIMITS.maxContentBytes || skillMdContent.includes("\0")) {
+    throw new SkillImportError("manifest_validation_error", "SKILL.md exceeds the 256 KiB text limit or contains binary data.");
+  }
   const trimmed = skillMdContent.trimStart();
 
   if (!trimmed.startsWith("---")) {
@@ -170,15 +186,18 @@ export function parseSkillManifest(skillMdContent: string): SkillManifest {
   }
 
   // Find the closing --- (skip the opening one)
-  const closingIndex = trimmed.indexOf("\n---", 3);
-  if (closingIndex === -1) {
+  const boundary = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(trimmed);
+  if (!boundary) {
     throw new SkillImportError(
       "manifest_parse_error",
       "Invalid SKILL.md: missing closing '---' for YAML frontmatter",
     );
   }
 
-  const yamlBlock = trimmed.slice(3, closingIndex).trim();
+  const yamlBlock = boundary[1]!.trim();
+  if (!trimmed.slice(boundary[0].length).trim()) {
+    throw new SkillImportError("manifest_validation_error", "SKILL.md must contain instructions after the YAML frontmatter.");
+  }
   if (!yamlBlock) {
     throw new SkillImportError(
       "manifest_parse_error",
@@ -188,7 +207,7 @@ export function parseSkillManifest(skillMdContent: string): SkillManifest {
 
   let parsed: unknown;
   try {
-    parsed = yaml.load(yamlBlock);
+    parsed = yaml.load(yamlBlock, { schema: yaml.JSON_SCHEMA });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new SkillImportError(
@@ -207,13 +226,13 @@ export function parseSkillManifest(skillMdContent: string): SkillManifest {
   const raw = parsed as Record<string, unknown>;
 
   // Validate required fields
-  if (!raw.name || typeof raw.name !== "string") {
+  if (typeof raw.name !== "string" || !raw.name.trim() || raw.name.length > 200) {
     throw new SkillImportError(
       "manifest_validation_error",
       "Invalid SKILL.md frontmatter: missing required field 'name'",
     );
   }
-  if (!raw.description || typeof raw.description !== "string") {
+  if (typeof raw.description !== "string" || !raw.description.trim() || raw.description.length > 2000) {
     throw new SkillImportError(
       "manifest_validation_error",
       "Invalid SKILL.md frontmatter: missing required field 'description'",
@@ -226,11 +245,25 @@ export function parseSkillManifest(skillMdContent: string): SkillManifest {
   };
 
   // Only assign optional fields when present (exactOptionalPropertyTypes)
+  for (const [field, limit] of [["license", 1000], ["version", 100], ["author", 200]] as const) {
+    if (typeof raw[field] === "string" && (!raw[field].trim() || raw[field].length > limit)) {
+      throw new SkillImportError("manifest_validation_error", `Skill ${field} must be non-empty and at most ${limit} characters.`);
+    }
+  }
   if (typeof raw.license === "string") manifest.license = raw.license;
   if (typeof raw.version === "string") manifest.version = raw.version;
   if (typeof raw.author === "string") manifest.author = raw.author;
+  if (raw.metadata !== undefined && !isPlainObject(raw.metadata)) {
+    throw new SkillImportError("manifest_validation_error", "Skill metadata must be a JSON object.");
+  }
   if (isPlainObject(raw.metadata)) {
-    manifest.metadata = raw.metadata as Record<string, unknown>;
+    try {
+      const metadataJson = JSON.stringify(raw.metadata);
+      if (Buffer.byteLength(metadataJson, "utf8") > 65536) throw new Error("metadata too large");
+      manifest.metadata = JSON.parse(metadataJson) as Record<string, unknown>;
+    } catch {
+      throw new SkillImportError("manifest_validation_error", "Skill metadata must be acyclic JSON within the 64 KiB limit.");
+    }
   }
 
   return manifest;
@@ -309,6 +342,10 @@ interface GitHubContentItem {
  */
 function parseGitHubUrl(url: string): GitHubUrlInfo {
   const parsed = new URL(url);
+  if (parsed.protocol !== "https:" || !["github.com", "www.github.com"].includes(parsed.hostname)
+    || parsed.username || parsed.password || parsed.port) {
+    throw new SkillImportError("github_fetch_error", "Expected an HTTPS github.com repository URL without credentials or a custom port.");
+  }
   const segments = parsed.pathname
     .split("/")
     .filter((s) => s.length > 0);
@@ -322,6 +359,9 @@ function parseGitHubUrl(url: string): GitHubUrlInfo {
 
   const owner = segments[0]!;
   const repo = segments[1]!.replace(/\.git$/, "");
+  if (![owner, repo].every(value => /^[a-zA-Z0-9_.-]+$/.test(value) && value !== "." && value !== "..")) {
+    throw new SkillImportError("github_fetch_error", "Invalid GitHub owner or repository name.");
+  }
 
   // Default: root of the repo, no specific ref
   let ref: string | null = null;
@@ -352,6 +392,8 @@ async function githubApiFetch(url: string): Promise<Response> {
       Accept: "application/vnd.github.v3+json",
       "User-Agent": "Loomic-Skill-Importer/1.0",
     },
+    signal: AbortSignal.timeout(15_000),
+    redirect: "error",
   });
 
   if (!response.ok) {
@@ -400,13 +442,13 @@ async function listGitHubDirectory(
   }
 
   const response = await githubApiFetch(apiUrl);
-  const data: unknown = await response.json();
+  const data: unknown = await readBoundedJson(response, 2 * 1024 * 1024);
 
   if (!Array.isArray(data)) {
     // Single file response — wrap as array for consistent handling
     return [data as GitHubContentItem];
   }
-
+  if (data.length > 500) throw new SkillImportError("github_fetch_error", "Skill directory exceeds 500 entries.");
   return data as GitHubContentItem[];
 }
 
@@ -425,11 +467,32 @@ async function downloadGitHubFile(downloadUrl: string): Promise<string> {
       allowedMimeTypes: ["text/plain", "text/markdown"],
       headers: { "User-Agent": "Loomic-Skill-Importer/1.0" },
     });
-    return downloaded.buffer.toString("utf8");
+    return decodeSkillText(downloaded.buffer);
   } catch (error) {
     throw new SkillImportError(
       "github_fetch_error",
       `Failed to download file from GitHub: ${error instanceof Error ? error.message : "unknown error"}`,
+    );
+  }
+}
+
+/** Download a binary image reference and base64-encode it for text storage. */
+async function downloadGitHubBinary(downloadUrl: string): Promise<string> {
+  try {
+    const downloaded = await safeDownload(downloadUrl, {
+      kind: "image",
+      maxBytes: MAX_SKILL_FILE_BYTES,
+      timeoutMs: 20_000,
+      maxRedirects: 1,
+      allowedHosts: ["raw.githubusercontent.com", "github.com"],
+      allowedMimeTypes: [...IMAGE_MIME_BY_EXTENSION.values()],
+      headers: { "User-Agent": "Loomic-Skill-Importer/1.0" },
+    });
+    return downloaded.buffer.toString("base64");
+  } catch (error) {
+    throw new SkillImportError(
+      "github_fetch_error",
+      `Failed to download image reference from GitHub: ${error instanceof Error ? error.message : "unknown error"}`,
     );
   }
 }
@@ -444,7 +507,11 @@ async function collectGitHubFiles(
   basePath: string,
   ref: string | null,
   parentRelative: string,
+  budget: { files: number; bytes: number; directories: number },
 ): Promise<ImportedSkillFile[]> {
+  if (++budget.directories > 128 || parentRelative.split("/").length > 16) {
+    throw new SkillImportError("github_fetch_error", "Skill directory count or depth exceeds the import limit.");
+  }
   const items = await listGitHubDirectory(owner, repo, basePath, ref);
   const files: ImportedSkillFile[] = [];
 
@@ -454,22 +521,26 @@ async function collectGitHubFiles(
       : item.name;
 
     if (item.type === "file") {
-      // Skip binary files
-      if (isBinaryFile(item.name)) {
-        console.log(`[skill-import] Skipping binary file: ${relativePath}`);
-        continue;
+      const imageMime = imageMimeFor(item.name);
+      if (!imageMime && isBinaryFile(item.name)) {
+        throw new SkillImportError("unsupported_source", `Binary attachment ${relativePath} is not supported by text skill packages; no partial import was saved.`);
       }
 
       if (!item.download_url) {
-        console.warn(`[skill-import] No download URL for file: ${item.path}`);
-        continue;
+        throw new SkillImportError("github_fetch_error", `Missing attachment download URL: ${relativePath}`);
       }
-
-      const content = await downloadGitHubFile(item.download_url);
+      if (!isSafeSkillFilePath(relativePath) || ++budget.files > SKILL_PACKAGE_LIMITS.maxFiles) {
+        throw new SkillImportError("github_fetch_error", "Skill contains unsafe paths or more than 64 files.");
+      }
+      const content = imageMime
+        ? await downloadGitHubBinary(item.download_url)
+        : await downloadGitHubFile(item.download_url);
+      budget.bytes += Buffer.byteLength(content);
+      if (budget.bytes > SKILL_PACKAGE_LIMITS.maxPackageBytes) throw new SkillImportError("github_fetch_error", "Skill package exceeds 8 MiB.");
       files.push({
         filePath: relativePath,
         content,
-        mimeType: detectMimeType(item.name),
+        mimeType: imageMime ?? detectMimeType(item.name),
       });
     } else if (item.type === "dir") {
       // Recurse into subdirectories
@@ -479,10 +550,12 @@ async function collectGitHubFiles(
         item.path,
         ref,
         relativePath,
+        budget,
       );
       files.push(...nested);
+    } else {
+      throw new SkillImportError("unsupported_source", "Symbolic links and submodules are not supported in skill packages.");
     }
-    // Skip symlinks and submodules silently
   }
 
   return files;
@@ -507,9 +580,11 @@ export async function importFromGitHub(repoUrl: string): Promise<ImportedSkill> 
   const contents = await listGitHubDirectory(owner, repo, path, ref);
 
   // Step 2: Find SKILL.md
-  const skillMdItem = contents.find(
+  const skillMdItems = contents.filter(
     (item) => item.type === "file" && item.name.toUpperCase() === "SKILL.MD",
   );
+  if (skillMdItems.length > 1) throw new SkillImportError("manifest_validation_error", "Skill directory contains multiple SKILL.md files with conflicting case.");
+  const skillMdItem = skillMdItems[0];
 
   if (!skillMdItem?.download_url) {
     throw new SkillImportError(
@@ -528,8 +603,12 @@ export async function importFromGitHub(repoUrl: string): Promise<ImportedSkill> 
   // Step 3: Collect files from allowed subdirectories
   const allowedDirs = ["scripts", "references", "assets"];
   const files: ImportedSkillFile[] = [];
+  const budget = { files: 0, bytes: Buffer.byteLength(skillContent), directories: 0 };
 
   for (const item of contents) {
+    if (allowedDirs.includes(item.name.toLowerCase()) && item.type !== "dir") {
+      throw new SkillImportError("unsupported_source", "Skill resource directories cannot be links or regular files.");
+    }
     if (item.type !== "dir" || !allowedDirs.includes(item.name.toLowerCase())) {
       continue;
     }
@@ -540,6 +619,7 @@ export async function importFromGitHub(repoUrl: string): Promise<ImportedSkill> 
       item.path,
       ref,
       item.name,
+      budget,
     );
     files.push(...dirFiles);
   }
@@ -548,12 +628,12 @@ export async function importFromGitHub(repoUrl: string): Promise<ImportedSkill> 
     `[skill-import] GitHub import complete: ${files.length} files collected from ${owner}/${repo}`,
   );
 
-  return {
+  return validateImportedSkill({
     manifest,
     skillContent,
     files,
     sourceUrl: repoUrl,
-  };
+  });
 }
 
 // ── Tarball Importer ──────────────────────────────────────────────────────
@@ -562,8 +642,8 @@ export async function importFromGitHub(repoUrl: string): Promise<ImportedSkill> 
 interface TarballEntry {
   /** Path within the tarball (after stripping the root prefix) */
   path: string;
-  /** Raw text content */
-  content: string;
+  /** Raw bytes, decoded strictly only for the selected skill and its resources. */
+  content: Buffer;
 }
 
 /**
@@ -579,6 +659,7 @@ async function extractTarballEntries(buffer: Buffer): Promise<TarballEntry[]> {
     let entryCount = 0;
     let expandedBytes = 0;
     let failed = false;
+    const seenPaths = new Set<string>();
 
     const fail = (message: string) => {
       if (failed) return;
@@ -587,6 +668,7 @@ async function extractTarballEntries(buffer: Buffer): Promise<TarballEntry[]> {
     };
 
     const parser = new TarParser({
+      strict: true,
       // Let tar auto-detect gzip compression
       onReadEntry(entry) {
         if (failed) {
@@ -602,7 +684,7 @@ async function extractTarballEntries(buffer: Buffer): Promise<TarballEntry[]> {
           return;
         }
         const normalizedParts = entryPath.replace(/\\/g, "/").split("/");
-        if (entryPath.startsWith("/") || normalizedParts.includes("..")) {
+        if (entryPath.startsWith("/") || /[\\:%?#\x00-\x1f]/.test(entryPath) || normalizedParts.includes("..") || normalizedParts.includes(".")) {
           entry.resume();
           fail("Tarball contains an unsafe path.");
           return;
@@ -621,8 +703,15 @@ async function extractTarballEntries(buffer: Buffer): Promise<TarballEntry[]> {
         // Only process regular files
         if (entry.type !== "File") {
           entry.resume();
+          fail("Tarball contains unsupported symbolic links or special entries.");
           return;
         }
+        if (seenPaths.has(entryPath.toLowerCase())) {
+          entry.resume();
+          fail("Tarball contains duplicate file paths (case-insensitive).");
+          return;
+        }
+        seenPaths.add(entryPath.toLowerCase());
 
         if (entry.size > MAX_SKILL_FILE_BYTES) {
           entry.resume();
@@ -655,7 +744,9 @@ async function extractTarballEntries(buffer: Buffer): Promise<TarballEntry[]> {
 
           entries.push({
             path: entryPath,
-            content: fullContent.toString("utf-8"),
+            // Decode only after the skill root is known. Irrelevant README or
+            // package artwork may be binary, but required resources must not be.
+            content: fullContent,
           });
         });
       },
@@ -673,7 +764,7 @@ async function extractTarballEntries(buffer: Buffer): Promise<TarballEntry[]> {
     parser.on("end", () => {
       if (failed) return;
       // Strip root prefix from all paths if one was detected
-      if (rootPrefix) {
+      if (rootPrefix && entries.every(entry => entry.path.startsWith(rootPrefix!))) {
         for (const entry of entries) {
           if (entry.path.startsWith(rootPrefix)) {
             entry.path = entry.path.slice(rootPrefix.length);
@@ -730,96 +821,49 @@ export async function importFromTarballUrl(url: string): Promise<ImportedSkill> 
     (e) => e.path.toUpperCase() === "SKILL.MD",
   );
 
-  // Also look for SKILL.md in subdirectories (multi-skill packages like skills/xxx/SKILL.md)
-  const nestedSkillMd = !skillMdEntry
-    ? entries.find((e) => /\/SKILL\.MD$/i.test(e.path))
-    : null;
-
-  // Fallback: use README.md + package.json when no SKILL.md exists
-  const readmeEntry = entries.find(
-    (e) => e.path.toUpperCase() === "README.MD",
-  );
-  const pkgJsonEntry = entries.find(
-    (e) => e.path === "package.json",
-  );
-
-  const effectiveSkillMd = skillMdEntry ?? nestedSkillMd;
-
-  let manifest: SkillManifest;
-  let skillContent: string;
-
-  if (effectiveSkillMd) {
-    manifest = parseSkillManifest(effectiveSkillMd.content);
-    skillContent = effectiveSkillMd.content;
-  } else if (pkgJsonEntry) {
-    // Fallback: build manifest from package.json + use README as content
-    let pkgJson: Record<string, unknown>;
-    try {
-      pkgJson = JSON.parse(pkgJsonEntry.content) as Record<string, unknown>;
-    } catch {
-      throw new SkillImportError(
-        "manifest_parse_error",
-        `Failed to parse package.json in tarball: ${url}`,
-      );
-    }
-    const pkgName = (pkgJson.name as string) ?? "unknown-skill";
-    const shortName = pkgName.replace(/^@[^/]+\//, ""); // strip scope
-    manifest = {
-      name: shortName,
-      description: (pkgJson.description as string) ?? "Imported from npm",
-    };
-    if (pkgJson.version) manifest.version = pkgJson.version as string;
-    if (pkgJson.license) manifest.license = pkgJson.license as string;
-    if (typeof pkgJson.author === "string") manifest.author = pkgJson.author;
-    else if (pkgJson.author && typeof (pkgJson.author as any).name === "string") {
-      manifest.author = (pkgJson.author as any).name;
-    }
-
-    // Use README.md as skill content, or a minimal placeholder
-    skillContent = readmeEntry?.content
-      ?? `# ${shortName}\n\n${manifest.description}`;
-
-    console.log(
-      `[skill-import] No SKILL.md found, using package.json + README.md fallback for "${shortName}"`,
-    );
-  } else {
-    throw new SkillImportError(
-      "manifest_not_found",
-      `Neither SKILL.md nor package.json found in tarball: ${url}`,
-    );
+  const nestedManifests = entries.filter(e => /\/SKILL\.MD$/i.test(e.path));
+  if (!skillMdEntry && nestedManifests.length > 1) {
+    throw new SkillImportError("manifest_validation_error", "Archive contains multiple skills. Import the exact GitHub skill directory instead.");
   }
+  const effectiveSkillMd = skillMdEntry ?? nestedManifests[0];
+  if (!effectiveSkillMd) throw new SkillImportError("manifest_not_found", "A real SKILL.md is required. A package.json or README is not an executable skill.");
+  const skillContent = decodeSkillText(effectiveSkillMd.content);
+  const manifest = parseSkillManifest(skillContent);
+  const packagePrefix = effectiveSkillMd.path.slice(0, -"SKILL.md".length);
 
   console.log(
     `[skill-import] Parsed tarball manifest: name="${manifest.name}" version="${manifest.version ?? "unversioned"}"`,
   );
 
   // Collect files from allowed subdirectories
-  const ALLOWED_DIR_PATTERN = /^(scripts|references|assets)\//i;
+  const ALLOWED_DIR_PATTERN = /^(scripts|references|assets)\//;
 
   const files: ImportedSkillFile[] = entries
+    .filter(entry => entry.path.startsWith(packagePrefix))
+    .map(entry => ({ ...entry, path: entry.path.slice(packagePrefix.length) }))
     .filter((entry) => {
       // Must be in an allowed subdirectory
       if (!ALLOWED_DIR_PATTERN.test(entry.path)) return false;
-      // Must not be binary
-      if (isBinaryFile(entry.path)) return false;
+      if (!imageMimeFor(entry.path) && isBinaryFile(entry.path)) throw new SkillImportError("unsupported_source", `Binary attachment ${entry.path} is not supported; no partial import was saved.`);
       return true;
     })
-    .map((entry) => ({
-      filePath: entry.path,
-      content: entry.content,
-      mimeType: detectMimeType(entry.path),
-    }));
+    .map((entry) => {
+      const imageMime = imageMimeFor(entry.path);
+      return imageMime
+        ? { filePath: entry.path, content: entry.content.toString("base64"), mimeType: imageMime }
+        : { filePath: entry.path, content: decodeSkillText(entry.content), mimeType: detectMimeType(entry.path) };
+    });
 
   console.log(
     `[skill-import] Tarball import complete: ${files.length} files collected from ${url}`,
   );
 
-  return {
+  return validateImportedSkill({
     manifest,
     skillContent,
     files,
     sourceUrl: url,
-  };
+  });
 }
 
 // ── Main Entry Point ──────────────────────────────────────────────────────
@@ -869,4 +913,43 @@ export async function importSkillFromUrl(url: string): Promise<ImportedSkill> {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function decodeSkillText(buffer: Uint8Array): string {
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+    if (text.includes("\0")) throw new Error("binary NUL");
+    return text;
+  } catch {
+    throw new SkillImportError("manifest_validation_error", "Skill instructions and attachments must be valid UTF-8 text; binary data cannot be imported as text.");
+  }
+}
+
+/** Reject incomplete/unsafe imports before any persistence (including marketplace JSON). */
+export function validateImportedSkill(imported: ImportedSkill): ImportedSkill {
+  parseSkillManifest(imported.skillContent);
+  const parsed = skillCreateRequestSchema.safeParse({ name: imported.manifest.name,
+    description: imported.manifest.description, category: "custom", skillContent: imported.skillContent, files: imported.files });
+  if (!parsed.success) throw new SkillImportError("manifest_validation_error", "Skill package has unsafe or duplicate paths, invalid text, or exceeds its file/size limits.");
+  return imported;
+}
+
+/** Streaming byte limit applies before JSON parsing, even without Content-Length. */
+export async function readBoundedJson(response: Response, maxBytes: number): Promise<unknown> {
+  if (Number(response.headers.get("content-length") ?? 0) > maxBytes) {
+    await response.body?.cancel();
+    throw new SkillImportError("github_fetch_error", "Remote JSON response exceeds its size limit.");
+  }
+  const reader = response.body?.getReader();
+  if (!reader) throw new SkillImportError("github_fetch_error", "Remote response is empty.");
+  let size = 0; const chunks: Uint8Array[] = [];
+  try {
+    while (true) {
+      const { value, done } = await reader.read(); if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) throw new SkillImportError("github_fetch_error", "Remote JSON response exceeds its size limit.");
+      chunks.push(value);
+    }
+    return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+  } finally { await reader.cancel().catch(() => undefined); }
 }

@@ -1,3 +1,5 @@
+import { randomBytes } from "node:crypto";
+
 /**
  * canvas-element-helpers.ts
  *
@@ -31,11 +33,16 @@ export type HandlerResult = {
 // ID / version utilities
 // ---------------------------------------------------------------------------
 
-/** Generate a 20-character random alphanumeric ID (matches Excalidraw format). */
+const ID_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+/** Generate a 20-character random alphanumeric ID (matches Excalidraw format)
+ * from a CSPRNG so created element IDs cannot collide or be predicted. */
 export function generateId(): string {
-  return (
-    Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)
-  ).slice(0, 20);
+  const bytes = randomBytes(20);
+  let id = "";
+  for (let index = 0; index < 20; index += 1)
+    id += ID_ALPHABET[bytes[index]! % ID_ALPHABET.length];
+  return id;
 }
 
 /** Increment element version and refresh versionNonce + updated timestamp. */
@@ -85,7 +92,14 @@ export function measureTextWidth(text: string, fontSize: number): number {
  * instead of "#RRGGBB" strings.
  */
 export function coerceColor(v: unknown, fallback: string): string {
-  if (typeof v === "number") return `#${v.toString(16).padStart(6, "0")}`;
+  if (typeof v === "number" && Number.isFinite(v)) {
+    const n = Math.trunc(v);
+    // Only a 24-bit RGB value is a valid #RRGGBB; alpha forms, negatives and
+    // NaN fall back instead of emitting an invalid hex string.
+    return n >= 0 && n <= 0xffffff
+      ? `#${n.toString(16).padStart(6, "0")}`
+      : fallback;
+  }
   if (typeof v === "string" && v.length > 0) return v;
   return fallback;
 }

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { createDesignDiscoveryTool } from "./design-discovery.js";
+import { toolExecutionContext } from "./tool-run-context.js";
 
 describe("native design discovery", () => {
   it("lists real board metadata and constrains the query to the active canvas/workspace", async () => {
@@ -26,17 +27,14 @@ describe("native design discovery", () => {
       designResourceService: {},
       designTemplateService: {},
     } as any);
-    const result = await t.invoke(
-      {},
-      {
+    const result = await t.execute({}, toolExecutionContext({
         configurable: {
           access_token: "token",
           canvas_id: "canvas",
           workspace_id: "workspace",
           user_id: "user",
         },
-      },
-    );
+      }));
     expect(result).toMatchObject({
       designs: [
         { design_id: "design-real", width: 800, height: 600, revision: 3 },
@@ -48,7 +46,7 @@ describe("native design discovery", () => {
   it("fails closed without authenticated canvas context", async () => {
     const client = vi.fn();
     const t = createDesignDiscoveryTool({ createUserClient: client } as any);
-    expect(await t.invoke({})).toMatchObject({
+    expect(await t.execute({}, toolExecutionContext({}))).toMatchObject({
       error: "design_context_missing",
     });
     expect(client).not.toHaveBeenCalled();

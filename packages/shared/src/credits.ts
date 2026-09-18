@@ -68,7 +68,8 @@ export const PLAN_CONFIGS: Record<SubscriptionPlan, PlanConfig> = {
     maxVideoResolution: "720p",
     maxProjects: 3,
     maxBrandKits: 1,
-    watermark: true,
+    // Platform watermarks are disabled until commercialization is introduced.
+    watermark: false,
     monthlyPrice: 0,
     yearlyPrice: 0,
   },

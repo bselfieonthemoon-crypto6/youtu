@@ -3,6 +3,9 @@ import type {
   CanvasDetail,
   ChatMessageCreateRequest,
   CreateImageJobRequest,
+  NodeImageSubmissionRequest,
+  NodeImageSubmissionResponse,
+  NodeImageSubmissionLookup,
   JobResponse,
   MarketplaceDetail,
   MarketplaceSearchResponse,
@@ -39,6 +42,10 @@ import type {
 } from "@loomic/shared";
 import {
   canvasGetResponseSchema,
+  nodeImageSubmissionRequestSchema,
+  nodeImageSubmissionResponseSchema,
+  nodeImageSubmissionLookupSchema,
+  nodeImageSubmissionLookupResponseSchema,
   canvasSaveResponseSchema,
   providerConfigListResponseSchema,
   providerConfigResponseSchema,
@@ -295,7 +302,7 @@ export async function fetchWorkspaceSettings(
 
 export async function updateWorkspaceSettings(
   accessToken: string,
-  data: { defaultModel: string },
+  data: { defaultModel?: string },
 ): Promise<WorkspaceSettingsResponse> {
   const response = await fetch(`${getServerBaseUrl()}/api/workspace/settings`, {
     method: "PUT",
@@ -540,6 +547,27 @@ export async function fetchVideoModels(accessToken?: string): Promise<{
   return (await response.json()) as { models: VideoModelInfo[] };
 }
 
+export async function submitNodeImageGeneration(
+  accessToken: string, payload: NodeImageSubmissionRequest,
+): Promise<NodeImageSubmissionResponse> {
+  const request = nodeImageSubmissionRequestSchema.parse(payload);
+  const response = await fetch(`${getServerBaseUrl()}/api/jobs/node-image-generation`, {
+    method: "POST", headers: authJsonHeaders(accessToken), body: JSON.stringify(request),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return nodeImageSubmissionResponseSchema.parse(await response.json());
+}
+
+export async function getNodeImageSubmission(accessToken: string, input: NodeImageSubmissionLookup) {
+  const key = nodeImageSubmissionLookupSchema.parse(input);
+  const query = new URLSearchParams({ canvas_id: key.canvasId, element_id: key.elementId });
+  const response = await fetch(`${getServerBaseUrl()}/api/jobs/node-image-generation/${key.requestId}?${query}`, {
+    method: "GET", headers: authJsonHeaders(accessToken), cache: "no-store",
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return nodeImageSubmissionLookupResponseSchema.parse(await response.json());
+}
+
 export async function generateImageDirect(
   accessToken: string,
   prompt: string,
@@ -581,13 +609,17 @@ export async function generateVideoDirect(
     resolution?: string;
     aspectRatio?: string;
     inputImages?: string[];
+    idempotencyKey?: string;
   },
 ): Promise<GenerateVideoResponse> {
   const response = await fetch(
     `${getServerBaseUrl()}/api/agent/generate-video`,
     {
       method: "POST",
-      headers: authJsonHeaders(accessToken),
+      headers: {
+        ...authJsonHeaders(accessToken),
+        ...(options?.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
+      },
       body: JSON.stringify({
         prompt,
         ...(options?.model ? { model: options.model } : {}),
@@ -722,6 +754,17 @@ export async function testProviderConnection(
   );
   if (!response.ok) return handleErrorResponse(response);
   return providerConnectionTestResponseSchema.parse(await response.json());
+}
+
+export async function discoverDraftProviderModels(
+  accessToken: string,
+  input: { baseUrl: string; apiKey?: string; configId?: string },
+): Promise<ProviderModelDiscoveryResponse> {
+  const response = await fetch(`${getServerBaseUrl()}/api/workspace/provider-configs/discover-models`, {
+    method: "POST", headers: authJsonHeaders(accessToken), body: JSON.stringify(input),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return providerModelDiscoveryResponseSchema.parse(await response.json());
 }
 
 export async function discoverProviderModels(

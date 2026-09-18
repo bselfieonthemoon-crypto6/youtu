@@ -1,17 +1,21 @@
 "use client";
+import { agentStartErrorMessage } from "../lib/agent-start-error";
+import { agentContextErrorMessage } from "../lib/agent-run-error";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { projectGenerationMessages } from "../lib/chat-generation-presentation";
+import { messageResendReferences } from "../lib/chat-message-resend";
 
 import { useBreakpoint } from "../hooks/use-breakpoint";
 import type {
   ContentBlock,
   AgentExecutionMode,
+  DesignTaskTarget,
   ImageArtifact,
   ImageGenerationPreference,
   MessageMention,
   StreamEvent,
   VideoArtifact,
-  VideoGenerationPreference,
 } from "@loomic/shared";
 import { useAgentModel } from "../hooks/use-agent-model";
 import {
@@ -20,6 +24,12 @@ import {
   useChatSessions,
 } from "../hooks/use-chat-sessions";
 import { useChatStream } from "../hooks/use-chat-stream";
+import { useWorkspaceSkills } from "../hooks/use-workspace-skills";
+import type { CanvasSelectionSnapshot } from "../lib/canvas-selection-snapshot";
+import {
+  resolveFreshAuthorizedDesignScope,
+  resolveFreshTaskTarget,
+} from "../lib/chat-submission-scope";
 import {
   INITIAL_AGENT_MODEL_KEY,
   INITIAL_ATTACHMENTS_KEY,
@@ -37,7 +47,6 @@ import { claimDailyCredits } from "../lib/credits-api";
 import { preserveChatCopy } from "../lib/chat-clipboard";
 import {
   fetchImageModels,
-  fetchWorkspaceSkills,
   restoreJobToCanvas,
   saveMessage,
 } from "../lib/server-api";
@@ -64,7 +73,9 @@ import type { ToolConfirmationKind } from "./chat/tool-block-view";
 import {
   ClarificationDialog,
   ConfirmationDialog,
+  hasImageExecutionReceipt,
   parseClarificationQuestions,
+  parseStructuredClarificationQuestions,
   parseConfirmationRequest,
   parseToolConfirmationRequest,
   type ClarificationQuestion,
@@ -85,6 +96,7 @@ type ChatSidebarProps = {
   initialSessionId?: string | undefined;
   onSessionChange?: (sessionId: string) => void;
   onRequestCanvasImages?: () => CanvasImageItem[];
+  onRequestCanvasSelection?: (canvasId: string) => CanvasSelectionSnapshot;
   currentBrandKitId?: string | null;
   ws: WebSocketHandle;
   selectedCanvasElements?: CanvasSelectedElement[];
@@ -120,8 +132,6 @@ function markConfirmationHandled(confirmationId: string): void {
   }
 }
 
-import { isExplicitImageConfirmationMessage } from "@loomic/shared";
-
 export function ChatSidebar({
   activeDesignId,
   beforeDesignSend,
@@ -137,6 +147,7 @@ export function ChatSidebar({
   initialSessionId,
   onSessionChange,
   onRequestCanvasImages,
+  onRequestCanvasSelection,
   currentBrandKitId,
   ws,
   selectedCanvasElements,
@@ -200,9 +211,20 @@ export function ChatSidebar({
   const chatSidebarRef = useRef<HTMLDivElement>(null);
 
   const initialPromptSent = useRef(false);
+  const messageListRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const activeRunIdRef = useRef<string | null>(null);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const submissionVersionRef = useRef(0);
+  const submissionStartingVersionRef = useRef<number | null>(null);
+  const completedRunIdsRef = useRef(new Set<string>());
+  const recoveryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const terminalRecoveryRef = useRef(false);
+  const completedResumeRetriesRef = useRef(new Set<string>());
+  const detachLiveStreamRef = useRef<(() => void) | null>(null);
+  const detachResumedStreamRef = useRef<(() => void) | null>(null);
   const [cancelRequested, setCancelRequested] = useState(false);
+  const [resumeRequest, setResumeRequest] = useState(0);
   const [runHistoryOpen, setRunHistoryOpen] = useState(false);
   const [clarificationQuestions, setClarificationQuestions] = useState<
     ClarificationQuestion[]
@@ -218,7 +240,21 @@ export function ChatSidebar({
   messageMentionsRef.current = messageMentions;
   const selectedCanvasElementsRef = useRef(selectedCanvasElements);
   selectedCanvasElementsRef.current = selectedCanvasElements;
+
   const prevConnectedRef = useRef(false);
+  const scheduleActiveRunRecovery = useCallback(() => {
+    if (recoveryTimerRef.current) clearTimeout(recoveryTimerRef.current);
+    const sessionId = activeSessionIdRef.current;
+    const version = submissionVersionRef.current;
+    recoveryTimerRef.current = setTimeout(() => {
+      recoveryTimerRef.current = null;
+      if (activeSessionIdRef.current !== sessionId || submissionVersionRef.current !== version) return;
+      terminalRecoveryRef.current = true;
+      prevConnectedRef.current = false;
+      setResumeRequest(current => current + 1);
+    }, 150);
+  }, [activeSessionIdRef]);
+  useEffect(() => () => { if (recoveryTimerRef.current) clearTimeout(recoveryTimerRef.current); }, []);
   const consumedImageCommandRef = useRef<string | null>(null);
   const canvasSyncTimersRef = useRef<number[]>([]);
   const completedConfirmationIdsRef = useRef(new Set<string>());
@@ -285,6 +321,9 @@ export function ChatSidebar({
 
   const { showTierLimit } = useTierLimitToast();
   const { toast: showToast } = useToast();
+  const handleSkillSelect = useCallback((invitation: string) => {
+    chatInputRef.current?.prependInvitation(invitation);
+  }, []);
 
   // ── Sidebar resize ──
   const SIDEBAR_MIN = 300;
@@ -373,7 +412,9 @@ export function ChatSidebar({
 
   // ── Auto-scroll to bottom ──
   const scrollToBottom = useCallback(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const messageList = messageListRef.current;
+    if (!messageList) return;
+    messageList.scrollTo({ top: messageList.scrollHeight, behavior: "smooth" });
   }, []);
 
   useEffect(() => {
@@ -393,8 +434,13 @@ export function ChatSidebar({
     }
 
     const updateClearance = () => {
+      const composer = dialog.closest<HTMLElement>("[data-chat-composer-shell]");
+      const coveredComposerHeight = composer?.getBoundingClientRect().height ?? 0;
       setFloatingDialogClearance(
-        Math.ceil(dialog.getBoundingClientRect().height) + 24,
+        Math.max(
+          0,
+          Math.ceil(dialog.getBoundingClientRect().height - coveredComposerHeight),
+        ) + 24,
       );
     };
     updateClearance();
@@ -437,38 +483,19 @@ export function ChatSidebar({
     };
   }, [accessToken]);
 
-  // Fetch enabled workspace skills for @ mention
+  // Share authoritative install/toggle refreshes with the Skills page and cards.
+  const { skills: workspaceSkills } = useWorkspaceSkills(accessToken);
   useEffect(() => {
-    if (!accessToken) return;
-    let cancelled = false;
-
-    fetchWorkspaceSkills(accessToken)
-      .then((data) => {
-        if (cancelled) return;
-        const allSkills = data.skills ?? [];
-        const enabledSkills = allSkills.filter((s) => s.enabled);
-        console.log(
-          `[chat-sidebar] Workspace skills loaded: ${allSkills.length} total, ${enabledSkills.length} enabled`,
-        );
-        setSkillMentionItems(
-          enabledSkills.map((s) => ({
+    setSkillMentionItems(workspaceSkills
+      .filter((skill) => skill.installed === true && skill.enabled === true && skill.readiness && skill.readiness.status !== "unavailable")
+      .map((s) => ({
             kind: "skill" as const,
             id: s.id,
             label: s.name,
             slug: s.slug,
             description: s.description,
-          })),
-        );
-      })
-      .catch((err) => {
-        console.error("[chat-sidebar] Failed to load workspace skills:", err);
-        if (!cancelled) setSkillMentionItems([]);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [accessToken]);
+      })));
+  }, [workspaceSkills]);
 
   // ── Fetch brand kit items for @mention picker ──
   useEffect(() => {
@@ -507,6 +534,7 @@ export function ChatSidebar({
 
   const clearActiveRun = useCallback(() => {
     activeRunIdRef.current = null;
+    setActiveRunId(null);
     cancelRequestedRef.current = false;
     setCancelRequested(false);
   }, []);
@@ -527,34 +555,16 @@ export function ChatSidebar({
     void handleNewChat();
   }, [handleCancelRun, handleNewChat]);
 
-  const imageConfirmationSenderRef = useRef<
-    | ((
-        id: string,
-        decision: "confirm" | "cancel",
-      ) => Promise<{ status: string; message?: string }>)
-    | null
-  >(null);
   const handleConfirmAction = useCallback(
     (
       confirmationId: string,
       decision: "confirm" | "cancel",
       confirmationKind: ToolConfirmationKind = "delete",
     ) => {
-      if (["image_generation"].includes(confirmationKind)) {
-        // Image confirmations are durable session-bound run commands. The
-        // legacy destructive-action endpoint stores closures and cannot replay them.
-        return (
-          imageConfirmationSenderRef.current?.(confirmationId, decision) ??
-          Promise.resolve({
-            status: "failed",
-            message: "对话尚未就绪，请稍后重试。",
-          })
-        );
-      }
       // During the initial session load React state can already contain the
       // visible session while the ref observed by this callback is one render
-      // behind. Fall back to state so an auto-confirmed image proposal still
-      // gets its optimistic chat placeholder immediately.
+      // behind. Fall back to state so a confirmed proposal still gets its
+      // optimistic chat placeholder immediately.
       const confirmationSessionId =
         activeSessionIdRef.current ?? activeSessionId;
       return new Promise<{ status: string; message?: string }>((resolve) => {
@@ -869,6 +879,10 @@ export function ChatSidebar({
                 observedGenerationJobs.current.delete(key);
               }
             } else {
+              // A concurrent successful job can reload persisted messages and
+              // restore this old queued projection. Allow re-observation then;
+              // the terminal status below prevents polling our own update.
+              observedGenerationJobs.current.delete(key);
               updateSessionMessages(session, (previous) =>
                 previous.map((item) => ({
                   ...item,
@@ -877,14 +891,14 @@ export function ChatSidebar({
                       b.type === "tool" && b.output?.jobId === jobId
                         ? {
                             ...b,
-                            status: "failed" as const,
+                            status: job.status === "canceled" ? "canceled" as const : "failed" as const,
                             output: {
                               ...b.output,
                               status: job.status,
-                              error: job.error_message ?? "生成任务未完成",
+                              error: job.status === "canceled" ? "任务已取消，不会将后续结果放入画布" : job.error_message ?? "生成任务未完成",
                             },
                             outputSummary:
-                              job.error_message ?? "生成任务未完成",
+                              job.status === "canceled" ? "任务已取消，不会将后续结果放入画布" : job.error_message ?? "生成任务未完成",
                           }
                         : b,
                     ) ?? [],
@@ -924,26 +938,45 @@ export function ChatSidebar({
       imageGenerationPreferenceOverride?: ImageGenerationPreference,
       mentionsOverride?: MessageMention[],
       executionModeOverride?: AgentExecutionMode,
-      imageConfirmation?: {
-        confirmationId: string;
-        decision: "confirm" | "cancel";
-      },
+      preserveComposer = false,
     ) => {
       const currentSessionId = activeSessionIdRef.current;
-      if (streaming || !currentSessionId) return;
+      if (!currentSessionId) return;
+      const selectedEls = [...(selectedCanvasElementsRef.current ?? [])];
+      const designContext = { ...designSendRef.current };
+      const explicitAttachments = attachmentsOverride ?? readyAttachments;
+      // Only a fresh, all-design multi-selection can add secondary targets. A
+      // selected/open object is useful read context even for consultation; the
+      // task's write guards still decide effects.
+      const freshAuthorizedScope = resolveFreshAuthorizedDesignScope({
+        attachments: explicitAttachments,
+        selection: selectedEls,
+      });
+      const target: DesignTaskTarget | undefined = freshAuthorizedScope?.target ?? resolveFreshTaskTarget({
+        attachments: explicitAttachments,
+        canvasImages: onRequestCanvasImages?.() ?? [], selection: selectedEls,
+      });
+      // Copy synchronously before any save/ACK wait. Explicit attachment and
+      // design targets have their own evidence and cannot inherit stale selection.
+      const canvasSelection = explicitAttachments.length === 0
+        ? { elementIds: [...new Set(onRequestCanvasSelection?.(canvasId).elementIds ?? [])] }
+        : undefined;
+      // Capture scope and references synchronously. Later canvas clicks never retarget a run.
+      const boundDesignId = target?.kind === "design" ? target.designId : undefined;
       let executionFailed = false;
+      let settledRunId: string | null = null;
       let designPreflightError: string | null = null;
 
-      // Merge explicitly-attached images with auto-sensed canvas selection images
+      // Explicit attachments take precedence over a stale canvas selection.
       let currentAttachments = attachmentsOverride ?? readyAttachments;
-      const selectedEls = selectedCanvasElementsRef.current ?? [];
       const selectedImageEls = selectedEls.filter(
         (el) =>
           el.type === "image" && el.fileId && (el.storageUrl || el.dataUrl),
       );
-      if (selectedImageEls.length > 0 && !attachmentsOverride) {
+      const referenceImageEls = selectedImageEls;
+      if (referenceImageEls.length > 0 && !attachmentsOverride && currentAttachments.length === 0) {
         const existingIds = new Set(currentAttachments.map((a) => a.assetId));
-        const selectionAttachments: ReadyAttachment[] = selectedImageEls
+        const selectionAttachments: ReadyAttachment[] = referenceImageEls
           .filter((el) => !existingIds.has(el.assetId ?? el.id))
           .map((el) => ({
             assetId: el.assetId ?? el.id,
@@ -956,17 +989,30 @@ export function ChatSidebar({
           currentAttachments = [...currentAttachments, ...selectionAttachments];
         }
       }
-      const currentImageGenerationPreference =
-        imageGenerationPreferenceOverride ??
+      const currentImageGenerationPreference = imageGenerationPreferenceOverride ??
         activeImageGenerationPreferenceRef.current;
-      const currentVideoGenerationPreference =
-        activeVideoGenerationPreferenceRef.current;
+      const currentVideoGenerationPreference = activeVideoGenerationPreferenceRef.current;
+      const currentModel = agentModelRef.current;
+      // Model mentions are current-message instructions. Replaying a previous
+      // task's mention can resurrect a removed workspace alias and override the
+      // model mode currently shown in the UI.
       const currentMentions = mentionsOverride ?? messageMentionsRef.current;
       // The product now has one execution policy: always use the deliberate
       // Thinking path. Keep the optional argument only for call compatibility
       // with older stored home-page payloads, but never let it downgrade a run.
       void executionModeOverride;
       const currentExecutionMode: AgentExecutionMode = "thinking";
+      // React state is not synchronous: two clicks can otherwise both pass the
+      // `streaming` check before its render. Close that window before creating
+      // either the durable message identity or the run.
+      if (submissionStartingVersionRef.current !== null) return { status: "failed" as const };
+      const submissionVersion = ++submissionVersionRef.current;
+      submissionStartingVersionRef.current = submissionVersion;
+      detachLiveStreamRef.current?.();
+      detachResumedStreamRef.current?.();
+      detachResumedStreamRef.current = null;
+      setClarificationQuestions([]);
+      setConfirmationRequest(null);
 
       // Add user message locally
       const imageBlocks: ContentBlock[] = currentAttachments.map((a) => ({
@@ -1009,8 +1055,9 @@ export function ChatSidebar({
             : {}),
         };
       });
+      const userMessageId = crypto.randomUUID();
       const userMsg = {
-        id: `user-${Date.now()}`,
+        id: userMessageId,
         role: "user" as const,
         contentBlocks: [
           { type: "text" as const, text },
@@ -1020,8 +1067,10 @@ export function ChatSidebar({
       };
       updateSessionMessages(currentSessionId, (prev) => [...prev, userMsg]);
 
-      // Persist user message (fire-and-forget)
-      saveMessage(accessTokenRef.current, currentSessionId, {
+      // Persist before starting the run. The returned run is durably bound to
+      // this exact user message, so confirmation cannot drift to older prose.
+      const persistedUserMessage = saveMessage(accessTokenRef.current, currentSessionId, {
+        id: userMessageId,
         role: "user",
         content: text,
         contentBlocks: [
@@ -1029,9 +1078,7 @@ export function ChatSidebar({
           ...mentionBlocks,
           ...imageBlocks,
         ],
-      }).catch((err) =>
-        console.error("[chat] Failed to save user message:", err),
-      );
+      });
 
       // Auto-title from first user message
       autoTitleSession(text);
@@ -1044,19 +1091,18 @@ export function ChatSidebar({
       ]);
       setStreaming(true);
       clearActiveRun();
+      let unsubscribeRun: (() => void) | undefined;
+      let cancelStartWait: (() => void) | undefined;
 
       try {
+        await persistedUserMessage;
         const perf = {
           t0Send: performance.now(),
           tAck: 0,
           tFirstToken: 0,
           gotFirstToken: false,
         };
-        const designContext = designSendRef.current;
-        if (
-          designContext.activeDesignId &&
-          imageConfirmation?.decision !== "cancel"
-        ) {
+        if (boundDesignId && boundDesignId === designContext.activeDesignId) {
           try {
             await designContext.beforeDesignSend?.();
           } catch (e) {
@@ -1067,11 +1113,6 @@ export function ChatSidebar({
             throw e;
           }
         }
-        if (
-          designSendRef.current.activeDesignId !== designContext.activeDesignId
-        )
-          throw new Error("画板目标已切换，请重新发送。");
-
         let resolveStream: () => void;
         const streamDone = new Promise<void>((r) => {
           resolveStream = r;
@@ -1079,7 +1120,7 @@ export function ChatSidebar({
         const runIdRef = { current: "" };
 
         const cleanup = ws.onEvent((event) => {
-          if (!runIdRef.current || event.runId !== runIdRef.current) return;
+          if (submissionVersionRef.current !== submissionVersion || !runIdRef.current || event.runId !== runIdRef.current) return;
 
           // Track first token timing
           if (!perf.gotFirstToken && event.type === "message.delta") {
@@ -1109,13 +1150,6 @@ export function ChatSidebar({
 
           // Apply event to messages (single source of truth — shared with reconnect)
           applyStreamEvent(event, assistantId, currentSessionId);
-          if (
-            imageConfirmation &&
-            (event.type === "run.failed" ||
-              (event.type === "tool.completed" &&
-                typeof event.output?.error === "string"))
-          )
-            executionFailed = true;
 
           // Forward event to parent for fallback job polling (timed-out generation recovery)
           onStreamEvent?.(event);
@@ -1125,8 +1159,8 @@ export function ChatSidebar({
           const backendInserted =
             event.type === "tool.completed" &&
             event.output &&
-            typeof (event.output as Record<string, unknown>).elementId ===
-              "string";
+            (typeof (event.output as Record<string, unknown>).elementId === "string" ||
+              typeof (event.output as Record<string, unknown>).design_id === "string");
           if (
             event.type === "tool.completed" &&
             event.artifacts &&
@@ -1150,7 +1184,7 @@ export function ChatSidebar({
           // Preview model hint: suggest switching when run fails
           if (event.type === "run.failed") {
             const currentModel = agentModelRef.current ?? "";
-            if (currentModel.includes("preview")) {
+            if (currentModel.includes("preview") && !agentContextErrorMessage(event.error)) {
               showToast(
                 "当前 Preview 模型请求不稳定，建议切换模型后重试",
                 "error",
@@ -1163,27 +1197,38 @@ export function ChatSidebar({
             event.type === "run.failed" ||
             event.type === "run.canceled"
           ) {
+            completedRunIdsRef.current.add(event.runId);
+            settledRunId = event.runId;
             clearActiveRun();
             resolveStream();
           }
         });
 
         // Start run via WebSocket
+        unsubscribeRun = cleanup;
+        const detachStream = () => {
+          cleanup();
+          executionFailed = true;
+          resolveStream();
+        };
+        detachLiveStreamRef.current = detachStream;
         const runId = await new Promise<string>((resolve, reject) => {
           const timeout = setTimeout(() => {
             cleanup();
-            reject(new Error("WebSocket ack timeout — connection may be down"));
-          }, 10_000);
+            cancelStartWait?.();
+            reject(new Error("Agent 启动确认超时，请检查任务状态后再试，避免重复提交。"));
+          }, 30_000);
 
-          ws.startRun(
+          const stopWaiting = ws.startRun(
             {
               sessionId: currentSessionId,
               conversationId: canvasId,
+              userMessageId,
               prompt: text,
-              ...(designContext.activeDesignId
-                ? { activeDesignId: designContext.activeDesignId }
+              ...(boundDesignId
+                ? { activeDesignId: boundDesignId }
                 : {}),
-              ...(imageConfirmation ? { imageConfirmation } : {}),
+              ...(canvasSelection ? { canvasSelection } : {}),
               canvasId,
               accessToken: accessTokenRef.current,
               ...(currentAttachments.length > 0
@@ -1202,31 +1247,45 @@ export function ChatSidebar({
                     videoGenerationPreference: currentVideoGenerationPreference,
                   }
                 : {}),
-              ...(agentModelRef.current
-                ? { model: agentModelRef.current }
+              ...(currentModel
+                ? { model: currentModel }
                 : {}),
               executionMode: currentExecutionMode,
             },
             (ack) => {
               clearTimeout(timeout);
+              if (submissionStartingVersionRef.current === submissionVersion)
+                submissionStartingVersionRef.current = null;
               perf.tAck = performance.now();
               console.log(
                 `[perf] send → ack: ${(perf.tAck - perf.t0Send).toFixed(0)}ms`,
               );
               const id = ack.payload.runId as string;
               runIdRef.current = id;
-              activeRunIdRef.current = id;
-              if (cancelRequestedRef.current) ws.cancelRun(id);
+              if (submissionVersionRef.current === submissionVersion) {
+                activeRunIdRef.current = id;
+                setActiveRunId(id);
+                if (cancelRequestedRef.current) ws.cancelRun(id);
+              }
               resolve(id);
             },
+            (error) => {
+              clearTimeout(timeout);
+              if (submissionStartingVersionRef.current === submissionVersion)
+                submissionStartingVersionRef.current = null;
+              reject(error);
+            },
           );
+          if (typeof stopWaiting === "function") cancelStartWait = stopWaiting;
         });
-        clearAttachments();
-        setMessageMentions([]);
+        if (submissionVersionRef.current === submissionVersion && !preserveComposer) {
+          clearAttachments();
+          setMessageMentions([]);
+        }
 
         await streamDone;
         cleanup();
-      } catch {
+      } catch (error) {
         executionFailed = true;
         updateSessionMessages(currentSessionId, (prev) =>
           prev.map((m) => {
@@ -1239,15 +1298,23 @@ export function ChatSidebar({
                 ...m.contentBlocks,
                 {
                   type: "text" as const,
-                  text: designPreflightError ?? "Failed to get response.",
+                  text: designPreflightError ?? agentStartErrorMessage(error),
                 },
               ],
             };
           }),
         );
       } finally {
-        setStreaming(false);
-        clearActiveRun();
+        if (submissionStartingVersionRef.current === submissionVersion)
+          submissionStartingVersionRef.current = null;
+        unsubscribeRun?.();
+        cancelStartWait?.();
+        if (submissionVersionRef.current === submissionVersion) {
+          detachLiveStreamRef.current = null;
+          setStreaming(false);
+          clearActiveRun();
+          if (settledRunId) scheduleActiveRunRecovery();
+        }
       }
       return { status: executionFailed ? "failed" : "accepted" };
     },
@@ -1267,26 +1334,26 @@ export function ChatSidebar({
       accessTokenRef,
       activeSessionIdRef,
       clearActiveRun,
+      scheduleActiveRunRecovery,
+      onRequestCanvasImages,
+      onRequestCanvasSelection,
     ],
   );
 
-  imageConfirmationSenderRef.current = async (confirmationId, decision) => {
-    if (streaming || !ws.connected)
-      return {
-        status: "failed",
-        message: "请等待当前回复结束并确认连接正常。",
-      };
-    const result = await handleSend(
-      decision === "confirm" ? "确认生成" : "取消生成",
-      [],
-      undefined,
-      [],
-      undefined,
-      { confirmationId, decision },
-    );
-    if (result?.status === "accepted") markConfirmationHandled(confirmationId);
-    return result ?? { status: "failed", message: "确认未发送，请重试。" };
-  };
+  const editingSendRef = useRef(false);
+  const handleEditSend = useCallback(async (message: Message, text: string, sessionId: string | null) => {
+    if (!sessionId || activeSessionIdRef.current !== sessionId) throw new Error("会话已切换，请在当前会话重新编辑。");
+    if (streaming || editingSendRef.current) throw new Error("请等待当前回复结束后再发送。");
+    if (!ws.connected) throw new Error("连接已断开，请连接恢复后重试。");
+    if (!text.trim()) throw new Error("请输入消息内容。");
+    const references = messageResendReferences(message.contentBlocks);
+    editingSendRef.current = true;
+    try {
+      const result = await handleSend(text, references.attachments, references.imageGenerationPreference,
+        references.mentions, undefined, true);
+      if (!result || result.status === "failed") throw new Error("请求未能完成，请查看错误提示后重试。");
+    } finally { editingSendRef.current = false; }
+  }, [activeSessionIdRef, handleSend, streaming, ws.connected]);
 
   // Explicit commands from the selected-image toolbar survive deselection.
   // Agent actions pass an attachment override directly, avoiding a state race
@@ -1322,6 +1389,20 @@ export function ChatSidebar({
     }
   }, [activeSessionId, addCanvasRef, handleSend, imageChatCommand, streaming]);
 
+  // Hot reloads and late receipt merges can leave a questionnaire opened from
+  // prose that belongs to an already submitted image task. Close that stale UI
+  // as soon as the authoritative receipt is present.
+  useEffect(() => {
+    if (clarificationQuestions.length === 0) return;
+    const lastMessage = messages[messages.length - 1];
+    if (
+      lastMessage?.role === "assistant" &&
+      hasImageExecutionReceipt(lastMessage.contentBlocks)
+    ) {
+      setClarificationQuestions([]);
+    }
+  }, [clarificationQuestions.length, messages]);
+
   // Turn settled, numbered assistant questions into a guided answer dialog.
   useEffect(() => {
     if (streaming || clarificationQuestions.length > 0 || confirmationRequest)
@@ -1337,9 +1418,15 @@ export function ChatSidebar({
       )
       .map((block) => block.text)
       .join("");
-    const questions = parseClarificationQuestions(text);
+    const hasImageReceipt = hasImageExecutionReceipt(lastMessage.contentBlocks);
+    const structuredQuestions = hasImageReceipt
+      ? []
+      : parseStructuredClarificationQuestions(lastMessage.contentBlocks);
+    const questions = structuredQuestions.length > 0
+      ? structuredQuestions
+      : (hasImageReceipt ? [] : parseClarificationQuestions(text));
     const confirmation =
-      questions.length === 0
+      questions.length === 0 && !hasImageReceipt
         ? (parseToolConfirmationRequest(lastMessage.contentBlocks) ??
           parseConfirmationRequest(text))
         : null;
@@ -1355,38 +1442,10 @@ export function ChatSidebar({
       confirmation?.kind === "design_mutation" ||
       confirmation?.kind === "design_template_apply"
     ) {
-      // Design confirmations are rendered inside their exact tool result so
-      // users can review the target revision and action without a duplicate
-      // floating dialog. The card sends the real product confirmation command.
+      // Design confirmations requiring authoritative target details are rendered
+      // inside their exact tool result. This avoids a duplicate generic dialog
+      // that could bypass those details.
       handledClarificationMessageIdsRef.current.add(lastMessage.id);
-      return;
-    }
-
-    const previousMessage = messages[messages.length - 2];
-    const previousText =
-      previousMessage?.contentBlocks
-        .filter(
-          (block): block is Extract<ContentBlock, { type: "text" }> =>
-            block.type === "text",
-        )
-        .map((block) => block.text)
-        .join("") ?? "";
-    if (
-      confirmation?.confirmationId &&
-      confirmation.kind !== "image_generation" &&
-      previousMessage?.role === "user" &&
-      isExplicitImageConfirmationMessage(previousText)
-    ) {
-      handledClarificationMessageIdsRef.current.add(lastMessage.id);
-      void handleConfirmAction(
-        confirmation.confirmationId,
-        "confirm",
-        confirmation.kind ?? "delete",
-      ).then((result) => {
-        if (result.status !== "accepted" && result.status !== "applied") {
-          setConfirmationRequest(confirmation);
-        }
-      });
       return;
     }
 
@@ -1396,7 +1455,6 @@ export function ChatSidebar({
   }, [
     clarificationQuestions.length,
     confirmationRequest,
-    handleConfirmAction,
     messages,
     streaming,
   ]);
@@ -1407,6 +1465,7 @@ export function ChatSidebar({
       onClose={() => setClarificationQuestions([])}
       onSubmit={(answer) => {
         setClarificationQuestions([]);
+        // Unbound chat questions are ordinary conversation.
         void handleSend(answer);
       }}
     />
@@ -1575,7 +1634,15 @@ export function ChatSidebar({
   // Uses the shared applyStreamEvent to handle live events — no duplicated logic.
   useEffect(() => {
     if (!ws.connected || sessionsLoading) {
-      if (!ws.connected) prevConnectedRef.current = false;
+      if (!ws.connected) {
+        prevConnectedRef.current = false;
+        // The server keeps running. Detach this obsolete local stream so
+        // reconnect can restore it once, without leaving an unresolved send.
+        detachLiveStreamRef.current?.();
+        detachResumedStreamRef.current?.();
+        detachResumedStreamRef.current = null;
+        setStreaming(false);
+      }
       return;
     }
     if (prevConnectedRef.current) return;
@@ -1588,16 +1655,41 @@ export function ChatSidebar({
     if (initialPrompt && !initialPromptSent.current) return;
 
     void (async () => {
+      const resumeVersion = submissionVersionRef.current;
       // Reload messages from DB (server may have persisted while disconnected)
-      await reloadMessages(sessionId);
+      // Terminal events can precede server persistence. Keep the complete local
+      // transcript while restoring another live run; true reconnects still reload.
+      const terminalRecovery = terminalRecoveryRef.current;
+      terminalRecoveryRef.current = false;
+      if (!terminalRecovery) await reloadMessages(sessionId);
+      if (resumeVersion !== submissionVersionRef.current || activeSessionIdRef.current !== sessionId) return;
 
       // Resume canvas binding (after DB messages are set)
       ws.resumeCanvas(canvasId, (ack) => {
+        if (resumeVersion !== submissionVersionRef.current || activeSessionIdRef.current !== sessionId) return;
         const activeRunId = (ack.payload as Record<string, unknown>)
           .activeRunId;
+        const activeRunSessionId = (ack.payload as Record<string, unknown>).activeSessionId;
+        // A canvas may have live runs from several chats. Require server-proven
+        // conversation identity before appending a resumed run's events here.
+        if (typeof activeRunId === "string" && activeRunSessionId !== sessionId) {
+          clearActiveRun();
+          setStreaming(false);
+          return;
+        }
+        if (typeof activeRunId === "string" && completedRunIdsRef.current.has(activeRunId)) {
+          clearActiveRun();
+          setStreaming(false);
+          if (!completedResumeRetriesRef.current.has(activeRunId)) {
+            completedResumeRetriesRef.current.add(activeRunId);
+            scheduleActiveRunRecovery();
+          }
+          return;
+        }
         if (activeRunId && typeof activeRunId === "string") {
           setStreaming(true);
           activeRunIdRef.current = activeRunId;
+          setActiveRunId(activeRunId);
           cancelRequestedRef.current = false;
           setCancelRequested(false);
 
@@ -1621,7 +1713,7 @@ export function ChatSidebar({
 
           // Reuse the shared stream event handler — eliminates ~70 lines of duplication
           const unsub = ws.onEvent((evt) => {
-            if (evt.runId !== activeRunId) return;
+            if (submissionVersionRef.current !== resumeVersion || evt.runId !== activeRunId) return;
 
             applyStreamEvent(evt, assistantId, sessionId);
             onStreamEvent?.(evt);
@@ -1631,14 +1723,15 @@ export function ChatSidebar({
             const wsBackendInserted =
               evt.type === "tool.completed" &&
               evt.output &&
-              typeof (evt.output as Record<string, unknown>).elementId ===
-                "string";
+              (typeof (evt.output as Record<string, unknown>).elementId === "string" ||
+                typeof (evt.output as Record<string, unknown>).design_id === "string");
             if (
               evt.type === "tool.completed" &&
               evt.artifacts &&
               evt.toolName !== "screenshot_canvas" &&
               !wsBackendInserted
             ) {
+              completedRunIdsRef.current.add(evt.runId);
               for (const artifact of evt.artifacts) {
                 if (artifact.type === "image" && onImageGenerated) {
                   onImageGenerated(artifact as ImageArtifact);
@@ -1661,8 +1754,14 @@ export function ChatSidebar({
               clearActiveRun();
               setStreaming(false);
               unsub();
+              detachResumedStreamRef.current = null;
+              scheduleActiveRunRecovery();
             }
           });
+          detachResumedStreamRef.current = unsub;
+        } else {
+          clearActiveRun();
+          setStreaming(false);
         }
       });
     })();
@@ -1682,7 +1781,11 @@ export function ChatSidebar({
     setStreaming,
     initialPrompt,
     clearActiveRun,
+    resumeRequest,
+    scheduleActiveRunRecovery,
   ]);
+
+  const displayedMessages = useMemo(() => projectGenerationMessages(messages), [messages]);
 
   // ── Collapsed state ──
   if (!open) {
@@ -1732,7 +1835,7 @@ export function ChatSidebar({
       <div className="flex min-h-[48px] items-center justify-between pl-4 pr-2">
         <div className="flex min-w-0 flex-1 items-center gap-1">
           <h2 className="text-sm font-semibold text-foreground shrink-0">
-            Loomic Agent
+            Cromic Agent
           </h2>
           {!sessionsLoading && (
             <SessionSelector
@@ -1800,6 +1903,7 @@ export function ChatSidebar({
         }
       >
         <div
+          ref={messageListRef}
           className="flex-1 overflow-y-auto overflow-x-hidden flex flex-col gap-6 px-4 py-4"
           aria-live="polite"
           aria-relevant="additions"
@@ -1809,22 +1913,26 @@ export function ChatSidebar({
               <div className="h-5 w-5 animate-spin rounded-full border-2 border-border border-t-foreground" />
             </div>
           ) : messages.length === 0 ? (
-            <ChatSkills onSend={handleSend} />
+            <ChatSkills onSelectSkill={handleSkillSelect} accessToken={accessToken} />
           ) : (
-            messages.map((msg) => (
+            displayedMessages.map((msg) => (
               <ChatMessage
-                key={msg.id}
+                key={`${activeSessionId}:${msg.id}`}
                 role={msg.role}
                 contentBlocks={msg.contentBlocks}
                 isStreaming={
                   streaming &&
                   msg.role === "assistant" &&
-                  msg === messages[messages.length - 1]
+                  msg.id === messages[messages.length - 1]?.id
                 }
                 onConfirmAction={handleConfirmAction}
                 onWaitGeneration={handleWaitGeneration}
                 onRestoreGeneration={handleRestoreGeneration}
                 onRetryRead={handleRetryRead}
+                {...(msg.role === "user" ? {
+                  onEditSend: (text: string) => handleEditSend(msg, text, activeSessionId),
+                  editDisabled: streaming || !ws.connected,
+                } : {})}
                 {...(onOpenDesign ? { onOpenDesign } : {})}
               />
             ))
@@ -1868,7 +1976,7 @@ export function ChatSidebar({
       </ErrorBoundary>
 
       {/* Input */}
-      <div className="relative">
+      <div className="relative" data-chat-composer-shell>
         {clarificationDialogEl}
         {confirmationDialogEl}
         {atQuery !== null && mentionPickerItems.length > 0 && (
@@ -1887,7 +1995,7 @@ export function ChatSidebar({
           ref={chatInputRef}
           accessToken={accessToken}
           onSend={handleSend}
-          disabled={streaming || sessionsLoading || messagesLoading}
+          disabled={streaming || sessionsLoading || messagesLoading || !ws.connected}
           running={streaming}
           canceling={cancelRequested}
           onCancel={handleCancelRun}

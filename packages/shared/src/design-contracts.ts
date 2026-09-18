@@ -123,7 +123,15 @@ export const designObjectRoleSchema = z.enum([
 ]);
 export type DesignObjectRole = z.infer<typeof designObjectRoleSchema>;
 
+export const designObjectAnimationSchema = z.object({
+  type: z.enum(["float", "scale"]),
+  durationMs: finiteNumberSchema.min(500).max(10000),
+  amount: finiteNumberSchema.min(1).max(100),
+}).strict();
+export type DesignObjectAnimation = z.infer<typeof designObjectAnimationSchema>;
+
 const designObjectBaseShape = {
+  animation: designObjectAnimationSchema.nullable().optional(),
   objectId: designUuidSchema,
   objectVersion: z.number().int().positive(),
   name: z.string().trim().min(1).max(200).optional(),
@@ -254,6 +262,8 @@ export const designSvgObjectSchema = z
   .strict();
 
 const textShape = {
+  paintFirst: z.enum(["fill", "stroke"]).optional(),
+  splitByGrapheme: z.boolean().optional(),
   text: z.string().max(100_000),
   fontFaceId: designUuidSchema.nullable().optional(),
   fontFamily: z.string().trim().min(1).max(200),
@@ -504,6 +514,7 @@ export type LoomicDesignNodeMetadata = z.infer<
 >;
 
 const patchCommonShape = {
+  animation: designObjectAnimationSchema.nullable().optional(),
   name: z.string().trim().min(1).max(200).optional(),
   x: finiteNumberSchema.optional(),
   y: finiteNumberSchema.optional(),
@@ -961,6 +972,123 @@ export const designMutationResponseSchema = z
   .strict();
 export type DesignMutationResponse = z.infer<
   typeof designMutationResponseSchema
+>;
+
+const canvasElementIdSchema = z.string().trim().min(1).max(200);
+const canvasElementVersionSchema = z.number().int().nonnegative();
+
+export const manualCanvasImageScenePoseSchema = z
+  .object({
+    x: finiteNumberSchema,
+    y: finiteNumberSchema,
+    width: positiveFiniteNumberSchema,
+    height: positiveFiniteNumberSchema,
+    // Excalidraw stores scene angles in radians.
+    angle: finiteNumberSchema,
+  })
+  .strict();
+export type ManualCanvasImageScenePose = z.infer<
+  typeof manualCanvasImageScenePoseSchema
+>;
+
+export const manualCanvasImagePlacementSchema = z.union([
+  z.object({ kind: z.literal("fit") }).strict(),
+  z
+    .object({
+      kind: z.literal("preserve"),
+      scene_pose: manualCanvasImageScenePoseSchema.optional(),
+    })
+    .strict(),
+]);
+export type ManualCanvasImagePlacement = z.infer<
+  typeof manualCanvasImagePlacementSchema
+>;
+
+/**
+ * Imports an already-persisted canvas image as one native design object.
+ * asset_object_id is intentionally absent: the server resolves it from the
+ * authorized, version-guarded canvas element instead of trusting the caller.
+ */
+export const manualCanvasImageImportRequestSchema = z
+  .object({
+    request_id: designUuidSchema,
+    design_id: designUuidSchema,
+    expected_design_revision: z.number().int().nonnegative(),
+    canvas_id: designUuidSchema,
+    source_element_id: canvasElementIdSchema,
+    expected_source_element_version: canvasElementVersionSchema,
+    board_element_id: canvasElementIdSchema,
+    expected_board_element_version: canvasElementVersionSchema,
+    mode: z.enum(["copy", "adopt"]),
+    placement: manualCanvasImagePlacementSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (
+      value.placement.kind === "preserve" &&
+      value.placement.scene_pose !== undefined &&
+      value.mode !== "copy"
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "scene_pose is only valid for a copy import",
+        path: ["placement", "scene_pose"],
+      });
+    }
+    if (value.source_element_id === value.board_element_id) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "source and board elements must be different",
+        path: ["board_element_id"],
+      });
+    }
+  });
+export type ManualCanvasImageImportRequest = z.infer<
+  typeof manualCanvasImageImportRequestSchema
+>;
+
+export const manualCanvasImageImportResponseSchema = z
+  .object({
+    operation_id: designUuidSchema,
+    design_id: designUuidSchema,
+    design_revision: z.number().int().positive(),
+    object_id: designUuidSchema,
+    object_version: z.literal(1),
+    source_canvas_id: designUuidSchema,
+    source_canvas_revision: z.number().int().nonnegative(),
+    source_element_id: canvasElementIdSchema,
+    source_element_version: canvasElementVersionSchema,
+    mode: z.enum(["copy", "adopt"]),
+    replayed: z.boolean(),
+  })
+  .strict();
+export type ManualCanvasImageImportResponse = z.infer<
+  typeof manualCanvasImageImportResponseSchema
+>;
+
+export const undoManualCanvasImageImportRequestSchema = z
+  .object({
+    idempotency_key: designUuidSchema,
+    expected_design_revision: z.number().int().nonnegative(),
+    expected_object_version: z.number().int().positive(),
+  })
+  .strict();
+export type UndoManualCanvasImageImportRequest = z.infer<
+  typeof undoManualCanvasImageImportRequestSchema
+>;
+
+export const undoManualCanvasImageImportResponseSchema = z
+  .object({
+    operation_id: designUuidSchema,
+    design_id: designUuidSchema,
+    design_revision: z.number().int().positive(),
+    object_id: designUuidSchema,
+    removed: z.literal(true),
+    replayed: z.boolean(),
+  })
+  .strict();
+export type UndoManualCanvasImageImportResponse = z.infer<
+  typeof undoManualCanvasImageImportResponseSchema
 >;
 
 export const designConflictResponseSchema = z

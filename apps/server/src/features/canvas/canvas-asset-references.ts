@@ -1,4 +1,4 @@
-import type { CanvasContent } from "@loomic/shared";
+import { isUuid, type CanvasContent } from "@loomic/shared";
 
 type CanvasRecord = Record<string, unknown>;
 type StorageClient = {
@@ -102,8 +102,4 @@ function asRecord(value: unknown): CanvasRecord | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as CanvasRecord
     : null;
-}
-
-function isUuid(value: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }

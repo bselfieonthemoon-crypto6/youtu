@@ -20,6 +20,24 @@ const ids = {
 } as const;
 
 describe("DesignDocumentController", () => {
+  it("ignores duplicate or older fanout deliveries without regressing revision", () => {
+    const controller = controllerWith(
+      { mutateDesign: vi.fn(), getDesign: vi.fn(), queueDesignPreview: vi.fn() },
+      [ids.request1],
+    );
+    const event = {
+      type: "design.sync" as const,
+      designId: ids.design,
+      revision: 5,
+      updateType: "mutated" as const,
+      changedObjectIds: [],
+    };
+    expect(controller.applySync(event)).toBe(true);
+    expect(controller.applySync(event)).toBe(false);
+    expect(controller.applySync({ ...event, revision: 4 })).toBe(false);
+    expect(controller.getState().authoritativeRevision).toBe(5);
+  });
+
   it("reuses one frozen idempotency key across a network retry", async () => {
     const mutateDesign = vi
       .fn()

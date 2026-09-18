@@ -3,7 +3,7 @@ export type ImageReplacementStatus = "generating" | "error";
 export type ImageReplacementData = {
   type: "image-replacement";
   status: ImageReplacementStatus;
-  operation: "replace-text" | "regenerate" | "upscale" | "remove-background" | "region-matting" | "split-layers" | "erase-transparent" | "smart-erase";
+  operation: "replace-text" | "regenerate" | "upscale" | "remove-background" | "region-matting" | "split-layers" | "erase-transparent" | "smart-erase" | "local-repaint" | "outpaint";
   jobId?: string;
   errorMessage?: string;
 };
@@ -63,7 +63,7 @@ export function updateImageReplacementElement(api: {
   updateScene: (scene: { elements: any[]; captureUpdate?: string }) => void;
 }, elementId: string, updates: Partial<ImageReplacementData> & { isDeleted?: boolean }): void {
   const elements = api.getSceneElements().map((element: any) => {
-    if (element.id !== elementId || !isImageReplacementElement(element)) return element;
+    if (element.id !== elementId || element.isDeleted || !isImageReplacementElement(element)) return element;
     const { isDeleted, ...customUpdates } = updates;
     return {
       ...element,

@@ -122,4 +122,71 @@ describe("ImageEraserOverlay", () => {
 
     expect(context.fillStyle).toBe("rgba(0, 0, 0, 1)");
   });
+
+  it("uses the repaint panel to submit a smart mask and prompt", () => {
+    const onConfirm = vi.fn();
+    render(
+      <ImageEraserOverlay
+        repaint
+        bounds={{ x: 0, y: 0, width: 200, height: 200 }}
+        onCancel={vi.fn()}
+        onConfirm={onConfirm}
+      />,
+    );
+    const surface = screen.getByLabelText("局部重绘涂抹区域") as HTMLCanvasElement;
+    surface.setPointerCapture = vi.fn();
+    surface.hasPointerCapture = vi.fn(() => true);
+    surface.releasePointerCapture = vi.fn();
+
+    expect(screen.getByRole("button", { name: "开始重绘" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("修改要求"), { target: { value: "把桌上的杯子改成花瓶" } });
+    fireEvent.pointerDown(surface, { button: 0, pointerId: 1, clientX: 40, clientY: 40 });
+    fireEvent.pointerUp(surface, { pointerId: 1 });
+    fireEvent.click(screen.getByRole("button", { name: "开始重绘" }));
+
+    expect(onConfirm).toHaveBeenCalledWith("smart", [{ radius: 0.09, points: [{ x: 0.2, y: 0.2 }] }], "把桌上的杯子改成花瓶");
+  });
+
+  it("uses quick fill only to populate the prompt and keeps its draft while busy", () => {
+    const onCancel = vi.fn();
+    const onConfirm = vi.fn();
+    const { rerender } = render(
+      <ImageEraserOverlay repaint bounds={{ x: 0, y: 0, width: 200, height: 200 }} onCancel={onCancel} onConfirm={onConfirm} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "移除选中内容" }));
+    expect(screen.getByLabelText("修改要求")).toHaveValue("移除涂抹区域内的内容并自然补全背景");
+    expect(screen.getByRole("button", { name: "开始重绘" })).toBeDisabled();
+    const surface = screen.getByLabelText("局部重绘涂抹区域") as HTMLCanvasElement;
+    surface.setPointerCapture = vi.fn();
+    surface.hasPointerCapture = vi.fn(() => true);
+    surface.releasePointerCapture = vi.fn();
+    fireEvent.pointerDown(surface, { button: 0, pointerId: 1, clientX: 40, clientY: 40 });
+    fireEvent.pointerUp(surface, { pointerId: 1 });
+    expect(screen.getByRole("button", { name: "开始重绘" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "开始重绘" }));
+    expect(onConfirm).toHaveBeenCalledWith("smart", [{ radius: 0.09, points: [{ x: 0.2, y: 0.2 }] }], "移除涂抹区域内的内容并自然补全背景");
+
+    rerender(<ImageEraserOverlay repaint busy error="重绘失败，请重试" bounds={{ x: 0, y: 0, width: 200, height: 200 }} onCancel={onCancel} onConfirm={onConfirm} />);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onCancel).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("修改要求")).toHaveValue("移除涂抹区域内的内容并自然补全背景");
+    expect(screen.getByRole("alert")).toHaveTextContent("重绘失败，请重试");
+    expect(screen.getByRole("button", { name: "重绘中…" })).toBeDisabled();
+  });
+
+  it("rejects a repaint mask that has been completely erased", () => {
+    render(<ImageEraserOverlay repaint bounds={{ x: 0, y: 0, width: 200, height: 200 }} onCancel={vi.fn()} onConfirm={vi.fn()} />);
+    const surface = screen.getByLabelText("局部重绘涂抹区域") as HTMLCanvasElement;
+    surface.setPointerCapture = vi.fn();
+    surface.hasPointerCapture = vi.fn(() => true);
+    surface.releasePointerCapture = vi.fn();
+    fireEvent.change(screen.getByLabelText("修改要求"), { target: { value: "修复这里" } });
+    fireEvent.pointerDown(surface, { button: 0, pointerId: 1, clientX: 40, clientY: 40 });
+    fireEvent.pointerUp(surface, { pointerId: 1 });
+    expect(screen.getByRole("button", { name: "开始重绘" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "减少涂抹" }));
+    fireEvent.pointerDown(surface, { button: 0, pointerId: 2, clientX: 40, clientY: 40 });
+    fireEvent.pointerUp(surface, { pointerId: 2 });
+    expect(screen.getByRole("button", { name: "开始重绘" })).toBeDisabled();
+  });
 });

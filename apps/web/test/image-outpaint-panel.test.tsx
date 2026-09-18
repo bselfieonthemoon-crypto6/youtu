@@ -1,0 +1,50 @@
+import { cleanup,fireEvent,render,screen,waitFor } from "@testing-library/react";
+import { afterEach,beforeEach,expect,it,vi } from "vitest";
+const mocks=vi.hoisted(()=>({create:vi.fn(),models:vi.fn(),update:vi.fn(),placeholder:vi.fn()}));
+vi.mock("../src/lib/server-api",()=>({createImageGenerationJob:mocks.create,fetchImageModels:mocks.models,fetchJob:vi.fn()}));
+vi.mock("../src/lib/canvas-image-replacement",()=>({createImageReplacementElement:mocks.placeholder,updateImageReplacementElement:mocks.update}));
+import {ImageOutpaintPanel} from "../src/components/canvas/image-outpaint-panel";
+afterEach(cleanup);
+beforeEach(()=>{vi.clearAllMocks();mocks.models.mockResolvedValue({models:[{id:"model"}]});mocks.placeholder.mockReturnValue("placeholder");});
+const props=()=>({source:{dataURL:"data:image/png;base64,test",width:800,height:600},placement:{x:0,y:0,width:400,height:300},api:{},accessToken:"test",canvasId:"canvas",monitor:vi.fn().mockResolvedValue({status:"succeeded",result:{canvas_element_id:"new"}}),onRefresh:vi.fn(),onClose:vi.fn()});
+it("previews margins and rejects an empty expansion",()=>{
+ render(<ImageOutpaintPanel {...props()}/>);
+ expect(screen.getByText("输出：1200 × 900 像素")).toBeTruthy();
+ fireEvent.click(screen.getByRole("button",{name:"清零"}));
+ expect((screen.getByRole("button",{name:"开始扩图"}) as HTMLButtonElement).disabled).toBe(true);
+ fireEvent.change(screen.getByLabelText("右扩展像素"),{target:{value:"200"}});
+ expect(screen.getByText("输出：1000 × 600 像素")).toBeTruthy();
+});
+it("submits one canvas-only task preserving source and avoiding double click",async()=>{
+ const p=props();let accept!:(value:unknown)=>void;
+ mocks.create.mockImplementation(()=>new Promise(resolve=>{accept=resolve;}));
+ render(<ImageOutpaintPanel {...p}/>);
+ fireEvent.click(screen.getByRole("button",{name:"开始扩图"}));fireEvent.click(screen.getByRole("button",{name:"扩图中…"}));
+ await waitFor(()=>expect(mocks.create).toHaveBeenCalledOnce());
+ expect(p.onClose).not.toHaveBeenCalled();
+ accept({job:{id:"job",status:"queued"}});
+ await waitFor(()=>expect(p.onClose).toHaveBeenCalledOnce());
+ expect(mocks.create).toHaveBeenCalledOnce();
+ expect(mocks.create.mock.calls[0]![1]).toMatchObject({operation:"outpaint",input_images:[p.source.dataURL],outpaint_margins:{left:200,right:200,top:150,bottom:150},placement_x:440,placement_width:600,placement_height:450});
+ expect(mocks.create.mock.calls[0]![1]).not.toHaveProperty("mask_image");
+ expect(p.monitor).not.toHaveBeenCalled();
+ expect(p.onRefresh).not.toHaveBeenCalled();
+ expect(mocks.update).toHaveBeenCalledWith(p.api,"placeholder",{jobId:"job"});
+});
+it("keeps inputs open when submission is rejected",async()=>{
+ const p=props();mocks.create.mockRejectedValue(Object.assign(new Error("invalid request"),{status:400}));
+ render(<ImageOutpaintPanel {...p}/>);fireEvent.click(screen.getByRole("button",{name:"开始扩图"}));
+ await screen.findByText("invalid request");
+ expect(p.onClose).not.toHaveBeenCalled();
+ expect(mocks.update).toHaveBeenCalledWith(p.api,"placeholder",{isDeleted:true});
+});
+it("keeps the same frozen submission after an uncertain response",async()=>{
+ const p=props();mocks.create.mockRejectedValueOnce(new Error("network")).mockResolvedValueOnce({job:{id:"job"}});
+ render(<ImageOutpaintPanel {...p}/>);fireEvent.click(screen.getByRole("button",{name:"开始扩图"}));
+ await screen.findByRole("button",{name:"重试 / 查询任务"});
+ expect((screen.getByRole("button",{name:"关闭"}) as HTMLButtonElement).disabled).toBe(true);
+ fireEvent.click(screen.getByRole("button",{name:"重试 / 查询任务"}));
+ await waitFor(()=>expect(p.onClose).toHaveBeenCalledOnce());
+ expect(mocks.placeholder).toHaveBeenCalledOnce();
+ expect(mocks.create.mock.calls[1]![1]).toBe(mocks.create.mock.calls[0]![1]);
+});

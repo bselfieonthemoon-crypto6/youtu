@@ -1,0 +1,73 @@
+{
+  "slug": "product-visual",
+  "name": "商品与产品视觉",
+  "description": "规划或生成商品主图、产品场景与卖点图片，保护真实产品外形、包装和标识；不编造功效或配件。",
+  "version": "2.2.0",
+  "category": "design",
+  "iconName": "palette",
+  "license": null,
+  "metadata": {
+    "bundle": "loomic-design-skills-v2",
+    "loomic": {
+      "schemaVersion": 1,
+      "execution": "image",
+      "routing": { "keywords": ["商品", "产品", "主图", "ecommerce", "product image", "product shot", "product visual"], "priority": 30 },
+      "intents": [
+        "product",
+        "ecommerce",
+        "product-preservation"
+      ],
+      "outputKinds": [
+        "raster-image",
+        "image-prompt"
+      ],
+      "requiredTools": [
+        "generate_image",
+        "edit_image"
+      ],
+      "optionalTools": [
+        "inspect_canvas"
+      ],
+      "models": [
+        {
+          "role": "planner",
+          "required": true,
+          "preferredIds": []
+        },
+        {
+          "role": "vision",
+          "required": false,
+          "preferredIds": []
+        },
+        {
+          "role": "image",
+          "required": true,
+          "preferredIds": []
+        }
+      ],
+      "limitations": [
+        "技能不增加运行时工具、模型、权限或预算；无真实参考来源不宣称产品保真。",
+        "本包为 Loomic 原创流程，研究来源不是效果 benchmark；未运行上游脚本或自动下载依赖。",
+        "本运行时位图只落无限画布，不创建、修改或导出原生画板；生成编辑不能保证商标和包装逐像素准确。"
+      ],
+      "examples": [
+        "保持这张瓶身和标签不变，换成干净的促销版式。"
+      ],
+      "sources": [
+        {
+          "title": "Cover art-direction dimensions",
+          "url": "https://github.com/JimLiu/baoyu-skills/blob/main/skills/baoyu-cover-image/SKILL.md",
+          "license": "MIT",
+          "relation": "inspired-by"
+        }
+      ],
+      "composition": {
+        "role": "domain",
+        "stages": [
+          "design",
+          "prompt"
+        ]
+      }
+    }
+  }
+}

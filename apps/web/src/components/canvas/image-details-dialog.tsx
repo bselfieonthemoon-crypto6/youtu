@@ -22,13 +22,21 @@ export function ImageDetailsDialog({ image, open, onOpenChange }: {
   ];
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="max-h-[85dvh] overflow-y-auto sm:max-w-lg">
         <DialogHeader><DialogTitle>图片详细信息</DialogTitle></DialogHeader>
         <div className="overflow-hidden rounded-xl border border-border">
           {rows.map(([label, value]) => (
             <div key={label} className="grid grid-cols-[88px_1fr] gap-3 border-b border-border px-3 py-2.5 last:border-b-0">
               <span className="text-muted-foreground">{label}</span>
-              <span className="min-w-0 break-words text-foreground">{value}</span>
+              {label === "提示词" && image.prompt ? (
+                <details key={`${image.id}:${open}`} className="group min-w-0 text-foreground">
+                  <summary className="cursor-pointer text-sm text-muted-foreground hover:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2">
+                    <span className="group-open:hidden">展开提示词</span>
+                    <span className="hidden group-open:inline">收起提示词</span>
+                  </summary>
+                  <p className="mt-2 max-h-48 overflow-y-auto whitespace-pre-wrap break-words pr-2">{value}</p>
+                </details>
+              ) : <span className="min-w-0 break-words text-foreground">{value}</span>}
             </div>
           ))}
         </div>

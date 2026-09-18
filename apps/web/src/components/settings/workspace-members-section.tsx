@@ -97,7 +97,7 @@ export function WorkspaceMembersSection({
     <section aria-labelledby="workspace-members-heading">
       <div className="mb-5">
         <h2 id="workspace-members-heading" className="text-lg font-semibold">用户管理</h2>
-        <p className="mt-1 text-sm text-muted-foreground">管理当前工作区成员和权限。仅支持添加已经注册 Loomic 的用户。</p>
+        <p className="mt-1 text-sm text-muted-foreground">管理当前工作区成员和权限。仅支持添加已经注册 Cromic 的用户。</p>
       </div>
 
       <form onSubmit={handleAdd} className="mb-5 grid gap-2 rounded-xl border border-border bg-card p-4 sm:grid-cols-[1fr_120px_auto]">

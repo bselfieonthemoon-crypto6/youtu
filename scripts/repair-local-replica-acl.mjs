@@ -1,0 +1,13 @@
+import { execFileSync, spawnSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+const container='supabase_db_thtdhcvjppuvlvahfmga';
+const dump='/tmp/loomic-replica-20260907.dump';
+const list=execFileSync('docker',['exec',container,'pg_restore','-l',dump],{encoding:'utf8'});
+const selected=list.split('\n').filter(l=>!l.startsWith(';') && (/\bACL\b/.test(l)||/ FUNCTION realtime list_changes\(/.test(l))).join('\n');
+const file='artifacts/local-replica-20260907/acl.list';
+writeFileSync(file,selected+'\n');
+execFileSync('docker',['cp',file,`${container}:/tmp/loomic-replica-acl.list`]);
+const result=spawnSync('docker',['exec',container,'pg_restore','-U','supabase_admin','-d','loomic_replica_light_20260907','-L','/tmp/loomic-replica-acl.list',dump],{encoding:'utf8'});
+writeFileSync('artifacts/local-replica-20260907/acl-restore.log',result.stderr||'');
+console.log(JSON.stringify({exitCode:result.status,errors:(result.stderr.match(/pg_restore: error:/g)||[]).length}));
+process.exitCode=result.status??1;

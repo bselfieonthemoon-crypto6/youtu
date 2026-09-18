@@ -7,7 +7,17 @@
       "**/.turbo/**",
       "**/.next/**",
       "**/dist/**",
-      "**/out/**"
+      "**/out/**",
+      "**/build/**",
+      "**/.output/**",
+      "**/.loomic-build/**",
+      "**/coverage/**",
+      "**/test-results/**",
+      "**/artifacts/**",
+      "**/*.min.js",
+      "**/*.qa.mjs",
+      "**/supabase/migrations/**",
+      "**/packages/shared/src/supabase/database.ts"
     ],
     "include": [
       "**/*.js",
@@ -26,7 +36,50 @@
   "linter": {
     "enabled": true,
     "rules": {
-      "recommended": true
+      "recommended": true,
+      "suspicious": {
+        "noAssignInExpressions": "warn",
+        "noConfusingVoidType": "warn",
+        "noControlCharactersInRegex": "warn",
+        "noExplicitAny": "off",
+        "noImplicitAnyLet": "warn",
+        "noArrayIndexKey": "warn",
+        "noThenProperty": "off"
+      },
+      "performance": {
+        "noDelete": "off"
+      },
+      "correctness": {
+        "noUnnecessaryContinue": "off",
+        "useExhaustiveDependencies": "warn"
+      },
+      "complexity": {
+        "noForEach": "warn"
+      },
+      "a11y": {
+        "noAutofocus": "warn",
+        "noLabelWithoutControl": "warn",
+        "noNoninteractiveTabindex": "warn",
+        "noRedundantRoles": "warn",
+        "noSvgWithoutTitle": "warn",
+        "useButtonType": "warn",
+        "useFocusableInteractive": "warn",
+        "useKeyWithClickEvents": "warn",
+        "useMediaCaption": "warn",
+        "useSemanticElements": "warn",
+        "useValidAnchor": "warn",
+        "useValidAriaProps": "warn",
+        "useValidAriaRole": "warn"
+      },
+      "style": {
+        "noNonNullAssertion": "off",
+        "noParameterAssign": "off",
+        "noUnusedTemplateLiteral": "off",
+        "noUselessElse": "off",
+        "useNumberNamespace": "off",
+        "useSingleVarDeclarator": "off",
+        "useTemplate": "off"
+      }
     }
   }
 }

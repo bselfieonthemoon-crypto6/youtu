@@ -24,13 +24,85 @@ export function createWorkspaceProviderResolver(options: {
 }) {
   const environment = createEnvironmentProviders(options.env);
   return {
+    async resolveImageGenerationPlan(input: {
+      workspaceId: string;
+      jobId: string;
+      modelId: string;
+      requiredUpstreamModel?: string | readonly string[];
+    }): Promise<{ source: "database_snapshot"; scope: GenerationProviderScope }> {
+      if (!input.modelId.startsWith("workspace:") || !options.providerSnapshotService.resolveImageGenerationPlan) {
+        throw invalidSnapshot();
+      }
+      let snapshots;
+      try {
+        snapshots = await options.providerSnapshotService.resolveImageGenerationPlan({
+          workspaceId: input.workspaceId,
+          jobId: input.jobId,
+        });
+      } catch {
+        throw invalidSnapshot();
+      }
+      const providers = snapshots.map((snapshot) => {
+        if (
+          snapshot.modality !== "image" ||
+          !snapshot.capabilities.includes("image_generation") ||
+          `workspace:${snapshot.catalogKey}` !== input.modelId ||
+          (input.requiredUpstreamModel && ![input.requiredUpstreamModel].flat().includes(snapshot.upstreamModelId)) ||
+          snapshot.attemptOrdinal === undefined
+        ) {
+          throw invalidSnapshot();
+        }
+        const publicModel: ModelInfo = {
+          id: input.modelId,
+          displayName: snapshot.upstreamModelId,
+          description: "Workspace image model",
+        };
+        const upstream = options.createImageProvider
+          ? options.createImageProvider(
+              snapshot.apiKey,
+              snapshot.baseUrl,
+              `workspace-image:${snapshot.snapshotId}`,
+              publicModel,
+            )
+          : new OpenAIImageProvider(snapshot.apiKey, snapshot.baseUrl, {
+              name: `workspace-image:${snapshot.snapshotId}`,
+              models: [publicModel],
+            });
+        return {
+          snapshot,
+          provider: remapImageModel(upstream, input.modelId, snapshot.upstreamModelId),
+        };
+      });
+      const primary = providers[0]?.provider;
+      if (!primary) throw invalidSnapshot();
+      return {
+        source: "database_snapshot",
+        scope: {
+          imageProvider: primary,
+          auxiliaryImageProviders: providers.slice(1).map((entry) => entry.provider),
+          imageProviderAttempts: providers.map(({ provider, snapshot }) => ({
+            ordinal: snapshot.attemptOrdinal as number,
+            providerName: provider.name,
+            modelId: input.modelId,
+            providerModelId: snapshot.providerModelCatalogKey
+              ? `workspace:${snapshot.providerModelCatalogKey}`
+              : input.modelId,
+            upstreamModelId: snapshot.upstreamModelId,
+          })),
+        },
+      };
+    },
     async resolve(input: {
       workspaceId: string;
       jobId: string;
       modality: "image" | "video";
       modelId: string;
+      stage?: "foreground_matting";
+      requiredUpstreamModel?: string | readonly string[];
     }): Promise<{ source: "database_snapshot" | "environment"; scope: GenerationProviderScope }> {
       if (!input.modelId.startsWith("workspace:")) {
+        if (input.requiredUpstreamModel && ![input.requiredUpstreamModel].flat().includes(input.modelId)) throw invalidSnapshot();
+        if (input.stage === "foreground_matting" && (input.modality !== "image" || input.modelId !== "gpt-image-2")) throw invalidSnapshot();
         const provider = input.modality === "image"
           ? environment.imageProviders.find((candidate) => candidate.models.some((model) => model.id === input.modelId))
           : environment.videoProviders.find((candidate) => candidate.models.some((model) => model.id === input.modelId));
@@ -45,7 +117,11 @@ export function createWorkspaceProviderResolver(options: {
 
       let snapshot;
       try {
-        snapshot = await options.providerSnapshotService.resolveJobSnapshot({
+        const resolve = input.stage === "foreground_matting"
+          ? options.providerSnapshotService.resolveForegroundSnapshot
+          : options.providerSnapshotService.resolveJobSnapshot;
+        if (!resolve) throw invalidSnapshot();
+        snapshot = await resolve({
           workspaceId: input.workspaceId,
           jobId: input.jobId,
         });
@@ -55,8 +131,10 @@ export function createWorkspaceProviderResolver(options: {
       const expectedCapability = input.modality === "image" ? "image_generation" : "video_generation";
       if (
         snapshot.modality !== input.modality ||
+        (input.requiredUpstreamModel !== undefined && ![input.requiredUpstreamModel].flat().includes(snapshot.upstreamModelId)) ||
         !snapshot.capabilities.includes(expectedCapability) ||
         `workspace:${snapshot.catalogKey}` !== input.modelId
+        || (input.stage === "foreground_matting" && snapshot.upstreamModelId !== "gpt-image-2")
       ) {
         throw invalidSnapshot();
       }
@@ -97,6 +175,9 @@ function remapImageModel(provider: ImageProvider, publicModelId: string, upstrea
   return {
     name: provider.name,
     models: provider.models.map((model) => ({ ...model, id: publicModelId })),
+    ...(provider.supportsImageMask !== undefined
+      ? { supportsImageMask: provider.supportsImageMask }
+      : {}),
     generate(params: ImageGenerateParams) {
       return provider.generate({ ...params, model: upstreamModelId });
     },

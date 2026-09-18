@@ -65,8 +65,12 @@ import {
 import {
   finalizeDesignImageJobChat,
   finalizeSucceededImageJob,
+  finalizeTerminalImageJobPlaceholder,
   reconcileSucceededDesignImageChats,
   reconcileSucceededImageJobs,
+  reconcileTerminalImageJobChats,
+  reconcileTerminalImageJobPlaceholders,
+  type FinalizableJob,
 } from "./features/jobs/job-canvas-finalizer.js";
 import { createProviderSnapshotService } from "./features/providers/index.js";
 import { runWithGenerationProviderScope } from "./generation/providers/registry.js";
@@ -244,6 +248,22 @@ async function main() {
           `${tag} Canvas recovery finalized=${outcome.finalized} failed=${outcome.failed}`,
         );
       }
+      const terminalImages = await reconcileTerminalImageJobPlaceholders(getAdminClient());
+      if (terminalImages.finalized > 0 || terminalImages.failed > 0) {
+        console.log(
+          `${tag} Terminal canvas recovery finalized=${terminalImages.finalized} failed=${terminalImages.failed}`,
+        );
+      }
+      const terminalImageChats = await reconcileTerminalImageJobChats(getAdminClient());
+      if (terminalImageChats.finalized > 0 || terminalImageChats.failed > 0) {
+        console.log(
+          `${tag} Terminal image chat recovery finalized=${terminalImageChats.finalized} failed=${terminalImageChats.failed}`,
+        );
+      }
+      const refunds = await reconcileTerminalJobRefunds({ getAdminClient }, creditService, tag);
+      if (refunds.refunded > 0 || refunds.failed > 0) {
+        console.log(`${tag} Refund recovery refunded=${refunds.refunded} failed=${refunds.failed}`);
+      }
       const bindings = await designBindingReconciler.reconcile(50);
       const designJobs = await reconcileSucceededDesignImageJobs(
         getAdminClient(),
@@ -296,14 +316,21 @@ async function main() {
   const submissionMaintenance = createBackgroundMaintenance(async () => {
     if (Date.now() - lastSubmissionRecoveryAt < 30_000) return;
     lastSubmissionRecoveryAt = Date.now();
-    const { error } = await getAdminClient().rpc("loomic_recover_image_submissions" as never);
-    if (error) throw new Error(error.message);
-  }, error => console.error(`${tag} Image submission recovery failed:`, error));
+    const admin = getAdminClient();
+    const [{ error: imageError }, { error: videoError }] = await Promise.all([
+      admin.rpc("loomic_recover_image_submissions" as never),
+      admin.rpc("loomic_recover_video_submissions" as never),
+    ]);
+    if (imageError) throw new Error(imageError.message);
+    if (videoError) throw new Error(videoError.message);
+  }, error => console.error(`${tag} Submission recovery failed:`, error));
   const pollQueue = async (queue: (typeof WORKER_QUEUES)[number]) => {
     while (running) {
       try {
-        if (queue === "image_generation_jobs") {
+        if (queue === "image_generation_jobs" || queue === "video_generation_jobs") {
           submissionMaintenance.trigger();
+        }
+        if (queue === "image_generation_jobs") {
           maintenance.trigger();
         }
         const inFlight = inFlightByQueue.get(queue);
@@ -390,6 +417,10 @@ export async function processMessage(
   workspaceProviderResolver?: WorkspaceProviderResolver,
   designJobFinalizer?: DesignJobFinalizer,
   designPreviewFailures?: DesignPreviewFailureRepository,
+  terminalImagePlaceholderFinalizer: (
+    admin: ReturnType<ExecutorContext["getAdminClient"]>,
+    job: FinalizableJob,
+  ) => Promise<boolean> = finalizeTerminalImageJobPlaceholder,
 ) {
   const jobId = msg.message.job_id as string;
   const jobType =
@@ -410,6 +441,17 @@ export async function processMessage(
   console.log(
     `${tag} Processing job ${jobId} (${jobType})${sessionShort ? ` session:${sessionShort}` : ""}`,
   );
+  const settleTerminalPlaceholder = async (job?: FinalizableJob) => {
+    if (jobType !== "image_generation") return;
+    try {
+      const current = job ?? await ctx.jobService.getJobAdmin(jobId) as FinalizableJob;
+      await terminalImagePlaceholderFinalizer(ctx.getAdminClient(), current);
+    } catch (settleError) {
+      // The terminal job state and refund are already durable. Periodic
+      // reconciliation retries only the canvas placeholder convergence.
+      console.error(`${tag} Terminal placeholder finalization deferred for job ${jobId}:`, settleError);
+    }
+  };
 
   // Claim before doing any work. A cancellation racing with delivery wins because
   // both updates are conditional in Postgres. Duplicate/stale queue messages must
@@ -428,6 +470,7 @@ export async function processMessage(
     });
     if (!job) return;
     if (job.status === "canceled") {
+      await settleTerminalPlaceholder(job as FinalizableJob);
       await refundTerminalJob(jobId, "canceled", ctx, creditService, tag);
       await ctx.pgmq.archive(queue, msg.msg_id);
     } else if (job.status === "running") {
@@ -436,6 +479,9 @@ export async function processMessage(
       await ctx.pgmq.setVt(queue, msg.msg_id, VT_BY_QUEUE[queue] ?? 120);
       console.log(`${tag} Deferred in-progress job ${jobId} for recovery`);
       return;
+    } else if (job.status === "dead_letter") {
+      await settleTerminalPlaceholder(job as FinalizableJob);
+      await ctx.pgmq.archive(queue, msg.msg_id);
     } else {
       await ctx.pgmq.archive(queue, msg.msg_id);
     }
@@ -447,8 +493,25 @@ export async function processMessage(
 
   // Increment only after a successful claim, so duplicate deliveries do not
   // consume retry attempts.
-  const { attempt_count, max_attempts } =
-    await ctx.jobService.incrementAttempt(jobId);
+  let attempt_count: number;
+  let max_attempts: number;
+  try {
+    ({ attempt_count, max_attempts } = await ctx.jobService.incrementAttempt(jobId));
+  } catch (attemptError) {
+    // A provider call is only safe after its retry attempt is durable. Do not
+    // infer a counter from a failed or malformed RPC response: preserve the
+    // queue message and retry after the job row has been returned to `failed`.
+    console.error(
+      `${tag} Attempt recording failed for job ${jobId}; execution deferred:`,
+      attemptError,
+    );
+    await ctx.jobService.markFailed(
+      jobId,
+      "attempt_increment_failed",
+      "Job attempt could not be recorded; execution deferred.",
+    );
+    return;
+  }
 
   const executor = getExecutor(jobType);
   if (!executor) {
@@ -460,6 +523,7 @@ export async function processMessage(
     );
     await ctx.pgmq.archive(queue, msg.msg_id);
     if (transitioned) {
+      await settleTerminalPlaceholder();
       await refundTerminalJob(jobId, "dead_letter", ctx, creditService, tag);
       await recordDesignPreviewTerminalFailure(
         jobType,
@@ -484,7 +548,8 @@ export async function processMessage(
       const payload = job.payload ?? {};
       const isLocalOperation =
         jobType === "image_generation" &&
-        isLocalImageOperation(payload.operation);
+        isLocalImageOperation(payload.operation) &&
+        !(payload.operation === "split_layers" && payload.layer_backend === "semantic");
       const modelId =
         typeof payload.model === "string"
           ? payload.model
@@ -492,12 +557,38 @@ export async function processMessage(
             ? "black-forest-labs/flux-kontext-pro"
             : "wan-video/wan-2.6";
       if (!isLocalOperation) {
-        const resolution = await workspaceProviderResolver.resolve({
-          workspaceId: job.workspace_id,
-          jobId,
-          modality: jobType === "image_generation" ? "image" : "video",
-          modelId,
-        });
+        const requiredUpstream = payload.operation === "remove_background"
+          ? { requiredUpstreamModel: ["gpt-image-2", "gpt-image-2.5-flare"] }
+          : (payload.foreground_policy as { mode?: string } | undefined)?.mode === "native_transparent"
+          ? { requiredUpstreamModel: "gpt-image-2" as const }
+          : {};
+        const resolution =
+          jobType === "image_generation" && modelId.startsWith("workspace:")
+            ? await workspaceProviderResolver.resolveImageGenerationPlan({
+                workspaceId: job.workspace_id,
+                jobId,
+                modelId,
+                ...requiredUpstream,
+              })
+            : await workspaceProviderResolver.resolve({
+                workspaceId: job.workspace_id,
+                jobId,
+                modality: jobType === "image_generation" ? "image" : "video",
+                modelId,
+                ...requiredUpstream,
+              });
+        const foreground = payload.foreground_policy as { mode?: unknown; mattingModel?: unknown } | undefined;
+        if (jobType === "image_generation" && foreground && typeof foreground === "object" && !Array.isArray(foreground) && foreground.mode === "api_matting") {
+          if (typeof foreground.mattingModel !== "string") throw new Error("Invalid foreground model binding");
+          // Resolve BOTH immutable stage credentials before making any paid call.
+          const helper = await workspaceProviderResolver.resolve({ workspaceId: job.workspace_id,
+            jobId, modality: "image", modelId: foreground.mattingModel, stage: "foreground_matting" });
+          if (!helper.scope.imageProvider) throw new Error("Foreground provider unavailable");
+          resolution.scope.auxiliaryImageProviders = [
+            ...(resolution.scope.auxiliaryImageProviders ?? []),
+            helper.scope.imageProvider,
+          ];
+        }
         execute = () =>
           runWithGenerationProviderScope(resolution.scope, () =>
             executor(jobId, msg.message as Record<string, unknown>, ctx),
@@ -534,6 +625,7 @@ export async function processMessage(
     if (!transitioned) {
       const job = await ctx.jobService.getJobAdmin(jobId);
       if (job.status === "canceled") {
+        await settleTerminalPlaceholder(job as FinalizableJob);
         await refundTerminalJob(jobId, "canceled", ctx, creditService, tag);
       }
     }
@@ -550,10 +642,28 @@ export async function processMessage(
     // Non-retryable errors: retrying with the same input will always fail.
     // Dead-letter immediately so the caller (agent polling) gets fast feedback.
     const NON_RETRYABLE_CODES = new Set([
+      "job_canceled",
       "invalid_input",
+      "background_removal_invalid_output",
+      "foreground_policy_required",
+      "foreground_policy_mismatch",
+      "layer_backend_unconfigured",
+      "layer_backend_config_invalid",
+      "layer_backend_remote_not_authorized",
+      "layer_backend_model_unavailable",
+      "layer_backend_unavailable",
+      "layer_backend_timeout",
+      "layer_output_invalid",
+      "layer_output_overlap",
+      "layer_checkpoint_invalid",
+      "layer_checkpoint_unavailable",
+      "image_generation_checkpoint_invalid",
+      "image_generation_result_unknown",
+      "image_aspect_ratio_mismatch",
       "model_not_found",
       "provider_not_found",
       "provider_snapshot_invalid",
+      "provider_rejected",
       "safety_filter",
       "design_renderer_unavailable",
       "design_export_pixel_budget_exceeded",
@@ -576,6 +686,7 @@ export async function processMessage(
       await ctx.pgmq.archive(queue, msg.msg_id);
 
       if (transitioned) {
+        await settleTerminalPlaceholder();
         await refundTerminalJob(jobId, "dead_letter", ctx, creditService, tag);
         await recordDesignPreviewTerminalFailure(
           jobType,
@@ -588,6 +699,7 @@ export async function processMessage(
       } else {
         const job = await ctx.jobService.getJobAdmin(jobId);
         if (job.status === "canceled") {
+          await settleTerminalPlaceholder(job as FinalizableJob);
           await refundTerminalJob(jobId, "canceled", ctx, creditService, tag);
         }
       }
@@ -609,6 +721,7 @@ export async function processMessage(
       } else {
         const job = await ctx.jobService.getJobAdmin(jobId);
         if (job.status === "canceled") {
+          await settleTerminalPlaceholder(job as FinalizableJob);
           await refundTerminalJob(jobId, "canceled", ctx, creditService, tag);
           await ctx.pgmq.archive(queue, msg.msg_id);
         }
@@ -624,7 +737,7 @@ export async function processMessage(
 export async function refundTerminalJob(
   jobId: string,
   terminalStatus: "canceled" | "dead_letter",
-  ctx: ExecutorContext,
+  ctx: Pick<ExecutorContext, "getAdminClient">,
   creditService: CreditService,
   tag: string,
 ) {
@@ -673,6 +786,40 @@ export async function refundTerminalJob(
       refundErr,
     );
   }
+}
+
+/** Recover terminal jobs whose one-shot refund path failed. Refunds are
+ * idempotent per job, so concurrent maintenance workers remain safe. */
+export async function reconcileTerminalJobRefunds(
+  ctx: Pick<ExecutorContext, "getAdminClient">,
+  creditService: CreditService,
+  tag: string,
+  limit = 50,
+) {
+  const admin = ctx.getAdminClient();
+  const { data, error } = await admin.from("background_jobs")
+    .select("id,status")
+    .in("status", ["canceled", "dead_letter"])
+    .gt("credits_cost", 0)
+    .order("updated_at", { ascending: true })
+    .limit(limit);
+  if (error) throw error;
+  let refunded = 0;
+  let failed = 0;
+  for (const row of data ?? []) {
+    const before = await admin.from("credit_transactions").select("id")
+      .eq("job_id", row.id).eq("transaction_type", "generation_refund")
+      .limit(1).maybeSingle();
+    if (before.error) { failed += 1; continue; }
+    if (before.data) continue;
+    await refundTerminalJob(row.id, row.status as "canceled" | "dead_letter", ctx, creditService, tag);
+    const after = await admin.from("credit_transactions").select("id")
+      .eq("job_id", row.id).eq("transaction_type", "generation_refund")
+      .limit(1).maybeSingle();
+    if (after.data) refunded += 1;
+    else failed += 1;
+  }
+  return { refunded, failed };
 }
 
 function sleep(ms: number): Promise<void> {

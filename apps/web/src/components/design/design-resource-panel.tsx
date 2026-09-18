@@ -563,13 +563,13 @@ function LazyBlobImage({
     };
   }, [visible]);
   return (
-    <div ref={rootRef} className="aspect-square bg-muted">
+    <div ref={rootRef} className="relative aspect-square overflow-hidden bg-muted">
       {url && (
         <img
           src={url}
           alt={alt}
           loading="lazy"
-          className="size-full object-cover"
+          className="absolute inset-0 block size-full object-contain"
         />
       )}
     </div>

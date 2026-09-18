@@ -83,6 +83,10 @@ async function objects(list,key){
   }else if(['rect','circle','triangle'].includes(o.type)){
    item={...base,type:o.type,fill:paint(o.fill),stroke:paint(o.stroke),strokeWidth:(o.strokeWidth??0)*sx,...(shadow?{shadow}:{}),...(o.type==='rect'?{radiusX:(o.rx??0)*sx,radiusY:(o.ry??0)*sy}:{})};
   }else throw Error('Unsupported type: '+o.type);
+  if (['textbox','i-text','text'].includes(o.type)) {
+   item.paintFirst=o.paintFirst??'fill';
+   item.splitByGrapheme=o.splitByGrapheme??false;
+  }
   out.push(item);
  }return out;
 }

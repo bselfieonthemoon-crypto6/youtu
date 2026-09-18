@@ -22,12 +22,14 @@ const {
   replaceMock,
 } = vi.hoisted(() => ({
   canvasApiMock: {
-    getSceneElements: vi.fn(() => []),
+    getAppState: vi.fn((): { selectedElementIds: Record<string, boolean> } => ({ selectedElementIds: {} })),
+    getSceneElements: vi.fn((): Array<{ id: string }> => []),
     getSceneElementsIncludingDeleted: vi.fn(() => []),
     updateScene: vi.fn(),
   },
   canvasEditorState: {
     onCanvasRefreshRequest: null as null | (() => Promise<void>),
+    onRequestCanvasSelection: null as null | ((canvasId: string) => { elementIds: string[] }),
   },
   fetchCanvasMock: vi.fn(),
   fetchProjectMock: vi.fn(),
@@ -109,7 +111,16 @@ vi.mock("../src/components/brand-kit-selector", () => ({
 }));
 
 vi.mock("../src/components/chat-sidebar", () => ({
-  ChatSidebar: () => null,
+  ChatSidebar: (props: {onOpenDesign: (id: string) => void; onSessionChange: (id: string) => void; activeDesignId?: string; beforeDesignSend?: () => Promise<void>; onRequestCanvasSelection: (canvasId: string) => { elementIds: string[] }}) => {
+    canvasEditorState.onRequestCanvasSelection = props.onRequestCanvasSelection;
+    return (
+    <div>
+      <button onClick={() => props.onOpenDesign("design-a")}>open design</button>
+      <button onClick={() => props.onSessionChange("session-new")}>change session</button>
+      <div data-testid="agent-design">{props.activeDesignId}:{typeof props.beforeDesignSend}</div>
+    </div>
+    );
+  },
 }));
 vi.mock("../src/components/canvas-empty-hint", () => ({
   CanvasEmptyHint: () => null,
@@ -130,7 +141,7 @@ vi.mock("../src/components/credits/credit-header-button", () => ({
   CreditHeaderButton: () => null,
 }));
 vi.mock("../src/components/design/design-editor-session", () => ({
-  DesignEditorSession: () => null,
+  DesignEditorSession: (props: {inline: boolean}) => <div data-testid="design-mode">{props.inline ? "inline" : "overlay"}</div>,
 }));
 
 type CanvasResponse = ReturnType<typeof canvasResponse>;
@@ -188,13 +199,51 @@ describe("canvas page loading", () => {
     fetchCanvasMock.mockReset();
     fetchProjectMock.mockReset();
     replaceMock.mockReset();
-    canvasApiMock.getSceneElements.mockClear();
+    canvasApiMock.getAppState.mockReset().mockReturnValue({ selectedElementIds: {} });
+    canvasApiMock.getSceneElements.mockReset().mockReturnValue([]);
     canvasApiMock.getSceneElementsIncludingDeleted.mockClear();
     canvasApiMock.updateScene.mockClear();
     canvasEditorState.onCanvasRefreshRequest = null;
+    canvasEditorState.onRequestCanvasSelection = null;
   });
 
   afterEach(() => cleanup());
+
+  it("binds the send-time reader to the current canvas API and rejects previous-canvas selections", async () => {
+    fetchCanvasMock.mockImplementation(async (_token: string, canvasId: string) => canvasResponse(canvasId, `project-${canvasId}`));
+    fetchProjectMock.mockResolvedValue(projectResponse("Project", "kit"));
+    const { rerender } = render(<CanvasPage />);
+    const editorA = await screen.findByTestId("canvas-editor");
+    const readSelection = canvasEditorState.onRequestCanvasSelection!;
+    expect(readSelection("canvas-a")).toEqual({ elementIds: [] });
+    canvasApiMock.getAppState.mockReturnValue({ selectedElementIds: { "text-a": true, "foreign-text": true } });
+    canvasApiMock.getSceneElements.mockReturnValue([{ id: "text-a" }]);
+    fireEvent.click(editorA);
+    expect(readSelection("canvas-a")).toEqual({ elementIds: ["text-a"] });
+    expect(readSelection("canvas-b")).toEqual({ elementIds: [] });
+
+    navigationState.canvasId = "canvas-b";
+    rerender(<CanvasPage />);
+    await waitFor(() => expect(screen.getByTestId("canvas-editor")).toHaveTextContent("canvas-b:"));
+    // The B editor is mounted but has not provided its API; A's scene must not leak.
+    expect(readSelection("canvas-b")).toEqual({ elementIds: [] });
+    expect(readSelection("canvas-a")).toEqual({ elementIds: [] });
+    canvasApiMock.getAppState.mockReturnValue({ selectedElementIds: { "text-b": true } });
+    canvasApiMock.getSceneElements.mockReturnValue([{ id: "text-b" }]);
+    fireEvent.click(screen.getByTestId("canvas-editor"));
+    expect(readSelection("canvas-b")).toEqual({ elementIds: ["text-b"] });
+  });
+
+  it("opens the inline artboard and binds Agent context without a URL flag", async () => {
+    fetchCanvasMock.mockResolvedValue(canvasResponse("canvas-a", "project-a"));
+    fetchProjectMock.mockResolvedValue(projectResponse("Project A", "kit-a"));
+    render(<CanvasPage />);
+    fireEvent.click(await screen.findByText("open design"));
+    expect(await screen.findByTestId("design-mode")).toHaveTextContent("inline");
+    expect(screen.getByTestId("agent-design")).toHaveTextContent("design-a:function");
+    fireEvent.click(screen.getByText("change session"));
+    expect(replaceMock).toHaveBeenLastCalledWith("/canvas?id=canvas-a&session=session-new");
+  });
 
   it("ignores an older canvas response after the canvas id changes", async () => {
     const canvasA = deferred<CanvasResponse>();

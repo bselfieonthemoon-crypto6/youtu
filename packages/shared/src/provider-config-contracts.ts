@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { modelContextProfileSchema } from "./model-context-contracts.js";
 
 export const providerCapabilitySchema = z.enum([
   "text",
@@ -24,6 +25,7 @@ const providerModelFields = {
   modality: providerModelModalitySchema,
   enabled: z.boolean(),
   capabilities: providerCapabilitiesSchema.optional(),
+  contextProfile: modelContextProfileSchema.nullable().optional(),
 };
 
 export const providerModelInputSchema = z.object(providerModelFields).strict();
@@ -70,6 +72,19 @@ export const providerConfigUpdateRequestSchema = z
   .refine((value) => Object.keys(value).length > 0, {
     message: "At least one provider setting must be supplied.",
   });
+
+/**
+ * Read-only model discovery for an unsaved provider draft.  A config ID is
+ * optional so an existing key may only be reused by the server when the draft
+ * stays on that configuration's origin.
+ */
+export const providerModelDiscoveryDraftRequestSchema = z
+  .object({
+    baseUrl: providerBaseUrlSchema,
+    apiKey: providerApiKeySchema.optional(),
+    configId: providerConfigIdSchema.optional(),
+  })
+  .strict();
 
 export const providerLastTestStatusSchema = z.enum([
   "never",
@@ -119,7 +134,9 @@ export const providerConnectionTestResponseSchema = z
 
 export const providerModelDiscoveryResponseSchema = z
   .object({
-    models: z.array(providerModelInputSchema).max(500),
+    // Discovery is read-only and may return a provider's full bounded catalog.
+    // Persisted selections remain capped at 500 by the create/update schemas.
+    models: z.array(providerModelInputSchema).max(10_000),
   })
   .strict();
 
@@ -154,6 +171,9 @@ export type ProviderConfigCreateRequest = z.infer<
 >;
 export type ProviderConfigUpdateRequest = z.infer<
   typeof providerConfigUpdateRequestSchema
+>;
+export type ProviderModelDiscoveryDraftRequest = z.infer<
+  typeof providerModelDiscoveryDraftRequestSchema
 >;
 export type WorkspaceProviderConfig = z.infer<
   typeof workspaceProviderConfigSchema

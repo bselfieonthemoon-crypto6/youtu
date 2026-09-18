@@ -37,6 +37,8 @@ const TOOL_CONFIG: Record<string, ToolDisplayConfig> = {
     showCard: true,
   },
   inspect_design: { label: "读取设计", icon: "eye", showCard: true },
+  update_design_brief: { label: "整理当前需求", icon: "brush", showCard: true },
+  verify_design_result: { label: "核验保存与预览", icon: "eye", showCard: true },
   get_design_objects: { label: "读取设计对象", icon: "eye", showCard: true },
   manipulate_design: { label: "修改设计", icon: "brush", showCard: true },
   search_design_resources: {
@@ -60,6 +62,8 @@ const TOOL_CONFIG: Record<string, ToolDisplayConfig> = {
     icon: "image",
     showCard: true,
   },
+  edit_image: { label: "修改或参考图片", icon: "image", showCard: true },
+  create_design_boards: { label: "创建原生画板", icon: "brush", showCard: true },
   generate_video: {
     label: "\u751f\u6210\u89c6\u9891",
     icon: "video",
@@ -80,6 +84,11 @@ const TOOL_CONFIG: Record<string, ToolDisplayConfig> = {
     icon: "search",
     showCard: true,
   },
+  search_prompt_library: { label: "搜索提示词案例", icon: "search", showCard: true },
+  get_prompt_library_entry: { label: "读取提示词原文", icon: "eye", showCard: true },
+  list_skills: { label: "查看可用技能", icon: "search", showCard: true },
+  use_skill: { label: "加载设计技能", icon: "palette", showCard: true },
+  compose_skills: { label: "组合设计技能", icon: "palette", showCard: true },
   task: { label: "\u6267\u884c\u4efb\u52a1", icon: "tool", showCard: false },
 };
 

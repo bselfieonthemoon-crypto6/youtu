@@ -60,7 +60,15 @@ export function waitForGenerationJob(
   const promise = (async () => {
     const startedAt = Date.now();
     while (Date.now() - startedAt <= MAX_POLL_DURATION_MS) {
-      const { job } = await fetchJob(accessToken, jobId);
+      let job: BackgroundJob;
+      try {
+        job = (await fetchJob(accessToken, jobId)).job;
+      } catch {
+        // Transport errors say nothing about generation state. Keep observing
+        // the same durable job; never turn a transient fetch into a failed image.
+        await delay(POLL_INTERVAL_MS);
+        continue;
+      }
       if (
         (job.status === "succeeded" &&
           (job.target_kind === "canvas"
@@ -76,7 +84,7 @@ export function waitForGenerationJob(
       }
       await delay(POLL_INTERVAL_MS);
     }
-    throw new Error("等待生成结果超时，请稍后再试。");
+    throw new Error("暂时无法同步生成状态，后台任务仍会继续，请稍后刷新查看。");
   })().finally(() => {
     sharedPolls.delete(pollKey);
   });

@@ -1,6 +1,5 @@
 export type ImageToolbarActionId =
   | "remove-background"
-  | "region-matting"
   | "split-layers"
   | "replace-text"
   | "edit-region"
@@ -9,6 +8,7 @@ export type ImageToolbarActionId =
   | "crop"
   | "upscale"
   | "erase"
+  | "outpaint"
   | "add-to-chat"
   | "details"
   | "download";

@@ -1,4 +1,5 @@
 import {
+  parseWorkspaceModelId,
   workspaceCatalogModelSchema,
   type WorkspaceCatalogModel,
 } from "@loomic/shared";
@@ -25,6 +26,16 @@ export type WorkspaceModelCatalogService = {
     publicId: string,
     modality: WorkspaceCatalogModel["modality"],
   ): Promise<ResolvedWorkspaceModel | null>;
+  /**
+   * Resolves the frozen upstream identity of an unavailable image alias only
+   * when at least one currently enabled, connection-tested exact-upstream
+   * alternative exists. It never returns a cross-model substitute.
+   */
+  resolveCompatibleImageFallback?(
+    user: AuthenticatedUser,
+    workspaceId: string,
+    publicId: string,
+  ): Promise<ResolvedWorkspaceModel | null>;
 };
 
 export type WorkspaceModelCatalogEntry = {
@@ -44,6 +55,48 @@ export function createWorkspaceModelCatalogService(options: {
   getAdminClient: () => AdminSupabaseClient;
 }): WorkspaceModelCatalogService {
   return {
+    async resolveCompatibleImageFallback(user, workspaceId, publicId) {
+      const catalogKey = parsePublicCatalogKey(publicId);
+      if (!catalogKey) return null;
+      const admin = options.getAdminClient();
+      await assertWorkspaceMembership(admin, user.id, workspaceId);
+      const requestedResult = await (admin.from("workspace_provider_models") as any)
+        .select("catalog_key,provider_config_id,upstream_model_id,modality,capabilities,workspace_provider_configs!inner(workspace_id,revision)")
+        .eq("catalog_key", catalogKey)
+        .eq("modality", "image")
+        .eq("workspace_provider_configs.workspace_id", workspaceId)
+        .maybeSingle();
+      if (requestedResult.error) throw new WorkspaceModelCatalogError();
+      if (!requestedResult.data) return null;
+      const requested = requestedResult.data as Record<string, unknown>;
+      const capabilities = workspaceCatalogModelSchema.shape.capabilities.parse(
+        requested.capabilities ?? [],
+      );
+      if (!capabilities.includes("image_generation")) return null;
+      const upstreamModelId = String(requested.upstream_model_id);
+      const candidateResult = await (admin.from("workspace_provider_models") as any)
+        .select("catalog_key,workspace_provider_configs!inner(workspace_id,enabled,last_test_status)")
+        .eq("upstream_model_id", upstreamModelId)
+        .eq("modality", "image")
+        .eq("enabled", true)
+        // This column is JSONB, not a PostgreSQL text array. PostgREST's
+        // array overload emits {image_generation}, which is invalid JSON.
+        .contains("capabilities", JSON.stringify(["image_generation"]))
+        .eq("workspace_provider_configs.workspace_id", workspaceId)
+        .eq("workspace_provider_configs.enabled", true)
+        .eq("workspace_provider_configs.last_test_status", "succeeded")
+        .limit(1);
+      if (candidateResult.error) throw new WorkspaceModelCatalogError();
+      if (!Array.isArray(candidateResult.data) || candidateResult.data.length === 0) return null;
+      const config = requested.workspace_provider_configs as Record<string, unknown>;
+      return {
+        upstreamModelId,
+        catalogKey: String(requested.catalog_key),
+        providerConfigId: String(requested.provider_config_id),
+        revision: Number(config.revision),
+        capabilities,
+      };
+    },
     async listPublished(user, workspaceId) {
       const admin = options.getAdminClient();
       await assertWorkspaceMembership(admin, user.id, workspaceId);
@@ -126,6 +179,5 @@ async function assertWorkspaceMembership(
 }
 
 function parsePublicCatalogKey(publicId: string) {
-  const match = /^workspace:([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i.exec(publicId);
-  return match?.[1] ?? null;
+  return parseWorkspaceModelId(publicId);
 }

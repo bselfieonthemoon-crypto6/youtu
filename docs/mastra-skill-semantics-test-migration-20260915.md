@@ -1,0 +1,25 @@
+# Skill semantics integration test migration
+
+The previous suite combined current Mastra Skill manifests with the legacy DeepAgent proposal/confirmation tool inventory. `logo-design` and `campaign-design` require `edit_image`; the old inventory did not provide it, so three scenarios stopped at `compose_skills` with `skill_unavailable`.
+
+The suite now uses the current Mastra SDK stream, toolkit and native image tools. It retains literal prompt/model/framing, carousel style and exact copy, current correction over old style, and clarification without submission. Assertions target direct native image submission rather than `loomic_propose_image` or `awaiting_confirmation`. Native design-target assertions belong to the legacy confirmation tests, since Mastra delivers raster assets to the infinite canvas.
+
+The original fixture is preserved as `artifacts/skill-conflict-repro-20260915/legacy-suite-source.txt`, SHA256 `B2AA9286E01B845E15BCB5B9CA223B5B6748875F2A026147089E549699F5F43D`. Prior reproduction reports describe that archived version. The old isolation configuration forbids native-image modules and is not suitable for running the migrated suite.
+
+These checks use synthetic provider transport and mocked submission. They verify actual SDK/tool orchestration and argument retention, not language-model intent accuracy, real provider image quality or database delivery. Production runtime, paid confirmation policy, billing, skills and worker logic are outside this test-only migration.
+
+The old carousel composition included `typography-layout`, whose current manifest requires native-design inspection and mutation tools. It cannot be enabled by adding fake native writes to the Mastra fixture. Carousel typography remains a user constraint; the migrated composition uses applicable bitmap and reference guides. Style-library readiness must include the registered read-only prompt-library tools. Whole loaded guides are checked in tool results; model-side context remains subject to the normal runtime budget.
+
+Terra (medium) implements the test migration. Main reviews scope and performs integration acceptance. Existing toolkit/skill-tool and legacy confirmation regressions passed: 107 tests across four files.
+
+All four migrated scenarios passed with one Vitest worker, and server typecheck passed. A transparent spy delegates to the actual `compose_skills.invoke` and records the same run's return value without changing it or invoking composition again. Assertions cover the real composed receipt, method-only authority, selected helpers, completed UI summary, exactly one processing receipt for each generation, Low/1K defaults and a completed run. No scenarios are skipped. Current correction and historical style are both checked in the outgoing model context.
+
+Main final Mastra integration: 114 tests passed across eight files (migrated semantics 4; Agent 14; native image tool 41; ratio state 5; nonstandard approximation 12; grounding 14; durable jobs 18; legacy native preflight 6). Combined with the separately checked 107 toolkit/skill-tool/legacy-confirmation cases, 221 unique targeted tests passed. Machine-readable evidence is `artifacts/skill-conflict-repro-20260915/final-integration-results.json`; only synthetic transport and mocked submission were used.
+
+Main subsequently corrected the spy's spread-argument tuple type (`Parameters<typeof invoke>`) after an independent typecheck found TS2556, and added a different first catalog model so erroneous fallback cannot satisfy the selected-model assertion. The final four scenarios passed again; evidence is `artifacts/skill-conflict-repro-20260915/migrated-final-results.json`. Main's final typecheck, rather than an earlier delegated status, is authoritative.
+
+Final main server typecheck completed with exit code 0 after those corrections.
+
+A subsequent health check found PID 36672 had also exited. This time its stderr explicitly reported `FATAL ERROR: Zone Allocation failed - process out of memory`; the log is archived as `artifacts/skill-conflict-repro-20260915/api-oom.stderr.log`. System committed memory measured 44,499,484,672 bytes against a 47,106,416,640-byte limit. No additional test workers were started. With no queued/running background jobs, main relaunched the local API as PID 39256; health returned HTTP 200. The resource error is an additional observed environment limitation, not a failing semantics test. Recovery does not prove long-term API stability or establish which process first caused global memory pressure.
+
+During acceptance a shell process reported out-of-memory and the previously running local API was found unavailable. The exact cause of API exit was not established; its log had no fatal error. Neither agent stopped an existing service. After checking that no queued/running background jobs or recent active Agent runs existed, main started the API with the local replica configuration as PID 36672. API and web returned HTTP 200. Remaining acceptance runs use a single worker and sequential checks.

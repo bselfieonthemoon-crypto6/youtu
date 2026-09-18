@@ -100,7 +100,7 @@ export class GoogleVertexImageProvider implements ImageProvider {
     }
 
     const aspectRatio = params.aspectRatio ?? "1:1";
-    const imageSize = QUALITY_TO_IMAGE_SIZE[params.quality ?? "hd"] ?? "2K";
+    const imageSize = QUALITY_TO_IMAGE_SIZE[params.quality ?? "standard"] ?? "1K";
 
     // Build content parts: text prompt + optional input images.
     const parts: Array<

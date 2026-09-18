@@ -214,7 +214,7 @@ export function createConnectionManagerDesignBroadcaster(options: {
       if (error) throw new Error(`design_node_lookup_failed:${error.message}`);
       const canvasIds = new Set((data ?? []).map((row) => row.canvas_id));
       for (const canvasId of canvasIds) {
-        options.connections.sendToCanvas(canvasId, event);
+        await options.connections.sendToCanvas(canvasId, event);
       }
     },
   };

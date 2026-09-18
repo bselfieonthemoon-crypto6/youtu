@@ -49,4 +49,40 @@ describe("request-scoped generation providers", () => {
     await expect(firstJob).resolves.toBe(first);
     await expect(secondJob).resolves.toBe(second);
   });
+
+  it("isolates both primary and helper providers across concurrent two-stage jobs", async () => {
+    const firstPrimary = fakeProvider("workspace:first-primary", "shared-primary");
+    const firstHelper = fakeProvider("workspace:first-helper", "shared-helper");
+    const secondPrimary = fakeProvider("workspace:second-primary", "shared-primary");
+    const secondHelper = fakeProvider("workspace:second-helper", "shared-helper");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const firstJob = runWithGenerationProviderScope(
+      { imageProvider: firstPrimary, auxiliaryImageProviders: [firstHelper] },
+      async () => {
+        await gate;
+        return [
+          getImageProvider(resolveImageProviderName("shared-primary")),
+          getImageProvider(resolveImageProviderName("shared-helper")),
+        ];
+      },
+    );
+    const secondJob = runWithGenerationProviderScope(
+      { imageProvider: secondPrimary, auxiliaryImageProviders: [secondHelper] },
+      async () => {
+        release();
+        await Promise.resolve();
+        return [
+          getImageProvider(resolveImageProviderName("shared-primary")),
+          getImageProvider(resolveImageProviderName("shared-helper")),
+        ];
+      },
+    );
+
+    await expect(firstJob).resolves.toEqual([firstPrimary, firstHelper]);
+    await expect(secondJob).resolves.toEqual([secondPrimary, secondHelper]);
+  });
 });

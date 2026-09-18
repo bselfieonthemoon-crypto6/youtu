@@ -1,5 +1,5 @@
-import { tool } from "langchain";
 import { z } from "zod";
+import { createAgentTool } from "./tool-run-context.js";
 
 import {
   type AvailableVideoModel,
@@ -164,7 +164,7 @@ export async function runVideoGenerate(
   submitVideoJob?: SubmitVideoJobFn,
   availableModels = getAvailableVideoModels(),
 ): Promise<VideoGenerateResult> {
-  let input = rawInput;
+  const input = rawInput;
   const t0 = Date.now();
   const lap = (label: string, extra?: Record<string, unknown>) => {
     console.log(
@@ -173,17 +173,14 @@ export async function runVideoGenerate(
     );
   };
 
-  // Filter invalid image references
-  if (input.inputImages?.length) {
-    const validImages = input.inputImages.filter(
-      (img) =>
-        img.startsWith("http://") ||
-        img.startsWith("https://") ||
-        img.startsWith("data:"),
-    );
-    input = {
-      ...input,
-      inputImages: validImages.length > 0 ? validImages : undefined,
+  // An unresolved reference must fail the request, not silently downgrade a
+  // paid image-to-video submission into a different text-to-video operation.
+  if (input.inputImages?.length
+    && input.inputImages.some(img =>
+      !img.startsWith("http://") && !img.startsWith("https://") && !img.startsWith("data:"))) {
+    return {
+      summary: "视频参考图尚未解析，未提交生成。请先读取有效图片后重试。",
+      error: "video_reference_image_invalid",
     };
   }
 
@@ -333,16 +330,14 @@ export function createVideoGenerateTool(deps?: {
     ? models.map((m) => `${m.displayName} (${m.id})`).join(", ")
     : "No video models available";
 
-  return tool(
-    async (input: VideoGenerateInput) => {
+  return createAgentTool({
+    id: "generate_video",
+    description: `Generate a video using AI. Available models: ${modelSummary}. Supports text-to-video, image-to-video, and video editing. Returns the generated video URL.`,
+    inputSchema: buildVideoGenerateSchema(models),
+    execute: async (input) => {
       return await runVideoGenerate(input, deps?.submitVideoJob, models);
     },
-    {
-      name: "generate_video",
-      description: `Generate a video using AI. Available models: ${modelSummary}. Supports text-to-video, image-to-video, and video editing. Returns the generated video URL.`,
-      schema: buildVideoGenerateSchema(models),
-    },
-  );
+  });
 }
 
 function validateCapabilities(

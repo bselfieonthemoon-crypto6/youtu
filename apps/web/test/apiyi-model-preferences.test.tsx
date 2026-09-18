@@ -36,6 +36,24 @@ describe("workspace model preferences", () => {
     expect(result.current.preference).toEqual({
       mode: "manual",
       models: ["google/nano-banana-2"],
+      aspectRatio: "auto",
+    });
+  });
+
+  it("defaults legacy preferences to an automatic aspect ratio and persists a selected ratio", () => {
+    localStorage.setItem("loomic:image-model-preference", JSON.stringify({
+      mode: "auto",
+      models: [],
+    }));
+
+    const { result } = renderHook(() => useImageModelPreference());
+    expect(result.current.preference.aspectRatio).toBe("auto");
+
+    result.current.setAspectRatio("16:9");
+    expect(JSON.parse(localStorage.getItem("loomic:image-model-preference") ?? "{}")).toMatchObject({
+      mode: "auto",
+      models: [],
+      aspectRatio: "16:9",
     });
   });
 

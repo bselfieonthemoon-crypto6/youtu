@@ -12,6 +12,28 @@ export type CanvasFileLoadQueue = {
   dispose(): void;
 };
 
+export function canvasFileSourceKey(candidate: CanvasFileCandidate): string {
+  return JSON.stringify([
+    candidate.fileId,
+    candidate.assetId ?? null,
+    candidate.storageUrl ?? null,
+  ]);
+}
+
+/**
+ * The loader owns in-flight requests, so its React effect must only restart
+ * when a file's readable source changes. Canvas refreshes deserialize fresh
+ * files/elements objects even when they describe exactly the same assets.
+ */
+export function canvasFileSourcesKey(
+  candidates: readonly CanvasFileCandidate[],
+): string {
+  return candidates
+    .map(canvasFileSourceKey)
+    .sort()
+    .join("|");
+}
+
 type CanvasViewportElement = {
   type?: unknown;
   isDeleted?: unknown;

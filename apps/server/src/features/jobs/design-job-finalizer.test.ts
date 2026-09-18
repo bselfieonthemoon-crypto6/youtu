@@ -162,6 +162,23 @@ function repository(): DesignFinalizationRepository {
 }
 
 describe("DesignJobFinalizer", () => {
+  it("retains a late generated asset and settles only its attachment as superseded", async () => {
+    const repo = repository();
+    const previews = { enqueue: vi.fn() };
+    const mutations: DesignJobMutationPort = {
+      get: vi.fn(async () => document(4)),
+      mutate: vi.fn().mockRejectedValue(new Error("agent_task_superseded")),
+    };
+    const succeeded = job();
+    const outcome = await new DesignJobFinalizer(repo, mutations, previews).finalize(succeeded);
+    expect(outcome).toMatchObject({ inserted: false, finalization: {
+      status: "needs_attention", error_code: "agent_task_superseded", result: { attachment_status: "superseded" },
+    } });
+    expect(repo.finish).toHaveBeenCalledTimes(1);
+    expect(previews.enqueue).not.toHaveBeenCalled();
+    expect(succeeded.status).toBe("succeeded");
+    expect(succeeded.result).toMatchObject({ asset_id: ids.asset });
+  });
   it.each([[0, 0], [99, 1], [undefined, 1]])("inserts requested layer %s at bounded index %s", async (layerIndex, expected) => {
     const mutations: DesignJobMutationPort = {
       get: vi.fn(async () => document(4, true)),
@@ -394,6 +411,41 @@ describe("DesignJobFinalizer", () => {
         },
       },
     });
+  });
+
+  it("preserves the original when semantic splitting adds a named group beside it", async () => {
+    const repo = repository();
+    const splitJob = job({ replaceObjectId: ids.existingObject });
+    splitJob.payload = { ...splitJob.payload, operation: "split_layers",
+      layer_backend: "semantic", layer_names: ["left", "right"], repair_background: true,
+      input_images: ["https://example.test/source.png"],
+      target: { ...(splitJob.payload.target as Record<string, unknown>),
+        source_object_id: ids.existingObject, expected_object_version: 2,
+        source_asset_object_id: "90000000-0000-4000-8000-000000000001",
+        placement: { x: 500, y: 200 } } };
+    splitJob.result = { asset_id: "70000000-0000-4000-8000-000000000002",
+      width: 100, height: 100, mime_type: "image/png",
+      source_width: 100, source_height: 100,
+      layers: [
+        { asset_id: "70000000-0000-4000-8000-000000000002", width: 100,
+          height: 100, mime_type: "image/png", kind: "background", name: "修补底图", x: 0, y: 0 },
+        { asset_id: "70000000-0000-4000-8000-000000000003", width: 40,
+          height: 50, mime_type: "image/png", kind: "element", name: "left", x: 10, y: 20, index: 1 },
+      ] };
+    const mutations: DesignJobMutationPort = {
+      get: vi.fn(async () => document(1, true)),
+      mutate: vi.fn(async input => ({ design_id: ids.design, revision: 2,
+        changed_object_ids: input.commands.flatMap((command: DesignCommand) =>
+          command.action === "object.add" ? [command.object.objectId] : []), replayed: false })),
+    };
+    const outcome = await new DesignJobFinalizer(repo, mutations).finalize(splitJob);
+    const commands = vi.mocked(mutations.mutate).mock.calls[0]![0].commands;
+    expect(commands).toHaveLength(2);
+    expect(commands.every(command => command.action === "object.add")).toBe(true);
+    expect(commands[0]).toMatchObject({ action: "object.add",
+      object: { name: "修补底图", x: 500, y: 200 } });
+    expect(commands[1]).toMatchObject({ action: "object.add", object: { name: "left" } });
+    expect(outcome?.finalization).toMatchObject({ status: "completed" });
   });
 
   it("uses the fair service-side recovery candidate scan", async () => {

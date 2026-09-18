@@ -46,6 +46,8 @@ export type ToolExecutionRetryContext = {
   canvasId: string;
   sessionId: string;
   threadId: string;
+  /** Workspace of the original run; required to re-run workspace-scoped reads. */
+  workspaceId: string;
   isNew: boolean;
 };
 

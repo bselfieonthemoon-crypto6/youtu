@@ -1,4 +1,5 @@
 // @credits-system — Direct generation routes with credit deduction and tier checks
+import { createHash, randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 
@@ -21,6 +22,8 @@ import type { ViewerService } from "../features/bootstrap/ensure-user-foundation
 import type { UploadService } from "../features/uploads/upload-service.js";
 import type { AuthenticatedUser, RequestAuthenticator } from "../supabase/user.js";
 import { safeDownload } from "../security/safe-download.js";
+import { validateImageGenerationRequestLimits } from "../generation/image-request-limits.js";
+import { sanitizeErrorForClient } from "../utils/error-sanitizer.js";
 
 const generateImageRequestSchema = z.object({
   prompt: z.string().min(1),
@@ -37,6 +40,11 @@ const generateVideoRequestSchema = z.object({
   aspectRatio: z.enum(["16:9", "9:16"]).optional(),
   inputImages: z.array(z.string()).max(3).optional(),
 });
+
+export function httpVideoSubmissionKey(idempotencyKey?: string): string {
+  const identity = idempotencyKey ?? randomUUID();
+  return `http:${createHash("sha256").update(identity).digest("hex")}`;
+}
 
 export async function registerGenerateRoutes(
   app: FastifyInstance,
@@ -81,6 +89,17 @@ export async function registerGenerateRoutes(
     }
 
     const model = payload.model ?? "gpt-image-2-all";
+    const limitViolation = validateImageGenerationRequestLimits({
+      model,
+      prompt: payload.prompt,
+    });
+    if (limitViolation) {
+      return reply.code(422).send(
+        applicationErrorResponseSchema.parse({
+          error: { code: limitViolation.code, message: limitViolation.message },
+        }),
+      );
+    }
 
     try {
       // ── Tier guard + credit checks ──
@@ -90,7 +109,7 @@ export async function registerGenerateRoutes(
 
       if (options.creditService && options.tierGuard) {
         const sub = await options.creditService.getSubscription(viewer.workspace.id);
-        const quality: ImageQualityLevel = payload.quality ?? "hd";
+        const quality: ImageQualityLevel = payload.quality ?? "standard";
         options.tierGuard.checkModelAccess(sub.plan, model);
         // Throws TierGuardError (resolution_not_allowed) if plan doesn't allow this quality
         options.tierGuard.checkResolution(sub.plan, quality);
@@ -114,7 +133,7 @@ export async function registerGenerateRoutes(
               prompt: payload.prompt,
               model,
               aspectRatio: payload.aspectRatio ?? "1:1",
-              quality: payload.quality ?? "hd",
+              quality: payload.quality ?? "standard",
             },
             deferEnqueue: true,
             providerBilling: {
@@ -282,67 +301,100 @@ export async function registerGenerateRoutes(
     }
 
     const model = payload.model ?? "google-official/veo-3.1-generate-preview";
+    const rawIdempotencyKey = request.headers["idempotency-key"];
+    if (Array.isArray(rawIdempotencyKey)
+      || (typeof rawIdempotencyKey === "string"
+        && (rawIdempotencyKey.trim().length === 0 || rawIdempotencyKey.length > 200))) {
+      return reply.code(400).send(
+        applicationErrorResponseSchema.parse({
+          error: { code: "invalid_request", message: "Invalid Idempotency-Key header." },
+        }),
+      );
+    }
+    const submissionKey = httpVideoSubmissionKey(
+      typeof rawIdempotencyKey === "string" ? rawIdempotencyKey : undefined,
+    );
 
     try {
       // ── Tier guard + credit checks ──
       const viewer = await options.viewerService.ensureViewer(user);
       const workspaceId = viewer.workspace.id;
-      let creditsCost = 0;
-
-      if (options.creditService && options.tierGuard) {
-        const sub = await options.creditService.getSubscription(workspaceId);
-        options.tierGuard.checkModelAccess(sub.plan, model);
-        if (payload.resolution) {
-          options.tierGuard.checkVideoResolution(
-            sub.plan,
-            payload.resolution as VideoResolution,
-          );
-        }
-        await options.tierGuard.checkConcurrency(workspaceId, sub.plan);
-        creditsCost = options.tierGuard.calculateCreditCost(
-          model,
-          "video_generation",
-          {
-            ...(payload.duration != null ? { duration: payload.duration } : {}),
-            ...(payload.resolution
-              ? { resolution: payload.resolution as VideoResolution }
-              : {}),
-          },
-        );
-      }
-
-      // ── Create job ──
-      const job = await options.jobService.createJob(user, {
-        workspaceId,
-        jobType: "video_generation",
-        payload: {
-          prompt: payload.prompt,
-          model,
-          ...(payload.duration != null ? { duration: payload.duration } : {}),
-          ...(payload.resolution ? { resolution: payload.resolution } : {}),
-          ...(payload.aspectRatio
-            ? { aspect_ratio: payload.aspectRatio }
-            : {}),
-          ...(payload.inputImages?.length
-            ? { input_images: payload.inputImages }
-            : {}),
-        },
+      const jobPayload = {
+        prompt: payload.prompt,
+        model,
+        ...(payload.duration != null ? { duration: payload.duration } : {}),
+        ...(payload.resolution ? { resolution: payload.resolution } : {}),
+        ...(payload.aspectRatio ? { aspect_ratio: payload.aspectRatio } : {}),
+        ...(payload.inputImages?.length ? { input_images: payload.inputImages } : {}),
+      };
+      let job = await options.jobService.findVideoSubmission(user, {
+        workspaceId, submissionKey, kind: "http", expectedPayload: jobPayload,
       });
 
-      // ── Deduct credits BEFORE generation ──
-      if (options.creditService && creditsCost > 0) {
-        try {
-          const txId = await options.creditService.deductCredits(
-            workspaceId,
-            user.id,
-            creditsCost,
-            job.id,
-            `Direct video generation: ${model}`,
+      if (!job) {
+        let creditsCost = 0;
+        if (options.creditService && options.tierGuard) {
+          const sub = await options.creditService.getSubscription(workspaceId);
+          options.tierGuard.checkModelAccess(sub.plan, model);
+          if (payload.resolution) {
+            options.tierGuard.checkVideoResolution(
+              sub.plan,
+              payload.resolution as VideoResolution,
+            );
+          }
+          await options.tierGuard.checkConcurrency(workspaceId, sub.plan);
+          creditsCost = options.tierGuard.calculateCreditCost(
+            model,
+            "video_generation",
+            {
+              ...(payload.duration != null ? { duration: payload.duration } : {}),
+              ...(payload.resolution
+                ? { resolution: payload.resolution as VideoResolution }
+                : {}),
+            },
           );
-          await options.jobService.setCreditsInfo(job.id, creditsCost, txId);
-        } catch (deductError) {
-          await options.jobService.cancelJob(user, job.id).catch(() => {});
-          throw deductError;
+        }
+
+        const created = await options.jobService.createJobWithReplay(user, {
+          workspaceId,
+          jobType: "video_generation",
+          deferEnqueue: true,
+          videoSubmission: { kind: "http", key: submissionKey },
+          providerBilling: {
+            creditsCost,
+            pricingVersion: "credits-v1",
+            unit: "second" as const,
+          },
+          payload: jobPayload,
+        });
+        job = created.job;
+      }
+
+      if (job.status === "queued") {
+        const creditsCost = Number(job.payload.video_credits_cost);
+        if (!Number.isSafeInteger(creditsCost) || creditsCost < 0)
+          throw new JobServiceError("job_create_failed", "Durable video price is invalid.", 409);
+        try {
+          await options.jobService.commitVideoJob(user, {
+            jobId: job.id, submissionKey, creditsCost,
+          });
+        } catch (commitError) {
+          if (commitError instanceof CreditServiceError) {
+            const canceled = await options.jobService.cancelUncommittedVideoJob(user, {
+              jobId: job.id, submissionKey,
+            }).catch(() => false);
+            if (canceled) throw commitError;
+          }
+          if (commitError instanceof JobServiceError
+            && commitError.code === "video_commit_rejected") {
+            const canceled = await options.jobService.cancelUncommittedVideoJob(user, {
+              jobId: job.id, submissionKey,
+            });
+            if (canceled) throw commitError;
+          }
+          // The transaction may have committed while its response was lost.
+          // Keep polling this durable identity; the worker recovery scan will
+          // publish a still-uncommitted row without creating or charging again.
         }
       }
 
@@ -437,8 +489,6 @@ async function pollJobUntilDone(
   const start = Date.now();
 
   while (Date.now() - start < maxWait) {
-    await delay(pollInterval);
-
     const current = await jobService.getJobAdmin(jobId);
 
     if (current.status === "succeeded" && current.result) {
@@ -454,7 +504,9 @@ async function pollJobUntilDone(
     }
 
     if (current.status === "dead_letter" || current.status === "canceled") {
-      return { error: current.error_message ?? `Job ${current.status}` };
+      return { error: current.error_message
+        ? sanitizeErrorForClient(new Error(current.error_message))
+        : `Job ${current.status}` };
     }
 
     if (
@@ -462,9 +514,13 @@ async function pollJobUntilDone(
       current.attempt_count >= current.max_attempts
     ) {
       return {
-        error: current.error_message ?? "Job failed after max retries",
+        error: current.error_message
+          ? sanitizeErrorForClient(new Error(current.error_message))
+          : "Job failed after max retries",
       };
     }
+
+    await delay(pollInterval);
   }
 
   return { error: `Job timed out after ${maxWait / 1000}s` };

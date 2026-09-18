@@ -1,13 +1,25 @@
-import { tool } from "langchain";
 import { z } from "zod";
 import type { DesignToolDependencies } from "./design-tools.js";
+import { createAgentTool, runContextOf } from "./tool-run-context.js";
+
+/** Run context this tool needs; the runtime builds it once per run. */
+type DesignDiscoveryContext = {
+  access_token?: string;
+  canvas_id?: string;
+  workspace_id?: string;
+  user_id?: string;
+};
 
 export function createDesignDiscoveryTool(
   deps: DesignToolDependencies & { createUserClient: (token: string) => any },
 ) {
-  return tool(
-    async (_input, config) => {
-      const c = config?.configurable;
+  return createAgentTool({
+    id: "list_designs",
+    description:
+      "Discover real native design IDs, names and dimensions linked to the current infinite canvas. Call this before inspect_design when the user refers to a design board without providing its ID. Never invent an ID.",
+    inputSchema: z.object({}),
+    execute: async (_input, context) => {
+      const c = runContextOf(context) as DesignDiscoveryContext;
       if (!c?.access_token || !c?.canvas_id || !c?.workspace_id || !c?.user_id)
         return { error: "design_context_missing" };
       const { data, error } = await deps
@@ -23,26 +35,30 @@ export function createDesignDiscoveryTool(
           error: "design_list_failed",
           summary: "读取画板列表失败，请重试，不要编造 design_id。",
         };
-      const designs = [];
-      for (const row of (data ?? []).slice(0, 100)) {
-        const design = await deps.designService.get(
-          {
-            id: c.user_id,
-            accessToken: c.access_token,
-            email: "",
-            userMetadata: {},
-          },
-          row.design_id,
-        );
-        if (design.workspace_id === c.workspace_id)
-          designs.push({
+      const user = {
+        id: c.user_id,
+        accessToken: c.access_token,
+        email: "",
+        userMetadata: {},
+      };
+      // Resolve boards concurrently and isolate per-row failures so one bad
+      // design does not fail the whole list.
+      const loaded = await Promise.all((data ?? []).slice(0, 100).map(async (row: { design_id: string }) => {
+        try {
+          const design = await deps.designService.get(user, row.design_id);
+          if (design.workspace_id !== c.workspace_id) return null;
+          return {
             design_id: design.id,
             name: design.name,
             width: design.width,
             height: design.height,
             revision: design.revision,
-          });
-      }
+          };
+        } catch {
+          return null;
+        }
+      }));
+      const designs = loaded.filter((item): item is NonNullable<typeof item> => item !== null);
       return {
         designs,
         truncated: (data ?? []).length > 100,
@@ -52,11 +68,5 @@ export function createDesignDiscoveryTool(
             : "按用户指定名称选择画板；不明确时请询问，不要猜测。",
       };
     },
-    {
-      name: "list_designs",
-      description:
-        "Discover real native design IDs, names and dimensions linked to the current infinite canvas. Call this before inspect_design when the user refers to a design board without providing its ID. Never invent an ID.",
-      schema: z.object({}),
-    },
-  );
+  });
 }

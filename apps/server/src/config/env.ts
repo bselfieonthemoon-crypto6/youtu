@@ -1,6 +1,5 @@
 import { readFileSync } from "node:fs";
 
-export const DEFAULT_AGENT_BACKEND_MODE = "state";
 export const DEFAULT_APIYI_AGENT_MODEL = "gemini-3.1-flash-lite";
 export const DEFAULT_AGENT_MODEL = `apiyi:${DEFAULT_APIYI_AGENT_MODEL}`;
 export const DEFAULT_SERVER_PORT = 3001;
@@ -13,11 +12,11 @@ export function resolveDefaultAgentModel(_env: {
   return DEFAULT_AGENT_MODEL;
 }
 
-export type AgentBackendMode = "filesystem" | "state";
-
 export type ServerEnv = {
-  agentBackendMode: AgentBackendMode;
-  agentFilesRoot?: string;
+  /** Keep the bounded Mastra omitted-write recovery enabled unless explicitly disabled. */
+  mastraWriteRepairEnabled?: boolean;
+  /** Require a tool on the first recovery step unless explicitly disabled. */
+  mastraWriteRepairToolChoice?: boolean;
   designImportRoot?: string;
   agentModel: string;
   apiYiApiBase?: string;
@@ -68,9 +67,6 @@ export function loadServerEnv(
   overrides: Partial<ServerEnv> = {},
   source: NodeJS.ProcessEnv = process.env,
 ): ServerEnv {
-  const agentFilesRoot =
-    overrides.agentFilesRoot ??
-    parseAgentFilesRoot(source.LOOMIC_AGENT_FILES_ROOT);
   const designImportRoot =
     overrides.designImportRoot ??
     normalizeOptionalString(source.LOOMIC_DESIGN_IMPORT_ROOT);
@@ -190,6 +186,12 @@ export function loadServerEnv(
     (source.WORKER_MAX_BATCH_SIZE
       ? Number.parseInt(source.WORKER_MAX_BATCH_SIZE, 10)
       : undefined);
+  const mastraWriteRepairEnabled =
+    overrides.mastraWriteRepairEnabled ??
+    parseBooleanEnv(source.LOOMIC_MASTRA_WRITE_REPAIR_ENABLED, true);
+  const mastraWriteRepairToolChoice =
+    overrides.mastraWriteRepairToolChoice ??
+    parseBooleanEnv(source.LOOMIC_MASTRA_WRITE_REPAIR_TOOL_CHOICE, true);
 
   // Explicit LOOMIC_AGENT_MODEL takes precedence; the only environment-backed
   // fallback is the APIYI text model.
@@ -199,15 +201,13 @@ export function loadServerEnv(
     explicitModel ?? resolveDefaultAgentModel({ apiYiApiKey });
 
   return {
-    agentBackendMode:
-      overrides.agentBackendMode ??
-      parseAgentBackendMode(source.LOOMIC_AGENT_BACKEND_MODE),
     agentModel: resolvedAgentModel,
+    mastraWriteRepairEnabled,
+    mastraWriteRepairToolChoice,
     port: overrides.port ?? parsePort(source.LOOMIC_SERVER_PORT ?? source.PORT),
     version: overrides.version ?? readServerVersion(),
     webOrigin:
       overrides.webOrigin ?? source.LOOMIC_WEB_ORIGIN ?? DEFAULT_WEB_ORIGIN,
-    ...(agentFilesRoot ? { agentFilesRoot } : {}),
     ...(designImportRoot ? { designImportRoot } : {}),
     ...(googleApiKey ? { googleApiKey } : {}),
     ...(googleApplicationCredentials ? { googleApplicationCredentials } : {}),
@@ -263,24 +263,16 @@ export function loadServerEnv(
   };
 }
 
-function parseAgentBackendMode(rawMode: string | undefined): AgentBackendMode {
-  if (!rawMode) {
-    return DEFAULT_AGENT_BACKEND_MODE;
-  }
-
-  if (rawMode === "state" || rawMode === "filesystem") {
-    return rawMode;
-  }
-
-  throw new Error(`Invalid LOOMIC_AGENT_BACKEND_MODE value: ${rawMode}`);
-}
-
-function parseAgentFilesRoot(rawRoot: string | undefined) {
-  return normalizeOptionalString(rawRoot);
-}
-
 function parseAgentModel(rawModel: string | undefined) {
   return normalizeOptionalString(rawModel);
+}
+
+function parseBooleanEnv(rawValue: string | undefined, defaultValue: boolean): boolean {
+  const value = rawValue?.trim().toLowerCase();
+  if (!value) return defaultValue;
+  if (value === "true" || value === "1") return true;
+  if (value === "false" || value === "0") return false;
+  throw new Error(`Invalid boolean environment value: ${rawValue}`);
 }
 
 function normalizeOptionalString(value: string | undefined) {

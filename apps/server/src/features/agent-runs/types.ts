@@ -9,6 +9,8 @@ export type CreateAcceptedAgentRunInput = {
   createdBy?: string;
   executionMode?: "fast" | "thinking";
   model?: string;
+  prompt?: string;
+  requestMessageId?: string;
   runId: string;
   sessionId: string;
   threadId: string;

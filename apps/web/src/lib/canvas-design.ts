@@ -20,6 +20,7 @@ export const DESIGN_SIZE_PRESETS = [
 export type DesignOpenTarget = {
   designId: string;
   canvasElementId: string;
+  initialObjectId?: string;
 };
 
 export type DesignCopyAttempt = { requestId: string; elementId: string };

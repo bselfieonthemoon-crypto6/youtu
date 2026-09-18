@@ -1,3 +1,7 @@
+import { isDeepStrictEqual } from "node:util";
+import { authorizeConversationImageJobs, ImageJobAccessError, scopeConversationImageJobs,
+  type ConversationImageJobScope } from "./conversation-image-job-access.js";
+
 import type {
   BackgroundJob,
   BackgroundJobStatus,
@@ -10,9 +14,11 @@ import type {
 import {
   canvasJobTargetSchema,
   designJobTargetSchema,
+  imageForegroundPolicySchema,
   jobTargetFinalizationDtoSchema,
   jobTargetSchema,
   loomicSceneV1Schema,
+  isUuid,
 } from "@loomic/shared";
 
 import type { PgmqClient } from "../../queue/pgmq-client.js";
@@ -23,6 +29,7 @@ import type {
 } from "../../supabase/user.js";
 import type { ProviderSnapshotService } from "../providers/provider-snapshot-service.js";
 import type { ProviderExecutionBillingSnapshot } from "../providers/provider-snapshot-service.js";
+import { CreditServiceError } from "../credits/credit-service.js";
 import {
   normalizeGenerationPayloadForCreation,
   targetColumns,
@@ -44,7 +51,18 @@ export class JobServiceError extends Error {
     | "job_not_found"
     | "job_create_failed"
     | "job_query_failed"
-    | "job_cancel_failed";
+    | "job_cancel_failed"
+    | "job_attempt_increment_failed"
+    | "mastra_commit_rejected"
+    | "mastra_commit_unknown"
+    | "video_commit_rejected"
+    | "video_commit_unknown"
+    | "image_generation_run_limit"
+    | "image_quality_not_authorized"
+    | "image_resolution_not_authorized"
+    | "image_generation_requested_count_unsupported"
+    | "image_execution_tier_invalid"
+    | "image_legacy_background_removal_contract_required";
 
   constructor(
     code: JobServiceError["code"],
@@ -72,10 +90,68 @@ export type CreateJobInput = {
   /** Create the durable record without publishing to PGMQ. Defaults to false. */
   deferEnqueue?: boolean;
   providerBilling?: ProviderExecutionBillingSnapshot;
+  /** Server-owned Mastra submission identity. Never accepted from a tool call. */
+  mastraSubmission?: { runId: string; key: string; defaultRunLimit?: number };
+  /** Server-owned durable video identity. Never accepted from an HTTP body or tool call. */
+  videoSubmission?:
+    | { kind: "mastra"; runId: string; key: string }
+    | { kind: "http"; key: string };
 };
 
 export type JobService = {
+  /** Server-trusted lookup; agent_runs intentionally has no authenticated RLS policy. */
+  assertMastraImageRun(user: AuthenticatedUser, input: {
+    runId: string;
+    sessionId: string;
+  }): Promise<{ requestMessageId: string }>;
+  /** Validate a native design target before any provider snapshot or billing. */
+  assertMastraDesignImageTarget(user: AuthenticatedUser, input: {
+    workspaceId: string;
+    canvasId: string;
+    target: DesignJobTarget;
+  }): Promise<DesignJobTarget>;
+  /** Read an already-created direct image job without rerunning mutable preflight checks. */
+  findMastraImageSubmission(user: AuthenticatedUser, input: {
+    workspaceId: string;
+    sessionId: string;
+    canvasId: string;
+    runId: string;
+    submissionKey: string;
+    designId?: string;
+  }): Promise<BackgroundJob | null>;
   commitImageJob(user: AuthenticatedUser, jobId: string): Promise<void>;
+  commitMastraImageJob(user: AuthenticatedUser, input: {
+    jobId: string;
+    runId: string;
+    submissionKey: string;
+    creditsCost: number;
+  }): Promise<void>;
+  /** CAS compensation: never cancels a job that may already be published or running. */
+  cancelUncommittedMastraImageJob(user: AuthenticatedUser, input: {
+    jobId: string;
+    runId: string;
+    submissionKey: string;
+  }): Promise<boolean>;
+  findVideoSubmission(user: AuthenticatedUser, input: {
+    workspaceId: string;
+    submissionKey: string;
+    kind: "mastra" | "http";
+    sessionId?: string;
+    canvasId?: string;
+    runId?: string;
+    expectedPayload?: Record<string, unknown>;
+  }): Promise<BackgroundJob | null>;
+  commitVideoJob(user: AuthenticatedUser, input: {
+    jobId: string;
+    submissionKey: string;
+    creditsCost: number;
+    runId?: string;
+  }): Promise<void>;
+  /** CAS compensation: only an unpublished durable video submission is cancelable. */
+  cancelUncommittedVideoJob(user: AuthenticatedUser, input: {
+    jobId: string;
+    submissionKey: string;
+  }): Promise<boolean>;
   resolveDesignOperationTarget(
     user: AuthenticatedUser,
     target: DesignJobTarget,
@@ -113,6 +189,8 @@ export type JobService = {
     filters?: { status?: BackgroundJobStatus; jobType?: BackgroundJobType },
   ): Promise<BackgroundJob[]>;
   cancelJob(user: AuthenticatedUser, jobId: string): Promise<BackgroundJob>;
+  getConversationImageJob(user: AuthenticatedUser, scope: ConversationImageJobScope, jobId?: string): Promise<Record<string, unknown> | null>;
+  cancelJobAdmin(user: AuthenticatedUser, jobId: string, scope: ConversationImageJobScope): Promise<BackgroundJob>;
   getJobAdmin(jobId: string): Promise<BackgroundJob>;
 
   // Admin-only methods (use admin client, no user auth)
@@ -181,7 +259,118 @@ export function createJobService(options: {
   const SELECT_COLS =
     "id, workspace_id, project_id, canvas_id, target_kind, design_id, session_id, thread_id, queue_name, job_type, status, payload, result, error_code, error_message, attempt_count, max_attempts, credits_transaction_id, created_by, created_at, updated_at, started_at, completed_at, failed_at, canceled_at";
 
+  // Both authorization paths share the existing conditional state transition.
+  // Refunds remain the responsibility of the existing worker/accounting flow.
+  async function cancelWithClient(client: any, jobId: string, scope?: ConversationImageJobScope) {
+    let query = client.from("background_jobs")
+      .update({ status: "canceled", canceled_at: new Date().toISOString() }).eq("id", jobId)
+      .in("status", ["queued", "running"]);
+    if (scope) query = scopeConversationImageJobs(query, scope);
+    const { data: job, error } = await query.select(SELECT_COLS).maybeSingle();
+    if (error) throw new JobServiceError("job_cancel_failed", "Failed to cancel job.", 500);
+    if (!job) throw new JobServiceError("job_not_found", "Job not found or already completed.", 404);
+    return mapJobRow(job as Record<string, unknown>);
+  }
+
   return {
+    async assertMastraImageRun(user, input) {
+      const { data, error } = await (options.getAdminClient().from("agent_runs") as any)
+        .select("request_message_id")
+        .eq("id", input.runId)
+        .eq("session_id", input.sessionId)
+        .eq("created_by", user.id)
+        .in("status", ["accepted", "running"])
+        .maybeSingle();
+      if (error || !data || typeof data.request_message_id !== "string")
+        throw new JobServiceError(
+          "job_query_failed",
+          "Direct image run scope is unavailable.",
+          error ? 500 : 403,
+        );
+      return { requestMessageId: data.request_message_id };
+    },
+
+    async assertMastraDesignImageTarget(user, input) {
+      const target = designJobTargetSchema.parse(input.target);
+      const client = options.createUserClient(user.accessToken);
+      const [documentResult, nodeResult] = await Promise.all([
+        client.from("design_documents")
+          .select("id,workspace_id,project_id,revision,deleted_at")
+          .eq("id", target.design_id)
+          .maybeSingle(),
+        client.from("design_nodes")
+          .select("design_id")
+          .eq("design_id", target.design_id)
+          .eq("canvas_id", input.canvasId)
+          .eq("workspace_id", input.workspaceId)
+          .is("deleted_at", null)
+          .maybeSingle(),
+      ]);
+      const document = documentResult.data as {
+        workspace_id?: unknown; project_id?: unknown; revision?: unknown; deleted_at?: unknown;
+      } | null;
+      if (documentResult.error || nodeResult.error || !document || !nodeResult.data
+        || document.workspace_id !== input.workspaceId || document.deleted_at !== null)
+        throw new JobServiceError(
+          "job_create_failed",
+          "Direct image design target is unavailable.",
+          documentResult.error || nodeResult.error ? 500 : 403,
+        );
+      if (document.revision !== target.expected_revision)
+        throw new JobServiceError(
+          "job_create_failed",
+          "The design changed before image submission.",
+          409,
+        );
+      if (target.source_object_id || target.placement?.replace_object_id) {
+        const resolved = await this.resolveDesignOperationTarget(user, target);
+        if (resolved.workspaceId !== input.workspaceId || resolved.projectId !== document.project_id)
+          throw new JobServiceError("job_create_failed", "Direct image design target is unavailable.", 403);
+        return resolved.target;
+      }
+      return target;
+    },
+
+    async findMastraImageSubmission(user, input) {
+      const client = options.createUserClient(user.accessToken);
+      const { data, error } = await client.from("background_jobs")
+        .select(SELECT_COLS)
+        .eq("created_by", user.id)
+        .eq("workspace_id", input.workspaceId)
+        .eq("session_id", input.sessionId)
+        .eq("job_type", "image_generation")
+        .contains("payload", { mastra_submission_key: input.submissionKey,
+          mastra_origin_run_id: input.runId })
+        .maybeSingle();
+      if (error)
+        throw new JobServiceError("job_query_failed", "Failed to read direct image submission.", 500);
+      if (!data) return null;
+      const job = mapJobRow(data as unknown as Record<string, unknown>);
+      const target = job.payload.target as Record<string, unknown> | null | undefined;
+      if (input.designId === undefined) {
+        if (job.target_kind !== "canvas" || job.canvas_id !== input.canvasId || job.design_id !== null
+          || target?.kind !== "canvas" || target.canvas_id !== input.canvasId)
+          throw new JobServiceError("job_create_failed", "Direct image replay scope mismatch.", 409);
+        return job;
+      }
+      if (job.target_kind !== "design" || job.canvas_id !== null || job.design_id !== input.designId
+        || target?.kind !== "design" || target.design_id !== input.designId)
+        throw new JobServiceError("job_create_failed", "Direct image replay scope mismatch.", 409);
+      const [documentResult, nodeResult] = await Promise.all([
+        client.from("design_documents").select("workspace_id,deleted_at")
+          .eq("id", input.designId).maybeSingle(),
+        client.from("design_nodes").select("design_id")
+          .eq("design_id", input.designId).eq("canvas_id", input.canvasId)
+          .eq("workspace_id", input.workspaceId).is("deleted_at", null).maybeSingle(),
+      ]);
+      const document = documentResult.data as { workspace_id?: unknown; deleted_at?: unknown } | null;
+      if (documentResult.error || nodeResult.error || !document || !nodeResult.data
+        || document.workspace_id !== input.workspaceId || document.deleted_at !== null)
+        throw new JobServiceError("job_create_failed", "Direct image replay scope mismatch.",
+          documentResult.error || nodeResult.error ? 500 : 403);
+      return job;
+    },
+
     async resolveDesignOperationTarget(user, rawTarget) {
       const target = designJobTargetSchema.parse(rawTarget);
       const sourceObjectId =
@@ -224,14 +413,23 @@ export function createJobService(options: {
       const source = scene.objects.find(
         (object) => object.objectId === sourceObjectId,
       );
-      if (
-        !source ||
-        source.type !== "image" ||
-        (target.expected_object_version !== undefined &&
-          source.objectVersion !== target.expected_object_version) ||
-        (target.source_asset_object_id !== undefined &&
-          source.assetObjectId !== target.source_asset_object_id)
-      ) {
+      // inspect_design exposes both object_id and asset_object_id. Models can
+      // place the former in source_asset_object_id while still identifying the
+      // exact same live object through source_object_id/replace_object_id. That
+      // mix-up is safe to normalize only for this one proven object; arbitrary
+      // asset mismatches remain a stale/unauthorized target failure.
+      if (!source || source.type !== "image") {
+        throw new JobServiceError(
+          "job_create_failed",
+          "The source image changed or is unavailable.",
+          409,
+        );
+      }
+      const sourceAssetMatches = target.source_asset_object_id === undefined
+        || target.source_asset_object_id === source.assetObjectId
+        || target.source_asset_object_id === source.objectId;
+      if ((target.expected_object_version !== undefined &&
+          source.objectVersion !== target.expected_object_version) || !sourceAssetMatches) {
         throw new JobServiceError(
           "job_create_failed",
           "The source image changed or is unavailable.",
@@ -304,7 +502,41 @@ export function createJobService(options: {
           400,
         );
       }
-      const normalizedPayload =
+      if (input.proposalId && (input.mastraSubmission || input.videoSubmission))
+        throw new JobServiceError("job_create_failed", "Image submission identity is ambiguous.", 400);
+      if (input.mastraSubmission && input.videoSubmission)
+        throw new JobServiceError("job_create_failed", "Submission identity is ambiguous.", 400);
+      if ("mastra_submission_key" in input.payload || "mastra_origin_run_id" in input.payload
+        || "mastra_credits_cost" in input.payload || "mastra_pricing_version" in input.payload
+        || "mastra_default_run_limit" in input.payload)
+        throw new JobServiceError("job_create_failed", "Reserved image submission metadata is not accepted in payload.", 400);
+      if (input.mastraSubmission) {
+        const [keyRunId, digest, extra] = input.mastraSubmission.key.split(":");
+        if (!input.sessionId
+          || !isUuid(input.mastraSubmission.runId)
+          || keyRunId !== input.mastraSubmission.runId || !/^[0-9a-f]{64}$/.test(digest ?? "") || extra !== undefined)
+          throw new JobServiceError("job_create_failed", "Invalid server image submission identity.", 400);
+      }
+      if (["video_submission_key", "video_submission_kind", "video_origin_run_id",
+        "video_credits_cost", "video_pricing_version"].some(key => key in input.payload))
+        throw new JobServiceError("job_create_failed", "Reserved video submission metadata is not accepted in payload.", 400);
+      if (input.videoSubmission) {
+        if (input.jobType !== "video_generation")
+          throw new JobServiceError("job_create_failed", "Video submission identity requires a video job.", 400);
+        const parts = input.videoSubmission.key.split(":");
+        const validMastra = input.videoSubmission.kind === "mastra"
+          && Boolean(input.sessionId) && Boolean(input.canvasId)
+          && isUuid(input.videoSubmission.runId)
+          && parts.length === 2 && parts[0] === input.videoSubmission.runId
+          && /^[0-9a-f]{64}$/.test(parts[1] ?? "");
+        const validHttp = input.videoSubmission.kind === "http"
+          && parts.length === 2 && parts[0] === "http"
+          && /^[0-9a-f]{64}$/.test(parts[1] ?? "")
+          && !input.sessionId && !input.canvasId;
+        if (!validMastra && !validHttp)
+          throw new JobServiceError("job_create_failed", "Invalid server video submission identity.", 400);
+      }
+      const normalizedGenerationPayload =
         input.jobType === "image_generation" ||
         input.jobType === "video_generation"
           ? normalizeGenerationPayloadForCreation({
@@ -313,6 +545,23 @@ export function createJobService(options: {
               fallbackTarget: explicitTarget,
             })
           : input.payload;
+      const normalizedPayload = input.mastraSubmission ? {
+        ...normalizedGenerationPayload,
+        mastra_submission_key: input.mastraSubmission.key,
+        mastra_origin_run_id: input.mastraSubmission.runId,
+        mastra_credits_cost: input.providerBilling?.creditsCost ?? 0,
+        mastra_pricing_version: input.providerBilling?.pricingVersion ?? "credits-v1",
+        mastra_default_run_limit: input.mastraSubmission.defaultRunLimit ?? 4,
+      } : input.videoSubmission ? {
+        ...normalizedGenerationPayload,
+        video_submission_key: input.videoSubmission.key,
+        video_submission_kind: input.videoSubmission.kind,
+        ...(input.videoSubmission.kind === "mastra"
+          ? { video_origin_run_id: input.videoSubmission.runId }
+          : {}),
+        video_credits_cost: input.providerBilling?.creditsCost ?? 0,
+        video_pricing_version: input.providerBilling?.pricingVersion ?? "credits-v1",
+      } : normalizedGenerationPayload;
       const columns = targetColumns(explicitTarget);
       const projectId = await resolveTargetProject({
         admin: options.getAdminClient(),
@@ -328,6 +577,23 @@ export function createJobService(options: {
         explicitTarget?.kind === "design"
           ? explicitTarget.idempotency_key
           : null;
+      const canvasImageEditOperation =
+        input.jobType === "image_generation" &&
+        ["local_repaint", "outpaint"].includes(
+          (normalizedPayload as Record<string, unknown>).operation as string,
+        )
+          ? ((normalizedPayload as Record<string, unknown>).operation as
+              | "local_repaint"
+              | "outpaint")
+          : null;
+      const canvasImageEditReplayKey =
+        canvasImageEditOperation &&
+        explicitTarget?.kind === "canvas" &&
+        explicitTarget.element_id
+          ? explicitTarget.element_id
+          : null;
+      const mastraReplayKey = input.mastraSubmission?.key ?? null;
+      const videoReplayKey = input.videoSubmission?.key ?? null;
       const findReplay = async () => {
         if (input.proposalId) {
           const { data, error } = await client
@@ -359,6 +625,90 @@ export function createJobService(options: {
             job: existing,
             billingCommitted: Boolean(data.credits_transaction_id),
           };
+        }
+        if (mastraReplayKey && input.mastraSubmission) {
+          const { data, error } = await client.from("background_jobs")
+            .select(SELECT_COLS).eq("created_by", user.id).eq("session_id", input.sessionId!)
+            .eq("job_type", "image_generation")
+            .contains("payload", { mastra_submission_key: mastraReplayKey,
+              mastra_origin_run_id: input.mastraSubmission.runId }).maybeSingle();
+          if (error) throw new JobServiceError("job_query_failed", "Failed to read direct image submission.", 500);
+          if (!data) return null;
+          const existing = mapJobRow(data as unknown as Record<string, unknown>);
+          const comparablePayload = (payload: Record<string, unknown>) => {
+            const { mastra_pricing_version: _pricingVersion, mastra_default_run_limit: _runLimit, ...request } = payload;
+            return request;
+          };
+          if (existing.workspace_id !== input.workspaceId || existing.project_id !== projectId
+            || existing.canvas_id !== columns.canvasId || existing.design_id !== columns.designId
+            || !isDeepStrictEqual(comparablePayload(existing.payload as Record<string, unknown>), comparablePayload(normalizedPayload)))
+            throw new JobServiceError("job_create_failed", "Direct image submission context mismatch.", 409);
+          return { job: existing, billingCommitted: Boolean(data.credits_transaction_id) };
+        }
+        if (videoReplayKey && input.videoSubmission) {
+          const expectedIdentity = {
+            video_submission_key: videoReplayKey,
+            video_submission_kind: input.videoSubmission.kind,
+            ...(input.videoSubmission.kind === "mastra"
+              ? { video_origin_run_id: input.videoSubmission.runId }
+              : {}),
+          };
+          const { data, error } = await client.from("background_jobs")
+            .select(SELECT_COLS).eq("created_by", user.id)
+            .eq("workspace_id", input.workspaceId)
+            .eq("job_type", "video_generation")
+            .contains("payload", expectedIdentity).maybeSingle();
+          if (error)
+            throw new JobServiceError("job_query_failed", "Failed to read durable video submission.", 500);
+          if (!data) return null;
+          const existing = mapJobRow(data as unknown as Record<string, unknown>);
+          if (existing.session_id !== (input.sessionId ?? null)
+            || existing.canvas_id !== columns.canvasId
+            || existing.project_id !== projectId
+            || !isDeepStrictEqual(existing.payload as Record<string, unknown>, normalizedPayload))
+            throw new JobServiceError("job_create_failed", "Durable video submission context mismatch.", 409);
+          return { job: existing, billingCommitted: Boolean(data.credits_transaction_id) };
+        }
+        if (
+          canvasImageEditOperation &&
+          canvasImageEditReplayKey &&
+          explicitTarget?.kind === "canvas"
+        ) {
+          const { data, error } = await client
+            .from("background_jobs")
+            .select(SELECT_COLS)
+            .eq("created_by", user.id)
+            .eq("job_type", "image_generation")
+            .eq("canvas_id", explicitTarget.canvas_id)
+            .contains("payload", {
+              operation: canvasImageEditOperation,
+              target: { element_id: canvasImageEditReplayKey },
+            })
+            .maybeSingle();
+          if (error)
+            throw new JobServiceError(
+              "job_query_failed",
+              "Failed to query canvas image edit job.",
+              500,
+            );
+          if (data) {
+            const existing = mapJobRow(data as unknown as Record<string, unknown>);
+            if (
+              existing.workspace_id !== input.workspaceId ||
+              existing.project_id !== projectId ||
+              !isDeepStrictEqual(existing.payload, normalizedPayload)
+            ) {
+              throw new JobServiceError(
+                "job_create_failed",
+                "The canvas image edit placeholder was reused with different input.",
+                409,
+              );
+            }
+            return {
+              job: existing,
+              billingCommitted: Boolean(data.credits_transaction_id),
+            };
+          }
         }
         if (!designReplayKey || explicitTarget?.kind !== "design") return null;
         const { data, error } = await client
@@ -423,7 +773,13 @@ export function createJobService(options: {
             409,
           );
       }
-      const { data: job, error } = await client
+      // Durable video metadata is server authority. Insert those rows with the
+      // service client so direct authenticated table writes cannot forge a
+      // zero-cost submission that the commit RPC would later trust.
+      const persistenceClient = input.videoSubmission
+        ? options.getAdminClient()
+        : client;
+      const { data: job, error } = await persistenceClient
         .from("background_jobs")
         .insert({
           ...(input.proposalId ? { id: input.proposalId } : {}),
@@ -450,6 +806,13 @@ export function createJobService(options: {
             replayed: true,
             billingCommitted: concurrentReplay.billingCommitted,
           };
+        const policyCode = ["image_generation_run_limit", "image_quality_not_authorized", "image_resolution_not_authorized", "image_generation_requested_count_unsupported", "image_execution_tier_invalid", "image_legacy_background_removal_contract_required"]
+          .find(code => error?.message?.includes(code));
+        if (input.mastraSubmission && policyCode)
+          throw new JobServiceError(policyCode as JobServiceError["code"],
+            policyCode === "image_generation_run_limit"
+              ? "本轮图片生成与编辑已达到输出上限。未创建新任务、未扣费。"
+              : "当前用户原文未授权该图片档位或数量。未创建新任务、未扣费。", 422);
         throw new JobServiceError(
           "job_create_failed",
           "Failed to create job record.",
@@ -466,20 +829,30 @@ export function createJobService(options: {
           if (!options.providerSnapshotService) {
             throw new Error("Provider snapshot service is unavailable.");
           }
-          await options.providerSnapshotService.createJobSnapshot({
+          const snapshotInput = {
             workspaceId: input.workspaceId,
             jobId: job.id,
             modelRef: requestedModel,
             ...(input.providerBilling
-              ? { billing: input.providerBilling }
+              ? { billing: { ...input.providerBilling,
+                  ...((normalizedPayload as any).foreground_policy ? { creditsCost: (normalizedPayload as any).foreground_policy.generationCredits } : {}),
+                } }
               : {}),
-          });
+          };
+          if (
+            input.jobType === "image_generation" &&
+            options.providerSnapshotService.createImageGenerationPlan
+          ) {
+            await options.providerSnapshotService.createImageGenerationPlan(snapshotInput);
+          } else {
+            await options.providerSnapshotService.createJobSnapshot(snapshotInput);
+          }
         } catch (snapshotError) {
           console.error(
             "[job-service] provider snapshot creation failed:",
             snapshotError,
           );
-          await client.from("background_jobs").delete().eq("id", job.id);
+          await persistenceClient.from("background_jobs").delete().eq("id", job.id);
           throw new JobServiceError(
             "job_create_failed",
             "Failed to create job record.",
@@ -488,6 +861,18 @@ export function createJobService(options: {
         }
       }
 
+      {
+        const foreground = (normalizedPayload as any).foreground_policy;
+        if (foreground?.mode === "api_matting" && foreground.mattingModel?.startsWith("workspace:")) {
+          try {
+            if (!options.providerSnapshotService?.createForegroundSnapshot) throw new Error("Foreground snapshot service unavailable");
+            await options.providerSnapshotService.createForegroundSnapshot({ workspaceId: input.workspaceId, jobId: job.id });
+          } catch {
+            await persistenceClient.from("background_jobs").delete().eq("id", job.id);
+            throw new JobServiceError("job_create_failed", "Cannot freeze the confirmed foreground provider; no job was queued.", 409);
+          }
+        }
+      }
       if (input.deferEnqueue) {
         return {
           job: mapJobRow(job as unknown as Record<string, unknown>),
@@ -510,7 +895,7 @@ export function createJobService(options: {
         });
       } catch (enqueueErr) {
         console.error("[job-service] pgmq.send failed:", enqueueErr);
-        await client.from("background_jobs").delete().eq("id", job.id);
+        await persistenceClient.from("background_jobs").delete().eq("id", job.id);
         throw new JobServiceError(
           "job_create_failed",
           "Failed to enqueue job.",
@@ -529,6 +914,45 @@ export function createJobService(options: {
       const job = await this.getJob(user, jobId);
       if (job.created_by !== user.id)
         throw new JobServiceError("job_not_found", "Job not found.", 404);
+      const foreground = job.payload.foreground_policy === undefined
+        ? undefined
+        : imageForegroundPolicySchema.parse(job.payload.foreground_policy);
+      if (job.status === "queued" && typeof job.payload.model === "string" && job.payload.model.startsWith("workspace:")) {
+        if (!options.providerSnapshotService)
+          throw new JobServiceError("job_create_failed", "Primary provider snapshot service unavailable", 409);
+        let primaryCredits: number;
+        let pricingVersion = "credits-v1";
+        if (foreground) {
+          primaryCredits = foreground.generationCredits;
+          pricingVersion = foreground.pricingVersion;
+        } else {
+          const { data: proposal, error } = await (options
+            .getAdminClient() as any)
+            .from("image_generation_proposals")
+            .select("approved_cost")
+            .eq("id", jobId)
+            .maybeSingle();
+          const approvedCost = (proposal as { approved_cost?: unknown } | null)?.approved_cost;
+          if (error || !Number.isSafeInteger(approvedCost) || (approvedCost as number) < 0)
+            throw new JobServiceError("job_create_failed", "Confirmed image price unavailable", 409);
+          primaryCredits = approvedCost as number;
+        }
+        const snapshotInput = {
+          workspaceId: job.workspace_id,
+          jobId,
+          modelRef: job.payload.model,
+          billing: { creditsCost: primaryCredits, pricingVersion, unit: "image" },
+        } as const;
+        if (options.providerSnapshotService.createImageGenerationPlan) {
+          await options.providerSnapshotService.createImageGenerationPlan(snapshotInput);
+        } else {
+          await options.providerSnapshotService.createJobSnapshot(snapshotInput);
+        }
+      }
+      if (job.status === "queued" && foreground?.mode === "api_matting" && foreground.mattingModel?.startsWith("workspace:")) {
+        if (!options.providerSnapshotService?.createForegroundSnapshot) throw new JobServiceError("job_create_failed", "Foreground snapshot service unavailable", 409);
+        await options.providerSnapshotService.createForegroundSnapshot({ workspaceId: job.workspace_id, jobId });
+      }
       const { error } = await options
         .getAdminClient()
         .rpc("loomic_commit_image_job" as never, { p_job: jobId } as never);
@@ -538,6 +962,128 @@ export function createJobService(options: {
           `Image submission not committed: ${error.message}`,
           500,
         );
+    },
+
+    async commitMastraImageJob(user, input) {
+      if (!Number.isSafeInteger(input.creditsCost) || input.creditsCost < 0)
+        throw new JobServiceError("job_create_failed", "Invalid direct image price.", 400);
+      let response: { error: { message: string; code?: string } | null };
+      try {
+        response = await options.getAdminClient().rpc(
+          "loomic_commit_mastra_image_job" as never,
+          { p_job: input.jobId, p_user: user.id, p_run: input.runId,
+            p_submission_key: input.submissionKey, p_cost: input.creditsCost } as never,
+        ) as { error: { message: string; code?: string } | null };
+      } catch {
+        throw new JobServiceError("mastra_commit_unknown", "Direct image commit outcome is unknown.", 503);
+      }
+      if (response.error) {
+        if (response.error.code === "P0001" && response.error.message === "INSUFFICIENT_CREDITS")
+          throw new CreditServiceError("insufficient_credits", "Insufficient credits", 402);
+        const isDefinitiveDatabaseRejection = response.error.code === "P0001"
+          && (/^(?:mastra_|image_|loomic_)/.test(response.error.message)
+            || /^credit_(?:balance_not_found|invalid_amount|job_required|job_not_found|job_not_chargeable|price_mismatch)$/.test(response.error.message));
+        throw new JobServiceError(isDefinitiveDatabaseRejection
+          ? "mastra_commit_rejected" : "mastra_commit_unknown",
+        isDefinitiveDatabaseRejection
+          ? "Direct image submission was rejected before enqueue."
+          : "Direct image commit outcome is unknown.",
+        isDefinitiveDatabaseRejection ? 409 : 503);
+      }
+    },
+
+    async cancelUncommittedMastraImageJob(user, input) {
+      const { data, error } = await options.getAdminClient().from("background_jobs")
+        .update({ status: "canceled", canceled_at: new Date().toISOString() })
+        .eq("id", input.jobId)
+        .eq("created_by", user.id)
+        .eq("status", "queued")
+        .is("image_enqueued_at", null)
+        .contains("payload", { mastra_origin_run_id: input.runId,
+          mastra_submission_key: input.submissionKey })
+        .select("id")
+        .maybeSingle();
+      if (error)
+        throw new JobServiceError("job_cancel_failed", "Failed to compensate direct image submission.", 500);
+      return Boolean(data);
+    },
+
+    async findVideoSubmission(user, input) {
+      const client = options.createUserClient(user.accessToken);
+      const identity = {
+        video_submission_key: input.submissionKey,
+        video_submission_kind: input.kind,
+        ...(input.kind === "mastra" && input.runId
+          ? { video_origin_run_id: input.runId }
+          : {}),
+      };
+      const { data, error } = await client.from("background_jobs")
+        .select(SELECT_COLS)
+        .eq("created_by", user.id)
+        .eq("workspace_id", input.workspaceId)
+        .eq("job_type", "video_generation")
+        .contains("payload", identity)
+        .maybeSingle();
+      if (error)
+        throw new JobServiceError("job_query_failed", "Failed to read durable video submission.", 500);
+      if (!data) return null;
+      const job = mapJobRow(data as unknown as Record<string, unknown>);
+      if (input.kind === "mastra") {
+        if (!input.runId || !input.sessionId || !input.canvasId
+          || job.session_id !== input.sessionId || job.canvas_id !== input.canvasId)
+          throw new JobServiceError("job_query_failed", "Durable video submission scope mismatch.", 403);
+      } else if (job.session_id !== null || job.canvas_id !== null) {
+        throw new JobServiceError("job_query_failed", "Durable video submission scope mismatch.", 403);
+      }
+      if (input.expectedPayload) {
+        const { video_submission_key: _key, video_submission_kind: _kind,
+          video_origin_run_id: _run, video_credits_cost: _cost,
+          video_pricing_version: _pricing, ...storedPayload } = job.payload as Record<string, unknown>;
+        if (!isDeepStrictEqual(storedPayload, input.expectedPayload))
+          throw new JobServiceError("job_create_failed", "Idempotency key was reused with different video input.", 409);
+      }
+      return job;
+    },
+
+    async commitVideoJob(user, input) {
+      if (!Number.isSafeInteger(input.creditsCost) || input.creditsCost < 0)
+        throw new JobServiceError("job_create_failed", "Invalid durable video price.", 400);
+      let response: { error: { message: string; code?: string } | null };
+      try {
+        response = await options.getAdminClient().rpc(
+          "loomic_commit_video_job" as never,
+          { p_job: input.jobId, p_user: user.id,
+            p_submission_key: input.submissionKey, p_cost: input.creditsCost,
+            p_run: input.runId ?? null } as never,
+        ) as { error: { message: string; code?: string } | null };
+      } catch {
+        throw new JobServiceError("video_commit_unknown", "Video commit outcome is unknown.", 503);
+      }
+      if (response.error) {
+        if (response.error.code === "P0001" && response.error.message === "INSUFFICIENT_CREDITS")
+          throw new CreditServiceError("insufficient_credits", "Insufficient credits", 402);
+        const definitive = (response.error.code === "P0001"
+          && /^video_submission_(?:invalid|forbidden|run_forbidden|http_invalid|kind_invalid)$/.test(response.error.message))
+          || /^(?:credit_(?:balance_not_found|invalid_amount|job_required|job_not_found|job_not_chargeable|price_mismatch))$/.test(response.error.message);
+        throw new JobServiceError(definitive ? "video_commit_rejected" : "video_commit_unknown",
+          definitive ? "Video submission was rejected before enqueue."
+            : "Video commit outcome is unknown.", definitive ? 409 : 503);
+      }
+    },
+
+    async cancelUncommittedVideoJob(user, input) {
+      const { data, error } = await options.getAdminClient().from("background_jobs")
+        .update({ status: "canceled", canceled_at: new Date().toISOString() })
+        .eq("id", input.jobId)
+        .eq("created_by", user.id)
+        .eq("status", "queued")
+        .is("video_enqueued_at", null)
+        .contains("payload", { video_submission_key: input.submissionKey })
+        .select("id")
+        .maybeSingle();
+      if (error)
+        throw new JobServiceError("job_cancel_failed", "Failed to compensate durable video submission.", 500);
+      return Boolean(data);
     },
 
     async enqueueJob(user, jobId) {
@@ -685,30 +1231,31 @@ export function createJobService(options: {
     },
 
     async cancelJob(user, jobId) {
-      const client = options.createUserClient(user.accessToken);
-      const { data: job, error } = await client
-        .from("background_jobs")
-        .update({ status: "canceled", canceled_at: new Date().toISOString() })
-        .eq("id", jobId)
-        .in("status", ["queued", "running"])
-        .select(SELECT_COLS)
-        .maybeSingle();
+      return cancelWithClient(options.createUserClient(user.accessToken), jobId);
+    },
 
-      if (error) {
-        throw new JobServiceError(
-          "job_cancel_failed",
-          "Failed to cancel job.",
-          500,
-        );
-      }
-      if (!job) {
-        throw new JobServiceError(
-          "job_not_found",
-          "Job not found or already completed.",
-          404,
-        );
-      }
-      return mapJobRow(job as unknown as Record<string, unknown>);
+    async getConversationImageJob(user, scope, jobId) {
+      const admin = options.getAdminClient();
+      await authorizeConversationImageJobs(admin, user.id, scope);
+      let query = scopeConversationImageJobs(admin.from("background_jobs")
+        .select("id,status,result,error_code,error_message,created_at,model:payload->>model,requestedAspectRatio:payload->>aspect_ratio,creditsCost:payload->>mastra_credits_cost,creditsCostColumn:credits_cost,pricingVersion:payload->>mastra_pricing_version,quality:payload->>quality,resolution:payload->>resolution"), scope);
+      if (jobId) query = query.eq("id", jobId);
+      const { data, error } = await query.order("created_at", { ascending: false }).limit(1).maybeSingle();
+      if (error) throw new JobServiceError("job_query_failed", "Failed to query image status.", 500);
+      return data;
+    },
+
+    async cancelJobAdmin(user, jobId, scope) {
+      const admin = options.getAdminClient();
+      const role = await authorizeConversationImageJobs(admin, user.id, scope);
+      const { data: job, error } = await scopeConversationImageJobs(admin.from("background_jobs")
+        .select(SELECT_COLS).eq("id", jobId), scope).maybeSingle();
+      if (error) throw new JobServiceError("job_query_failed", "Failed to query job.", 500);
+      if (!job) throw new JobServiceError("job_not_found", "Job not found.", 404);
+      if (job.created_by !== user.id && role !== "owner" && role !== "admin") throw new ImageJobAccessError();
+      if (["succeeded", "failed", "dead_letter", "canceled"].includes(job.status))
+        return mapJobRow(job as Record<string, unknown>);
+      return cancelWithClient(admin, jobId, scope);
     },
 
     async getJobAdmin(jobId) {
@@ -894,36 +1441,68 @@ export function createJobService(options: {
     async incrementAttempt(jobId) {
       const admin = options.getAdminClient();
       // NOTE: increment_job_attempt may not be in generated Supabase types yet
-      const { data, error } = await (
-        admin.rpc as unknown as (
-          name: string,
-          args: Record<string, unknown>,
-        ) => Promise<{
-          data: unknown;
-          error: { message?: string } | null;
-        }>
-      )("increment_job_attempt", { p_job_id: jobId });
+      let data: unknown;
+      let error: { message?: string } | null;
+      try {
+        ({ data, error } = await (
+          admin.rpc as unknown as (
+            name: string,
+            args: Record<string, unknown>,
+          ) => Promise<{
+            data: unknown;
+            error: { message?: string } | null;
+          }>
+        )("increment_job_attempt", { p_job_id: jobId }));
+      } catch (rpcError) {
+        console.error(
+          "[job-service] increment_job_attempt RPC threw:",
+          rpcError,
+        );
+        throw new JobServiceError(
+          "job_attempt_increment_failed",
+          "Job attempt could not be recorded.",
+          503,
+        );
+      }
 
       if (error) {
         console.error(
           "[job-service] increment_job_attempt RPC failed:",
           error.message,
         );
-        return { attempt_count: 1, max_attempts: 3 };
+        throw new JobServiceError(
+          "job_attempt_increment_failed",
+          "Job attempt could not be recorded.",
+          503,
+        );
       }
 
       const row = Array.isArray(data) ? data[0] : data;
       if (row && typeof row === "object") {
         const record = row as Record<string, unknown>;
-        return {
-          attempt_count:
-            typeof record.attempt_count === "number" ? record.attempt_count : 1,
-          max_attempts:
-            typeof record.max_attempts === "number" ? record.max_attempts : 3,
-        };
+        const attemptCount = record.attempt_count;
+        const maxAttempts = record.max_attempts;
+        if (
+          typeof attemptCount === "number" && Number.isSafeInteger(attemptCount) &&
+          attemptCount >= 1 &&
+          typeof maxAttempts === "number" && Number.isSafeInteger(maxAttempts) &&
+          maxAttempts >= 1
+        ) {
+          return {
+            attempt_count: attemptCount,
+            max_attempts: maxAttempts,
+          };
+        }
       }
-      // Job not found — return safe defaults
-      return { attempt_count: 1, max_attempts: 3 };
+      console.error(
+        "[job-service] increment_job_attempt returned an invalid result:",
+        data,
+      );
+      throw new JobServiceError(
+        "job_attempt_increment_failed",
+        "Job attempt could not be recorded.",
+        503,
+      );
     },
   };
 }

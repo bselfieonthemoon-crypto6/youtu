@@ -11,6 +11,10 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 describe("ApiYiVideoProvider", () => {
   const fetchMock = vi.fn();
+  const transport = () => ({
+    fetch: fetchMock as unknown as typeof fetch,
+    resolve: async () => ["93.184.216.34"],
+  });
 
   beforeEach(() => {
     fetchMock.mockReset();
@@ -39,6 +43,8 @@ describe("ApiYiVideoProvider", () => {
     const provider = new ApiYiVideoProvider(
       "secret",
       "https://api.apiyi.com/v1/",
+      undefined,
+      transport(),
     );
     const result = await provider.generate({
       model: "veo-3.1-fast-generate-preview",
@@ -56,8 +62,8 @@ describe("ApiYiVideoProvider", () => {
     });
     expect(result.url).toBe("data:video/mp4;base64,AAECAw==");
 
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("https://api.apiyi.com/v1/videos");
+    const [url, init] = fetchMock.mock.calls[0] as [URL, RequestInit];
+    expect(url.href).toBe("https://api.apiyi.com/v1/videos");
     expect(init.headers).toMatchObject({
       Authorization: "Bearer secret",
       "Content-Type": "application/json",
@@ -84,6 +90,8 @@ describe("ApiYiVideoProvider", () => {
     const provider = new ApiYiVideoProvider(
       "secret",
       "https://api.apiyi.com/v1",
+      undefined,
+      transport(),
     );
     await provider.generate({
       model: "veo-3.1-fast-generate-preview",
@@ -95,20 +103,32 @@ describe("ApiYiVideoProvider", () => {
     });
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(init.body).toBeInstanceOf(FormData);
-    const form = init.body as FormData;
-    expect(form.get("model")).toBe("veo-3.1-fast-generate-preview");
-    expect(form.get("duration")).toBe("8");
-    expect(form.get("resolution")).toBe("1080p");
-    expect(form.get("aspectRatio")).toBe("16:9");
-    expect(form.get("size")).toBe("1920x1080");
-    expect(form.get("input_reference")).toBeInstanceOf(Blob);
+    // SafeProviderFetch bridges FormData through a Request so the exact
+    // multipart bytes and generated boundary reach the provider as a stream.
+    expect(init.body).toBeInstanceOf(ReadableStream);
+    const headers = new Headers(init.headers);
+    expect(headers.get("content-type")).toMatch(/^multipart\/form-data; boundary=/);
+    const form = await new Response(init.body as ReadableStream).text();
+    expect(form).toContain('name="model"');
+    expect(form).toContain("veo-3.1-fast-generate-preview");
+    expect(form).toContain('name="duration"');
+    expect(form).toContain("8");
+    expect(form).toContain('name="resolution"');
+    expect(form).toContain("1080p");
+    expect(form).toContain('name="aspectRatio"');
+    expect(form).toContain("16:9");
+    expect(form).toContain('name="size"');
+    expect(form).toContain("1920x1080");
+    expect(form).toContain('name="input_reference"');
+    expect(form).toContain('filename="input.png"');
   });
 
   it("rejects unsupported short 1080p requests before submission", async () => {
     const provider = new ApiYiVideoProvider(
       "secret",
       "https://api.apiyi.com/v1",
+      undefined,
+      transport(),
     );
 
     await expect(

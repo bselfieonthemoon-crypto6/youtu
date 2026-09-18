@@ -40,7 +40,7 @@ export function DeleteProjectDialog({
           <Button
             onClick={onConfirm}
             disabled={deleting}
-            className="rounded-xl bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            className="rounded-xl bg-destructive text-white hover:bg-destructive/90 hover:text-white disabled:text-white"
           >
             {deleting ? (
               <motion.span

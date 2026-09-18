@@ -78,6 +78,37 @@ export function createChatService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
   threadService: Pick<ThreadService, "createThreadId">;
 }): ChatService {
+  async function requireVisibleRow(
+    client: UserSupabaseClient,
+    table: "canvases" | "chat_sessions",
+    id: string,
+  ): Promise<void> {
+    const { data, error } = await client
+      .from(table)
+      .select("id")
+      .eq("id", id)
+      .maybeSingle();
+
+    if (error) {
+      throw new ChatServiceError("chat_error", "Failed to verify chat access.", 500);
+    }
+    if (!data) {
+      // RLS deliberately makes an inaccessible row indistinguishable from a
+      // missing one. Keep that boundary in the API response as well.
+      throw new ChatServiceError("session_not_found", "Chat target not found.", 404);
+    }
+  }
+
+  function writeAccessRace(error: { code?: string } | null | undefined): ChatServiceError | null {
+    // A membership/canvas change can occur after the RLS read above. Supabase
+    // reports that write-side policy race as 42501; do not turn it into a
+    // retryable server failure or reveal whether the target previously existed.
+    if (error?.code === "42501") {
+      return new ChatServiceError("session_not_found", "Chat target not found.", 404);
+    }
+    return null;
+  }
+
   return {
     async listSessions(user, canvasId) {
       const client = options.createUserClient(user.accessToken);
@@ -100,6 +131,7 @@ export function createChatService(options: {
 
     async createSession(user, canvasId, title) {
       const client = options.createUserClient(user.accessToken);
+      await requireVisibleRow(client, "canvases", canvasId);
       const { data, error } = await client
         .from("chat_sessions")
         .insert({
@@ -111,6 +143,8 @@ export function createChatService(options: {
         .select("id, title, updated_at")
         .single();
 
+      const accessRace = writeAccessRace(error);
+      if (accessRace) throw accessRace;
       if (error || !data) {
         throw new ChatServiceError("chat_error", "Failed to create session.", 500);
       }
@@ -124,24 +158,27 @@ export function createChatService(options: {
 
     async updateSessionTitle(user, sessionId, title) {
       const client = options.createUserClient(user.accessToken);
-      const { error } = await client
+      const { error, count } = await client
         .from("chat_sessions")
-        .update({ title })
+        .update({ title }, { count: "exact" })
         .eq("id", sessionId);
 
       if (error) {
         throw new ChatServiceError("chat_error", "Failed to update session title.", 500);
       }
+      if (count === 0) {
+        throw new ChatServiceError("session_not_found", "Session not found.", 404);
+      }
     },
 
     async deleteSession(user, sessionId) {
       const client = options.createUserClient(user.accessToken);
-      const { error } = await client
+      const { error, count } = await client
         .from("chat_sessions")
-        .delete()
+        .delete({ count: "exact" })
         .eq("id", sessionId);
 
-      if (error) {
+      if (error || count === 0) {
         throw new ChatServiceError("session_not_found", "Session not found.", 404);
       }
     },
@@ -189,9 +226,11 @@ export function createChatService(options: {
 
     async createMessage(user, sessionId, input) {
       const client = options.createUserClient(user.accessToken);
-      const { data, error } = await client
+      await requireVisibleRow(client, "chat_sessions", sessionId);
+      const inserted = await client
         .from("chat_messages")
         .insert({
+          ...(input.id ? { id: input.id } : {}),
           session_id: sessionId,
           role: input.role,
           content: input.content,
@@ -204,8 +243,20 @@ export function createChatService(options: {
         })
         .select("id, role, content, tool_activities, content_blocks, created_at")
         .single();
-
-      if (error || !data) {
+      let data = inserted.data;
+      if (inserted.error?.code === "23505" && input.id) {
+        const existing = await client
+          .from("chat_messages")
+          .select("id, role, content, tool_activities, content_blocks, created_at")
+          .eq("id", input.id)
+          .eq("session_id", sessionId)
+          .maybeSingle();
+        if (!existing.error && existing.data?.role === input.role && existing.data.content === input.content)
+          data = existing.data;
+      }
+      const accessRace = writeAccessRace(inserted.error);
+      if (accessRace) throw accessRace;
+      if (!data) {
         throw new ChatServiceError("chat_error", "Failed to save message.", 500);
       }
 

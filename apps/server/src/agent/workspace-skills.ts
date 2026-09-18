@@ -1,4 +1,6 @@
 import type { UserSupabaseClient } from "../supabase/user.js";
+import { createHash } from "node:crypto";
+import { isImageSkillMimeType, isSafeSkillFilePath, type SkillReadiness } from "@loomic/shared";
 
 /**
  * A file bundled with a skill (scripts/, references/, assets/).
@@ -11,12 +13,21 @@ export interface SkillFileEntry {
 }
 
 /**
- * Metadata for a workspace skill loaded from the database.
- * Compatible with the deepagents SkillsMiddleware SkillMetadata shape.
+ * Metadata for a workspace skill loaded from the database. File paths are
+ * validated with the same canonical rule the import/package services enforce,
+ * so anything that reaches this loader is already known to be a safe relative
+ * path under scripts/, references/ or assets/.
  */
 export interface WorkspaceSkillEntry {
+  id?: string;
+  version?: string;
+  metadata?: Record<string, unknown>;
+  contentHash?: string;
+  readiness?: SkillReadiness;
   /** Skill slug (used as directory name in virtual path) */
   name: string;
+  /** Human-readable catalog name accepted as a selection alias. */
+  displayName?: string;
   /** Human-readable description for the system prompt */
   description: string;
   /** Virtual path where the agent can read_file the full SKILL.md content */
@@ -48,12 +59,13 @@ export async function loadWorkspaceSkills(
   const { data: rows, error } = await (userClient as any)
     .from("workspace_skills")
     .select(
-      "skill:skills(id, slug, name, description, skill_content, metadata)",
+      "skill:skills(id, slug, name, description, version, skill_content, metadata)",
     )
     .eq("workspace_id", workspaceId)
     .eq("enabled", true);
 
-  if (error || !rows?.length) return [];
+  if (error) throw new Error("Workspace skills could not be loaded.");
+  if (!rows?.length) return [];
 
   // Step 3: Batch-load associated files for all enabled skills
   const skillIds = (rows as any[])
@@ -62,13 +74,17 @@ export async function loadWorkspaceSkills(
 
   const filesBySkillId = new Map<string, SkillFileEntry[]>();
   if (skillIds.length > 0) {
-    const { data: fileRows } = await (userClient as any)
+    const { data: fileRows, error: fileError } = await (userClient as any)
       .from("skill_files")
-      .select("skill_id, file_path, content")
+      .select("skill_id, file_path, content, mime_type")
       .in("skill_id", skillIds);
+    if (fileError) throw new Error("Workspace skill references could not be loaded.");
 
     if (fileRows?.length) {
-      for (const fr of fileRows as Array<{ skill_id: string; file_path: string; content: string }>) {
+      for (const fr of fileRows as Array<{ skill_id: string; file_path: string; content: string; mime_type: string | null }>) {
+        // Image references are base64 previews for the library UI; the agent
+        // skill snapshot is text-only, so they are intentionally excluded.
+        if (fr.mime_type && isImageSkillMimeType(fr.mime_type)) continue;
         const existing = filesBySkillId.get(fr.skill_id) ?? [];
         existing.push({ path: fr.file_path, content: fr.content });
         filesBySkillId.set(fr.skill_id, existing);
@@ -78,7 +94,7 @@ export async function loadWorkspaceSkills(
 
   // Step 4: Map to WorkspaceSkillEntry, filtering out skills without DB content
   return (rows as Array<{ skill: Record<string, unknown> | null }>)
-    .map((row: { skill: Record<string, unknown> | null }) => {
+    .map((row: { skill: Record<string, unknown> | null }): WorkspaceSkillEntry | null => {
       const skill = row.skill;
       if (!skill?.skill_content) {
         if (skill?.slug) {
@@ -89,15 +105,34 @@ export async function loadWorkspaceSkills(
         return null;
       }
       const slug = skill.slug as string;
+      const files = filesBySkillId.get(skill.id as string) ?? [];
+      if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug) || typeof skill.skill_content !== "string" ||
+        !skill.skill_content.trim() || files.some(file => !isSafeSkillFilePath(file.path))) return null;
       return {
+        id: skill.id as string,
+        version: String(skill.version ?? "1.0"),
+        metadata: (skill.metadata ?? {}) as Record<string, unknown>,
+        contentHash: hashSkillPackage(skill.skill_content, files),
         name: slug,
+        displayName: typeof skill.name === "string" && skill.name.trim()
+          ? skill.name.trim()
+          : slug,
         description: skill.description as string,
         path: `/workspace-skills/${slug}/SKILL.md`,
         content: skill.skill_content as string,
-        files: filesBySkillId.get(skill.id as string) ?? [],
+        files,
       };
     })
     .filter((entry): entry is WorkspaceSkillEntry => entry !== null);
+}
+
+export function hashSkillPackage(content: string, files: readonly SkillFileEntry[]): string {
+  return createHash("sha256").update(JSON.stringify({
+    content: content.replace(/\r\n/g, "\n"),
+    files: [...files].sort((a, b) => a.path.localeCompare(b.path)).map(file => ({
+      path: file.path, content: file.content.replace(/\r\n/g, "\n"),
+    })),
+  })).digest("hex");
 }
 
 /**

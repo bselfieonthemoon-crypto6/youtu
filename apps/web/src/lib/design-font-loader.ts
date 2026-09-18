@@ -47,7 +47,7 @@ export function collectDesignFontReferences(
       const style =
         rawStyle === "italic" || rawStyle === "oblique" ? rawStyle : "normal";
       const rawWeight = record.fontWeight ?? record.font_weight;
-      references.set(faceId, {
+      references.set(`${faceId}:${family}:${style}:${String(rawWeight ?? 400)}`, {
         faceId,
         family,
         style,
@@ -109,7 +109,8 @@ async function loadOneFace(
     signal?: AbortSignal;
   },
 ) {
-  const cached = loadedFaces.get(reference.faceId);
+  const cacheKey = `${reference.faceId}:${reference.family}:${reference.style}:${reference.weight}`;
+  const cached = loadedFaces.get(cacheKey);
   if (cached) return cached;
   const pending = (async () => {
     const source = await input.client.getFontFaceContent(
@@ -128,11 +129,11 @@ async function loadOneFace(
       URL.revokeObjectURL(url);
     }
   })();
-  loadedFaces.set(reference.faceId, pending);
+  loadedFaces.set(cacheKey, pending);
   try {
     await pending;
   } catch (error) {
-    loadedFaces.delete(reference.faceId);
+    loadedFaces.delete(cacheKey);
     throw error;
   }
 }

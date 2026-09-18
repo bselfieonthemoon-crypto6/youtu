@@ -10,7 +10,6 @@ import type {
 import { registerRunRoutes } from "./runs.js";
 
 const testEnv: ServerEnv = {
-  agentBackendMode: "state",
   agentModel: "test-model",
   port: 3001,
   version: "test",

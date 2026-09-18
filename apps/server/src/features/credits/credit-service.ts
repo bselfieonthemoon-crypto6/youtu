@@ -208,6 +208,32 @@ export function createCreditService(options: {
       });
 
       if (error) {
+        // A concurrent caller can lose the refund RPC race after the database
+        // has durably recorded the first refund. Only the RPC's explicit
+        // duplicate-refund signal is safe to replay; a generic unique error
+        // could belong to another invariant and must still fail normally.
+        if (
+          error.code === "23505" &&
+          error.message === "credit_job_already_refunded" &&
+          amount > 0
+        ) {
+          const { data: existingRefund, error: existingRefundError } =
+            await admin
+              .from("credit_transactions")
+              .select("id")
+              .eq("job_id", jobId)
+              .eq("workspace_id", workspaceId)
+              .eq("user_id", userId)
+              .eq("transaction_type", "generation_refund")
+              .eq("amount", amount)
+              .gt("amount", 0)
+              .maybeSingle();
+
+          if (!existingRefundError && typeof existingRefund?.id === "string") {
+            return existingRefund.id;
+          }
+        }
+
         throw new CreditServiceError(
           "credit_refund_failed",
           "Failed to refund credits.",

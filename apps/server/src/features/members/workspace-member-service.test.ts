@@ -34,4 +34,34 @@ describe("workspace member service security", () => {
     await expect(service.add(user, "workspace-1", "other@example.com", "admin")).rejects.toMatchObject({ code: "member_forbidden", statusCode: 403 });
     expect(getAdminClient).not.toHaveBeenCalled();
   });
+
+  it("invalidates local sockets only after a successful member deletion", async () => {
+    const onMembershipInvalidated = vi.fn();
+    const admin = {
+      from: vi.fn(() => {
+        let deleting = false;
+        const query: any = {
+          select: vi.fn(() => query),
+          delete: vi.fn(() => { deleting = true; return query; }),
+          eq: vi.fn(() => query),
+          maybeSingle: vi.fn(async () => ({ data: { role: "member" }, error: null })),
+          then: (resolve: (value: unknown) => void) =>
+            resolve(deleting ? { error: null } : { data: null, error: null }),
+        };
+        return query;
+      }),
+    };
+    const service = createWorkspaceMemberService({
+      createUserClient: () => userClient("owner"),
+      getAdminClient: () => admin as never,
+      onMembershipInvalidated,
+    });
+
+    await service.remove(user, "workspace-1", "user-2");
+
+    expect(onMembershipInvalidated).toHaveBeenCalledWith({
+      workspaceId: "workspace-1",
+      userId: "user-2",
+    });
+  });
 });

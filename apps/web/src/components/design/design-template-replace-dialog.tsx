@@ -6,6 +6,7 @@ import type {
   DesignTemplateReplacePreviewResponse,
 } from "@loomic/shared";
 import { Loader2, Sparkles, X } from "lucide-react";
+import { createPortal } from "react-dom";
 
 import { Button } from "@/components/ui/button";
 
@@ -21,6 +22,7 @@ export function DesignTemplateReplaceDialog({
   onPreview,
   onApply,
   onCancel,
+  currentSize,
 }: {
   detail: DesignTemplateDetailDto;
   preview: DesignTemplateReplacePreviewResponse | null;
@@ -31,6 +33,7 @@ export function DesignTemplateReplaceDialog({
   onPreview: () => void;
   onApply: () => void;
   onCancel: () => void;
+  currentSize?: { width: number; height: number };
 }) {
   const update = (next: Binding) => {
     onBindingsChange([
@@ -38,8 +41,9 @@ export function DesignTemplateReplaceDialog({
       next,
     ]);
   };
-  return (
-    <div className="absolute inset-0 z-[120] flex items-center justify-center bg-black/30 p-4">
+  if (typeof document === "undefined") return null;
+  return createPortal(
+    <div className="pointer-events-auto fixed inset-0 z-[120] flex items-center justify-center bg-black/30 p-4">
       <dialog
         open
         aria-labelledby="design-template-replace-title"
@@ -52,10 +56,10 @@ export function DesignTemplateReplaceDialog({
               id="design-template-replace-title"
               className="truncate font-medium"
             >
-              智能替换 · {detail.template.name}
+              {detail.template.variables.length === 0 ? "应用模板" : "替换模板变量"} · {detail.template.name}
             </h2>
             <p className="text-xs text-muted-foreground">
-              先预览服务端计算的差异，再显式确认应用。
+              {detail.template.variables.length === 0 ? "确认后，将使用这套模板的内容和尺寸。" : "检查下方内容变化，确认后应用。"}
             </p>
           </div>
           <Button
@@ -70,11 +74,11 @@ export function DesignTemplateReplaceDialog({
         </header>
         <div className="grid min-h-0 flex-1 gap-4 overflow-y-auto p-4 md:grid-cols-[minmax(0,1fr)_280px]">
           <section>
-            <h3 className="text-sm font-medium">变量值</h3>
+            <h3 className="text-sm font-medium">{detail.template.variables.length === 0 ? "将发生的变化" : "变量值"}</h3>
             <div className="mt-2 grid gap-3">
               {detail.template.variables.length === 0 && (
                 <p className="rounded-lg border p-3 text-sm text-muted-foreground">
-                  此模板尚未定义可替换变量。
+                  此模板将替换现有内容和画板尺寸。当前文字、图片和图层将被模板内容替换，不会叠加；操作后可撤销恢复。
                 </p>
               )}
               {detail.template.variables.map((variable) => (
@@ -101,8 +105,14 @@ export function DesignTemplateReplaceDialog({
             </div>
           </section>
           <section>
-            <h3 className="text-sm font-medium">变更预览</h3>
-            {!preview ? (
+            <h3 className="text-sm font-medium">{detail.template.variables.length === 0 ? "画板尺寸" : "变更预览"}</h3>
+            {detail.template.variables.length === 0 ? (
+              <div className="mt-2 rounded-lg border p-3 text-sm">
+                <p>当前：{currentSize ? `${currentSize.width} × ${currentSize.height} px` : "当前画板尺寸"}</p>
+                <p className="mt-2 font-medium">应用后：{detail.scene.canvas.width} × {detail.scene.canvas.height} px</p>
+                <p className="mt-2 text-xs text-muted-foreground">使用模板原始尺寸和布局，不拉伸模板。确认后自动保存。</p>
+              </div>
+            ) : !preview ? (
               <p className="mt-2 rounded-lg border p-3 text-xs text-muted-foreground">
                 点击“重新预览”获取权威 diff。
               </p>
@@ -160,7 +170,7 @@ export function DesignTemplateReplaceDialog({
           >
             取消
           </Button>
-          <Button
+          {detail.template.variables.length > 0 && <Button
             type="button"
             variant="outline"
             disabled={busy}
@@ -168,22 +178,22 @@ export function DesignTemplateReplaceDialog({
           >
             {busy ? <Loader2 className="animate-spin" /> : <Sparkles />}
             重新预览
-          </Button>
+          </Button>}
           <Button
             type="button"
             disabled={
               busy ||
               !preview ||
               preview.unresolved_keys.length > 0 ||
-              preview.commands.length === 0
+              (detail.template.variables.length > 0 && preview.commands.length === 0)
             }
             onClick={onApply}
           >
-            确认应用替换
+            {busy ? "正在应用…" : detail.template.variables.length === 0 ? "替换内容并应用尺寸" : "确认应用替换"}
           </Button>
         </footer>
       </dialog>
-    </div>
+    </div>, document.body
   );
 }
 

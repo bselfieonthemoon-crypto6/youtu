@@ -91,7 +91,7 @@ export class GoogleImageProvider implements ImageProvider {
     }
 
     const aspectRatio = params.aspectRatio ?? "1:1";
-    const imageSize = QUALITY_TO_IMAGE_SIZE[params.quality ?? "hd"] ?? "2K";
+    const imageSize = QUALITY_TO_IMAGE_SIZE[params.quality ?? "standard"] ?? "1K";
     // Note: outputFormat is ignored — Gemini API does not support output format
     // selection; it always returns PNG via inlineData.
 

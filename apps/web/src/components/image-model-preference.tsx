@@ -37,7 +37,11 @@ export function ImageModelPreferencePopover({
         const available = new Set(data.models.map((model) => model.id));
         const selected = preference.models.filter((model) => available.has(model));
         if (selected.length !== preference.models.length) {
-          setPreference({ mode: selected.length > 0 ? preference.mode : "auto", models: selected });
+          setPreference({
+            ...preference,
+            mode: selected.length > 0 ? preference.mode : "auto",
+            models: selected,
+          });
         }
       })
       .catch(() => {});

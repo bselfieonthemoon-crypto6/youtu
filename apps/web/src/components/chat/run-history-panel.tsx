@@ -368,6 +368,8 @@ function dayLabel(value: string) {
 function toolDisplayName(name: string) {
   const names: Record<string, string> = {
     generate_image: "生成图片",
+    edit_image: "修改或参考图片",
+    create_design_boards: "创建原生画板",
     generate_video: "生成视频",
     manipulate_canvas: "操作画布",
     read_canvas: "读取画布",

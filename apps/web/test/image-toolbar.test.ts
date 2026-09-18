@@ -22,15 +22,19 @@ describe("image toolbar preferences", () => {
     expect(normalizeImageToolbarPreferences(null)).toEqual(DEFAULT_IMAGE_TOOLBAR_PREFERENCES);
   });
 
+  it("removes the retired subject-preview entry from saved preferences", () => {
+    expect(normalizeImageToolbarPreferences({ pinned: ["region-matting", "remove-background", "erase"], showLabels: true }))
+      .toEqual({ pinned: ["remove-background", "erase"], showLabels: true });
+  });
+
   it("keeps upscale and removes the retired agent actions", () => {
     const ids = IMAGE_TOOLBAR_ACTIONS.map((action) => action.id);
     expect(ids).toContain("upscale");
     expect(ids).toContain("remove-background");
-    expect(ids).toContain("region-matting");
+    expect(ids).not.toContain("region-matting");
     expect(ids).toContain("split-layers");
     expect(ids).toContain("erase");
     expect(IMAGE_TOOLBAR_ACTIONS.find((action) => action.id === "remove-background")?.available).toBe(true);
-    expect(IMAGE_TOOLBAR_ACTIONS.find((action) => action.id === "region-matting")?.available).toBe(true);
     expect(IMAGE_TOOLBAR_ACTIONS.find((action) => action.id === "split-layers")?.available).toBe(true);
     expect(IMAGE_TOOLBAR_ACTIONS.find((action) => action.id === "erase")?.available).toBe(true);
     expect(ids).not.toContain("relight");
@@ -66,8 +70,7 @@ describe("image toolbar direct-task prompts", () => {
       targetHeight: 1168,
     });
     const prompt = buildImageActionPrompt("upscale", { notes: "保持透明背景" }, image);
-    expect(prompt).toContain("1024×584px");
-    expect(prompt).toContain("2048×1168px");
+    expect(prompt).toContain("保持原始宽高比");
     expect(prompt).toContain("2K");
     expect(prompt).toContain("保持透明背景");
   });

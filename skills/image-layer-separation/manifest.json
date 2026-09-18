@@ -1,0 +1,69 @@
+{
+  "slug": "image-layer-separation",
+  "name": "图片分层与原生图层",
+  "description": "区分原生设计图层编辑与扁平图片分层，为拆分背景、主体、文字等提供当前可执行路径；不将 RGBA 位图拆解冒充原始 PSD 或可编辑字体。",
+  "version": "2.2.0",
+  "category": "design",
+  "iconName": "layers",
+  "license": null,
+  "metadata": {
+    "bundle": "loomic-design-skills-v2",
+    "loomic": {
+      "schemaVersion": 1,
+      "execution": "guidance",
+      "intents": [
+        "image-layer-separation",
+        "layer-grouping",
+        "rgba-layer-review"
+      ],
+      "outputKinds": [
+        "operation-guidance",
+        "native-layer-edit"
+      ],
+      "requiredTools": [],
+      "optionalTools": [
+        "inspect_canvas",
+        "inspect_design",
+        "get_design_objects",
+        "manipulate_design",
+        "verify_design_result"
+      ],
+      "models": [
+        {
+          "role": "planner",
+          "required": true,
+          "preferredIds": []
+        },
+        {
+          "role": "vision",
+          "required": false,
+          "preferredIds": []
+        }
+      ],
+      "limitations": [
+        "扁平图支持工具栏大模型流程：2–4个指定透明元素及修补底图，共3–5次生成，默认Low+1K；Agent仍没有直接split_layers工具。",
+        "已有原生设计图层可在实际工具和目标权限允许时编辑；位图拆分不能恢复原始 PSD、字体或被遮挡像素。",
+        "专用分层服务和旧本地处理独立保留，不在失败时隐式回退；本包不下载模型或安装外部服务。",
+        "本包是 Loomic 原创流程，官方模型卡不是本项目效果实测，不能声称分层结果已经通过视觉验收。"
+      ],
+      "examples": [
+        "把这张扁平海报拆成背景、产品和文字层。",
+        "只将画板里现有产品图层与标题分组，其他内容不动。"
+      ],
+      "sources": [
+        {
+          "title": "Qwen-Image-Layered 官方模型卡",
+          "url": "https://huggingface.co/Qwen/Qwen-Image-Layered",
+          "license": "Apache-2.0",
+          "relation": "inspired-by"
+        }
+      ],
+      "composition": {
+        "role": "domain",
+        "stages": [
+          "design"
+        ]
+      }
+    }
+  }
+}

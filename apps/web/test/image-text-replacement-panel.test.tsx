@@ -24,6 +24,16 @@ const image = {
 afterEach(cleanup);
 
 describe("ImageTextReplacementPanel", () => {
+  it("shows the source preview and separates multiline recognition into unchanged original labels", async () => {
+    render(<ImageTextReplacementPanel image={{ ...image, dataUrl: "data:image/png;base64,aGVsbG8=" }}
+      screenBounds={{ x: 20, y: 30, width: 256, height: 256 }}
+      onRecognize={async () => ["第一行\n第二行", "第三行"]} onApply={vi.fn()} onCancel={vi.fn()} />);
+    await screen.findByRole("textbox", { name: "替换 第一行" });
+    expect(screen.getAllByRole("textbox")).toHaveLength(3);
+    expect(screen.getByRole("img", { name: "待替换文字的原图" })).toBeTruthy();
+    expect(screen.getByText("第二行")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "应用" }) as HTMLButtonElement).disabled).toBe(true);
+  });
   it("recognizes text, lets the user edit it, and submits changed mappings only", async () => {
     const onRecognize = vi.fn(async () => ["aaaa.", "com"]);
     const onApply = vi.fn(async () => {});
@@ -51,8 +61,12 @@ describe("ImageTextReplacementPanel", () => {
     expect(
       (screen.getByRole("textbox", { name: "替换 com" }) as HTMLInputElement)
         .value,
-    ).toBe("com");
+    ).toBe("");
+    expect(screen.getByText("aaaa.")).toBeTruthy();
+    expect(screen.getByText("com")).toBeTruthy();
+    expect(screen.getAllByRole("textbox")).toHaveLength(2);
     fireEvent.change(first, { target: { value: "bbbb." } });
+    expect(screen.getByText("aaaa.")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "应用" }));
 
     await waitFor(() =>

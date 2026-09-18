@@ -50,6 +50,11 @@ describe("DesignImageTools", () => {
     fireEvent.click(screen.getByRole("button", { name: "图层拆分" }));
 
     expect(onRun).toHaveBeenNthCalledWith(1, "remove_background");
+    expect(onRun).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("AI 图层拆分")).toBeInTheDocument();
+    // AI splitting opens the current configuration panel; the separate
+    // local entry retains the legacy split_layers callback contract.
+    fireEvent.click(screen.getByRole("button", { name: "本地拆分" }));
     expect(onRun).toHaveBeenNthCalledWith(2, "split_layers");
     expect(onStartRegion).toHaveBeenCalledOnce();
     expect(onStartErase).toHaveBeenCalledOnce();

@@ -24,18 +24,27 @@ export const wsRpcRequestSchema = z.object({
 export const wsCommandAckSchema = z.object({
   type: z.literal("command.ack"),
   action: z.string().min(1),
+  requestId: z.string().min(1).max(128).optional(),
   payload: z.record(z.unknown()),
 });
 
 // --- Client → Server: Command ---
 
+const commandCredentials = {
+  accessToken: z.string().min(1).max(16384).optional(),
+  requestId: z.string().min(1).max(128).optional(),
+};
+
 export const wsRunCommandSchema = z.object({
+  ...commandCredentials,
   type: z.literal("command"),
   action: z.literal("agent.run"),
+  // Reuse the HTTP contract, including bounded, evidence-only canvasSelection.
   payload: runCreateRequestSchema,
 });
 
 export const wsCancelCommandSchema = z.object({
+  ...commandCredentials,
   type: z.literal("command"),
   action: z.literal("agent.cancel"),
   payload: z.object({ runId: z.string().min(1) }),
@@ -43,6 +52,7 @@ export const wsCancelCommandSchema = z.object({
 
 export const wsConfirmActionCommandSchema = z
   .object({
+    ...commandCredentials,
     type: z.literal("command"),
     action: z.literal("agent.confirm_action"),
     payload: z
@@ -55,6 +65,7 @@ export const wsConfirmActionCommandSchema = z
   .strict();
 
 export const wsRetryToolCommandSchema = z.object({
+  ...commandCredentials,
   type: z.literal("command"),
   action: z.literal("agent.retry_tool"),
   payload: z
@@ -66,6 +77,7 @@ export const wsRetryToolCommandSchema = z.object({
 });
 
 export const wsResumeCommandSchema = z.object({
+  ...commandCredentials,
   type: z.literal("command"),
   action: z.literal("canvas.resume"),
   payload: z.object({

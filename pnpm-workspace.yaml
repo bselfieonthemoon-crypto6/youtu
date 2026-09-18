@@ -3,12 +3,6 @@ packages:
   - packages/*
 
 overrides:
-  '@langchain/core': 1.2.9
-  '@langchain/langgraph': 1.4.13
-  '@langchain/langgraph-checkpoint': 1.1.5
-  '@langchain/langgraph-sdk': 1.9.23
-  langchain: 1.5.10
-  langsmith: 0.7.1
   '@hono/node-server@>=1.0.0 <1.19.15': 1.19.15
   'browserslist@<4.28.7': 4.28.8
   'body-parser@>=2.0.0 <2.3.0': 2.3.0

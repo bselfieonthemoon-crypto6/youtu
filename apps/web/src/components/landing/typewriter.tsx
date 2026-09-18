@@ -49,10 +49,9 @@ export function useTypewriter({
     setDisplayText("");
     setIsComplete(false);
 
-    let startTimeout: ReturnType<typeof setTimeout>;
     let typingInterval: ReturnType<typeof setInterval>;
 
-    startTimeout = setTimeout(() => {
+    const startTimeout = setTimeout(() => {
       typingInterval = setInterval(() => {
         const next = indexRef.current + 1;
         setDisplayText(text.slice(0, next));

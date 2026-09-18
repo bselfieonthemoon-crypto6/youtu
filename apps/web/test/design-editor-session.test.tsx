@@ -17,8 +17,9 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const getDesign = vi.fn();
-const queueDesignPreview = vi.fn();
+const queueDesignPreview = vi.fn(async () => ({ status: "queued" }));
 const mutateDesign = vi.fn();
+let latestSave: () => Promise<void>;
 const exportDesign = vi.fn();
 const listDesignExportJobs = vi.fn<() => Promise<BackgroundJob[]>>(
   async () => [],
@@ -34,6 +35,7 @@ const cancelDesignImageJob = vi.fn();
 const uploadFile = vi.hoisted(() => vi.fn());
 const fetchAssetBlob = vi.hoisted(() => vi.fn());
 const getFontFaceContent = vi.hoisted(() => vi.fn());
+const fetchLayerBackend = vi.hoisted(() => vi.fn(async () => ({ configured: false, available: false, model: "qwen-image-layered", reason: "尚未配置专用分层服务", remote: true })));
 const getTemplate = vi.hoisted(() => vi.fn());
 const listTemplates = vi.hoisted(() =>
   vi.fn<
@@ -76,7 +78,33 @@ const mockEditor = {
   })),
 };
 
-vi.mock("../src/lib/design-api", () => ({
+const exportClone = vi.hoisted(() => ({
+  loadScene: vi.fn(async () => undefined),
+  waitForImages: vi.fn(async () => ({ missingAssetObjectIds: [] as string[] })),
+  renderToBlob: vi.fn(async () => new Blob(["snapshot-pixels"])),
+  disposeEditor: vi.fn(),
+  offCanvas: vi.fn(),
+  disposeCanvas: vi.fn(async () => undefined),
+}));
+
+vi.mock("fabric", () => ({
+  Canvas: class MockExportCanvas {
+    off = exportClone.offCanvas;
+    dispose = exportClone.disposeCanvas;
+  },
+}));
+
+vi.mock("../src/components/design/fabric-object-editor", () => ({
+  FabricObjectEditor: class MockSnapshotEditor {
+    loadScene = exportClone.loadScene;
+    waitForImages = exportClone.waitForImages;
+    renderToBlob = exportClone.renderToBlob;
+    dispose = exportClone.disposeEditor;
+  },
+}));
+
+vi.mock("../src/lib/design-api", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../src/lib/design-api")>(),
   createDesignApiClient: () => ({
     getDesign,
     mutateDesign,
@@ -94,6 +122,10 @@ vi.mock("../src/lib/design-api", () => ({
 
 vi.mock("../src/lib/server-api", () => ({ uploadFile }));
 vi.mock("../src/lib/canvas-elements", () => ({ fetchAssetBlob }));
+vi.mock("../src/lib/layer-backend", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../src/lib/layer-backend")>(),
+  fetchLayerBackend,
+}));
 vi.mock("../src/lib/design-resource-api", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("../src/lib/design-resource-api")>();
@@ -148,6 +180,12 @@ vi.mock("../src/components/design/design-editor-overlay", () => ({
     subInteraction?: React.ReactNode;
     onCanvasReady?: (canvas: {
       on: (name: string, callback: () => void) => void;
+    }) => void;
+    onResourceMissing?: (input: {
+      objectId: string;
+      assetObjectId: string;
+      type: "image";
+      error: Error;
     }) => void;
     statusMessage?: string | null;
     exportJobs?: readonly BackgroundJob[];
@@ -216,7 +254,7 @@ vi.mock("../src/components/design/design-editor-overlay", () => ({
         >
           修改背景
         </button>
-        <button type="button" onClick={() => void props.onSave()}>
+        <button type="button" ref={() => { latestSave = props.onSave; }} onClick={() => void props.onSave()}>
           保存
         </button>
         <button
@@ -267,6 +305,19 @@ vi.mock("../src/components/design/design-editor-overlay", () => ({
           onClick={() => void props.onExport({ format: "png", multiplier: 1 })}
         >
           模拟导出
+        </button>
+        <button
+          type="button"
+          onClick={() =>
+            props.onResourceMissing?.({
+              objectId: "40000000-0000-4000-8000-000000000099",
+              assetObjectId: "50000000-0000-4000-8000-000000000099",
+              type: "image",
+              error: new Error("transient asset failure"),
+            })
+          }
+        >
+          模拟资源缺失
         </button>
         <button
           type="button"
@@ -322,6 +373,10 @@ describe("DesignEditorSession", () => {
     cleanup();
     vi.clearAllMocks();
     mockEditor.getSelectionIds.mockReturnValue([]);
+    serializeScene.mockImplementation(() => documentFixture().scene);
+    exportClone.loadScene.mockResolvedValue(undefined);
+    exportClone.waitForImages.mockResolvedValue({ missingAssetObjectIds: [] });
+    exportClone.renderToBlob.mockResolvedValue(new Blob(["snapshot-pixels"]));
     vi.unstubAllGlobals();
   });
 
@@ -359,6 +414,10 @@ describe("DesignEditorSession", () => {
       "token",
       "10000000-0000-4000-8000-000000000001",
     );
+    await waitFor(() => expect(queueDesignPreview).toHaveBeenCalledTimes(1));
+    expect(queueDesignPreview).toHaveBeenCalledWith("token", expect.objectContaining({
+      design_id: documentFixture().id, expected_revision: 0,
+    }));
   });
 
   it("binds a model image job to the authoritative selected design object", async () => {
@@ -390,7 +449,7 @@ describe("DesignEditorSession", () => {
       "token",
       expect.objectContaining({
         operation: "remove_background",
-        model: "local:feynobg",
+        model: "gpt-image-2",
         target: {
           kind: "design",
           design_id: initial.id,
@@ -413,6 +472,29 @@ describe("DesignEditorSession", () => {
     expect(createDesignImageJob.mock.calls[0]?.[1]).not.toHaveProperty(
       "input_images",
     );
+  });
+
+  it("submits an explicitly selected Qwen splitter with the same authoritative source and revision", async () => {
+    const initial = documentFixture({ revision: 7 });
+    (initial.scene.objects as unknown as ReturnType<typeof imageFixture>[]).push(imageFixture());
+    getDesign.mockResolvedValue(initial);
+    serializeScene.mockReturnValue(initial.scene);
+    createDesignImageJob.mockResolvedValue(imageJobFixture());
+    fetchLayerBackend.mockResolvedValueOnce({ configured: true, available: true, model: "qwen-image-layered", reason: "专用分层服务就绪", remote: true });
+    render(<DesignEditorSession accessToken="token" designId={initial.id} backgroundRoot={document.createElement("div")} onClose={vi.fn()} />);
+    await screen.findByTestId("editor-overlay");
+    fireEvent.click(screen.getByRole("button", { name: "模拟选择图片" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Qwen 专用分层" })).toBeEnabled());
+    expect(createDesignImageJob).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Qwen 专用分层" }));
+    await waitFor(() => expect(createDesignImageJob).toHaveBeenCalledOnce());
+    expect(createDesignImageJob).toHaveBeenCalledWith("token", expect.objectContaining({
+      operation: "split_layers", model: "qwen-image-layered",
+      target: expect.objectContaining({ kind: "design", design_id: initial.id, expected_revision: 7,
+        source_object_id: imageFixture().objectId, source_asset_object_id: imageFixture().assetObjectId,
+        expected_object_version: imageFixture().objectVersion, idempotency_key: expect.any(String) }),
+    }));
+    expect(createDesignImageJob.mock.calls[0]?.[1]).not.toHaveProperty("input_images");
   });
 
   it("restores a running image task and reloads the authoritative scene after finalization", async () => {
@@ -505,7 +587,7 @@ describe("DesignEditorSession", () => {
     await screen.findByTestId("editor-overlay");
     fireEvent.click(screen.getByRole("button", { name: "模板" }));
     fireEvent.click(await screen.findByRole("button", { name: "使用" }));
-    expect(await screen.findByText(/智能替换 · 活动模板/u)).toBeInTheDocument();
+    expect(await screen.findByText(/替换模板变量 · 活动模板/u)).toBeInTheDocument();
     expect(previewTemplateReplacement).toHaveBeenCalledWith(
       "token",
       expect.objectContaining({
@@ -556,6 +638,7 @@ describe("DesignEditorSession", () => {
       },
     };
     getDesign.mockResolvedValue(large);
+    serializeScene.mockReturnValue(large.scene);
     exportDesign.mockResolvedValue({ job: exportJobFixture() });
     const root = document.createElement("div");
     render(
@@ -862,6 +945,21 @@ describe("DesignEditorSession", () => {
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:catalog-font");
   });
 
+  it("retries a failed manual save using the same frozen request", async () => {
+    const initial = documentFixture({ revision: 3 });
+    getDesign.mockResolvedValue(initial);
+    mutateDesign.mockRejectedValueOnce(new Error("Unable to reach the design service."))
+      .mockResolvedValueOnce({ design_id: initial.id, revision: 4, changed_object_ids: [], replayed: false });
+    render(<DesignEditorSession accessToken="token" designId={initial.id}
+      backgroundRoot={document.createElement("div")} onClose={vi.fn()} />);
+    await screen.findByTestId("editor-overlay");
+    fireEvent.click(screen.getByRole("button", { name: "修改背景" }));
+    await expect(latestSave()).rejects.toThrow("Unable to reach");
+    await latestSave();
+    expect(mutateDesign).toHaveBeenCalledTimes(2);
+    expect(mutateDesign.mock.calls[1]).toEqual(mutateDesign.mock.calls[0]);
+  });
+
   it("persists a background edit through a structured CAS command", async () => {
     const initial = documentFixture({ revision: 3 });
     getDesign.mockResolvedValueOnce(initial);
@@ -1145,6 +1243,92 @@ describe("DesignEditorSession", () => {
         "50000000-0000-4000-8000-000000000001",
       ),
     );
+  });
+
+  it("waits for queued resource work before taking an isolated export snapshot", async () => {
+    const initial = documentFixture();
+    const exportedScene = structuredClone(initial.scene);
+    (
+      exportedScene.objects as unknown as ReturnType<typeof imageFixture>[]
+    ).push(imageFixture());
+    let resolveUpload!: (value: {
+      asset: { id: string };
+      url: string;
+    }) => void;
+    uploadFile.mockReturnValue(
+      new Promise((resolve) => {
+        resolveUpload = resolve;
+      }),
+    );
+    getDesign.mockResolvedValue(initial);
+    serializeScene.mockReturnValue(exportedScene);
+    const createObjectURL = vi.fn(() => "blob:snapshot-export");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", { createObjectURL, revokeObjectURL });
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
+
+    render(
+      <DesignEditorSession
+        accessToken="token"
+        designId={initial.id}
+        backgroundRoot={document.createElement("div")}
+        onClose={vi.fn()}
+      />,
+    );
+    await screen.findByTestId("editor-overlay");
+
+    fireEvent.click(screen.getByRole("button", { name: "上传图片" }));
+    await waitFor(() => expect(uploadFile).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "模拟导出" }));
+    await Promise.resolve();
+    expect(exportClone.loadScene).not.toHaveBeenCalled();
+
+    resolveUpload({
+      asset: { id: imageFixture().assetObjectId },
+      url: "https://example.invalid/signed",
+    });
+    await waitFor(() => expect(exportClone.loadScene).toHaveBeenCalledOnce());
+    expect(exportClone.loadScene).toHaveBeenCalledWith(
+      exportedScene,
+      expect.any(Function),
+    );
+    expect(exportClone.renderToBlob).toHaveBeenCalledOnce();
+    expect(exportClone.disposeEditor).toHaveBeenCalledOnce();
+    expect(exportClone.disposeCanvas).toHaveBeenCalledOnce();
+    click.mockRestore();
+  });
+
+  it("does not let a recovered resource's stale missing callback block export", async () => {
+    const initial = documentFixture();
+    getDesign.mockResolvedValue(initial);
+    serializeScene.mockReturnValue(initial.scene);
+    exportClone.waitForImages.mockResolvedValue({ missingAssetObjectIds: [] });
+    const createObjectURL = vi.fn(() => "blob:recovered-export");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", { createObjectURL, revokeObjectURL });
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
+
+    render(
+      <DesignEditorSession
+        accessToken="token"
+        designId={initial.id}
+        backgroundRoot={document.createElement("div")}
+        onClose={vi.fn()}
+      />,
+    );
+    await screen.findByTestId("editor-overlay");
+    fireEvent.click(screen.getByRole("button", { name: "模拟资源缺失" }));
+    fireEvent.click(screen.getByRole("button", { name: "模拟导出" }));
+
+    await waitFor(() => expect(exportClone.renderToBlob).toHaveBeenCalledOnce());
+    expect(screen.getByText(/已导出 活动海报@1x\.png/u)).toBeInTheDocument();
+    expect(exportClone.waitForImages).toHaveBeenCalledOnce();
+    expect(exportClone.disposeEditor).toHaveBeenCalledOnce();
+    click.mockRestore();
   });
 });
 

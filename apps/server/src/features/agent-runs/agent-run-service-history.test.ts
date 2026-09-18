@@ -2,8 +2,36 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import { createAgentRunMetadataService } from "./agent-run-service.js";
+import { CONTEXT_ERROR_MESSAGES } from "../../utils/context-error.js";
 
 describe("agent run metadata writes", () => {
+  it("atomically persists a new exact request for older clients without a message ID", async () => {
+    const rpc = vi.fn().mockResolvedValue({ error: null });
+    const from = vi.fn();
+    const service = createAgentRunMetadataService({ getAdminClient: () => ({ rpc, from }) as unknown as AdminSupabaseClient });
+    await service.createAcceptedRun({ createdBy: "user-1", runId: "run-1", sessionId: "session-1", threadId: "thread-1", prompt: "继续生成落地页" });
+    expect(rpc).toHaveBeenCalledWith("loomic_create_run_with_request", {
+      p_created_by: "user-1", p_run: "run-1", p_session: "session-1", p_thread: "thread-1",
+      p_model: null, p_execution_mode: "fast", p_prompt: "继续生成落地页",
+    });
+    expect(from).not.toHaveBeenCalled();
+  });
+
+  it("preserves an explicit request ID without creating another message", async () => {
+    const insert = vi.fn().mockResolvedValue({ error: null });
+    const rpc = vi.fn();
+    const service = createAgentRunMetadataService({ getAdminClient: () => ({ rpc, from: () => ({ insert }) }) as unknown as AdminSupabaseClient });
+    await service.createAcceptedRun({ runId: "run-1", sessionId: "session-1", threadId: "thread-1", requestMessageId: "message-1", prompt: "确认生成" });
+    expect(insert).toHaveBeenCalledWith(expect.objectContaining({ request_message_id: "message-1", request_prompt: "确认生成" }));
+    expect(rpc).not.toHaveBeenCalled();
+  });
+
+  it("does not fall back to an unbound run when atomic persistence fails", async () => {
+    const from = vi.fn();
+    const service = createAgentRunMetadataService({ getAdminClient: () => ({ from, rpc: vi.fn().mockResolvedValue({ error: { message: "invalid request" } }) }) as unknown as AdminSupabaseClient });
+    await expect(service.createAcceptedRun({ runId: "run-1", sessionId: "session-1", threadId: "thread-1", prompt: "生成" })).rejects.toThrow("Failed to persist accepted run and request.");
+    expect(from).not.toHaveBeenCalled();
+  });
   it("persists execution mode and creator and uses terminal CAS", async () => {
     const inserts: Record<string, unknown>[] = [];
     const updates: Array<{ patch: Record<string, unknown>; filters: unknown[] }> = [];
@@ -112,5 +140,11 @@ describe("agent run metadata writes", () => {
       message: "认证失败，请刷新页面重新登录。",
     });
     expect(JSON.stringify(detail)).not.toContain("sk-test-sensitive");
+    // Durable context reasons must survive a reload and its second sanitization.
+    runRow.error_code = "agent_context_budget_exceeded";
+    runRow.error_message = "PRIVATE_CONTEXT_BODY";
+    const contextDetail = await service.getRunDetail("run-1", "session-1");
+    expect(contextDetail?.error).toEqual({ code: "agent_context_budget_exceeded", message: CONTEXT_ERROR_MESSAGES.agent_context_budget_exceeded });
+    expect(JSON.stringify(contextDetail)).not.toContain("PRIVATE_CONTEXT_BODY");
   });
 });

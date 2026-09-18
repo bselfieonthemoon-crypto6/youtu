@@ -136,6 +136,11 @@ export function useChatSessions({
 
   // LRU message cache (replaces unbounded Record)
   const msgCacheRef = useRef<LRUMessageCache>(createLRUMessageCache());
+  // A reload is an asynchronous snapshot. Track both local mutations and the
+  // newest request per session so a late response cannot erase a streaming
+  // placeholder (and make all subsequent deltas miss their assistant id).
+  const messageVersionRef = useRef(new Map<string, number>());
+  const reloadRequestRef = useRef(new Map<string, number>());
 
   // ── Update messages for a specific session ──
   // Always writes to cache; only syncs to React state if the session is visible.
@@ -144,6 +149,10 @@ export function useChatSessions({
       const prev = msgCacheRef.current.get(targetSessionId) ?? [];
       const next = updater(prev);
       msgCacheRef.current.set(targetSessionId, next);
+      messageVersionRef.current.set(
+        targetSessionId,
+        (messageVersionRef.current.get(targetSessionId) ?? 0) + 1,
+      );
       if (activeSessionIdRef.current === targetSessionId) {
         setMessages(next);
       }
@@ -317,6 +326,8 @@ export function useChatSessions({
 
       // Clean up cached messages for deleted session
       msgCacheRef.current.delete(sessionId);
+      messageVersionRef.current.delete(sessionId);
+      reloadRequestRef.current.delete(sessionId);
     },
     [canvasId, streaming],
   );
@@ -341,8 +352,17 @@ export function useChatSessions({
       console.warn("[chat] reloadMessages called with empty sessionId, skipping");
       return;
     }
+    const messageVersion = messageVersionRef.current.get(sessionId) ?? 0;
+    const requestVersion = (reloadRequestRef.current.get(sessionId) ?? 0) + 1;
+    reloadRequestRef.current.set(sessionId, requestVersion);
     try {
       const msgRes = await fetchMessages(accessTokenRef.current, sessionId);
+      if (
+        reloadRequestRef.current.get(sessionId) !== requestVersion ||
+        (messageVersionRef.current.get(sessionId) ?? 0) !== messageVersion
+      ) {
+        return;
+      }
       if (msgRes.messages && msgRes.messages.length > 0) {
         const mapped = mapServerMessages(msgRes.messages);
         msgCacheRef.current.set(sessionId, mapped);

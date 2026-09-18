@@ -1,14 +1,24 @@
 "use client";
 
-import { type KeyboardEvent, useEffect, useRef, useState } from "react";
+import { type ButtonHTMLAttributes, type KeyboardEvent, useEffect, useRef, useState } from "react";
+import { Check, Download, Info, Layers3, LayoutTemplate, Loader2, Redo2, Save, Type, Undo2 } from "lucide-react";
 import { createPortal } from "react-dom";
 import type { DesignEditorOverlayProps } from "./design-editor-overlay";
 import { DesignEditorOverlay } from "./design-editor-overlay";
 import { DesignLayersPanel } from "./design-layers-panel";
 import { DesignPropertiesPanel } from "./design-properties-panel";
 import { FabricDesignSurface } from "./fabric-design-surface";
+import { DesignNameButton } from "./design-name-button";
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from "../ui/dropdown-menu";
 
-/** Opt-in shell. Authoritative document/history/jobs remain owned by the session. */
+function ToolbarButton({ label, active = false, children, ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { label: string; active?: boolean }) {
+  return <button {...props} type="button" title={label} aria-label={label}
+    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-30 ${active ? "bg-foreground/[0.08] text-foreground" : "text-foreground/60 hover:bg-foreground/[0.04] hover:text-foreground"}`}>
+    {children}
+  </button>;
+}
+
+/** Inline shell. Authoritative document/history/jobs remain owned by the session. */
 export function DesignInlineEditor(props: DesignEditorOverlayProps) {
   const [bounds, setBounds] = useState<{
     left: number;
@@ -19,6 +29,8 @@ export function DesignInlineEditor(props: DesignEditorOverlayProps) {
     clipTop: number;
     clipWidth: number;
     clipHeight: number;
+    panelRight: number;
+    panelWidth: number;
   } | null>(null);
   const [resources, setResources] = useState(false);
   const [layers, setLayers] = useState(false);
@@ -26,6 +38,7 @@ export function DesignInlineEditor(props: DesignEditorOverlayProps) {
   const [closing, setClosing] = useState(false);
   const [legacy, setLegacy] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const [missing, setMissing] = useState(false);
   const [rotatedBoard, setRotatedBoard] = useState(false);
   const currentProps = useRef(props);
@@ -47,16 +60,21 @@ export function DesignInlineEditor(props: DesignEditorOverlayProps) {
         )?.[1];
         setRotatedBoard(Boolean(angle && Number(angle) !== 0));
         const rect = preview.getBoundingClientRect();
+        const displayScale = Math.max(rect.width, rect.height) / Math.max(props.width, props.height);
         const clip = preview.parentElement?.getBoundingClientRect() ?? rect;
+        const canvasBounds = root?.querySelector<HTMLElement>('[data-testid="canvas-editor"]')?.getBoundingClientRect()
+          ?? root?.getBoundingClientRect() ?? clip;
         const next = {
           left: rect.left,
           top: rect.top,
-          width: rect.width,
-          height: rect.height,
-          clipLeft: clip.left,
-          clipTop: clip.top,
-          clipWidth: clip.width,
-          clipHeight: clip.height,
+          width: props.width * displayScale,
+          height: props.height * displayScale,
+          clipLeft: canvasBounds.left,
+          clipTop: canvasBounds.top,
+          clipWidth: canvasBounds.width,
+          clipHeight: canvasBounds.height,
+          panelRight: Math.max(0, window.innerWidth - canvasBounds.right),
+          panelWidth: Math.min(288, Math.max(0, canvasBounds.width)),
         };
         setBounds((old) =>
           old &&
@@ -73,7 +91,7 @@ export function DesignInlineEditor(props: DesignEditorOverlayProps) {
     };
     frame = requestAnimationFrame(update);
     return () => cancelAnimationFrame(frame);
-  }, [legacy, props.backgroundRoot, props.designId]);
+  }, [legacy, props.backgroundRoot, props.designId, props.width, props.height]);
 
   useEffect(() => {
     const warn = (e: BeforeUnloadEvent) => {
@@ -87,7 +105,7 @@ export function DesignInlineEditor(props: DesignEditorOverlayProps) {
     setBusy(true);
     setError(null);
     try {
-      await props.onSave();
+      await (after === props.onClose && props.onFinish ? props.onFinish() : props.onSave());
       after?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : "保存失败，修改仍保留");
@@ -116,12 +134,8 @@ export function DesignInlineEditor(props: DesignEditorOverlayProps) {
     }
   }
 
-  // Stage gate: grouped/rotated documents keep the established editor until
-  // their coordinate migration has its own browser acceptance coverage.
-  const complex = props.scene?.objects.some(
-    (o) => o.type === "group" || o.rotation !== 0,
-  );
-  if (legacy || complex || rotatedBoard)
+  const saveStatus = props.saving || busy ? "保存中…" : props.dirty ? "未保存" : (props.statusMessage ?? "已保存");
+  if (legacy)
     return <DesignEditorOverlay {...props} />;
   if (typeof document === "undefined") return null;
   return createPortal(
@@ -130,7 +144,7 @@ export function DesignInlineEditor(props: DesignEditorOverlayProps) {
       data-testid="design-inline-editor"
     >
       <section
-        className="pointer-events-auto fixed left-1/2 top-16 z-30 max-w-[90vw] -translate-x-1/2 rounded-2xl border bg-background p-2 shadow-lg [&_button]:rounded-lg [&_button]:px-2 [&_button]:py-1.5 [&_button:hover]:bg-muted [&_button:disabled]:opacity-40"
+        className="pointer-events-auto fixed left-1/2 top-16 z-30 max-w-[90vw] -translate-x-1/2 rounded-xl border border-border bg-card/75 p-1 shadow-card backdrop-blur-lg"
         style={
           bounds
             ? {
@@ -141,39 +155,41 @@ export function DesignInlineEditor(props: DesignEditorOverlayProps) {
         }
         onKeyDown={handleKeys}
       >
-        <div className="flex flex-wrap items-center gap-2 text-sm">
-          <span>正在编辑：{props.name}</span>
-          <button onClick={() => setResources((v) => !v)}>资源</button>
-          <button onClick={() => setLayers((v) => !v)}>图层 / 属性</button>
-          <button disabled={!props.canUndo} onClick={props.onUndo}>
-            撤销
-          </button>
-          <button disabled={!props.canRedo} onClick={props.onRedo}>
-            重做
-          </button>
-          <button onClick={() => props.onAddObject?.("text")}>添加文字</button>
-          <button disabled={busy || props.saving} onClick={() => void save()}>
-            保存
-          </button>
-          <button
-            disabled={busy}
-            onClick={() => void save(() => setLegacy(true))}
-          >
-            完整编辑器 / 导出
-          </button>
-          <button
-            disabled={busy}
-            onClick={() => (props.dirty ? setClosing(true) : void save(props.onClose))}
-          >
-            完成
-          </button>
+        <div role="toolbar" aria-label="画板工具栏" className="flex items-center gap-0.5 overflow-x-auto whitespace-nowrap">
+          <div className="flex shrink-0 items-center gap-2 px-2" title={`正在编辑：${props.name} · ${saveStatus}`}>
+            <span className={`size-1.5 shrink-0 rounded-full ${props.dirty ? "bg-amber-500" : "bg-emerald-500"}`} aria-hidden="true" />
+            <span className="max-w-24 truncate text-xs text-foreground/70">{props.onRename ? <DesignNameButton name={props.name} onRename={props.onRename} /> : props.name}</span>
+          </div>
+          <div className="mx-0.5 h-6 w-px shrink-0 bg-border" />
+          <ToolbarButton label="资源" active={resources} aria-pressed={resources} onClick={() => setResources((v) => !v)}><LayoutTemplate className="size-4" /></ToolbarButton>
+          <ToolbarButton label="图层 / 属性" active={layers} aria-pressed={layers} onClick={() => setLayers((v) => !v)}><Layers3 className="size-4" /></ToolbarButton>
+          <ToolbarButton label="添加文字" onClick={() => props.onAddObject?.("text")}><Type className="size-4" /></ToolbarButton>
+          <div className="mx-0.5 h-6 w-px shrink-0 bg-border" />
+          <ToolbarButton label="撤销" disabled={!props.canUndo} onClick={props.onUndo}><Undo2 className="size-4" /></ToolbarButton>
+          <ToolbarButton label="重做" disabled={!props.canRedo} onClick={props.onRedo}><Redo2 className="size-4" /></ToolbarButton>
+          <div className="mx-0.5 h-6 w-px shrink-0 bg-border" />
+          <ToolbarButton label="保存" disabled={busy || props.saving} onClick={() => void save()}>{busy || props.saving ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}</ToolbarButton>
+          <ToolbarButton label="画板详情" disabled={busy || downloading} onClick={() => void save(() => setLegacy(true))}><Info className="size-4" /></ToolbarButton>
+          <DropdownMenu>
+            <DropdownMenuTrigger aria-label="下载" title="下载" disabled={busy || downloading || !props.onExport} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-foreground/60 hover:bg-foreground/[0.04] disabled:opacity-30">
+              {downloading ? <Loader2 className="size-4 animate-spin" /> : <Download className="size-4" />}
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" data-design-subinteraction="true" onKeyDown={e => e.stopPropagation()}>
+              {([['png', 'PNG'], ['transparent-png', '透明 PNG'], ['jpeg', 'JPEG'], ['gif', '动态 GIF']] as const).map(([format, label]) => (
+                <DropdownMenuItem key={format} disabled={downloading} onClick={async () => {
+                  if (!props.onExport || downloading) return;
+                  setDownloading(true); setError(null);
+                  try { await props.onExport({ format, multiplier: 1 }); }
+                  catch (cause) { setError(cause instanceof Error ? cause.message : "下载失败，请重试。"); }
+                  finally { setDownloading(false); }
+                }}>{label}</DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <ToolbarButton label="完成" disabled={busy || props.saving} onClick={() => void save(props.onClose)}><Check className="size-4" /></ToolbarButton>
         </div>
-        <p className="text-xs text-muted-foreground" role="status">
-          {props.saving
-            ? "保存中…"
-            : props.dirty
-              ? "未保存"
-              : (props.statusMessage ?? "已保存")}
+        <p className="sr-only" role="status">
+          {saveStatus}
         </p>
         {(error || props.saveError) && (
           <p role="alert" className="text-sm text-destructive">
@@ -182,6 +198,9 @@ export function DesignInlineEditor(props: DesignEditorOverlayProps) {
         )}
         {missing && (
           <p role="alert">画板预览不在可视区域，请移回画板或切换完整编辑器。</p>
+        )}
+        {rotatedBoard && (
+          <p role="alert">画板节点整体已旋转，暂不支持原位编辑。请将画板节点角度恢复为 0°，或点击“画板详情”继续。</p>
         )}
         {props.conflictRevision != null && (
           <div role="alert">
@@ -217,8 +236,8 @@ export function DesignInlineEditor(props: DesignEditorOverlayProps) {
           {props.resourcePanel}
         </aside>
       )}
-      {layers && props.scene && props.layerAdapter && (
-        <aside className="pointer-events-auto fixed z-20 bottom-24 right-[400px] top-32 w-72 overflow-auto rounded-2xl border bg-background shadow-lg">
+      {layers && bounds && props.scene && props.layerAdapter && (
+        <aside data-testid="design-properties-dock" style={{ right: bounds.panelRight, width: bounds.panelWidth }} className="pointer-events-auto fixed z-20 bottom-24 top-32 overflow-auto rounded-2xl border bg-background shadow-lg">
           {props.propertyActions && (
             <DesignPropertiesPanel
               selectedObjects={props.scene.objects.filter((o) =>
@@ -234,7 +253,7 @@ export function DesignInlineEditor(props: DesignEditorOverlayProps) {
           />
         </aside>
       )}
-      {bounds && (
+      {bounds && !rotatedBoard && (
         <div
           className="fixed overflow-hidden"
           style={{
@@ -245,7 +264,7 @@ export function DesignInlineEditor(props: DesignEditorOverlayProps) {
           }}
         >
           <div
-            className="pointer-events-auto absolute overflow-hidden ring-2 ring-primary"
+            className="pointer-events-auto absolute overflow-visible ring-2 ring-primary"
             style={{
               left: bounds.left - bounds.clipLeft,
               top: bounds.top - bounds.clipTop,
@@ -285,6 +304,7 @@ export function DesignInlineEditor(props: DesignEditorOverlayProps) {
             }}
           >
             <FabricDesignSurface
+              showOverflow
               width={props.width}
               height={props.height}
               background={props.background}

@@ -1,0 +1,37 @@
+{
+  "slug": "gpt-image-2-style-library",
+  "name": "图文提示词风格参考",
+  "description": "为开放设计需求或用户要求优化的生图提示，跨现有图文库检索并筛选构图、风格和场景参考；配合专业设计 Skill，不改写原样执行的节点提示或单纯改字任务。",
+  "version": "1.0.1",
+  "category": "design",
+  "iconName": "palette",
+  "license": "MIT",
+  "metadata": {
+    "bundle": "loomic-design-skills-v2",
+    "loomic": {
+      "schemaVersion": 1,
+      "execution": "guidance",
+      "composition": { "role": "reference", "stages": ["design", "reference", "prompt"] },
+      "intents": ["style-reference", "prompt-library-search", "prompt-optimization"],
+      "outputKinds": ["prompt-references", "style-guidance"],
+      "requiredTools": ["search_prompt_library", "get_prompt_library_entry"],
+      "optionalTools": ["compose_skills", "inspect_design", "get_brand_kit"],
+      "models": [{ "role": "planner", "required": true, "preferredIds": [] }],
+      "limitations": [
+        "仅提供检索与参考建议；不需要新增生图模型，不触发生成或授权。",
+        "图片链接仅作案例预览，没有视觉输入时不能声称已看图；不自动用作生图附件。",
+        "只检索当前图文库允许的来源；上游第三方案例仍须按其权利声明处理。"
+      ],
+      "examples": [
+        "为咖啡活动海报从现有图文库找留白构图，保留用户的文案和 Logo。",
+        "用已选风格辅助六张产品轮播，不改变数量、产品包装或指定模型。"
+      ],
+      "sources": [{
+        "title": "awesome-gpt-image-2 style-library Skill (073d105d4dbb3f3afcd2e7cd194cee3a557b0999)",
+        "url": "https://github.com/freestylefly/awesome-gpt-image-2/blob/073d105d4dbb3f3afcd2e7cd194cee3a557b0999/agents/skills/gpt-image-2-style-library/SKILL.md",
+        "license": "MIT (workflow only; third-party cases excluded)",
+        "relation": "adapted-from"
+      }]
+    }
+  }
+}

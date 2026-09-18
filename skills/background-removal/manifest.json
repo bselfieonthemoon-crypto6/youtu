@@ -1,0 +1,65 @@
+{
+  "slug": "background-removal",
+  "name": "背景去除与透明素材",
+  "description": "将已有图片编辑为透明背景 PNG，或生成透明素材；区分图片透明处理与画板透明导出。",
+  "version": "2.2.0",
+  "category": "design",
+  "iconName": "scissors",
+  "license": null,
+  "metadata": {
+    "bundle": "loomic-design-skills-v2",
+    "loomic": {
+      "schemaVersion": 1,
+      "execution": "image",
+      "intents": [
+        "background-removal",
+        "cutout",
+        "transparent-background"
+      ],
+      "outputKinds": [
+        "transparent-png"
+      ],
+      "requiredTools": [
+        "edit_image"
+      ],
+      "optionalTools": [
+        "generate_image",
+        "inspect_design",
+        "get_design_objects",
+        "update_design_brief",
+        "verify_design_result",
+        "get_brand_kit"
+      ],
+      "models": [
+        {
+          "role": "image",
+          "required": true,
+          "preferredIds": []
+        }
+      ],
+      "limitations": [
+        "技能不增加运行时工具、模型、权限或预算；用户局部修改不扩展为重设计。",
+        "本包为 Loomic 原创流程，研究来源不是效果 benchmark；未运行上游脚本或自动下载依赖。",
+        "已有图片使用 edit_image.operation=generate、sourceUsage=edit、sourceAssetIds、background=transparent 与 outputFormat=png；新透明素材使用 generate_image，并明确同样的透明背景与 PNG 输出。",
+        "图片编辑可能改变主体细节，不保证产品标签、文字、纹理逐像素保真；透明输出检查不等于视觉质量验收。",
+        "透明背景不是局部主体选择或交互蒙版；不能用提示词声称实现了未提供的精细抠图能力。"
+      ],
+      "examples": [
+        "只去掉这张产品照片的背景，产品和标签不能变。"
+      ],
+      "sources": [
+        {
+          "title": "OpenAI Image generation：透明背景与图像编辑",
+          "url": "https://developers.openai.com/api/docs/guides/image-generation",
+          "relation": "inspired-by"
+        }
+      ],
+      "composition": {
+        "role": "domain",
+        "stages": [
+          "design"
+        ]
+      }
+    }
+  }
+}

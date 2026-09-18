@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { skillReadinessSchema } from "./skill-runtime-contracts.js";
 
 // === Enums ===
 
@@ -35,6 +36,7 @@ export const skillListItemSchema = z.object({
   installed: z.boolean().optional(),
   enabled: z.boolean().optional(),
   installedAt: z.string().datetime({ offset: true }).optional(),
+  readiness: skillReadinessSchema.optional(),
 });
 export type SkillListItem = z.infer<typeof skillListItemSchema>;
 
@@ -62,39 +64,95 @@ export type SkillDetail = z.infer<typeof skillDetailSchema>;
 
 // === Request Schemas ===
 
+export const SKILL_PACKAGE_LIMITS = {
+  maxFiles: 64,
+  maxFileBytes: 2 * 1024 * 1024,
+  maxContentBytes: 256 * 1024,
+  maxPackageBytes: 8 * 1024 * 1024,
+} as const;
+
+/**
+ * Image reference files are stored as base64 `content` with an `image/*`
+ * mime type. They are delivered for preview/reference; the agent's text-only
+ * skill snapshot must skip them rather than feed raw base64 to a model.
+ */
+export function isImageSkillMimeType(mimeType: string): boolean {
+  return /^image\/(?:png|jpeg|webp|gif)$/i.test(mimeType);
+}
+
+/** Canonical, portable relative paths only; never normalize away traversal. */
+export function isSafeSkillFilePath(value: string): boolean {
+  if (value.length > 500 || !/^(scripts|references|assets)\//.test(value)) return false;
+  if (/[\\:%?#\x00-\x1f\x7f]/.test(value)) return false;
+  return value.split("/").every((part) => part.length > 0 && part !== "." && part !== ".."
+    && !/[. ]$/.test(part) && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part));
+}
+
+const textBytes = (value: string) => {
+  let bytes = 0;
+  for (const character of value) {
+    const point = character.codePointAt(0)!;
+    bytes += point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
+  }
+  return bytes;
+};
+const boundedText = (maxBytes: number) => z.string().refine(
+  (value) => !value.includes("\0") && textBytes(value) <= maxBytes,
+  `Text must not contain NUL and must fit within ${maxBytes} UTF-8 bytes.`,
+);
+const skillBodySchema = boundedText(SKILL_PACKAGE_LIMITS.maxContentBytes)
+  .refine((value) => value.trim().length > 0, "Skill instructions must not be empty.");
+export const skillPackageFileSchema = z.object({
+  filePath: z.string().refine(isSafeSkillFilePath, "Use a safe relative path under scripts/, references/, or assets/."),
+  content: boundedText(SKILL_PACKAGE_LIMITS.maxFileBytes),
+  mimeType: z.string().min(1).max(100).regex(/^[a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+$/).optional(),
+}).strict();
+const packageFilesSchema = z.array(skillPackageFileSchema).max(SKILL_PACKAGE_LIMITS.maxFiles);
+function validatePackageBudget(value: { skillContent?: string | undefined; files?: Array<{ filePath: string; content: string }> | undefined }, ctx: z.RefinementCtx) {
+  const paths = new Set<string>();
+  let bytes = textBytes(value.skillContent ?? "");
+  for (const [index, file] of (value.files ?? []).entries()) {
+    const key = file.filePath.toLowerCase();
+    if (paths.has(key)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["files", index, "filePath"], message: "Duplicate file path (case-insensitive)." });
+    paths.add(key);
+    bytes += textBytes(file.content);
+  }
+  if (bytes > SKILL_PACKAGE_LIMITS.maxPackageBytes) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["files"], message: "Skill package exceeds the 8 MiB total text budget." });
+}
+
 export const skillCreateRequestSchema = z.object({
   name: z.string().trim().min(1).max(200),
   description: z.string().trim().min(1).max(2000),
   category: skillCategorySchema,
-  skillContent: z.string().min(1),
+  skillContent: skillBodySchema,
   iconName: z.string().max(100).optional(),
-  files: z.array(z.object({
-    filePath: z.string().min(1).max(500),
-    content: z.string(),
-    mimeType: z.string().max(100).optional(),
-  })).optional(),
-});
+  files: packageFilesSchema.optional(),
+}).strict().superRefine(validatePackageBudget);
 export type SkillCreateRequest = z.infer<typeof skillCreateRequestSchema>;
 
 export const skillUpdateRequestSchema = z.object({
   name: z.string().trim().min(1).max(200).optional(),
   description: z.string().trim().min(1).max(2000).optional(),
   category: skillCategorySchema.optional(),
-  skillContent: z.string().min(1).optional(),
+  skillContent: skillBodySchema.optional(),
   iconName: z.string().max(100).optional(),
-});
+  // Omitted: preserve all files. Present: replace the complete file set.
+  files: packageFilesSchema.optional(),
+}).strict().refine((value) => Object.keys(value).length > 0, "No fields to update.")
+  .superRefine(validatePackageBudget);
 export type SkillUpdateRequest = z.infer<typeof skillUpdateRequestSchema>;
 
 export const workspaceSkillToggleRequestSchema = z.object({
   enabled: z.boolean(),
-});
+}).strict();
 export type WorkspaceSkillToggleRequest = z.infer<
   typeof workspaceSkillToggleRequestSchema
 >;
 
 export const skillImportRequestSchema = z.object({
-  url: z.string().url().min(1),
-});
+  url: z.string().url().max(2000).regex(/^https:\/\/[^/?#@]+(?:[/?#]|$)/i, "Import requires an HTTPS URL without credentials."),
+}).strict();
+export const workspaceSkillInstallRequestSchema = z.object({ skillId: z.string().uuid() }).strict();
 export type SkillImportRequest = z.infer<typeof skillImportRequestSchema>;
 
 // === Response Schemas ===
@@ -151,6 +209,6 @@ export const marketplaceDetailSchema = marketplaceSkillSchema.extend({
 export type MarketplaceDetail = z.infer<typeof marketplaceDetailSchema>;
 
 export const marketplaceInstallRequestSchema = z.object({
-  packageName: z.string().min(1),
-});
+  packageName: z.string().min(1).max(214).regex(/^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/),
+}).strict();
 export type MarketplaceInstallRequest = z.infer<typeof marketplaceInstallRequestSchema>;

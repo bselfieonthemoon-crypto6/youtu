@@ -1,6 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
+import { Check, Copy, Pencil } from "lucide-react";
 import React, {
   useCallback,
   useEffect,
@@ -55,7 +56,43 @@ type ChatMessageProps = {
     toolExecutionId: string,
   ) => Promise<{ status: string; message?: string }>;
   onOpenDesign?: (designId: string) => void;
+  onEditSend?: (text: string) => Promise<void>;
+  editDisabled?: boolean;
 };
+
+/**
+ * Read-only preparation tools remain in the persisted transcript for audit
+ * and model continuity, but are implementation details in the customer chat.
+ */
+const INTERNAL_PREPARATION_TOOLS = new Set([
+  "discover_tools",
+  "list_skills",
+  "use_skill",
+  "compose_skills",
+  "search_prompt_library",
+  "get_prompt_library_entry",
+  "ask_clarification",
+]);
+
+export function isUserVisibleToolBlock(block: ToolBlock): boolean {
+  return !INTERNAL_PREPARATION_TOOLS.has(block.toolName);
+}
+
+const INTERNAL_PREPARATION_NARRATION = [
+  /\b(?:i(?:'ll|\s+will|\s+need\s+to|\s+am\s+going\s+to)|let\s+me)\b[\s\S]{0,180}\b(?:load|inspect|check|see|list|read|pick)\b[\s\S]{0,140}\b(?:skill|guide|catalog|tool|prompt)/i,
+  /(?:我(?:先|需要|会|将)|先).{0,70}(?:查看|看全|读取|加载|搜索|检查|选择).{0,80}(?:技能|指南|目录|工具|提示词)/s,
+];
+
+export function hideInternalPreparationNarration(text: string): string {
+  return text
+    .split(/(\n\s*\n)/)
+    .filter((part) =>
+      /^\n\s*\n$/.test(part) ||
+      !INTERNAL_PREPARATION_NARRATION.some((pattern) => pattern.test(part)),
+    )
+    .join("")
+    .replace(/^(?:\s*\n)+|(?:\s*\n)+$/g, "");
+}
 
 /**
  * Top-level chat message component.
@@ -78,11 +115,19 @@ export const ChatMessage = React.memo(
     onRestoreGeneration,
     onRetryRead,
     onOpenDesign,
+    onEditSend,
+    editDisabled,
   }: ChatMessageProps) {
     const isUser = role === "user";
 
     if (isUser) {
-      return <UserMessage contentBlocks={contentBlocks} />;
+      return (
+        <UserMessage
+          contentBlocks={contentBlocks}
+          {...(onEditSend ? { onEditSend } : {})}
+          {...(editDisabled !== undefined ? { editDisabled } : {})}
+        />
+      );
     }
 
     return (
@@ -108,7 +153,9 @@ export const ChatMessage = React.memo(
       prev.onWaitGeneration === next.onWaitGeneration &&
       prev.onRestoreGeneration === next.onRestoreGeneration &&
       prev.onRetryRead === next.onRetryRead &&
-      prev.onOpenDesign === next.onOpenDesign
+      prev.onOpenDesign === next.onOpenDesign &&
+      prev.onEditSend === next.onEditSend &&
+      prev.editDisabled === next.editDisabled
     );
   },
 );
@@ -119,8 +166,12 @@ export const ChatMessage = React.memo(
 
 const UserMessage = React.memo(function UserMessage({
   contentBlocks,
+  onEditSend,
+  editDisabled = false,
 }: {
   contentBlocks: ContentBlock[];
+  onEditSend?: (text: string) => Promise<void>;
+  editDisabled?: boolean;
 }) {
   // Categorize blocks once per render
   const { text, imageBlocks, mentionBlocks } = useMemo(() => {
@@ -145,63 +196,90 @@ const UserMessage = React.memo(function UserMessage({
     };
   }, [contentBlocks]);
 
-  return (
-    <motion.div
-      initial={{ opacity: 0, x: 12 }}
-      animate={{ opacity: 1, x: 0 }}
-      transition={{ duration: 0.3, ease: "easeOut" }}
-      className="flex w-full flex-col items-end gap-2 pl-10"
-    >
-      {text && (
-        <div className="inline-block rounded-xl bg-muted px-3 py-2.5 whitespace-pre-wrap break-words text-sm font-medium leading-6 text-foreground">
-          <span className="cursor-text select-text [word-break:break-word]">
-            {text}
-          </span>
-          {mentionBlocks.length > 0 && (
-            <span className="inline">
-              {mentionBlocks.map((block, idx) => (
-                <MentionPill
-                  key={idx}
-                  label={(block as { label: string }).label}
-                  kind={
-                    (
-                      block as {
-                        mentionType: "image-model" | "brand-kit-asset";
-                      }
-                    ).mentionType
-                  }
-                />
-              ))}
-            </span>
-          )}
-          {imageBlocks.length > 0 && (
-            <span className="inline">
-              {imageBlocks.map((block, idx) => (
-                <ImagePill
-                  key={idx}
-                  src={(block as { url: string }).url}
-                  name={(block as { name?: string }).name ?? `image-${idx + 1}`}
-                />
-              ))}
-            </span>
-          )}
-        </div>
-      )}
-      {!text && (imageBlocks.length > 0 || mentionBlocks.length > 0) && (
-        <div className="inline-block rounded-xl bg-muted px-3 py-2.5">
+  const [isEditing, setIsEditing] = useState(false);
+  const [draft, setDraft] = useState(text);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [copyState, setCopyState] = useState<"idle" | "success" | "error">(
+    "idle",
+  );
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const submitGuardRef = useRef(false);
+
+  useEffect(() => {
+    if (!isEditing) return;
+    textareaRef.current?.focus({ preventScroll: true });
+    const textarea = textareaRef.current;
+    if (textarea) {
+      textarea.style.height = "auto";
+      textarea.style.height = `${Math.min(textarea.scrollHeight, 180)}px`;
+    }
+  }, [isEditing]);
+
+  useEffect(() => {
+    if (!isEditing) return;
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 180)}px`;
+  }, [draft, isEditing]);
+
+  const cancelEdit = useCallback(() => {
+    if (isSubmitting) return;
+    setDraft(text);
+    setEditError(null);
+    setIsEditing(false);
+  }, [isSubmitting, text]);
+
+  const submitEdit = useCallback(async () => {
+    const value = draft.trim();
+    if (!onEditSend || !value || editDisabled || submitGuardRef.current || isSubmitting) return;
+    submitGuardRef.current = true;
+    setIsSubmitting(true);
+    setEditError(null);
+    try {
+      await onEditSend(draft);
+      setIsEditing(false);
+    } catch (error) {
+      setEditError(
+        error instanceof Error && error.message
+          ? error.message
+          : "发送失败，请重试",
+      );
+    } finally {
+      submitGuardRef.current = false;
+      setIsSubmitting(false);
+    }
+  }, [draft, editDisabled, isSubmitting, onEditSend]);
+
+  const copyMessage = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopyState("success");
+    } catch {
+      setCopyState("error");
+    }
+    window.setTimeout(() => setCopyState("idle"), 1800);
+  }, [text]);
+
+  const renderAttachments = () => (
+    <>
+      {mentionBlocks.length > 0 && (
+        <span className="inline">
           {mentionBlocks.map((block, idx) => (
             <MentionPill
-              key={`mention-${idx}`}
+              key={idx}
               label={(block as { label: string }).label}
               kind={
-                (
-                  block as {
-                    mentionType: "image-model" | "brand-kit-asset";
-                  }
-                ).mentionType
+                (block as { mentionType: "image-model" | "brand-kit-asset" })
+                  .mentionType
               }
             />
           ))}
+        </span>
+      )}
+      {imageBlocks.length > 0 && (
+        <span className="inline">
           {imageBlocks.map((block, idx) => (
             <ImagePill
               key={idx}
@@ -209,8 +287,79 @@ const UserMessage = React.memo(function UserMessage({
               name={(block as { name?: string }).name ?? `image-${idx + 1}`}
             />
           ))}
-        </div>
+        </span>
       )}
+    </>
+  );
+
+  const bubble = isEditing ? (
+    <div className="w-full max-w-[min(100%,36rem)] rounded-xl bg-muted px-3 py-2.5">
+      <textarea
+        ref={textareaRef}
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={(event) => {
+          if (
+            event.key === "Enter" &&
+            (event.ctrlKey || event.metaKey) &&
+            !event.nativeEvent.isComposing
+          ) {
+            event.preventDefault();
+            void submitEdit();
+          }
+        }}
+        disabled={isSubmitting}
+        aria-label="编辑消息"
+        className="block max-h-[180px] min-h-[48px] w-full resize-none overflow-y-auto bg-transparent text-sm font-medium leading-6 text-foreground outline-none"
+      />
+      {renderAttachments()}
+      {editError && (
+        <p role="alert" className="mt-1 text-xs text-destructive">
+          {editError}
+        </p>
+      )}
+      <div className="mt-2 flex justify-end gap-2">
+        <button type="button" onClick={cancelEdit} disabled={isSubmitting} className="rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-background/60" aria-label="取消编辑" title="取消">
+          取消
+        </button>
+        <button type="button" onClick={() => void submitEdit()} disabled={editDisabled || isSubmitting || !draft.trim()} className="rounded-md bg-primary px-2.5 py-1 text-xs text-primary-foreground disabled:opacity-50" aria-label="发送编辑后的消息" title="发送">
+          {isSubmitting ? "发送中…" : "发送"}
+        </button>
+      </div>
+    </div>
+  ) : text ? (
+    <div className="inline-block max-w-full rounded-xl bg-muted px-3 py-2.5 whitespace-pre-wrap break-words text-sm font-medium leading-6 text-foreground">
+      <span className="cursor-text select-text [word-break:break-word]">{text}</span>
+      {renderAttachments()}
+    </div>
+  ) : (
+    <div className="inline-block max-w-full rounded-xl bg-muted px-3 py-2.5">
+      {renderAttachments()}
+    </div>
+  );
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, x: 12 }}
+      animate={{ opacity: 1, x: 0 }}
+      transition={{ duration: 0.3, ease: "easeOut" }}
+      className="flex w-full flex-col items-end gap-2 pl-10"
+    >
+      {bubble}
+      <div className="flex items-center gap-1 text-muted-foreground">
+        <button type="button" onClick={() => void copyMessage()} className="rounded-md p-1 hover:bg-muted" aria-label={copyState === "success" ? "已复制" : "复制消息"} title="复制">
+          {copyState === "success" ? <Check className="h-3.5 w-3.5" aria-hidden="true" /> : <Copy className="h-3.5 w-3.5" aria-hidden="true" />}
+        </button>
+        {onEditSend && (
+          <button type="button" onClick={() => { setDraft(text); setEditError(null); setIsEditing(true); }} disabled={editDisabled || isEditing} className="rounded-md p-1 hover:bg-muted disabled:opacity-50" aria-label="编辑消息" title="编辑">
+            <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+        )}
+        <span className="sr-only" aria-live="polite">
+          {copyState === "success" ? "消息已复制" : copyState === "error" ? "复制失败" : ""}
+        </span>
+        {copyState === "error" && <span className="text-xs text-destructive" role="alert">复制失败，请选中文字复制</span>}
+      </div>
     </motion.div>
   );
 });
@@ -247,6 +396,19 @@ const AssistantMessage = React.memo(function AssistantMessage({
   const [highlightedToolCallId, setHighlightedToolCallId] = useState<
     string | null
   >(null);
+  const internalToolBlocks = useMemo(
+    () =>
+      contentBlocks.filter(
+        (block): block is ToolBlock =>
+          block.type === "tool" && !isUserVisibleToolBlock(block),
+      ),
+    [contentBlocks],
+  );
+  const hasInternalPreparation = internalToolBlocks.length > 0;
+  const internalPreparationRunning = internalToolBlocks.some(
+    (block) => block.status === "running",
+  );
+  const hasThinkingBlock = contentBlocks.some((block) => block.type === "thinking");
 
   useEffect(
     () => () => {
@@ -259,6 +421,7 @@ const AssistantMessage = React.memo(function AssistantMessage({
     const result = new Map<string, Map<string, ToolBlock[]>>();
     for (const block of contentBlocks) {
       if (block.type !== "tool") continue;
+      if (!isUserVisibleToolBlock(block)) continue;
       const linked = block as ToolBlock & {
         planId?: string;
         planStepId?: string;
@@ -292,25 +455,40 @@ const AssistantMessage = React.memo(function AssistantMessage({
   // Find the last text block index for streaming cursor placement
   const lastTextIdx = useMemo(() => {
     for (let i = contentBlocks.length - 1; i >= 0; i--) {
-      if (contentBlocks[i]!.type === "text") return i;
+      const block = contentBlocks[i]!;
+      if (
+        block.type === "text" &&
+        (!hasInternalPreparation || hideInternalPreparationNarration(block.text).trim())
+      ) return i;
     }
     return -1;
-  }, [contentBlocks]);
+  }, [contentBlocks, hasInternalPreparation]);
 
   // Show thinking indicator when streaming but no content has arrived yet
   const hasContent = useMemo(
     () =>
       contentBlocks.some(
         (b) =>
-          (b.type === "text" && b.text.length > 0) ||
+          (b.type === "text" &&
+            (hasInternalPreparation
+              ? hideInternalPreparationNarration(b.text).length > 0
+              : b.text.length > 0)) ||
           b.type === "plan" ||
-          b.type === "tool" ||
-          b.type === "thinking",
+          (b.type === "tool" && isUserVisibleToolBlock(b)) ||
+          b.type === "thinking" ||
+          (b.type === "tool" && !isUserVisibleToolBlock(b)),
       ),
-    [contentBlocks],
+    [contentBlocks, hasInternalPreparation],
   );
 
   const showThinking = isStreaming && !hasContent;
+  // Once text or tool output is visible, keep a quiet status affordance in
+  // place while the run is still active. A trailing thinking block already
+  // renders its own live indicator, so do not duplicate it here.
+  const showProcessing =
+    isStreaming &&
+    hasContent &&
+    contentBlocks.at(-1)?.type !== "thinking";
 
   return (
     <motion.div
@@ -334,6 +512,16 @@ const AssistantMessage = React.memo(function AssistantMessage({
             className="inline-block h-1 w-1 rounded-full bg-muted-foreground animate-bounce-dot"
             style={{ animationDelay: "300ms" }}
           />
+        </div>
+      )}
+      {hasInternalPreparation && !hasThinkingBlock && (
+        <div
+          role={internalPreparationRunning ? "status" : undefined}
+          aria-live={internalPreparationRunning ? "polite" : undefined}
+          className="flex items-center gap-2 text-xs text-muted-foreground/70"
+        >
+          <span aria-hidden="true">{internalPreparationRunning ? "◌" : "✓"}</span>
+          <span>{internalPreparationRunning ? "正在分析中" : "分析完成"}</span>
         </div>
       )}
       {contentBlocks.map((block, idx) => {
@@ -363,17 +551,22 @@ const AssistantMessage = React.memo(function AssistantMessage({
         }
 
         if (block.type === "text") {
+          const visibleText = hasInternalPreparation
+            ? hideInternalPreparationNarration(block.text)
+            : block.text;
+          if (!visibleText.trim()) return null;
           const showCursor = isStreaming && idx === lastTextIdx;
           return (
             <MarkdownRenderer
               key={idx}
-              text={block.text}
+              text={visibleText}
               showCursor={showCursor}
             />
           );
         }
 
         if (block.type === "tool") {
+          if (!isUserVisibleToolBlock(block)) return null;
           return (
             <div
               key={block.toolCallId}
@@ -402,6 +595,30 @@ const AssistantMessage = React.memo(function AssistantMessage({
         // ImageBlock -- skip in assistant messages (user-side only)
         return null;
       })}
+      {showProcessing && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="flex items-center gap-1 text-xs text-muted-foreground/70"
+        >
+          <span>处理中</span>
+          <span
+            aria-hidden="true"
+            className="inline-block h-1 w-1 rounded-full bg-muted-foreground/70 animate-bounce-dot"
+            style={{ animationDelay: "0ms" }}
+          />
+          <span
+            aria-hidden="true"
+            className="inline-block h-1 w-1 rounded-full bg-muted-foreground/70 animate-bounce-dot"
+            style={{ animationDelay: "150ms" }}
+          />
+          <span
+            aria-hidden="true"
+            className="inline-block h-1 w-1 rounded-full bg-muted-foreground/70 animate-bounce-dot"
+            style={{ animationDelay: "300ms" }}
+          />
+        </div>
+      )}
     </motion.div>
   );
 });

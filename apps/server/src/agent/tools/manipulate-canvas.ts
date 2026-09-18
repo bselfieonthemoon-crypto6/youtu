@@ -1,5 +1,5 @@
-import { tool } from "langchain";
 import { z } from "zod";
+import { createAgentTool, runContextOf } from "./tool-run-context.js";
 import type { CanvasContent } from "@loomic/shared";
 import { mergeCanvasContent } from "../../features/canvas/canvas-content-merge.js";
 import {
@@ -14,8 +14,8 @@ import {
   type FrozenCanvasOperation,
 } from "../../features/agent-actions/destructive-confirmation-service.js";
 import {
-  CanvasElement,
-  HandlerResult,
+  type CanvasElement,
+  type HandlerResult,
   generateId,
   measureTextWidth,
   coerceColor,
@@ -105,17 +105,90 @@ const operationSchema = z.object({
     .optional()
     .describe("Alignment direction (align)"),
   direction: z.enum(["horizontal", "vertical"]).optional().describe("Distribution direction (distribute)"),
+}).superRefine((value, context) => {
+  // Fields are flat/optional for provider compatibility, so require the exact
+  // subset each action needs. Without this an omitted x/width/text is written
+  // as `undefined` and corrupts the persisted element.
+  const need = (field: keyof typeof value, label: string) => {
+    if (value[field] === undefined || value[field] === null)
+      context.addIssue({ code: "custom", message: `${value.action} requires ${label}.` });
+  };
+  switch (value.action) {
+    case "move":
+      need("element_id", "element_id"); need("x", "x"); need("y", "y"); break;
+    case "resize":
+      need("element_id", "element_id"); need("width", "width"); need("height", "height"); break;
+    case "delete":
+      need("element_id", "element_id"); break;
+    case "update_style": {
+      need("element_id", "element_id");
+      const hasStyle = (["strokeColor", "backgroundColor", "opacity", "fontSize", "strokeWidth"] as const)
+        .some(key => value[key] !== undefined);
+      if (!hasStyle) context.addIssue({ code: "custom", message: "update_style requires at least one style field." });
+      break;
+    }
+    case "update_text":
+      need("element_id", "element_id"); need("text", "text"); break;
+    case "add_text":
+      need("text", "text"); need("x", "x"); need("y", "y"); break;
+    case "add_shape":
+      need("shape", "shape"); need("x", "x"); need("y", "y"); break;
+    case "add_line": {
+      const hasPoints = Array.isArray(value.points) && value.points.length > 0;
+      const hasBinding = value.start_element_id !== undefined || value.end_element_id !== undefined;
+      if (!hasPoints && !hasBinding)
+        context.addIssue({ code: "custom", message: "add_line requires points or element bindings." });
+      break;
+    }
+    case "reorder":
+      need("element_id", "element_id"); need("position", "position"); break;
+    case "align":
+      need("element_ids", "element_ids"); need("alignment", "alignment"); break;
+    case "distribute":
+      need("element_ids", "element_ids"); need("direction", "direction"); break;
+  }
 });
 
 const manipulateCanvasSchema = z.object({
   operations: z
     .array(operationSchema)
     .min(1)
-    .describe("List of operations to apply"),
+    .max(100)
+    .describe("List of operations to apply (at most 100)"),
 });
 
 // Flat operation type — all fields optional except `action`.
 type Operation = z.infer<typeof operationSchema>;
+
+/** Native multi-layer boards are manually edited user content. The Agent can
+ * observe them through design read tools, but must not alter their canvas node
+ * either directly or by creating/changing bindings to it. */
+function isNativeDesignBoardNode(element: CanvasElement): boolean {
+  const customData = element.customData;
+  return !!customData && typeof customData === "object" && !Array.isArray(customData)
+    && (customData as Record<string, unknown>).kind === "loomic-design"
+    && typeof (customData as Record<string, unknown>).designId === "string";
+}
+
+function nativeDesignBoardSnapshot(elements: readonly CanvasElement[]): string {
+  // Include the index and complete node: reordering, changing a boundElements
+  // list, tombstoning, or any future handler mutation is a protected change.
+  return JSON.stringify(elements.flatMap((element, index) =>
+    isNativeDesignBoardNode(element) ? [{ index, element }] : []));
+}
+
+function targetsNativeDesignBoard(
+  elements: readonly CanvasElement[],
+  operations: readonly Operation[],
+): boolean {
+  const protectedIds = new Set(elements.filter(isNativeDesignBoardNode).map(element => element.id));
+  return operations.some(operation => [
+    operation.element_id,
+    ...(operation.element_ids ?? []),
+    operation.start_element_id,
+    operation.end_element_id,
+  ].some(id => typeof id === "string" && protectedIds.has(id)));
+}
 
 const MAX_CANVAS_WRITE_ATTEMPTS = 3;
 
@@ -774,8 +847,10 @@ type ManipulationResult = {
     | "canvas_not_found"
     | "write_failed"
     | "write_conflict"
+    | "native_design_board_protected"
     | "confirmation_required"
-    | "confirmation_unavailable";
+    | "confirmation_unavailable"
+    | "delete_intent_not_explicit";
   message?: string;
   confirmation?: DestructiveProposal;
 };
@@ -821,6 +896,16 @@ export async function manipulateCanvasWithCas(
       files: {},
     }) as CanvasContent;
 
+    const persistedElements = (content.elements as CanvasElement[] | undefined) ?? [];
+    // Reject before creating a destructive-confirmation proposal as well: a
+    // later confirmation must never authorize Agent edits to a native board.
+    if (targetsNativeDesignBoard(persistedElements, operations)) {
+      return {
+        error: "native_design_board_protected",
+        message: "原生设计画板仅供读取参考，Agent 不能修改、移动、删除、排序或绑定其画布节点。请由用户在手动编辑器中操作。",
+      };
+    }
+
     if (
       options?.destructiveDeletionAuthorized &&
       options.expectedDestructiveTargets
@@ -837,6 +922,16 @@ export async function manipulateCanvasWithCas(
       operations.some((operation) => operation.action === "delete") &&
       !options?.destructiveDeletionAuthorized
     ) {
+      // The model's plan never authorizes deletion: the raw user message for
+      // this run must itself request removal. Callers that pass no prompt keep
+      // the confirmation-only behavior.
+      if (typeof _userPrompt === "string" && _userPrompt.trim().length > 0
+        && !hasExplicitCanvasDeleteIntent(_userPrompt)) {
+        return {
+          error: "delete_intent_not_explicit",
+          message: "本轮用户原话未明确要求删除元素，未删除。请先与用户确认要删除的对象。",
+        };
+      }
       if (!options?.confirmationService || !options.userId) {
         return {
           error: "confirmation_unavailable",
@@ -882,9 +977,8 @@ export async function manipulateCanvasWithCas(
       };
     }
     // Operation handlers mutate elements, so clone the persisted snapshot.
-    const elements = structuredClone(
-      (content.elements as CanvasElement[] | undefined) ?? [],
-    );
+    const elements = structuredClone(persistedElements);
+    const protectedBoardSnapshot = nativeDesignBoardSnapshot(elements);
     const descriptions: string[] = [];
     const errors: string[] = [];
     const createdIds: Record<string, string> = {};
@@ -908,6 +1002,15 @@ export async function manipulateCanvasWithCas(
     }
 
     validateBindings(elements);
+    // This catches changes which do not present as an explicit target (for
+    // example a binding side effect), and protects complete board identity and
+    // position/order rather than just its design ID.
+    if (nativeDesignBoardSnapshot(elements) !== protectedBoardSnapshot) {
+      return {
+        error: "native_design_board_protected",
+        message: "原生设计画板仅供读取参考，Agent 不能修改、移动、删除、排序或绑定其画布节点。请由用户在手动编辑器中操作。",
+      };
+    }
     const incoming = { ...content, elements } as CanvasContent;
     const updatedContent = mergeCanvasContent(content, incoming);
     const { data: updated, error: writeError } = await client
@@ -961,12 +1064,17 @@ export function createManipulateCanvasTool(deps: {
   createUserClient: (accessToken: string) => any;
   destructiveConfirmationService?: DestructiveConfirmationService;
 }) {
-  return tool(
-    async (input, config) => {
-      const canvasId = (config as any)?.configurable?.canvas_id;
-      const accessToken = (config as any)?.configurable?.access_token;
-      const userPrompt = (config as any)?.configurable?.user_prompt;
-      const userId = (config as any)?.configurable?.user_id;
+  return createAgentTool({
+    id: "manipulate_canvas",
+    description:
+      "TARGET GROUNDING REQUIRED: knowing element IDs is not permission to change them. Resolve each target from the user's requested scope, explicit selection or uniquely matching observed object. If a singular reference has multiple equally plausible matches, do NOT send an operation for every candidate or guess one: inspect if needed, then ask which object. Batch updates require an actual plural/all-objects request or an explicit multi-selection, not ambiguity. Consultation/analysis does not authorize edits. Manipulate ordinary Excalidraw elements on the infinite canvas only. Native multi-layer design board nodes and their objects are read-only reference material: never target, move, delete, reorder, style, text-edit, align, distribute, resize, or bind them; users edit those manually. Supports: move, resize, delete (ONLY when the current raw user message explicitly requests deletion; generating or refining never permits cleanup of old results), update_style, update_text (modify text content of any canvas element or its label), add_text, add_shape (with optional label for centered text), add_line (with optional element binding for auto-connected arrows), align, distribute, reorder. Use inspect_canvas first when target observations are missing. Returns created canvas element IDs for subsequent binding.",
+    inputSchema: manipulateCanvasSchema,
+    execute: async (input, context) => {
+      const runContext = runContextOf(context);
+      const canvasId = runContext.canvas_id as string | undefined;
+      const accessToken = runContext.access_token as string | undefined;
+      const userPrompt = runContext.user_prompt;
+      const userId = runContext.user_id;
 
       if (!canvasId || !accessToken) {
         return JSON.stringify({
@@ -992,11 +1100,5 @@ export function createManipulateCanvasTool(deps: {
         ),
       );
     },
-    {
-      name: "manipulate_canvas",
-      description:
-        "Manipulate Excalidraw elements on the infinite canvas only. NEVER use this tool for a native design document, a design_id, or objects returned by inspect_design/get_design_objects; use manipulate_design for those. Supports: move, resize, delete (ONLY when the current raw user message explicitly requests deletion; generating or refining never permits cleanup of old results), update_style, update_text (modify text content of any canvas element or its label), add_text, add_shape (with optional label for centered text), add_line (with optional element binding for auto-connected arrows), align, distribute, reorder. Use inspect_canvas first to understand the infinite-canvas layout. Returns created canvas element IDs for subsequent binding.",
-      schema: manipulateCanvasSchema,
-    },
-  );
+  });
 }

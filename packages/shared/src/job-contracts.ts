@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { imageForegroundPolicySchema } from "./image-foreground-policy.js";
+import { nativeImageResolutionValues } from "./native-image-size.js";
 
 import {
   type CanvasJobTarget,
@@ -35,7 +37,27 @@ export const imageOperationSchema = z.enum([
   "split_layers",
   "erase_transparent",
   "smart_erase",
+  "local_repaint",
+  "outpaint",
 ]);
+
+export const outpaintMarginsSchema = z
+  .object({
+    top: z.number().int().min(0).max(4_096),
+    right: z.number().int().min(0).max(4_096),
+    bottom: z.number().int().min(0).max(4_096),
+    left: z.number().int().min(0).max(4_096),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.top + value.right + value.bottom + value.left === 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "outpaint requires at least one positive margin",
+      });
+    }
+  });
+export type OutpaintMargins = z.infer<typeof outpaintMarginsSchema>;
 
 export const normalizedSelectionRegionSchema = z
   .object({
@@ -79,7 +101,9 @@ const uniqueStringsSchema = z
   });
 const uniqueInputImagesSchema = z
   .array(z.string())
-  .max(10)
+  // This is only a transport guard, not a provider capability claim. Known
+  // model-specific limits are checked after resolving the upstream model.
+  .max(32)
   .superRefine((values, context) => {
     const seen = new Set<string>();
     for (const [index, value] of values.entries()) {
@@ -97,14 +121,21 @@ const uniqueInputImagesSchema = z
 const imageGenerationShape = {
   prompt: z.string().min(1),
   operation: imageOperationSchema.optional(),
+  layer_backend: z.enum(["semantic"]).optional(),
+  layer_names: z.array(z.string().trim().min(1).max(80)).min(2).max(4).optional(),
+  repair_background: z.boolean().optional(),
+  output_format: z.enum(["png", "jpg", "webp"]).optional(),
+  background: z.enum(["transparent", "opaque", "auto"]).optional(),
   model: z.string().optional(),
   aspect_ratio: z.string().optional(),
   quality: z.enum(["standard", "hd", "ultra"]).optional(),
+  resolution: z.enum(nativeImageResolutionValues).optional(),
   output_width: z.number().int().min(16).max(3_840).optional(),
   output_height: z.number().int().min(16).max(3_840).optional(),
   input_images: uniqueInputImagesSchema.optional(),
   mask_image: z.string().optional(),
   selection_region: normalizedSelectionRegionSchema.optional(),
+  outpaint_margins: outpaintMarginsSchema.optional(),
 } as const;
 
 const requestContextShape = {
@@ -180,6 +211,103 @@ function validateLegacyRouting(
   }
 }
 
+function validateImageOperationInputs(
+  value: {
+    prompt: string;
+    operation?: z.infer<typeof imageOperationSchema> | undefined;
+    input_images?: string[] | undefined;
+    mask_image?: string | undefined;
+    outpaint_margins?: OutpaintMargins | undefined;
+    target?: { kind: string } | null | undefined;
+    canvas_id?: string | undefined;
+    layer_backend?: "semantic" | undefined;
+    layer_names?: string[] | undefined;
+    repair_background?: boolean | undefined;
+  },
+  context: z.RefinementCtx,
+) {
+  if (value.layer_backend === "semantic") {
+    if (value.operation !== "split_layers" || value.layer_names?.length === undefined || value.repair_background !== true ||
+      (value.input_images?.length !== 1 && value.target?.kind !== "design")) {
+      context.addIssue({ code: z.ZodIssueCode.custom,
+        message: "semantic layer splitting requires split_layers, one source image, 2-4 layer names and repaired background",
+        path: ["layer_backend"] });
+    }
+    if (value.layer_names && new Set(value.layer_names.map(name => name.trim().toLocaleLowerCase())).size !== value.layer_names.length) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "layer names must be distinct", path: ["layer_names"] });
+    }
+  } else if (value.layer_names !== undefined || value.repair_background !== undefined) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "layer_names and repair_background require semantic layer_backend", path: ["layer_backend"] });
+  }
+  if (value.operation === "outpaint") {
+    if (value.prompt.trim().length === 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "outpaint requires a non-empty prompt",
+        path: ["prompt"],
+      });
+    }
+    if (value.input_images?.length !== 1) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "outpaint requires exactly one input image",
+        path: ["input_images"],
+      });
+    }
+    if (value.mask_image !== undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "outpaint derives its mask and does not accept mask_image",
+        path: ["mask_image"],
+      });
+    }
+    if (!value.outpaint_margins) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "outpaint requires outpaint_margins",
+        path: ["outpaint_margins"],
+      });
+    }
+    if (value.target?.kind !== "canvas" && value.canvas_id === undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "outpaint requires a canvas target",
+        path: ["target"],
+      });
+    }
+    return;
+  }
+  if (value.outpaint_margins !== undefined) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "outpaint_margins is only valid for outpaint",
+      path: ["outpaint_margins"],
+    });
+  }
+  if (value.operation !== "local_repaint") return;
+  if (value.prompt.trim().length === 0) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "local repaint requires a non-empty prompt",
+      path: ["prompt"],
+    });
+  }
+  if (value.input_images?.length !== 1) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "local repaint requires exactly one input image",
+      path: ["input_images"],
+    });
+  }
+  if (!value.mask_image) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "local repaint requires a mask image",
+      path: ["mask_image"],
+    });
+  }
+}
+
 // Public entry schema. It accepts the old flat canvas routing or the modern
 // target, never both. API handlers must normalize it before enqueueing.
 export const createImageJobRequestSchema = z
@@ -190,17 +318,29 @@ export const createImageJobRequestSchema = z
     target: jobTargetSchema.nullable().optional(),
   })
   .strict()
-  .superRefine(validateLegacyRouting);
+  .superRefine((value, context) => {
+    validateLegacyRouting(value, context);
+    validateImageOperationInputs(value, context);
+  });
 export type CreateImageJobRequest = z.infer<typeof createImageJobRequestSchema>;
 
 // Canonical Worker input: routing is always one discriminated target or null
 // for a chat-only generation. It contains no legacy placement aliases.
+// Server attribution is deliberately excluded from the public request schema.
+export const imageGenerationInternalContextSchema = z.object({
+  origin_run_id: z.string().uuid().optional(),
+  source_element_id: z.string().min(1).max(200).optional(),
+  source_asset_id: z.string().uuid().optional(),
+}).strict();
 export const normalizedImageGenerationPayloadSchema = z
   .object({
     ...imageGenerationShape,
+    ...imageGenerationInternalContextSchema.shape,
+    foreground_policy: imageForegroundPolicySchema.optional(),
     target: jobTargetSchema.nullable(),
   })
-  .strict();
+  .strict()
+  .superRefine(validateImageOperationInputs);
 export const imageGenerationPayloadSchema =
   normalizedImageGenerationPayloadSchema;
 export type NormalizedImageGenerationPayload = z.infer<
@@ -243,14 +383,20 @@ export function normalizeImageGenerationPayload(
   const request = createImageJobRequestSchema.parse(input);
   return normalizedImageGenerationPayloadSchema.parse({
     prompt: request.prompt,
+    ...(request.output_format !== undefined ? { output_format: request.output_format } : {}),
+    ...(request.background !== undefined ? { background: request.background } : {}),
     ...(request.operation !== undefined
       ? { operation: request.operation }
       : {}),
+    ...(request.layer_backend !== undefined ? { layer_backend: request.layer_backend } : {}),
+    ...(request.layer_names !== undefined ? { layer_names: request.layer_names } : {}),
+    ...(request.repair_background !== undefined ? { repair_background: request.repair_background } : {}),
     ...(request.model !== undefined ? { model: request.model } : {}),
     ...(request.aspect_ratio !== undefined
       ? { aspect_ratio: request.aspect_ratio }
       : {}),
     ...(request.quality !== undefined ? { quality: request.quality } : {}),
+    ...(request.resolution !== undefined ? { resolution: request.resolution } : {}),
     ...(request.output_width !== undefined
       ? { output_width: request.output_width }
       : {}),
@@ -265,6 +411,9 @@ export function normalizeImageGenerationPayload(
       : {}),
     ...(request.selection_region !== undefined
       ? { selection_region: request.selection_region }
+      : {}),
+    ...(request.outpaint_margins !== undefined
+      ? { outpaint_margins: request.outpaint_margins }
       : {}),
     target:
       request.target !== undefined

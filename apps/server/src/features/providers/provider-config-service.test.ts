@@ -80,16 +80,18 @@ function adminForConfig(options: {
 }
 
 describe("provider config security", () => {
-  it("accepts only allowlisted HTTPS provider base URLs", () => {
+  it("accepts custom public HTTPS provider base URLs and rejects unsafe URL forms", () => {
     expect(normalizeBaseUrl("https://api.apiyi.com/v1/")).toBe(
       "https://api.apiyi.com/v1",
     );
+    expect(normalizeBaseUrl("https://api.openai.com/custom/v1/"))
+      .toBe("https://api.openai.com/custom/v1");
     for (const url of [
       "http://api.apiyi.com/v1",
       "https://127.0.0.1/v1",
-      "https://api.openai.com/v1",
+      "https://169.254.169.254/latest/meta-data",
+      "https://models.internal/v1",
       "https://user:pass@api.openai.com/v1",
-      "https://api.openai.com/internal",
       "https://api.openai.com/v1?target=metadata",
     ]) {
       expect(() => normalizeBaseUrl(url)).toThrow(ProviderConfigServiceError);
@@ -107,6 +109,35 @@ describe("provider config security", () => {
       statusCode: 403,
     });
     expect(getAdminClient).not.toHaveBeenCalled();
+  });
+
+  it("authorizes draft discovery before any configuration, Vault, or network access", async () => {
+    const getAdminClient = vi.fn();
+    const fetchFn = vi.fn() as unknown as typeof fetch;
+    const service = createProviderConfigService({
+      createUserClient: () => userClient("member"),
+      getAdminClient,
+      fetchFn,
+    });
+    await expect(service.discoverDraftModels(user, "workspace-1", {
+      baseUrl: "https://api.example.test/v1",
+      apiKey: "fresh-key-123",
+    })).rejects.toMatchObject({ code: "provider_forbidden", statusCode: 403 });
+    expect(getAdminClient).not.toHaveBeenCalled();
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it("requires a draft key when no persisted configuration is supplied", async () => {
+    const getAdminClient = vi.fn();
+    const fetchFn = vi.fn() as unknown as typeof fetch;
+    const service = createProviderConfigService({
+      createUserClient: () => userClient("owner"), getAdminClient, fetchFn,
+    });
+    await expect(service.discoverDraftModels(user, "workspace-1", {
+      baseUrl: "https://api.example.test/v1",
+    })).rejects.toMatchObject({ code: "provider_invalid_request", statusCode: 400 });
+    expect(getAdminClient).not.toHaveBeenCalled();
+    expect(fetchFn).not.toHaveBeenCalled();
   });
 
   it("returns safe list DTOs without Vault identifiers or API keys", async () => {
@@ -210,6 +241,7 @@ describe("provider config security", () => {
       createUserClient: () => userClient("owner"),
       getAdminClient: () => admin.client,
       fetchFn,
+      resolveProviderHost: async () => ["93.184.216.34"],
       now: () => "2026-09-01T01:00:00.000Z",
     });
     const result = await service.test(user, "workspace-1", "config-1");
@@ -220,6 +252,30 @@ describe("provider config security", () => {
       "Bearer sk-live-secret-7890",
     );
     expect(JSON.stringify(result)).not.toContain("secret");
+  });
+
+  it("reports redirects without following them or forwarding the provider key", async () => {
+    const fetchFn = vi.fn(async () => new Response(null, {
+      status: 302,
+      headers: { location: "https://169.254.169.254/latest/meta-data" },
+    })) as unknown as typeof fetch;
+    const admin = adminForConfig({
+      rpc: async (name) => ({
+        data: name === "loomic_provider_secret_read" ? "sk-live-secret-7890" : null,
+        error: null,
+      }),
+    });
+    const service = createProviderConfigService({
+      createUserClient: () => userClient("owner"),
+      getAdminClient: () => admin.client,
+      fetchFn,
+      resolveProviderHost: async () => ["93.184.216.34"],
+    });
+    await expect(service.test(user, "workspace-1", "config-1")).resolves.toMatchObject({
+      ok: false,
+      errorCode: "provider_redirect_not_allowed",
+    });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 
   it("discovers and classifies models from the persisted provider endpoint", async () => {
@@ -238,13 +294,121 @@ describe("provider config security", () => {
       createUserClient: () => userClient("owner"),
       getAdminClient: () => admin.client,
       fetchFn,
+      resolveProviderHost: async () => ["93.184.216.34"],
     });
     await expect(service.discoverModels(user, "workspace-1", "config-1")).resolves.toEqual([
       expect.objectContaining({ upstreamModelId: "chat-model", modality: "text", capabilities: ["text"] }),
       expect.objectContaining({ upstreamModelId: "gpt-image-2-all", modality: "image", capabilities: ["image_generation"] }),
       expect.objectContaining({ upstreamModelId: "veo-3.1", modality: "video", capabilities: ["video_generation"] }),
     ]);
-    expect(fetchFn).toHaveBeenCalledWith("https://api.apiyi.com/v1/models", expect.objectContaining({ redirect: "error" }));
+    expect(fetchFn).toHaveBeenCalledWith(expect.objectContaining({ href: "https://api.apiyi.com/v1/models" }), expect.objectContaining({ redirect: "manual" }));
+  });
+
+  it("uses a persisted key only when the normalized draft origin is unchanged and performs no writes", async () => {
+    const fetchFn = vi.fn(async () => new Response('{"data":[]}', {
+      status: 200, headers: { "content-type": "application/json" },
+    })) as unknown as typeof fetch;
+    const admin = adminForConfig({
+      rpc: async (name) => ({
+        data: name === "loomic_provider_secret_read" ? "stored-secret-7890" : null,
+        error: null,
+      }),
+    });
+    const service = createProviderConfigService({
+      createUserClient: () => userClient("owner"), getAdminClient: () => admin.client,
+      fetchFn, resolveProviderHost: async () => ["93.184.216.34"],
+    });
+    await expect(service.discoverDraftModels(user, "workspace-1", {
+      configId: "config-1", baseUrl: "https://API.APIYI.COM/v2/",
+    })).resolves.toEqual([]);
+    expect(admin.rpc).toHaveBeenCalledTimes(1);
+    expect(admin.rpc).toHaveBeenCalledWith("loomic_provider_secret_read", {
+      p_secret_id: "secret-internal-id",
+    });
+    expect((vi.mocked(fetchFn).mock.calls[0]?.[1]?.headers as Record<string, string>).Authorization)
+      .toBe("Bearer stored-secret-7890");
+    expect(admin.from.mock.calls.map(([table]) => table)).toEqual([
+      "workspace_provider_configs",
+    ]);
+  });
+
+  it("never forwards a stored key to a changed draft origin", async () => {
+    const fetchFn = vi.fn(async () => new Response('{"data":[]}', {
+      status: 200, headers: { "content-type": "application/json" },
+    })) as unknown as typeof fetch;
+    const admin = adminForConfig({
+      rpc: async (name) => ({
+        data: name === "loomic_provider_secret_read" ? "stored-secret-7890" : null,
+        error: null,
+      }),
+    });
+    const service = createProviderConfigService({
+      createUserClient: () => userClient("owner"), getAdminClient: () => admin.client,
+      fetchFn, resolveProviderHost: async () => ["93.184.216.34"],
+    });
+    await expect(service.discoverDraftModels(user, "workspace-1", {
+      configId: "config-1", baseUrl: "https://api.openai.com/v1",
+    })).rejects.toMatchObject({ code: "provider_invalid_request", statusCode: 400 });
+    expect(admin.rpc).not.toHaveBeenCalled();
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it("uses a fresh draft key without reading the persisted configuration or Vault", async () => {
+    const fetchFn = vi.fn(async () => new Response('{"data":[]}', {
+      status: 200, headers: { "content-type": "application/json" },
+    })) as unknown as typeof fetch;
+    const getAdminClient = vi.fn();
+    const service = createProviderConfigService({
+      createUserClient: () => userClient("owner"), getAdminClient,
+      fetchFn, resolveProviderHost: async () => ["93.184.216.34"],
+    });
+    await expect(service.discoverDraftModels(user, "workspace-1", {
+      configId: "config-1", baseUrl: "https://api.openai.com/v1", apiKey: "fresh-key-123",
+    })).resolves.toEqual([]);
+    expect(getAdminClient).not.toHaveBeenCalled();
+    expect((vi.mocked(fetchFn).mock.calls[0]?.[1]?.headers as Record<string, string>).Authorization)
+      .toBe("Bearer fresh-key-123");
+  });
+
+  it("returns more than the persisted-selection limit without silently truncating discovery", async () => {
+    const rows = Array.from({ length: 700 }, (_, index) => ({ id: `model-${index}` }));
+    const admin = adminForConfig({
+      rpc: async (name) => ({
+        data: name === "loomic_provider_secret_read" ? "sk-live-secret-7890" : null,
+        error: null,
+      }),
+    });
+    const service = createProviderConfigService({
+      createUserClient: () => userClient("owner"),
+      getAdminClient: () => admin.client,
+      fetchFn: vi.fn(async () => new Response(JSON.stringify({ data: rows }), {
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch,
+      resolveProviderHost: async () => ["93.184.216.34"],
+    });
+    const models = await service.discoverModels(user, "workspace-1", "config-1");
+    expect(models).toHaveLength(700);
+    expect(models.at(-1)?.upstreamModelId).toBe("model-699");
+  });
+
+  it("fails explicitly instead of truncating a catalog above the discovery limit", async () => {
+    const rows = Array.from({ length: 10_001 }, (_, index) => ({ id: `model-${index}` }));
+    const admin = adminForConfig({
+      rpc: async (name) => ({
+        data: name === "loomic_provider_secret_read" ? "sk-live-secret-7890" : null,
+        error: null,
+      }),
+    });
+    const service = createProviderConfigService({
+      createUserClient: () => userClient("owner"),
+      getAdminClient: () => admin.client,
+      fetchFn: vi.fn(async () => new Response(JSON.stringify({ data: rows }), {
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch,
+      resolveProviderHost: async () => ["93.184.216.34"],
+    });
+    await expect(service.discoverModels(user, "workspace-1", "config-1"))
+      .rejects.toMatchObject({ code: "provider_persistence_failed", statusCode: 502 });
   });
 
   it("rejects oversized connection-test responses with a stable code", async () => {
@@ -259,12 +423,45 @@ describe("provider config security", () => {
       getAdminClient: () => admin.client,
       fetchFn: vi.fn(async () => new Response("", {
         status: 200,
-        headers: { "content-length": String(64 * 1024 + 1) },
+        headers: { "content-length": String(4 * 1024 * 1024 + 1) },
       })) as unknown as typeof fetch,
+      resolveProviderHost: async () => ["93.184.216.34"],
     });
     await expect(service.test(user, "workspace-1", "config-1")).resolves.toMatchObject({
       ok: false,
       errorCode: "provider_response_too_large",
+    });
+  });
+
+  it.each([true, false])("accepts a large valid model catalog (Content-Length supplied: %s)", async (withLength) => {
+    const rows = Array.from({ length: 2_500 }, (_, index) => ({ id: `model-${index}-${"x".repeat(24)}` }));
+    const body = JSON.stringify({ data: rows });
+    expect(Buffer.byteLength(body)).toBeGreaterThan(64 * 1024);
+    expect(Buffer.byteLength(body)).toBeLessThan(512 * 1024);
+    const admin = adminForConfig({
+      rpc: async (name) => ({ data: name === "loomic_provider_secret_read" ? "sk-live-secret-7890" : null, error: null }),
+    });
+    const service = createProviderConfigService({
+      createUserClient: () => userClient("owner"), getAdminClient: () => admin.client,
+      fetchFn: vi.fn(async () => new Response(body, { status: 200,
+        headers: { "content-type": "application/json", ...(withLength ? { "content-length": String(Buffer.byteLength(body)) } : {}) } })) as unknown as typeof fetch,
+      resolveProviderHost: async () => ["93.184.216.34"],
+    });
+    await expect(service.test(user, "workspace-1", "config-1")).resolves.toMatchObject({ ok: true });
+  });
+
+  it("rejects an HTML success page instead of publishing a false healthy status", async () => {
+    const admin = adminForConfig({
+      rpc: async (name) => ({ data: name === "loomic_provider_secret_read" ? "sk-live-secret-7890" : null, error: null }),
+    });
+    const service = createProviderConfigService({
+      createUserClient: () => userClient("owner"), getAdminClient: () => admin.client,
+      fetchFn: vi.fn(async () => new Response("<html>sign in</html>", { status: 200,
+        headers: { "content-type": "text/html" } })) as unknown as typeof fetch,
+      resolveProviderHost: async () => ["93.184.216.34"],
+    });
+    await expect(service.test(user, "workspace-1", "config-1")).resolves.toMatchObject({
+      ok: false, errorCode: "provider_connection_failed",
     });
   });
 

@@ -1,0 +1,24 @@
+import assert from 'node:assert/strict';
+import {mkdir,writeFile} from 'node:fs/promises';
+import {createClient} from '@supabase/supabase-js';
+import {removeCompletedImagePlaceholder} from '../apps/server/src/features/canvas/canvas-element-writer.ts';
+
+assert.equal(process.env.SUPABASE_URL,'http://127.0.0.1:54421');
+const jobId=process.argv[2];assert(jobId,'Expected completed job UUID');
+const db=createClient(process.env.SUPABASE_URL!,process.env.SUPABASE_SERVICE_ROLE_KEY!,{auth:{persistSession:false}});
+const loaded=await db.from('background_jobs').select('*').eq('id',jobId).single();assert.ifError(loaded.error);
+const job=loaded.data;assert.equal(job.status,'succeeded');assert.equal(job.payload.operation,'split_layers');assert.equal(job.payload.layer_backend,'semantic');
+assert(job.result.canvas_finalized_at);assert(job.result.layers.length>0);
+const placeholderId=job.payload.target?.element_id??job.payload.placeholder_element_id;assert(placeholderId);
+const before=await db.from('canvases').select('content').eq('id',job.canvas_id).single();assert.ifError(before.error);
+for(const layer of job.result.layers) assert(before.data.content.elements.some((e:any)=>e.customData?.assetId===layer.asset_id),'Every output must have a canvas record before cleanup; preserve user deletions');
+const dir='artifacts/split-placeholder-recovery-20260915';await mkdir(dir,{recursive:true});
+await writeFile(`${dir}/${jobId}-before.json`,JSON.stringify(before.data.content));
+const changed=await removeCompletedImagePlaceholder(db as any,job.canvas_id,placeholderId,job.id);
+const after=await db.from('canvases').select('content').eq('id',job.canvas_id).single();assert.ifError(after.error);
+assert(after.data.content.elements.find((e:any)=>e.id===placeholderId)?.isDeleted);
+const remaining=(content:any)=>content.elements.filter((e:any)=>e.id!==placeholderId);
+assert.deepEqual(remaining(after.data.content),remaining(before.data.content),'Unrelated elements changed');
+assert.deepEqual(after.data.content.files,before.data.content.files,'Image files changed');
+const report={jobId,canvasId:job.canvas_id,placeholderId,changed,allLayersPreserved:true,otherElementsUnchanged:true};
+await writeFile(`${dir}/${jobId}-result.json`,JSON.stringify(report,null,2));console.log(JSON.stringify(report));

@@ -6,13 +6,30 @@ type PendingRPC = {
   resolve: (value: any) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
+  connectionId: string;
+  ws: WebSocket;
 };
+type ActiveRun = { runId: string; startedAt: number; sessionId?: string };
 
 export type ConnectionEntry = {
   ws: WebSocket;
   userId: string;
+  /** Opaque, server-issued identity for this exact socket instance. */
   connectionId: string;
+  /** Untrusted client hint retained for diagnostics only; never used for lookup. */
+  requestedConnectionId: string;
   canvasId: string | null;
+  workspaceId: string | null;
+};
+
+export type CanvasAuthorizationCheck = (input: {
+  userId: string;
+  canvasId: string;
+}) => Promise<boolean>;
+
+export type ConnectionManagerOptions = {
+  authorizeCanvas?: CanvasAuthorizationCheck;
+  onAuthorizationError?: (error: unknown) => void;
 };
 
 export class ConnectionManager {
@@ -22,28 +39,36 @@ export class ConnectionManager {
   private userIndex = new Map<string, Set<string>>();
   /** Canvas-level index: canvasId -> set of connectionIds */
   private canvasIndex = new Map<string, Set<string>>();
-  /** Tracks active runIds per canvas so reconnecting clients know if a run is in progress */
-  private activeRuns = new Map<string, { runId: string; startedAt: number }>();
+  /** Insertion order retains older in-flight runs beneath a newer conversation. */
+  private activeRuns = new Map<string, Map<string, ActiveRun>>();
   /** Pending RPC calls, keyed by unique request UUID (unchanged) */
   private pendingRPCs = new Map<string, PendingRPC>();
+  /** Preserve stream order even though legacy producers fire-and-forget. */
+  private canvasSendQueues = new Map<string, Promise<unknown>>();
+
+  constructor(private readonly options: ConnectionManagerOptions = {}) {}
 
   // ---------------------------------------------------------------------------
   // Registration & removal
   // ---------------------------------------------------------------------------
 
   /**
-   * Register a connection. Multiple connections per user are allowed.
-   * If the same connectionId already exists (reconnect), replace only that entry
-   * without closing any other connections.
+   * Register a socket under a fresh server identity. The client-provided ID is
+   * never an ownership token: duplicate IDs (including same-user reconnects)
+   * remain separate generations until their own sockets are removed.
    */
-  register(connectionId: string, userId: string, ws: WebSocket): void {
-    const existing = this.connections.get(connectionId);
-    if (existing) {
-      // Reconnect for same connectionId: clean up old entry from indexes
-      this.removeFromIndexes(connectionId, existing);
-    }
+  register(requestedConnectionId: string, userId: string, ws: WebSocket): string {
+    let connectionId = randomUUID();
+    while (this.connections.has(connectionId)) connectionId = randomUUID();
 
-    const entry: ConnectionEntry = { ws, userId, connectionId, canvasId: null };
+    const entry: ConnectionEntry = {
+      ws,
+      userId,
+      connectionId,
+      requestedConnectionId,
+      canvasId: null,
+      workspaceId: null,
+    };
     this.connections.set(connectionId, entry);
 
     let userSet = this.userIndex.get(userId);
@@ -52,6 +77,7 @@ export class ConnectionManager {
       this.userIndex.set(userId, userSet);
     }
     userSet.add(connectionId);
+    return connectionId;
   }
 
   /** Remove a connection from all indexes. */
@@ -60,13 +86,14 @@ export class ConnectionManager {
     if (!entry) return;
     this.removeFromIndexes(connectionId, entry);
     this.connections.delete(connectionId);
+    this.rejectPendingForConnection(connectionId);
   }
 
   /**
    * Associate a connection with a canvas.
    * Updates the canvasIndex so events can be broadcast to all viewers of that canvas.
    */
-  bindCanvas(connectionId: string, canvasId: string): void {
+  bindCanvas(connectionId: string, canvasId: string, workspaceId?: string): void {
     const entry = this.connections.get(connectionId);
     if (!entry) return;
 
@@ -80,6 +107,7 @@ export class ConnectionManager {
     }
 
     entry.canvasId = canvasId;
+    entry.workspaceId = workspaceId ?? null;
 
     let canvasSet = this.canvasIndex.get(canvasId);
     if (!canvasSet) {
@@ -90,18 +118,30 @@ export class ConnectionManager {
   }
 
   /** Mark a run as active for a canvas. */
-  setActiveRun(canvasId: string, runId: string): void {
-    this.activeRuns.set(canvasId, { runId, startedAt: Date.now() });
+  setActiveRun(canvasId: string, runId: string, sessionId?: string): void {
+    let runs = this.activeRuns.get(canvasId);
+    if (!runs) {
+      runs = new Map();
+      this.activeRuns.set(canvasId, runs);
+    }
+    // Duplicate notifications do not promote an older run or reset its age.
+    if (!runs.has(runId)) runs.set(runId, { runId, startedAt: Date.now(), ...(sessionId ? { sessionId } : {}) });
   }
 
-  /** Clear active run for a canvas. */
-  clearActiveRun(canvasId: string): void {
-    this.activeRuns.delete(canvasId);
+  /** Remove exactly one completed/canceled run, restoring any older live run. */
+  clearActiveRun(canvasId: string, runId: string): void {
+    const runs = this.activeRuns.get(canvasId);
+    if (!runs) return;
+    runs.delete(runId);
+    if (runs.size === 0) this.activeRuns.delete(canvasId);
   }
 
   /** Get active run info for a canvas, if any. */
-  getActiveRun(canvasId: string): { runId: string; startedAt: number } | null {
-    return this.activeRuns.get(canvasId) ?? null;
+  getActiveRun(canvasId: string): ActiveRun | null {
+    const runs = this.activeRuns.get(canvasId);
+    if (!runs) return null;
+    const newest = [...runs.values()].at(-1);
+    return newest ? { ...newest } : null;
   }
 
   // ---------------------------------------------------------------------------
@@ -137,16 +177,9 @@ export class ConnectionManager {
   // ---------------------------------------------------------------------------
 
   /** Send a StreamEvent to ALL connections viewing a specific canvas. */
-  pushToCanvas(canvasId: string, event: StreamEvent): void {
-    const ids = this.canvasIndex.get(canvasId);
-    if (!ids) return;
+  pushToCanvas(canvasId: string, event: StreamEvent): Promise<void> {
     const payload = JSON.stringify({ type: "event", event });
-    for (const cid of ids) {
-      const entry = this.connections.get(cid);
-      if (entry && entry.ws.readyState === 1) {
-        entry.ws.send(payload);
-      }
-    }
+    return this.enqueueCanvasSend(canvasId, payload).then(() => undefined);
   }
 
   /** Send a StreamEvent to ALL connections for a user. */
@@ -182,6 +215,25 @@ export class ConnectionManager {
     return true;
   }
 
+  /** Send sensitive direct data only after revalidating the current binding. */
+  async sendToAuthorized(
+    connectionId: string,
+    message: Record<string, unknown>,
+  ): Promise<boolean> {
+    const candidate = this.connections.get(connectionId);
+    if (!candidate || candidate.ws.readyState !== 1) return false;
+    if (!candidate.canvasId) return this.sendTo(connectionId, message);
+    const entry = await this.authorizedEntry(connectionId, candidate.canvasId);
+    if (!entry || entry.ws.readyState !== 1) return false;
+    try {
+      entry.ws.send(JSON.stringify(message));
+      return true;
+    } catch {
+      this.remove(connectionId);
+      return false;
+    }
+  }
+
   /**
    * Send a raw JSON message to ANY open connection for a user (backward compat).
    * Broadcasts to all open connections for the user and returns true if at least
@@ -203,19 +255,8 @@ export class ConnectionManager {
   }
 
   /** Send a protocol-level message to every open connection viewing a canvas. */
-  sendToCanvas(canvasId: string, message: Record<string, unknown>): boolean {
-    const ids = this.canvasIndex.get(canvasId);
-    if (!ids) return false;
-    const payload = JSON.stringify(message);
-    let delivered = false;
-    for (const connectionId of ids) {
-      const entry = this.connections.get(connectionId);
-      if (entry && entry.ws.readyState === 1) {
-        entry.ws.send(payload);
-        delivered = true;
-      }
-    }
-    return delivered;
+  sendToCanvas(canvasId: string, message: Record<string, unknown>): Promise<boolean> {
+    return this.enqueueCanvasSend(canvasId, JSON.stringify(message));
   }
 
   /**
@@ -238,17 +279,15 @@ export class ConnectionManager {
     params: Record<string, unknown>,
     timeout = 10_000,
   ): Promise<T> {
-    // First try connectionId as a direct lookup
-    let ws = this.connections.get(connectionId)?.ws;
-
-    // Fallback: treat connectionId as userId for backward compat
-    // (existing callers like screenshot-canvas pass userId)
-    if (!ws) {
-      ws = this.getByUser(connectionId);
-    }
-
-    if (!ws || ws.readyState !== 1) {
+    const entry = this.connections.get(connectionId);
+    if (!entry || entry.ws.readyState !== 1) {
       throw new Error(`Connection ${connectionId} not available`);
+    }
+    if (entry.canvasId) {
+      const authorized = await this.authorizedEntry(connectionId, entry.canvasId);
+      if (!authorized) {
+        throw new Error(`Connection ${connectionId} is no longer authorized`);
+      }
     }
 
     const id = randomUUID();
@@ -259,9 +298,15 @@ export class ConnectionManager {
         reject(new Error(`RPC timeout: ${method} (${timeout}ms)`));
       }, timeout);
 
-      this.pendingRPCs.set(id, { resolve, reject, timer });
+      this.pendingRPCs.set(id, {
+        resolve,
+        reject,
+        timer,
+        connectionId,
+        ws: entry.ws,
+      });
 
-      ws.send(
+      entry.ws.send(
         JSON.stringify({
           type: "rpc.request",
           id,
@@ -286,7 +331,7 @@ export class ConnectionManager {
     const ids = this.canvasIndex.get(canvasId);
     if (!ids) throw new Error(`Canvas connection ${canvasId} not available`);
     for (const connectionId of ids) {
-      const entry = this.connections.get(connectionId);
+      const entry = await this.authorizedEntry(connectionId, canvasId);
       if (entry?.ws.readyState === 1) {
         return this.rpc<T>(connectionId, method, params, timeout);
       }
@@ -295,15 +340,26 @@ export class ConnectionManager {
   }
 
   /**
-   * Handle an incoming RPC response. Keyed by the unique RPC request UUID,
-   * so connectionId is accepted but not needed for dispatch.
+   * Handle a response only when it comes from the exact socket generation that
+   * received the request. Knowing another request UUID is not authorization.
    */
   handleRpcResponse(
-    _connectionId: string,
+    connectionId: string,
     msg: { type: "rpc.response"; id: string; result?: unknown; error?: string },
-  ): void {
+    sourceSocket?: WebSocket,
+  ): boolean {
     const pending = this.pendingRPCs.get(msg.id);
-    if (!pending) return;
+    if (!pending) return false;
+
+    const sourceEntry = this.connections.get(connectionId);
+    if (
+      !sourceEntry ||
+      pending.connectionId !== connectionId ||
+      pending.ws !== sourceEntry.ws ||
+      (sourceSocket !== undefined && pending.ws !== sourceSocket)
+    ) {
+      return false;
+    }
 
     this.pendingRPCs.delete(msg.id);
     clearTimeout(pending.timer);
@@ -313,6 +369,7 @@ export class ConnectionManager {
     } else {
       pending.resolve(msg.result);
     }
+    return true;
   }
 
   // ---------------------------------------------------------------------------
@@ -329,6 +386,23 @@ export class ConnectionManager {
     this.userIndex.clear();
     this.canvasIndex.clear();
     this.activeRuns.clear();
+    this.canvasSendQueues.clear();
+  }
+
+  /** Apply a membership invalidation delivered by the durable fanout log. */
+  revokeWorkspaceUser(workspaceId: string, userId: string): number {
+    const ids = [...(this.userIndex.get(userId) ?? [])];
+    let revoked = 0;
+    for (const connectionId of ids) {
+      const entry = this.connections.get(connectionId);
+      if (!entry || entry.workspaceId !== workspaceId) continue;
+      this.remove(connectionId);
+      revoked += 1;
+      if (entry.ws.readyState === 1) {
+        entry.ws.close(4003, "Workspace access changed; reconnect required");
+      }
+    }
+    return revoked;
   }
 
   // ---------------------------------------------------------------------------
@@ -350,6 +424,82 @@ export class ConnectionManager {
         canvasSet.delete(connectionId);
         if (canvasSet.size === 0) this.canvasIndex.delete(entry.canvasId);
       }
+    }
+  }
+
+  private async authorizedEntry(
+    connectionId: string,
+    canvasId: string,
+  ): Promise<ConnectionEntry | undefined> {
+    const candidate = this.connections.get(connectionId);
+    if (!candidate || candidate.canvasId !== canvasId) return undefined;
+    // A null workspace marks legacy conversation routing rather than a
+    // persisted canvas. Real canvas binds always include their authorized
+    // workspace and must pass the database gate below.
+    if (!candidate.workspaceId || !this.options.authorizeCanvas) return candidate;
+
+    let authorized = false;
+    try {
+      authorized = await this.options.authorizeCanvas({
+        userId: candidate.userId,
+        canvasId,
+      });
+    } catch (error) {
+      // Database or checker errors fail closed, including when callers do not
+      // await a fire-and-forget push.
+      this.options.onAuthorizationError?.(error);
+    }
+
+    // A late check must never authorize a reconnected socket or a new canvas.
+    const current = this.connections.get(connectionId);
+    if (current !== candidate || current.canvasId !== canvasId) return undefined;
+    if (authorized) return current;
+
+    this.remove(connectionId);
+    if (current.ws.readyState === 1) {
+      current.ws.close(4003, "Canvas access changed; reconnect required");
+    }
+    return undefined;
+  }
+
+  private enqueueCanvasSend(canvasId: string, payload: string): Promise<boolean> {
+    const previous = this.canvasSendQueues.get(canvasId) ?? Promise.resolve();
+    const queued = previous.then(async () => {
+      const ids = [...(this.canvasIndex.get(canvasId) ?? [])];
+      let delivered = false;
+      for (const connectionId of ids) {
+        const entry = await this.authorizedEntry(connectionId, canvasId);
+        if (!entry || entry.ws.readyState !== 1) continue;
+        try {
+          entry.ws.send(payload);
+          delivered = true;
+        } catch {
+          this.remove(connectionId);
+        }
+      }
+      return delivered;
+    });
+    // Keep the chain usable after an unexpected implementation error and
+    // prevent ignored push promises from surfacing as unhandled rejections.
+    const safe = queued.catch((error) => {
+      this.options.onAuthorizationError?.(error);
+      return false;
+    });
+    this.canvasSendQueues.set(canvasId, safe);
+    void safe.finally(() => {
+      if (this.canvasSendQueues.get(canvasId) === safe) {
+        this.canvasSendQueues.delete(canvasId);
+      }
+    });
+    return safe;
+  }
+
+  private rejectPendingForConnection(connectionId: string): void {
+    for (const [requestId, pending] of this.pendingRPCs) {
+      if (pending.connectionId !== connectionId) continue;
+      this.pendingRPCs.delete(requestId);
+      clearTimeout(pending.timer);
+      pending.reject(new Error(`Connection ${connectionId} disconnected`));
     }
   }
 }

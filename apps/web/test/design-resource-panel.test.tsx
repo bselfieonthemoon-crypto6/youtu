@@ -97,6 +97,10 @@ describe("DesignResourcePanel", () => {
       name: /^封面素材\s*平台$/,
     });
     await waitFor(() => expect(createObjectURL).toHaveBeenCalledOnce());
+    const preview = card.querySelector("img")!;
+    expect(preview.classList.contains("object-contain")).toBe(true);
+    expect(preview.classList.contains("object-cover")).toBe(false);
+    expect(preview.parentElement?.classList.contains("aspect-square")).toBe(true);
     await userEvent.click(card);
     await waitFor(() => expect(onInsertResource).toHaveBeenCalledOnce());
     expect(onInsertResource.mock.calls[0]?.[0]).toMatchObject({

@@ -23,6 +23,8 @@ type ImageInsertOpts = {
   quality?: string;
   createdAt?: string;
   replaceElementId?: string;
+  rejectDeletedSourceJob?: boolean;
+  knownElementId?: string;
 };
 
 type VideoInsertOpts = {
@@ -36,6 +38,8 @@ type VideoInsertOpts = {
   durationSeconds?: number;
   title?: string;
   prompt?: string;
+  rejectDeletedSourceJob?: boolean;
+  knownElementId?: string;
 };
 
 type Placement = { x: number; y: number; width: number; height: number };
@@ -77,10 +81,11 @@ function calculateAutoPlacement(
   const visible = elements.filter((el) => !el.isDeleted);
 
   if (visible.length === 0) {
-    // Empty canvas: center around origin
+    // The persisted empty scene has a top-left viewport origin, not a camera
+    // centered at (0,0). Leave room for the fixed canvas header on first load.
     return {
-      x: -scaled.width / 2,
-      y: -scaled.height / 2,
+      x: 80,
+      y: 80,
       width: scaled.width,
       height: scaled.height,
     };
@@ -333,7 +338,7 @@ function buildImageGenerationPlaceholder(
 async function writeCanvasWithRetry(
   client: CanvasClient,
   canvasId: string,
-  buildIncoming: (latest: CanvasContent) => CanvasContent,
+  buildIncoming: (latest: CanvasContent) => CanvasContent | null,
 ): Promise<void> {
   for (let attempt = 0; attempt < MAX_CANVAS_WRITE_ATTEMPTS; attempt += 1) {
     const { data: latestRow, error: readError } = await client
@@ -351,7 +356,11 @@ async function writeCanvasWithRetry(
       appState: {},
       files: {},
     };
-    const merged = mergeCanvasContent(latest, buildIncoming(latest));
+    const incoming = buildIncoming(latest);
+    // A terminal worker can race a successful replacement, user deletion, or
+    // another terminal observer. Do not bump the canvas revision for a no-op.
+    if (!incoming) return;
+    const merged = mergeCanvasContent(latest, incoming);
     const { data: updated, error: writeError } = await client
       .from("canvases")
       .update({ content: merged as unknown as Json })
@@ -382,10 +391,21 @@ export async function insertImageGenerationPlaceholder(
   let resolvedPlacement: Placement | undefined;
   await writeCanvasWithRetry(client, opts.canvasId, (content) => {
     const elements = (content.elements as CanvasElement[]) ?? [];
-    const existing = elements.find(
-      (element) => element.id === opts.elementId && !element.isDeleted,
-    );
+    const existing = elements.find((element) => element.id === opts.elementId);
     if (existing) {
+      if (existing.isDeleted) throw Object.assign(
+        new Error("Image generation placeholder was deleted; it will not be recreated."),
+        { code: "image_generation_placeholder_deleted" },
+      );
+      const customData = existing.customData && typeof existing.customData === "object" && !Array.isArray(existing.customData)
+        ? existing.customData as Record<string, unknown> : {};
+      if (customData.type !== "image-generator"
+        || (customData.jobId !== opts.sourceJobId && customData.sourceJobId !== opts.sourceJobId)) {
+        throw Object.assign(
+          new Error("Canvas element id conflicts with the image generation placeholder."),
+          { code: "image_generation_placeholder_conflict" },
+        );
+      }
       resolvedPlacement = {
         x: Number(existing.x) || 0,
         y: Number(existing.y) || 0,
@@ -423,14 +443,27 @@ export async function markImageGenerationPlaceholderFailed(
   client: CanvasClient,
   canvasId: string,
   elementId: string,
+  sourceJobId: string,
   errorMessage: string,
-): Promise<void> {
+): Promise<boolean> {
+  let changed = false;
   await writeCanvasWithRetry(client, canvasId, (content) => {
+    changed = false;
     const elements = (content.elements as CanvasElement[]) ?? [];
+    const target = elements.find((element) => element.id === elementId);
+    const targetData = target?.customData && typeof target.customData === "object" && !Array.isArray(target.customData)
+      ? target.customData as Record<string, unknown> : null;
+    // Only settle the still-live placeholder created for this exact job. A
+    // generated image, tombstone, unrelated reused ID, or user-edited state is
+    // authoritative and must never be overwritten by a late worker outcome.
+    if (!target || target.isDeleted || targetData?.type !== "image-generator"
+      || targetData.status !== "generating"
+      || (targetData.jobId !== sourceJobId && targetData.sourceJobId !== sourceJobId)) return null;
+    changed = true;
     return {
       ...content,
       elements: elements.map((element) => {
-        if (element.id !== elementId || element.isDeleted) return element;
+        if (element.id !== elementId) return element;
         const customData =
           element.customData &&
           typeof element.customData === "object" &&
@@ -451,6 +484,7 @@ export async function markImageGenerationPlaceholderFailed(
       }),
     } as CanvasContent;
   });
+  return changed;
 }
 
 /**
@@ -461,6 +495,27 @@ export async function markImageGenerationPlaceholderFailed(
  * Store only a private Storage marker. The canvas read API issues a fresh
  * short-lived signed URL and the browser hydrates it for Excalidraw.
  */
+export async function removeCompletedImagePlaceholder(
+  client: CanvasClient, canvasId: string, elementId: string, sourceJobId: string,
+): Promise<boolean> {
+  let changed = false;
+  await writeCanvasWithRetry(client, canvasId, (content) => {
+    changed = false;
+    const elements = (content.elements as CanvasElement[]) ?? [];
+    const target = elements.find(element => element.id === elementId);
+    const data = target?.customData as Record<string, unknown> | undefined;
+    if (!target || (target.isDeleted && data?.completedJobId === sourceJobId) || target.type === "image"
+      || !["image-replacement", "image-generator"].includes(String(data?.type))
+      || (data?.jobId !== sourceJobId && data?.sourceJobId !== sourceJobId)) return null;
+    changed = true;
+    return { ...content, elements: elements.map(element => element.id === elementId ? {
+      ...element, isDeleted: true, customData: { ...data, completedJobId: sourceJobId }, version: (Number(element.version) || 1) + 1,
+      versionNonce: Math.floor(Math.random() * 2_000_000_000), updated: Date.now(),
+    } : element) } as CanvasContent;
+  });
+  return changed;
+}
+
 export async function insertImageElement(
   client: CanvasClient,
   opts: ImageInsertOpts,
@@ -475,8 +530,17 @@ export async function insertImageElement(
   let inserted = true;
   await writeCanvasWithRetry(client, opts.canvasId, (content) => {
     const elements = (content.elements as CanvasElement[]) ?? [];
+    const replacement = elements.find(element => element.id === opts.replaceElementId);
+    const replacementData = replacement?.customData as Record<string, unknown> | undefined;
+    const replaceInPlace = (replacementData?.type === "image-replacement" || replacementData?.type === "image-generator") &&
+      replacementData.jobId === opts.sourceJobId;
+    if (replacement?.type === "image" && replacementData?.sourceJobId === opts.sourceJobId) {
+      insertedElementId = replacement.id as string;
+      inserted = false;
+      return content;
+    }
     const nextElements = opts.replaceElementId
-      ? elements.map((element) => element.id === opts.replaceElementId && !element.isDeleted
+      ? elements.map((element) => !replaceInPlace && element.id === opts.replaceElementId && !element.isDeleted
           ? {
               ...element,
               isDeleted: true,
@@ -486,23 +550,57 @@ export async function insertImageElement(
             }
           : element)
       : elements;
-    const existing = findLiveElementBySourceJobId(nextElements, opts.sourceJobId);
+    // A generating node also carries sourceJobId. Only finished image pixels
+    // prove replay completion; the pending node must still be replaced.
+    const imageElements = nextElements.filter(element => element.type === "image");
+    const existing = findElementBySourceJobId(imageElements, opts.sourceJobId, false);
     if (existing) {
       insertedElementId = existing.id as string;
       inserted = false;
       return nextElements === elements ? content : { ...content, elements: nextElements } as CanvasContent;
     }
+    if (opts.rejectDeletedSourceJob && (
+      findElementBySourceJobId(imageElements, opts.sourceJobId, true)
+      || findDeletedElementById(imageElements, opts.knownElementId)
+    )) {
+      throw deletedSourceJobError();
+    }
     inserted = true;
     const files = ((content as { files?: Record<string, Record<string, unknown>> })
       .files ?? {});
-    const placement = explicitPlacement ?? calculateAutoPlacement(
+    const reservedPlacement = replaceInPlace ? {
+      x: Number(replacement!.x), y: Number(replacement!.y),
+      width: Number(replacement!.width), height: Number(replacement!.height),
+    } : explicitPlacement ?? calculateAutoPlacement(
       nextElements, opts.width, opts.height, IMAGE_MAX_SIZE,
     );
+    // A pending node reserves layout space, not permission to stretch the
+    // delivered pixels. Keep its live position and fit the actual image into
+    // that box (including a user-resized/moved node during generation).
+    const fit = Math.min(reservedPlacement.width / opts.width, reservedPlacement.height / opts.height);
+    const placement = { ...reservedPlacement,
+      width: opts.width * fit, height: opts.height * fit };
     const element = buildImageElement(fileId, placement, opts);
+    if (replaceInPlace && replacementData?.type === "image-generator") {
+      element.customData = { ...(element.customData as Record<string, unknown>), sourceNodeType: "image-generator" };
+    }
+    const sourceRequestId = (replacementData?.nodeImageRequest as Record<string, unknown> | undefined)?.requestId;
+    if (replaceInPlace && typeof sourceRequestId === "string") {
+      element.customData = { ...(element.customData as Record<string, unknown>), sourceRequestId };
+    }
+    if (replaceInPlace) Object.assign(element, {
+      id: replacement!.id,
+      angle: replacement!.angle ?? 0,
+      frameId: replacement!.frameId ?? null,
+      groupIds: replacement!.groupIds ?? [],
+      locked: replacement!.locked ?? false,
+      isDeleted: replacement!.isDeleted === true,
+      version: Number(replacement!.version ?? 1) + 1,
+    });
     insertedElementId = element.id as string;
     return {
       ...content,
-      elements: [...nextElements, element],
+      elements: replaceInPlace ? nextElements.map(item => item.id === element.id ? element : item) : [...nextElements, element],
       files: {
         ...files,
         [fileId]: {
@@ -536,11 +634,18 @@ export async function insertVideoElement(
   let inserted = true;
   await writeCanvasWithRetry(client, opts.canvasId, (content) => {
     const elements = (content.elements as CanvasElement[]) ?? [];
-    const existing = findLiveElementBySourceJobId(elements, opts.sourceJobId);
+    const videoElements = elements.filter(element => element.type === "embeddable");
+    const existing = findElementBySourceJobId(videoElements, opts.sourceJobId, false);
     if (existing) {
       insertedElementId = existing.id as string;
       inserted = false;
       return content;
+    }
+    if (opts.rejectDeletedSourceJob && (
+      findElementBySourceJobId(videoElements, opts.sourceJobId, true)
+      || findDeletedElementById(videoElements, opts.knownElementId)
+    )) {
+      throw deletedSourceJobError();
     }
     inserted = true;
     const placement = explicitPlacement ?? calculateAutoPlacement(
@@ -560,12 +665,13 @@ export async function insertVideoElement(
   return { elementId: insertedElementId, inserted };
 }
 
-function findLiveElementBySourceJobId(
+function findElementBySourceJobId(
   elements: CanvasElement[],
   sourceJobId: string,
+  deleted: boolean,
 ): CanvasElement | undefined {
   return elements.find((element) => {
-    if (element.isDeleted) return false;
+    if ((element.isDeleted === true) !== deleted) return false;
     const customData = element.customData;
     return (
       customData !== null &&
@@ -574,4 +680,19 @@ function findLiveElementBySourceJobId(
       (customData as Record<string, unknown>).sourceJobId === sourceJobId
     );
   });
+}
+
+function deletedSourceJobError(): Error & { code: "canvas_result_deleted" } {
+  return Object.assign(
+    new Error("The generated canvas result was deleted and cannot be restored."),
+    { code: "canvas_result_deleted" as const },
+  );
+}
+
+function findDeletedElementById(
+  elements: CanvasElement[],
+  elementId: string | undefined,
+): CanvasElement | undefined {
+  if (!elementId) return undefined;
+  return elements.find(element => element.id === elementId && element.isDeleted === true);
 }

@@ -17,6 +17,7 @@ import { z } from "zod";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import { applyDesignCommands } from "../designs/design-command-applier.js";
 import { normalizePersistedGenerationJob } from "./design-target-normalizer.js";
+import { isAgentTaskAttachmentRejected } from "../agent-tasks/agent-task-service.js";
 
 const generatedAssetSchema = z
   .object({
@@ -200,8 +201,27 @@ export class DesignJobFinalizer {
         "Layer splitting did not return a background and element layers.",
       );
     }
+    const semantic = input.job.payload.layer_backend === "semantic";
+    const layout = semantic ? {
+      x: input.target.placement?.x ?? source.x + source.width + 24,
+      y: input.target.placement?.y ?? source.y,
+      width: input.target.placement?.width ?? source.width,
+      height: input.target.placement?.height ?? source.height,
+    } : source;
     const commands: DesignCommand[] = [
-      {
+      semantic ? {
+        action: "object.add",
+        object: {
+          objectId: deterministicObjectId(input.commandId, 0),
+          objectVersion: 1,
+          type: "image",
+          name: typeof background.name === "string" ? background.name : "修补底图",
+          x: layout.x, y: layout.y, width: layout.width, height: layout.height,
+          rotation: source.rotation, opacity: source.opacity,
+          zIndex: source.zIndex + 1, locked: false, visible: true,
+          assetObjectId: background.asset_id, fit: "fill",
+        },
+      } : {
         action: "object.update",
         object_id: source.objectId,
         expected_object_version: source.objectVersion,
@@ -212,33 +232,34 @@ export class DesignJobFinalizer {
         },
       },
       ...elements.map((layer, index): DesignCommand => {
-        const width = (layer.width / sourceWidth) * source.width;
-        const height = (layer.height / sourceHeight) * source.height;
+        const width = (layer.width / sourceWidth) * layout.width;
+        const height = (layer.height / sourceHeight) * layout.height;
         const localCenterX =
-          source.x + ((layer.x + layer.width / 2) / sourceWidth) * source.width;
+          layout.x + ((layer.x + layer.width / 2) / sourceWidth) * layout.width;
         const localCenterY =
-          source.y +
-          ((layer.y + layer.height / 2) / sourceHeight) * source.height;
+          layout.y +
+          ((layer.y + layer.height / 2) / sourceHeight) * layout.height;
         const center = rotatePoint(
           localCenterX,
           localCenterY,
-          source.x + source.width / 2,
-          source.y + source.height / 2,
+          layout.x + layout.width / 2,
+          layout.y + layout.height / 2,
           source.rotation,
         );
         return {
           action: "object.add",
           object: {
-            objectId: deterministicObjectId(input.commandId, index),
+            objectId: deterministicObjectId(input.commandId, semantic ? index + 1 : index),
             objectVersion: 1,
             type: "image",
+            ...(typeof layer.name === "string" ? { name: layer.name } : {}),
             x: center.x - width / 2,
             y: center.y - height / 2,
             width,
             height,
             rotation: source.rotation,
             opacity: source.opacity,
-            zIndex: source.zIndex + 1 + index,
+            zIndex: source.zIndex + (semantic ? 2 : 1) + index,
             locked: false,
             visible: true,
             assetObjectId: layer.asset_id,
@@ -262,9 +283,9 @@ export class DesignJobFinalizer {
         input.job.created_by,
       );
       const objectIds = [
-        source.objectId,
+        semantic ? deterministicObjectId(input.commandId, 0) : source.objectId,
         ...elements.map((_, index) =>
-          deterministicObjectId(input.commandId, index),
+          deterministicObjectId(input.commandId, semantic ? index + 1 : index),
         ),
       ];
       const finalization = await this.repository.finish({
@@ -285,6 +306,7 @@ export class DesignJobFinalizer {
       });
       return { finalization, inserted: !mutation.replayed };
     } catch (error) {
+      if (isAgentTaskAttachmentRejected(error)) return this.superseded(input.job.id, input.commandId);
       if (error instanceof DesignJobMutationConflict) {
         return this.needsAttention(
           input.job.id,
@@ -403,6 +425,7 @@ export class DesignJobFinalizer {
         });
         return { finalization, inserted: !mutation.replayed };
       } catch (error) {
+        if (isAgentTaskAttachmentRejected(error)) return this.superseded(input.job.id, input.commandId);
         if (error instanceof DesignJobMutationConflict) continue;
         await this.repository.finish({
           jobId: input.job.id,
@@ -527,6 +550,7 @@ export class DesignJobFinalizer {
       });
       return { finalization, inserted: false };
     } catch (error) {
+      if (isAgentTaskAttachmentRejected(error)) return this.superseded(input.job.id, input.commandId);
       if (error instanceof DesignJobMutationConflict) {
         return this.needsAttention(
           input.job.id,
@@ -544,6 +568,18 @@ export class DesignJobFinalizer {
       });
       throw error;
     }
+  }
+
+  private async superseded(jobId: string, commandId: string): Promise<DesignJobFinalizationOutcome> {
+    const finalization = await this.repository.finish({
+      jobId,
+      commandId,
+      status: "needs_attention",
+      result: { attachment_status: "superseded" },
+      errorCode: "agent_task_superseded",
+      errorMessage: "图片已生成并保留；任务已更新，未应用到当前设计。",
+    });
+    return { finalization, inserted: false };
   }
 
   private async needsAttention(

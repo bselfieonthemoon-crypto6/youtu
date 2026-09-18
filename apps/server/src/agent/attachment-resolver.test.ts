@@ -7,6 +7,7 @@ import {
 
 const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]);
 const uuid = "00000000-0000-4000-8000-000000000001";
+const uuidV7 = "00000000-0000-7000-8000-000000000001";
 
 function clientWithAsset(asset: Record<string, unknown> | null) {
   const download = vi.fn(async () => ({
@@ -31,7 +32,7 @@ function clientWithAsset(asset: Record<string, unknown> | null) {
 }
 
 describe("agent attachment authorization", () => {
-  it("loads UUID assets through the RLS-backed metadata and storage clients", async () => {
+  it.each([uuid, uuidV7])("loads supported UUID asset %s through the RLS-backed metadata and storage clients", async assetId => {
     const { client, download } = clientWithAsset({
       bucket: "workspace-assets",
       object_path: "workspace/file.png",
@@ -39,7 +40,7 @@ describe("agent attachment authorization", () => {
     });
     const result = await resolveAgentImageAttachment({
       client,
-      attachment: { assetId: uuid, url: "https://attacker.invalid/ignored", mimeType: "image/png" },
+      attachment: { assetId, url: "https://attacker.invalid/ignored", mimeType: "image/png" },
     });
     expect(result.buffer).toEqual(png);
     expect(download).toHaveBeenCalledWith("workspace/file.png");

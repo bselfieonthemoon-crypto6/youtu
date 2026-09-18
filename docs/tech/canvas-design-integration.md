@@ -1,5 +1,13 @@
 # Canvas Design Skill — Integration & Verification Guide
 
+> ⚠️ **本文件已失效（2026-09 后为历史记录，不要据此实施）。**
+> 它描述的是 DeepAgents / LangChain 时代的实现：`skills/canvas-design/` 技能包、`SkillsMiddleware`、
+> `execute` 工具、`LOOMIC_SANDBOX_ROOT`、虚拟文件系统 `/skills/` 路由、以及运行结束清理 sandbox tmpdir。
+> 这些**全部已删除**：当前唯一运行时是 **Mastra**（`@mastra/core`），工具层用 `@mastra/core/tools` 的
+> `createTool`，模型层用 `@ai-sdk/openai-compatible`，`agent/backends/`、`agent/prompts/`、
+> `agent/persistence/`、`agent/evals/` 均已移除。
+> 现行架构请见 `.claude/CLAUDE.md` / `.codex/AGENTS.md` 与 `docs/tech/design-board-architecture.md`。
+
 ## Local Development Setup
 
 ### Prerequisites

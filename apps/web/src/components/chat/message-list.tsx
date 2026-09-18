@@ -7,13 +7,14 @@ import { ChatMessage } from "../chat-message";
 import { ChatSkills } from "../chat-skills";
 import { ErrorBoundary } from "../error-boundary";
 import { MessageErrorBoundary } from "./message-error-boundary";
+import { projectGenerationMessages } from "../../lib/chat-generation-presentation";
 
 type MessageListProps = {
   messages: Message[];
   streaming: boolean;
   sessionsLoading: boolean;
   messagesLoading: boolean;
-  onSend: (message: string) => void;
+  onSelectSkill: (invitation: string) => void;
 };
 
 /**
@@ -37,9 +38,10 @@ export const MessageList = React.memo(function MessageList({
   streaming,
   sessionsLoading,
   messagesLoading,
-  onSend,
+  onSelectSkill,
 }: MessageListProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const displayedMessages = React.useMemo(() => projectGenerationMessages(messages), [messages]);
 
   // Auto-scroll to bottom on new messages or streaming updates
   const scrollToBottom = useCallback(() => {
@@ -62,12 +64,12 @@ export const MessageList = React.memo(function MessageList({
             <div className="h-5 w-5 animate-spin rounded-full border-2 border-border border-t-foreground" />
           </div>
         ) : messages.length === 0 ? (
-          <ChatSkills onSend={onSend} />
+          <ChatSkills onSelectSkill={onSelectSkill} />
         ) : (
-          messages.map((msg, index) => {
+          displayedMessages.map((msg) => {
             // Only the last assistant message during streaming gets the
             // isStreaming flag -- all others are settled and fully memoized
-            const isLastMessage = index === messages.length - 1;
+            const isLastMessage = msg.id === messages[messages.length - 1]?.id;
             const isStreamingMessage =
               streaming && msg.role === "assistant" && isLastMessage;
 

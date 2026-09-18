@@ -1,11 +1,15 @@
-import { HumanMessage, SystemMessage } from "@langchain/core/messages";
-
 import type { ServerEnv } from "../../config/env.js";
-import { OpenAICompatibleChatModel } from "../../agent/openai-compatible-chat-model.js";
+import { createWorkspaceVisionModel } from "../../agent/workspace-vision-model.js";
 
 export type ImageTextRecognizer = {
   recognize(input: { buffer: Buffer; mimeType: string }): Promise<string[]>;
 };
+
+/** OCR is a bounded single-image extraction task, not a chat turn. */
+const OCR_MODEL = "deepseek-v4-flash-vision-exp";
+const OCR_MAX_OUTPUT_TOKENS = 1_000;
+const OCR_SYSTEM = "You are a precise OCR engine. Return JSON only, with no markdown or explanation.";
+const OCR_USER = "Read every visible text fragment in this image in natural visual order. Preserve exact spelling, capitalization and punctuation. Ignore purely decorative shapes. Return exactly: {\"texts\":[\"first\",\"second\"]}. Return an empty array when there is no text.";
 
 export function createImageTextRecognizer(env: ServerEnv): ImageTextRecognizer {
   return {
@@ -15,36 +19,21 @@ export function createImageTextRecognizer(env: ServerEnv): ImageTextRecognizer {
         (error as Error & { code?: string }).code = "vision_not_configured";
         throw error;
       }
-      const model = new OpenAICompatibleChatModel({
-        model: "deepseek-v4-flash-vision-exp",
+      // Built per call: the OCR channel has no per-run snapshot, and the model
+      // carries no cross-call state. `baseUrl` still goes through
+      // createSafeProviderFetch inside the abstraction.
+      const model = createWorkspaceVisionModel({
         apiKey: env.apiYiApiKey,
-        configuration: {
-          baseURL: env.apiYiApiBase ?? "https://api.apiyi.com/v1",
-        },
-        streaming: false,
-        temperature: 0,
-        maxTokens: 1_000,
+        baseUrl: env.apiYiApiBase ?? "https://api.apiyi.com/v1",
+        upstreamModelId: OCR_MODEL,
+      }, { temperature: 0 });
+      const response = await model.generate({
+        system: OCR_SYSTEM,
+        user: OCR_USER,
+        images: [{ dataUri: `data:${mimeType};base64,${buffer.toString("base64")}` }],
+        maxOutputTokens: OCR_MAX_OUTPUT_TOKENS,
       });
-      const response = await model.invoke([
-        new SystemMessage(
-          "You are a precise OCR engine. Return JSON only, with no markdown or explanation.",
-        ),
-        new HumanMessage({
-          content: [
-            {
-              type: "text",
-              text: "Read every visible text fragment in this image in natural visual order. Preserve exact spelling, capitalization and punctuation. Ignore purely decorative shapes. Return exactly: {\"texts\":[\"first\",\"second\"]}. Return an empty array when there is no text.",
-            },
-            {
-              type: "image_url",
-              image_url: {
-                url: `data:${mimeType};base64,${buffer.toString("base64")}`,
-              },
-            },
-          ],
-        }),
-      ]);
-      return parseRecognizedTexts(response.content);
+      return parseRecognizedTexts(response.text);
     },
   };
 }

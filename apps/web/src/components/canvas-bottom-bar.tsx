@@ -3,6 +3,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { HexColorPicker } from "react-colorful";
+import { Map as MapIcon, LayoutGrid } from "lucide-react";
+import { tidyCanvasLayout } from "../lib/canvas-tidy-layout";
+import { useToast } from "./toast";
+import { CanvasMinimap } from "./canvas-minimap";
 
 /* ── Preset color swatches for background picker ── */
 const BG_PRESETS = ["transparent","#000000","#FFFFFF","#d3f256","#6C5CE7","#00B894","#FD79A8","#0984E3"] as const;
@@ -22,6 +26,7 @@ interface CanvasBottomBarProps {
   onToggleFiles: () => void;
   /** Whether any left panel (layers/files) is open — shifts the bar right */
   leftPanelOpen: boolean;
+  editingDesign?: boolean;
 }
 
 /* ── Inline SVG icons ── */
@@ -126,7 +131,29 @@ function ElementRow({ el, onSelect }: { el: ExcalidrawEl; onSelect: (id: string)
 /* ================================================================
    Main component
    ================================================================ */
-export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, filesOpen, onToggleFiles, leftPanelOpen }: CanvasBottomBarProps) {
+export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, filesOpen, onToggleFiles, leftPanelOpen, editingDesign = false }: CanvasBottomBarProps) {
+  const { success: showSuccess } = useToast();
+  const handleTidy = () => {
+    if (!excalidrawApi || editingDesign) return;
+    const original = excalidrawApi.getSceneElementsIncludingDeleted();
+    const result = tidyCanvasLayout(original, excalidrawApi.getAppState().selectedElementIds ?? {});
+    if (!result.movedCount) {
+      showSuccess("没有需要整理的元素（锁定元素不移动）。");
+      return;
+    }
+    excalidrawApi.updateScene({
+      elements: result.elements.map((element: any, index: number) => element === original[index] ? element : {
+        ...element,
+        version: Number(element.version ?? 1) + 1,
+        versionNonce: Math.floor(Math.random() * 2_000_000_000),
+        updated: Date.now(),
+      }),
+      captureUpdate: "IMMEDIATELY",
+    });
+    showSuccess("已整理画布，可按 Ctrl+Z 撤销。");
+  };
+  const [minimapOpen, setMinimapOpen] = useState(false);
+  const minimapBtnRef = useRef<HTMLButtonElement>(null);
   /* ── Zoom state ── */
   const [zoom, setZoom] = useState(1);
   const [zoomMenuOpen, setZoomMenuOpen] = useState(false);
@@ -224,7 +251,21 @@ export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, fil
           <FileIcon className="h-3.5 w-3.5" />
         </button>
 
+        <button ref={minimapBtnRef} type="button" disabled={!excalidrawApi}
+          className={`${btnClass} ${minimapOpen ? "bg-muted text-foreground" : ""}`}
+          aria-label={minimapOpen ? "隐藏小地图" : "显示小地图"} aria-pressed={minimapOpen}
+          title={minimapOpen ? "隐藏小地图" : "显示小地图"}
+          onClick={() => { closeAllPopovers(); setMinimapOpen(open => !open); }}>
+                <MapIcon className="h-3.5 w-3.5" />
+        </button>
+
         {/* ── Divider ── */}
+        <button type="button" className={`${btnClass} disabled:opacity-40 disabled:cursor-not-allowed`}
+          disabled={!excalidrawApi || editingDesign} aria-label="整理画布"
+          title={editingDesign ? "请先退出画板编辑再整理画布" : "整理画布：有选中项时整理选中项，否则整理全部"}
+          onClick={handleTidy}>
+          <LayoutGrid className="h-3.5 w-3.5" />
+        </button>
         <span className="mx-1 h-3 w-px bg-border" />
 
         {/* ── Zoom controls ── */}
@@ -292,6 +333,7 @@ export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, fil
         </div>
       </Popover>
 
+      {minimapOpen && excalidrawApi && <CanvasMinimap api={excalidrawApi} anchor={minimapBtnRef.current} onClose={() => { setMinimapOpen(false); minimapBtnRef.current?.focus(); }} />}
       {/* Files panel is now a separate left sidebar component */}
     </div>
   );

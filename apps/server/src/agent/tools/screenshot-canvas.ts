@@ -1,9 +1,16 @@
-import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
 
 import type { ConnectionManager } from "../../ws/connection-manager.js";
 import type { PersistImageFn } from "./image-generate.js";
 import type { ScreenshotResult } from "@loomic/shared";
+import type { WorkspaceVisionModel } from "../workspace-vision-model.js";
+import { createAgentTool, runContextOf, toolAbortSignalOf } from "./tool-run-context.js";
+import {
+  assertImageReviewActive,
+  resolveCanvasScreenshotReviewImage,
+  reviewImagePixels,
+  runWithImageReviewDeadline,
+} from "../image-result-verification.js";
 
 const screenshotCanvasSchema = z.object({
   mode: z
@@ -13,34 +20,40 @@ const screenshotCanvasSchema = z.object({
     .object({
       x: z.number(),
       y: z.number(),
-      width: z.number(),
-      height: z.number(),
+      width: z.number().positive().max(100_000),
+      height: z.number().positive().max(100_000),
     })
     .optional()
     .describe("Required when mode is 'region'. Defines the crop rectangle."),
   max_dimension: z
-    .number()
+    .number().int().min(128).max(2048)
     .default(1024)
     .describe("Max width or height in pixels. 512=low, 1024=medium, 2048=high quality"),
+}).superRefine((value, context) => {
+  if (value.mode === "region" && !value.region)
+    context.addIssue({ code: "custom", path: ["region"], message: "mode=region requires an explicit region rectangle." });
 });
 
 export function createScreenshotCanvasTool(deps: {
   connectionManager: ConnectionManager;
   persistImage?: PersistImageFn;
   rpcTimeout?: number;
+  model?: WorkspaceVisionModel;
+  currentUserPrompt?: string;
 }) {
   const timeout = deps.rpcTimeout ?? 10_000;
 
-  return new DynamicStructuredTool({
-    name: "screenshot_canvas",
+  return createAgentTool({
+    id: "screenshot_canvas",
     description:
       "Take a visual screenshot of the canvas to inspect layout, design quality, color harmony, and spatial relationships. Use this to visually verify your changes or understand the current canvas state. Supports full canvas, specific region, or current viewport capture.",
-    schema: screenshotCanvasSchema,
-    func: async (input, _runManager, config): Promise<string> => {
-      const userId = (config as any)?.configurable?.user_id;
-      const canvasId = (config as any)?.configurable?.canvas_id;
+    inputSchema: screenshotCanvasSchema,
+    execute: async (input, toolContext): Promise<string> => {
+      const runContext = runContextOf(toolContext);
+      const userId = runContext.user_id as string | undefined;
+      const canvasId = runContext.canvas_id as string | undefined;
 
-      if (!userId || !canvasId) {
+      if (typeof userId !== "string" || typeof canvasId !== "string") {
         return JSON.stringify({
           error: "no_user_context",
           message: "screenshot_canvas requires a user context to communicate with the browser.",
@@ -48,6 +61,7 @@ export function createScreenshotCanvasTool(deps: {
       }
 
       try {
+        return await runWithImageReviewDeadline(toolAbortSignalOf(toolContext), async reviewSignal => {
         const result = await deps.connectionManager.rpcToCanvas<ScreenshotResult>(
           canvasId,
           "canvas.screenshot",
@@ -58,14 +72,24 @@ export function createScreenshotCanvasTool(deps: {
           },
           timeout,
         );
+        assertImageReviewActive(reviewSignal);
 
-        // Upload screenshot to storage to get a short HTTPS URL.
-        // Returning the raw data: URI (~1-2 MB base64) in the ToolMessage
-        // would be serialized as text by LangChain adapters (Google Gemini,
-        // OpenAI) since tool responses only support string content — this
-        // causes the conversation to instantly exceed the model's token limit.
-        // Pattern: same as generate_image — short URL in JSON, stream-adapter
-        // extracts screenshotUrl as a frontend artifact.
+        const visual = deps.model
+          ? await resolveCanvasScreenshotReviewImage(result.url).then(image => reviewImagePixels({
+              images: [image], model: deps.model!, taskBrief: { currentUserPrompt: deps.currentUserPrompt ?? "" },
+              mode: "canvas_verification", comparison: "individual", signal: reviewSignal,
+            })).catch(() => ({
+              status: "unavailable" as const, viewed: false, blockingIssues: [], suggestions: [], uncertainties: [],
+              error: "canvas_pixel_review_unavailable", summary: "截图已捕获，但未能查看实际像素，不能声称视觉验收通过。",
+            }))
+          : {
+              status: "unavailable" as const, viewed: false, blockingIssues: [], suggestions: [], uncertainties: [],
+              error: "canvas_vision_model_unavailable", summary: "截图已捕获，但视觉模型不可用，不能声称已查看像素。",
+            };
+        assertImageReviewActive(reviewSignal);
+
+        // Keep the existing short artifact URL, but never let a slow upload
+        // delay the actual pixel review or start more work after the deadline.
         let screenshotUrl: string | undefined;
         if (deps.persistImage) {
           try {
@@ -75,14 +99,21 @@ export function createScreenshotCanvasTool(deps: {
               `canvas-screenshot-${input.mode}`,
             );
           } catch {
-            // Non-fatal: fall back to text-only summary
+            // Non-fatal: the truthful pixel review remains available without an artifact URL.
           }
         }
-
+        assertImageReviewActive(reviewSignal);
         const output: Record<string, unknown> = {
-          summary: `Canvas screenshot captured (${result.width}x${result.height}, mode: ${input.mode})`,
+          summary: visual.summary,
+          captureSummary: `Canvas screenshot captured (${result.width}x${result.height}, mode: ${input.mode})`,
           width: result.width,
           height: result.height,
+          visualStatus: visual.status,
+          viewed: visual.viewed,
+          blockingIssues: visual.blockingIssues,
+          suggestions: visual.suggestions,
+          uncertainties: visual.uncertainties,
+          ...(visual.error ? { visualError: visual.error } : {}),
         };
 
         if (screenshotUrl) {
@@ -90,10 +121,13 @@ export function createScreenshotCanvasTool(deps: {
         }
 
         return JSON.stringify(output);
+        });
       } catch (error) {
         const message = error instanceof Error ? error.message : "Screenshot failed";
         return JSON.stringify({
           error: "screenshot_failed",
+          visualStatus: "unavailable",
+          viewed: false,
           message: `Screenshot failed: ${message}`,
         });
       }

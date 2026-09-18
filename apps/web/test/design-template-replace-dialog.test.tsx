@@ -12,6 +12,23 @@ import { DesignTemplateReplaceDialog } from "../src/components/design/design-tem
 afterEach(cleanup);
 
 describe("DesignTemplateReplaceDialog", () => {
+  it("allows ordinary templates only after confirmation and portals above the canvas", () => {
+    const ordinary = detail();
+    ordinary.template.variables = [];
+    const onApply = vi.fn();
+    const { container } = render(<DesignTemplateReplaceDialog
+      detail={ordinary} bindings={[]}
+      preview={{ design_id: ids.design, template_id: ids.template, design_revision: 2, template_revision: 3, commands: [], differences: [], unresolved_keys: [] }}
+      onBindingsChange={vi.fn()} onPreview={vi.fn()} onApply={onApply} onCancel={vi.fn()}
+    />);
+    expect(screen.getByText(/替换现有内容和画板尺寸/)).toBeInTheDocument();
+    expect(container).not.toContainElement(screen.getByRole("dialog"));
+    expect(onApply).not.toHaveBeenCalled();
+    const apply = screen.getByRole("button", { name: "替换内容并应用尺寸" });
+    expect(apply).toBeEnabled();
+    fireEvent.click(apply);
+    expect(onApply).toHaveBeenCalledOnce();
+  });
   it("shows smart diff and blocks apply while required values are unresolved", () => {
     const onBindingsChange = vi.fn();
     const onApply = vi.fn();

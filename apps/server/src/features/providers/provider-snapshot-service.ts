@@ -1,5 +1,6 @@
-import type { Json } from "@loomic/shared";
+import { isUuid, modelContextProfileSchema, type ModelContextProfile, type Json } from "@loomic/shared";
 
+import { normalizePublicProviderBaseUrl } from "../../security/safe-provider-fetch.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type {
   ProviderAdapter,
@@ -8,7 +9,6 @@ import type {
 } from "./types.js";
 
 const WORKSPACE_MODEL_PREFIX = "workspace:";
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CAPABILITIES = new Set<ProviderModelCapability>([
   "text",
   "vision_input",
@@ -56,6 +56,9 @@ export type ResolvedProviderExecutionSecret = {
   providerConfigId: string;
   providerRevision: number;
   catalogKey: string;
+  /** Concrete enabled model row used by a fallback attempt. */
+  providerModelCatalogKey?: string | null;
+  attemptOrdinal?: number;
   adapter: ProviderAdapter;
   baseUrl: string;
   upstreamModelId: string;
@@ -67,9 +70,17 @@ export type ResolvedProviderExecutionSecret = {
     unit: ProviderBillingUnit | null;
   };
   apiKey: string;
+  contextProfile?: ModelContextProfile | null;
 };
 
 export type ProviderSnapshotService = {
+  createImageGenerationPlan?(input: CreateJobProviderSnapshotInput): Promise<string[]>;
+  resolveImageGenerationPlan?(input: {
+    workspaceId: string;
+    jobId: string;
+  }): Promise<ResolvedProviderExecutionSecret[]>;
+  createForegroundSnapshot?(input: { workspaceId: string; jobId: string }): Promise<string>;
+  resolveForegroundSnapshot?(input: { workspaceId: string; jobId: string }): Promise<ResolvedProviderExecutionSecret>;
   createJobSnapshot(input: CreateJobProviderSnapshotInput): Promise<string>;
   createRunSnapshot(input: CreateRunProviderSnapshotInput): Promise<string>;
   resolveJobSnapshot(input: {
@@ -134,7 +145,7 @@ export function createProviderSnapshotService(options: {
         ...(billing.unit !== null ? { p_billing_unit: billing.unit } : {}),
       },
     );
-    if (error || typeof data !== "string" || !UUID_PATTERN.test(data)) {
+    if (error || !isUuid(data)) {
       throw new ProviderSnapshotServiceError(
         "provider_snapshot_create_failed",
         "Provider execution snapshot could not be created.",
@@ -147,12 +158,13 @@ export function createProviderSnapshotService(options: {
   async function resolve(
     rpcName:
       | "loomic_provider_job_snapshot_resolve"
+      | "loomic_foreground_snapshot_resolve"
       | "loomic_provider_run_snapshot_resolve",
     args:
       | { p_workspace_id: string; p_background_job_id: string }
       | { p_workspace_id: string; p_agent_run_id: string },
   ): Promise<ResolvedProviderExecutionSecret> {
-    const { data, error } = await options.getAdminClient().rpc(rpcName, args);
+    const { data, error } = await (options.getAdminClient().rpc as any)(rpcName, args);
     if (error) {
       throw new ProviderSnapshotServiceError(
         "provider_snapshot_unavailable",
@@ -168,10 +180,101 @@ export function createProviderSnapshotService(options: {
         404,
       );
     }
-    return mapResolvedRow(row as Record<string, unknown>);
+    const resolved = mapResolvedRow(row as Record<string, unknown>);
+    if (resolved.modality === "text") {
+      const profileResult = await (options.getAdminClient().rpc as any)("loomic_provider_context_profile", {
+        p_workspace: args.p_workspace_id, p_snapshot: resolved.snapshotId,
+      });
+      const profile = modelContextProfileSchema.nullable().safeParse(profileResult.data);
+      if (profileResult.error || !profile.success) throw new ProviderSnapshotServiceError(
+        "provider_snapshot_unavailable", "Model context profile is unavailable.", 503);
+      resolved.contextProfile = profile.data;
+    }
+    return resolved;
   }
 
   return {
+    async createImageGenerationPlan(input) {
+      const catalogKey = parseWorkspaceModelRef(input.modelRef);
+      const billing = normalizeBilling(input.billing);
+      if (
+        billing.creditsCost === null ||
+        billing.pricingVersion === null ||
+        billing.unit !== "image"
+      ) {
+        throw invalidRequest("A complete image billing quote is required.");
+      }
+      const { data, error } = await (options.getAdminClient().rpc as any)(
+        "loomic_image_provider_plan_create",
+        {
+          p_workspace_id: input.workspaceId,
+          p_background_job_id: input.jobId,
+          p_requested_catalog_key: catalogKey,
+          p_billing_credits_cost: billing.creditsCost,
+          p_billing_pricing_version: billing.pricingVersion,
+          p_billing_unit: billing.unit,
+        },
+      );
+      if (
+        error ||
+        !Array.isArray(data) ||
+        data.length === 0 ||
+        data.length > 8 ||
+        data.some((id) => !isUuid(id))
+      ) {
+        throw new ProviderSnapshotServiceError(
+          "provider_snapshot_create_failed",
+          "No compatible image provider plan could be frozen.",
+          409,
+        );
+      }
+      return data as string[];
+    },
+    async resolveImageGenerationPlan(input) {
+      const { data, error } = await (options.getAdminClient().rpc as any)(
+        "loomic_image_provider_plan_resolve",
+        {
+          p_workspace_id: input.workspaceId,
+          p_background_job_id: input.jobId,
+        },
+      );
+      if (error || !Array.isArray(data) || data.length === 0 || data.length > 8) {
+        throw new ProviderSnapshotServiceError(
+          error ? "provider_snapshot_unavailable" : "provider_snapshot_not_found",
+          "Image provider execution plan is unavailable.",
+          error ? 503 : 404,
+        );
+      }
+      const resolved = data.map((row) => mapResolvedRow(row as Record<string, unknown>));
+      if (
+        resolved.some((entry, index) =>
+          entry.modality !== "image" ||
+          entry.attemptOrdinal !== index ||
+          entry.catalogKey !== resolved[0]?.catalogKey ||
+          entry.upstreamModelId !== resolved[0]?.upstreamModelId ||
+          entry.billing.creditsCost !== resolved[0]?.billing.creditsCost ||
+          entry.billing.pricingVersion !== resolved[0]?.billing.pricingVersion ||
+          entry.billing.unit !== "image")
+      ) {
+        throw new ProviderSnapshotServiceError(
+          "provider_snapshot_unavailable",
+          "Image provider execution plan is invalid.",
+          503,
+        );
+      }
+      return resolved;
+    },
+    async createForegroundSnapshot(input) {
+      const { data, error } = await (options.getAdminClient().rpc as any)("loomic_foreground_snapshot_create", {
+        p_workspace_id: input.workspaceId, p_job_id: input.jobId,
+      });
+      if (error || !isUuid(data))
+        throw new ProviderSnapshotServiceError("provider_snapshot_create_failed", "Foreground provider snapshot could not be created.", 409);
+      return data;
+    },
+    resolveForegroundSnapshot(input) {
+      return resolve("loomic_foreground_snapshot_resolve", { p_workspace_id: input.workspaceId, p_background_job_id: input.jobId });
+    },
     createJobSnapshot(input) {
       return createSnapshot({
         workspaceId: input.workspaceId,
@@ -236,7 +339,7 @@ export function parseWorkspaceModelRef(modelRef: string): string {
     throw invalidRequest("A workspace provider model reference is required.");
   }
   const catalogKey = modelRef.slice(WORKSPACE_MODEL_PREFIX.length);
-  if (!UUID_PATTERN.test(catalogKey)) {
+  if (!isUuid(catalogKey)) {
     throw invalidRequest("Workspace provider model reference is invalid.");
   }
   return catalogKey;
@@ -294,13 +397,29 @@ function mapResolvedRow(row: Record<string, unknown>): ResolvedProviderExecution
       503,
     );
   }
+  let baseUrl: string;
+  try {
+    baseUrl = normalizePublicProviderBaseUrl(row.base_url);
+  } catch {
+    throw new ProviderSnapshotServiceError(
+      "provider_snapshot_unavailable",
+      "Provider execution snapshot is unavailable.",
+      503,
+    );
+  }
   return {
     snapshotId: row.snapshot_id,
     providerConfigId: row.provider_config_id,
     providerRevision: row.provider_revision,
     catalogKey: row.catalog_key,
+    ...(row.provider_model_catalog_key === null || typeof row.provider_model_catalog_key === "string"
+      ? { providerModelCatalogKey: row.provider_model_catalog_key as string | null }
+      : {}),
+    ...(typeof row.attempt_ordinal === "number"
+      ? { attemptOrdinal: row.attempt_ordinal }
+      : {}),
     adapter: row.adapter,
-    baseUrl: row.base_url,
+    baseUrl,
     upstreamModelId: row.upstream_model_id,
     modality: row.modality as ProviderModelModality,
     capabilities,

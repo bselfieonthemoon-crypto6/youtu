@@ -385,7 +385,7 @@ async function callLegacyAssetRpc(
     name: string,
     rpcArgs: Record<string, unknown>,
   ) => PromiseLike<{ data: unknown; error: { message?: string } | null }>;
-  return rpc(functionName, args);
+  return rpc.call(client, functionName, args);
 }
 
 function buildObjectPath(

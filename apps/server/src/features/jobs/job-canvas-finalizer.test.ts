@@ -1,15 +1,23 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const insertImageElement = vi.hoisted(() => vi.fn());
+const markImageGenerationPlaceholderFailed = vi.hoisted(() => vi.fn());
+const removeCompletedImagePlaceholder = vi.hoisted(() => vi.fn());
 
 vi.mock("../canvas/canvas-element-writer.js", () => ({
   insertImageElement,
+  markImageGenerationPlaceholderFailed,
+  removeCompletedImagePlaceholder,
 }));
 
 import {
   finalizeDesignImageJobChat,
   finalizeImageJobToCanvas,
+  finalizeTerminalImageJobPlaceholder,
   reconcileSucceededDesignImageChats,
+  reconcileSucceededImageJobs,
+  reconcileTerminalImageJobChats,
+  reconcileTerminalImageJobPlaceholders,
 } from "./job-canvas-finalizer.js";
 
 function createAdmin() {
@@ -32,6 +40,7 @@ function createAdmin() {
 
 const successfulJob = {
   id: "job-1",
+  workspace_id: "workspace-1",
   canvas_id: "canvas-1",
   target_kind: "canvas",
   design_id: null,
@@ -49,8 +58,224 @@ const successfulJob = {
 } as const;
 
 describe("image job canvas finalization", () => {
+  it("preserves durable zero-cost Low 2K metadata when replacing a queued card with success", async () => {
+    const { admin, upsert } = createAdmin();
+    insertImageElement.mockResolvedValue({ elementId: "element", inserted: true });
+    await finalizeImageJobToCanvas(admin as never, { ...successfulJob, session_id: "session-1",
+      payload: { ...successfulJob.payload, quality: "standard", resolution: "2k", mastra_credits_cost: 0, mastra_pricing_version: "credits-v1" },
+      result: { ...successfulJob.result, signed_url: "https://example.com/generated.png" } });
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ content_blocks: [expect.objectContaining({ output: expect.objectContaining({
+      creditsCost: 0, pricingVersion: "credits-v1", actualQuality: "Low", actualResolution: "2K", status: "succeeded",
+    }) })] }), { onConflict: "id" });
+  });
   beforeEach(() => {
     insertImageElement.mockReset();
+    markImageGenerationPlaceholderFailed.mockReset();
+    removeCompletedImagePlaceholder.mockReset();
+    markImageGenerationPlaceholderFailed.mockResolvedValue(true);
+  });
+
+  it.each([
+    ["dead_letter", "图片生成失败"],
+    ["canceled", "生成已取消"],
+  ])("settles a %s placeholder for the exact terminal job and records recovery", async (status, message) => {
+    const { admin, update, eqId, eqStatus } = createAdmin();
+    const terminal = { ...successfulJob, status, payload: { ...successfulJob.payload,
+      placeholder_element_id: "placeholder-1", target: { kind: "canvas", canvas_id: "canvas-1", element_id: "placeholder-1" } },
+      result: null };
+    await expect(finalizeTerminalImageJobPlaceholder(admin as never, terminal as never)).resolves.toBe(true);
+    expect(markImageGenerationPlaceholderFailed).toHaveBeenCalledExactlyOnceWith(
+      admin, "canvas-1", "placeholder-1", "job-1", message,
+    );
+    expect(update).toHaveBeenCalledWith({ result: expect.objectContaining({
+      canvas_terminal_finalized_at: expect.any(String), canvas_terminal_status: status,
+    }) });
+    expect(eqId).toHaveBeenCalledWith("id", "job-1");
+    expect(eqStatus).toHaveBeenCalledWith("status", status);
+  });
+
+  it("does not settle a retryable failure, success, design target, mismatched canvas, or already checked job", async () => {
+    const { admin, update } = createAdmin();
+    const payload = { placeholder_element_id: "placeholder-1", target: { kind: "canvas", canvas_id: "canvas-1" } };
+    const variants = [
+      { ...successfulJob, status: "failed", payload },
+      { ...successfulJob, status: "succeeded", payload },
+      { ...successfulJob, status: "dead_letter", target_kind: "design", payload },
+      { ...successfulJob, status: "dead_letter", payload: { ...payload, target: { kind: "canvas", canvas_id: "other" } } },
+      { ...successfulJob, status: "dead_letter", payload, result: { canvas_terminal_finalized_at: "done" } },
+    ];
+    for (const job of variants)
+      await expect(finalizeTerminalImageJobPlaceholder(admin as never, job as never)).resolves.toBe(false);
+    expect(markImageGenerationPlaceholderFailed).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["provider_rejected", true, "当前兼容图片渠道均明确拒绝"],
+    ["image_generation_result_unknown", false, "图片生成结果不确定"],
+  ])("durably replaces a running chat card for terminal %s without offering an automatic retry", async (errorCode, retryEligible, summaryText) => {
+    const { admin, update, upsert } = createAdmin();
+    const terminal = {
+      ...successfulJob,
+      session_id: "session-1",
+      target_kind: "design",
+      status: "dead_letter",
+      error_code: errorCode,
+      error_message: "bounded provider detail",
+      payload: { ...successfulJob.payload, mastra_submission_key: "run:digest" },
+      result: null,
+    };
+
+    await expect(finalizeTerminalImageJobPlaceholder(admin as never, terminal as never)).resolves.toBe(true);
+    expect(markImageGenerationPlaceholderFailed).not.toHaveBeenCalled();
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({
+      id: "job-1",
+      session_id: "session-1",
+      content: expect.stringContaining(summaryText),
+      content_blocks: [expect.objectContaining({
+        status: "failed",
+        retryable: false,
+        output: expect.objectContaining({
+          status: "dead_letter",
+          error_code: errorCode,
+          retryEligible,
+        }),
+      })],
+    }), { onConflict: "id" });
+    expect(update).toHaveBeenCalledWith({ result: expect.objectContaining({
+      chat_terminal_finalized_at: expect.any(String),
+      chat_terminal_status: "dead_letter",
+    }) });
+  });
+
+  it("recovers terminal design chat cards omitted by canvas-placeholder recovery", async () => {
+    const terminal = { ...successfulJob, session_id: "session-1", target_kind: "design",
+      canvas_id: null, status: "dead_letter", error_code: "provider_rejected", error_message: "no channel",
+      payload: { ...successfulJob.payload, mastra_submission_key: "run:digest" }, result: null };
+    const scan = {
+      select: vi.fn(), eq: vi.fn(), in: vi.fn(), not: vi.fn(), is: vi.fn(), order: vi.fn(),
+      limit: vi.fn(async () => ({ data: [terminal], error: null })),
+    };
+    scan.select.mockReturnValue(scan); scan.eq.mockReturnValue(scan); scan.in.mockReturnValue(scan);
+    scan.not.mockReturnValue(scan); scan.is.mockReturnValue(scan); scan.order.mockReturnValue(scan);
+    const upsert = vi.fn(async () => ({ error: null }));
+    const update = vi.fn(() => ({ eq: vi.fn(() => ({ eq: vi.fn(async () => ({ error: null })) })) }));
+    let backgroundReads = 0;
+    const admin = { from: vi.fn((table: string) => {
+      if (table === "chat_messages") return { upsert };
+      backgroundReads += 1;
+      return backgroundReads === 1 ? scan : { update };
+    }) };
+
+    await expect(reconcileTerminalImageJobChats(admin as never))
+      .resolves.toEqual({ checked: 1, finalized: 1, failed: 0 });
+    expect(scan.not).toHaveBeenCalledWith("session_id", "is", null);
+    expect(scan.not).toHaveBeenCalledWith("payload->>mastra_submission_key", "is", null);
+    expect(upsert).toHaveBeenCalled();
+  });
+
+  it("does not create a terminal chat card for a legacy image job without a Mastra placeholder", async () => {
+    const { admin, upsert, update } = createAdmin();
+    await expect(finalizeTerminalImageJobPlaceholder(admin as never, {
+      ...successfulJob,
+      session_id: "session-legacy",
+      target_kind: "design",
+      status: "dead_letter",
+      error_code: "provider_rejected",
+      result: null,
+    } as never)).resolves.toBe(false);
+    expect(upsert).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("recovers a previously archived terminal placeholder once and persists its marker", async () => {
+    const terminal = { ...successfulJob, status: "dead_letter", payload: {
+      placeholder_element_id: "placeholder-recovery", target: { kind: "canvas", canvas_id: "canvas-1" },
+    }, result: null };
+    const scan = {
+      select: vi.fn(), eq: vi.fn(), in: vi.fn(), is: vi.fn(), order: vi.fn(),
+      limit: vi.fn(async () => ({ data: [terminal], error: null })),
+    };
+    scan.select.mockReturnValue(scan); scan.eq.mockReturnValue(scan); scan.in.mockReturnValue(scan);
+    scan.is.mockReturnValue(scan); scan.order.mockReturnValue(scan);
+    const eqStatus = vi.fn(async () => ({ error: null }));
+    const eqId = vi.fn(() => ({ eq: eqStatus }));
+    const update = vi.fn(() => ({ eq: eqId }));
+    const admin = { from: vi.fn()
+      .mockReturnValueOnce(scan)
+      .mockReturnValueOnce({ update }) };
+
+    await expect(reconcileTerminalImageJobPlaceholders(admin as never))
+      .resolves.toEqual({ checked: 1, finalized: 1, failed: 0 });
+    expect(scan.is).toHaveBeenCalledWith("result->>canvas_terminal_finalized_at", null);
+    expect(markImageGenerationPlaceholderFailed).toHaveBeenCalledWith(
+      admin, "canvas-1", "placeholder-recovery", "job-1", "图片生成失败",
+    );
+    expect(update).toHaveBeenCalledWith({ result: expect.objectContaining({
+      canvas_terminal_status: "dead_letter", canvas_terminal_finalized_at: expect.any(String),
+    }) });
+  });
+
+  it("retains a late successful asset without attaching it or marking generation failed", async () => {
+    insertImageElement.mockRejectedValue(new Error("Failed to write canvas: agent_task_superseded"));
+    const { admin, update, eqStatus, upsert } = createAdmin();
+    await expect(finalizeImageJobToCanvas(admin as never, successfulJob)).resolves.toBeNull();
+    expect(update).toHaveBeenCalledWith({ result: expect.objectContaining({
+      asset_id: successfulJob.result.asset_id,
+      attachment_status: "superseded",
+      canvas_finalized_at: expect.any(String),
+    }) });
+    expect(eqStatus).toHaveBeenCalledWith("status", "succeeded");
+    expect(upsert).not.toHaveBeenCalled();
+  });
+
+  it("persists a terminal not-applied chat result when a current-task guard rejects attachment", async () => {
+    insertImageElement.mockRejectedValue(new Error("Failed to write canvas: agent_task_superseded"));
+    const { admin, update, upsert } = createAdmin();
+    await expect(finalizeImageJobToCanvas(admin as never, {
+      ...successfulJob,
+      session_id: "session-1",
+      result: {
+        ...successfulJob.result,
+        signed_url: "https://example.com/retained.png",
+      },
+    } as never)).resolves.toBeNull();
+
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({
+      id: "job-1",
+      session_id: "session-1",
+      content: expect.stringContaining("未应用到当前画布"),
+      content_blocks: [expect.objectContaining({
+        status: "completed",
+        output: expect.objectContaining({
+          status: "succeeded",
+          finalization_status: "needs_attention",
+          attachment_status: "superseded",
+          error_code: "agent_task_superseded",
+        }),
+        artifacts: [expect.objectContaining({
+          url: "https://example.com/retained.png",
+          jobId: "job-1",
+        })],
+      })],
+    }), { onConflict: "id" });
+    expect(update).toHaveBeenCalledWith({ result: expect.objectContaining({
+      attachment_status: "superseded",
+      canvas_finalized_at: expect.any(String),
+      chat_finalized_at: expect.any(String),
+    }) });
+  });
+
+  it("never inserts a standalone matting preview before user confirmation", async () => {
+    const { admin, update, upsert } = createAdmin();
+    const outcome = await finalizeImageJobToCanvas(admin as never, {
+      ...successfulJob, canvas_id: null, target_kind: null,
+      payload: { operation: "remove_background", target: null },
+    } as never);
+    expect(outcome).toBeNull();
+    expect(insertImageElement).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(upsert).not.toHaveBeenCalled();
   });
 
   it("inserts a successful opted-in image and records a durable marker", async () => {
@@ -177,7 +402,7 @@ describe("image job canvas finalization", () => {
     );
   });
 
-  it("restores a split background and foreground elements at matching canvas coordinates", async () => {
+  it.each([undefined, "semantic"])("restores split layers and settles only the placeholder (%s)", async (layerBackend) => {
     insertImageElement
       .mockResolvedValueOnce({
         elementId: "background-element",
@@ -196,6 +421,7 @@ describe("image job canvas finalization", () => {
         payload: {
           auto_finalize_canvas: true,
           operation: "split_layers",
+          layer_backend: layerBackend,
           prompt: "拆分图层",
           placement_x: 100,
           placement_y: 200,
@@ -240,7 +466,7 @@ describe("image job canvas finalization", () => {
       admin,
       expect.objectContaining({
         sourceJobId: "job-1:background:0",
-        replaceElementId: "split-placeholder",
+        ...(layerBackend === "semantic" ? {} : { replaceElementId: "split-placeholder" }),
       }),
       { x: 100, y: 200, width: 512, height: 256 },
     );
@@ -252,6 +478,11 @@ describe("image job canvas finalization", () => {
       }),
       { x: 164, y: 232, width: 128, height: 64 },
     );
+    if (layerBackend === "semantic") {
+      expect(removeCompletedImagePlaceholder).toHaveBeenCalledExactlyOnceWith(admin, "canvas-1", "split-placeholder", "job-1");
+      expect(insertImageElement.mock.calls[0]?.[1]).not.toHaveProperty("replaceElementId");
+      expect(removeCompletedImagePlaceholder.mock.invocationCallOrder[0]).toBeGreaterThan(insertImageElement.mock.invocationCallOrder[1]!);
+    } else expect(removeCompletedImagePlaceholder).not.toHaveBeenCalled();
     expect(update).toHaveBeenCalledWith(
       expect.objectContaining({
         result: expect.objectContaining({
@@ -338,8 +569,134 @@ describe("image job canvas finalization", () => {
     );
   });
 
-  it("filters finalized chats before limiting the reconciliation batch", async () => {
-    let pendingFilter = false;
+  it.each(["needs_attention", "failed"] as const)(
+    "persists a truthful terminal chat card when design delivery is %s",
+    async (status) => {
+      const { admin, upsert, update } = createAdmin();
+      const finalized = await finalizeDesignImageJobChat(
+        admin as never,
+        {
+          ...successfulJob,
+          canvas_id: null,
+          target_kind: "design",
+          design_id: "20000000-0000-4000-8000-000000000001",
+          session_id: "session-1",
+          result: {
+            ...successfulJob.result,
+            signed_url: "https://example.com/retained-image.png",
+          },
+        } as never,
+        {
+          status,
+          result: null,
+          error_code: "design_revision_conflict",
+          error_message: "设计已发生变化，图片未应用。",
+        } as never,
+      );
+
+      expect(finalized).toBe(true);
+      expect(upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "job-1",
+          content: expect.stringContaining("图片已生成"),
+          content_blocks: [
+            expect.objectContaining({
+              status: "completed",
+              output: expect.objectContaining({
+                status: "succeeded",
+                finalization_status: status,
+                error: "设计已发生变化，图片未应用。",
+              }),
+              artifacts: [
+                expect.objectContaining({
+                  url: "https://example.com/retained-image.png",
+                  jobId: "job-1",
+                }),
+              ],
+            }),
+          ],
+        }),
+        { onConflict: "id" },
+      );
+      expect(update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          result: expect.objectContaining({
+            chat_finalized_at: expect.any(String),
+          }),
+        }),
+      );
+    },
+  );
+
+  it("requests a database-prefiltered recovery batch so 100 dead assets cannot hide a live job", async () => {
+    const unfinished = {
+      ...successfulJob,
+      id: "old-unfinished-job",
+    };
+    const databaseRows = [
+      ...Array.from({ length: 100 }, (_, index) => ({
+        ...successfulJob,
+        id: `dead-asset-job-${index}`,
+        result: { ...successfulJob.result, asset_id: `dead-asset-${index}` },
+      })),
+      unfinished,
+    ];
+    const databaseLiveAssets = new Set<string>([successfulJob.result.asset_id]);
+    insertImageElement.mockResolvedValue({
+      elementId: "recovered-element",
+      inserted: true,
+    });
+    const backgroundQuery: any = {
+      update: vi.fn(() => ({
+        eq: vi.fn(() => ({
+          eq: vi.fn(async () => ({ error: null })),
+        })),
+      })),
+    };
+    const assetQuery: any = {
+      select: vi.fn(() => assetQuery),
+      in: vi.fn(() => assetQuery),
+      is: vi.fn(async () => ({
+        data: [{
+          id: successfulJob.result.asset_id,
+          workspace_id: successfulJob.workspace_id,
+        }],
+        error: null,
+      })),
+    };
+    const admin = {
+      rpc: vi.fn(async (_name: string, input: { p_limit: number }) => ({
+        data: databaseRows
+          .filter(job => databaseLiveAssets.has(job.result.asset_id))
+          .slice(0, input.p_limit),
+        error: null,
+      })),
+      from: vi.fn((table: string) =>
+        table === "asset_objects" ? assetQuery : backgroundQuery,
+      ),
+    };
+
+    await expect(reconcileSucceededImageJobs(admin as never)).resolves.toEqual({
+      checked: 1,
+      finalized: 1,
+      failed: 0,
+    });
+    expect(admin.rpc).toHaveBeenCalledWith(
+      "loomic_recoverable_canvas_image_jobs",
+      { p_limit: 100 },
+    );
+    expect(assetQuery.select).toHaveBeenCalledWith("id,workspace_id");
+    expect(assetQuery.in).toHaveBeenCalledWith("id", [
+      successfulJob.result.asset_id,
+    ]);
+    expect(assetQuery.is).toHaveBeenCalledWith("deletion_pending_at", null);
+    expect(insertImageElement).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ sourceJobId: "old-unfinished-job" }),
+    );
+  });
+
+  it("filters 100 pending design finalizations before limiting the terminal chat batch", async () => {
     const pending = {
       ...successfulJob,
       id: "pending-job",
@@ -352,24 +709,13 @@ describe("image job canvas finalization", () => {
         signed_url: "https://example.com/pending.png",
       },
     };
-    const completed = Array.from({ length: 100 }, (_, index) => ({
+    const pendingRows = Array.from({ length: 100 }, (_, index) => ({
       ...pending,
-      id: `completed-${index}`,
-      result: { ...pending.result, chat_finalized_at: "2026-09-04T00:00:00Z" },
+      id: `pending-${index}`,
     }));
+    const databaseRows = [...pendingRows, pending];
+    const terminalJobIds = new Set([pending.id]);
     const backgroundQuery = {
-      select: vi.fn(() => backgroundQuery),
-      eq: vi.fn(() => backgroundQuery),
-      not: vi.fn(() => backgroundQuery),
-      is: vi.fn((column: string) => {
-        if (column === "result->>chat_finalized_at") pendingFilter = true;
-        return backgroundQuery;
-      }),
-      order: vi.fn(() => backgroundQuery),
-      limit: vi.fn(async () => ({
-        data: pendingFilter ? [pending] : completed,
-        error: null,
-      })),
       update: vi.fn(() => ({
         eq: vi.fn(() => ({ eq: vi.fn(async () => ({ error: null })) })),
       })),
@@ -397,6 +743,12 @@ describe("image job canvas finalization", () => {
     };
     const upsert = vi.fn(async () => ({ error: null }));
     const admin = {
+      rpc: vi.fn(async (_name: string, input: { p_limit: number }) => ({
+        data: databaseRows
+          .filter(job => terminalJobIds.has(job.id))
+          .slice(0, input.p_limit),
+        error: null,
+      })),
       from: vi.fn((table: string) => {
         if (table === "background_jobs") return backgroundQuery;
         if (table === "job_target_finalizations") return finalizationQuery;
@@ -407,7 +759,10 @@ describe("image job canvas finalization", () => {
     await expect(
       reconcileSucceededDesignImageChats(admin as never),
     ).resolves.toEqual({ finalized: 1, failed: 0 });
-    expect(pendingFilter).toBe(true);
+    expect(admin.rpc).toHaveBeenCalledWith(
+      "loomic_recoverable_design_image_chats",
+      { p_limit: 100 },
+    );
     expect(upsert).toHaveBeenCalledTimes(1);
   });
 });

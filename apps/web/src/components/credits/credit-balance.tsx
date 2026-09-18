@@ -28,7 +28,7 @@ function AnimatedBalance({ value }: { value: number }) {
       step++;
       const progress = step / steps;
       // Ease-out curve
-      const eased = 1 - Math.pow(1 - progress, 3);
+      const eased = 1 - (1 - progress) ** 3;
       setDisplayed(Math.round(prev + diff * eased));
       if (step >= steps) {
         clearInterval(timer);

@@ -12,5 +12,7 @@ export default defineConfig({
   },
   test: {
     environment: "jsdom",
+    maxWorkers: 1,
+    fileParallelism: false,
   },
 });

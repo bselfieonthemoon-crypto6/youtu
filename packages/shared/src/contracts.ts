@@ -2,6 +2,8 @@ import { z } from "zod";
 
 import { toolArtifactSchema } from "./artifacts.js";
 import { brandKitAssetTypeSchema } from "./brand-kit-contracts.js";
+import { agentCollaborationSettingsSchema } from "./agent-collaboration-contracts.js";
+import { clarificationQuestionSchema } from "./clarification-contracts.js";
 
 export const identifierSchema = z.string().min(1);
 export const timestampSchema = z.string().datetime({ offset: true });
@@ -64,6 +66,7 @@ export const messageMentionSchema = z.discriminatedUnion("mentionType", [
 export const imageGenerationPreferenceSchema = z.object({
   mode: z.enum(["auto", "manual"]),
   models: z.array(z.string().min(1)),
+  aspectRatio: z.enum(["auto", "1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3", "4:5", "5:4", "21:9"]).optional(),
 });
 
 export const videoGenerationPreferenceSchema = z.object({
@@ -73,18 +76,54 @@ export const videoGenerationPreferenceSchema = z.object({
 
 export const agentExecutionModeSchema = z.enum(["fast", "thinking"]);
 
+/** Explicit UI selection scopes target identity; it does not grant write authority. */
+export const designTaskTargetSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("design"),
+    designId: z.string().uuid(),
+    objectIds: z.array(z.string().uuid()).max(100).optional(),
+    elementId: z.string().min(1).max(200).optional(),
+  }).strict(),
+  z.object({
+    kind: z.literal("canvas_image"),
+    elementId: z.string().min(1).max(200),
+    assetId: z.string().uuid(),
+  }).strict(),
+]);
+
+function designTaskTargetAuthorityKey(target: DesignTaskTarget): string {
+  return target.kind === "design"
+    ? `design:${target.designId}`
+    : `canvas_image:${target.elementId}:${target.assetId}`;
+}
+
+/** Exact destinations selected in the authenticated request. This list is
+ * evidence for the server target-scope service; workflow/model output can
+ * reference it but cannot create or broaden it. */
+export const designTaskAuthorizedTargetsSchema = z.array(designTaskTargetSchema)
+  .min(1).max(20)
+  .refine(targets => new Set(targets.map(designTaskTargetAuthorityKey)).size === targets.length,
+    "Authorized target destinations must be unique.")
+  .refine(targets => targets.every(target => target.kind !== "design" ||
+    !target.objectIds || new Set(target.objectIds).size === target.objectIds.length),
+    "Authorized target object IDs must be unique.");
+
+export type DesignTaskTarget = z.infer<typeof designTaskTargetSchema>;
+
+/** Send-time canvas selection is disambiguation evidence, never write authority. */
+export const canvasSelectionSchema = z.object({
+  elementIds: z.array(z.string().min(1).max(200)).max(100)
+    .refine(ids => new Set(ids).size === ids.length, "Selection element IDs must be unique."),
+}).strict();
+
 export const runCreateRequestSchema = z.object({
+  canvasSelection: canvasSelectionSchema.optional(),
   activeDesignId: z.string().uuid().optional(),
   sessionId: sessionIdSchema,
   conversationId: conversationIdSchema,
+  /** Durable identity of the user message that authorized this run. */
+  userMessageId: z.string().uuid().optional(),
   prompt: z.string(),
-  imageConfirmation: z
-    .object({
-      confirmationId: z.string().uuid(),
-      decision: z.enum(["confirm", "cancel"]),
-    })
-    .strict()
-    .optional(),
   canvasId: canvasIdSchema.optional(),
   attachments: z.array(imageAttachmentSchema).optional(),
   imageGenerationPreference: imageGenerationPreferenceSchema.optional(),
@@ -160,6 +199,7 @@ export const profileUpdateRequestSchema = z.object({
 
 export const workspaceSettingsSchema = z.object({
   defaultModel: z.string().min(1),
+  agentCollaboration: agentCollaborationSettingsSchema.optional(),
 });
 
 export const modelInfoSchema = z.object({
@@ -284,6 +324,13 @@ export const mentionBlockSchema = z.union([
   skillMentionBlockSchema,
 ]);
 
+export const clarificationBlockSchema = z.object({
+  type: z.literal("clarification"),
+  version: z.literal(1),
+  clarificationId: z.string().min(1),
+  questions: z.array(clarificationQuestionSchema).min(1).max(6),
+});
+
 export const contentBlockSchema = z.union([
   textBlockSchema,
   thinkingBlockSchema,
@@ -291,6 +338,7 @@ export const contentBlockSchema = z.union([
   toolBlockSchema,
   imageBlockSchema,
   mentionBlockSchema,
+  clarificationBlockSchema,
 ]);
 
 export const chatMessageSchema = z.object({
@@ -303,6 +351,8 @@ export const chatMessageSchema = z.object({
 });
 
 export const chatMessageCreateRequestSchema = z.object({
+  /** Client-generated identity used to bind the subsequent agent run. */
+  id: z.string().uuid().optional(),
   role: z.enum(["user", "assistant"]),
   content: z.string(),
   toolActivities: z.array(chatToolActivitySchema).nullable().optional(),

@@ -1,0 +1,53 @@
+{
+  "registry": "https://github.com/yukkcat/image-prompts",
+  "registryRevision": "bc5dd581b2d910209b965b9e77f47ff48a9eddcc",
+  "generatedAt": "2026-09-08T08:02:15+00:00",
+  "manifestSha256": "db7e4b210cdcd075e4f62c0e93beea66309bc70cd11bdd2244f611f4043878e6",
+  "registryTotal": 1742,
+  "importedTotal": 654,
+  "omittedSources": [
+    "davidwu-gpt-image2-prompts",
+    "freestylefly-gpt-image-2",
+    "awesome-gpt-image"
+  ],
+  "catalogSha256": "fbf0d80556c94dc360b27e0660f54ac5fd24ae64b806124e5c0320288c37f39b",
+  "sourceChecks": [
+    {
+      "id": "banana-prompt-quicker",
+      "count": 323,
+      "bytes": 397075,
+      "sha256": "0ae590d56820d1d9716691e96410ee6869dec28a7261de397f74ad2f6cbedda5"
+    },
+    {
+      "id": "awesome-gpt4o-image-prompts",
+      "count": 76,
+      "bytes": 96430,
+      "sha256": "ece926584179496d426bd9703c0ea30a13b89a9ce0101bb340056d049e58979d"
+    },
+    {
+      "id": "youmind-gpt-image-2",
+      "count": 126,
+      "bytes": 328069,
+      "sha256": "6c805b393cf8f0fcde64f9b2ea9ebd182c7a66188fe090b28f300b837870e1db"
+    },
+    {
+      "id": "youmind-nano-banana-pro",
+      "count": 129,
+      "bytes": 262082,
+      "sha256": "9365172fe786841f9fef404d3fced101acaa20225f6253a918d0adc2357a29fb"
+    }
+  ],
+  "modifications": [
+    "Category inference",
+    "Stable local identifiers",
+    "Model and reference labels are hints only",
+    "Public source image URLs retained for on-demand browser previews; no image files downloaded or stored",
+    "Example galleries never become generation inputs",
+    "Prompt text preserved without translation or rewriting"
+  ],
+  "entriesWithCover": 654,
+  "entriesWithGallery": 80,
+  "downloadedImages": 0,
+  "generatedImages": 0,
+  "userDataUploaded": false
+}

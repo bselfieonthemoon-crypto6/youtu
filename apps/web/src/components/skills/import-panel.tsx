@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import {
   ArrowRight,
@@ -12,7 +12,8 @@ import {
 
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/components/toast";
-import { ApiApplicationError, importSkillFromUrl } from "@/lib/server-api";
+import { importSkillFromUrl } from "@/lib/server-api";
+import { skillErrorMessage } from "@/lib/skills-client";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -48,6 +49,9 @@ export function ImportPanel({
   const { success, error: showError } = useToast();
 
   const [url, setUrl] = useState("");
+  const pending = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const [importState, setImportState] = useState<ImportState>({
     status: "idle",
   });
@@ -57,36 +61,36 @@ export function ImportPanel({
   // ---------------------------------------------------------------------------
 
   const handleImport = useCallback(async () => {
+    if (pending.current) return;
     const token = accessToken();
-    if (!token) return;
+    if (!token) { setImportState({ status: "error", message: "请登录后重试。" }); return; }
 
     const trimmed = url.trim();
     if (!trimmed) return;
 
     // Basic URL validation
     try {
-      new URL(trimmed);
+      if (new URL(trimmed).protocol !== "https:") throw new Error("HTTPS required");
     } catch {
-      setImportState({ status: "error", message: "请输入有效的 URL" });
+      setImportState({ status: "error", message: "请输入有效的 HTTPS URL" });
       return;
     }
 
+    pending.current = true;
     setImportState({ status: "loading" });
 
     try {
       const result = await importSkillFromUrl(token, trimmed);
+      if (!mounted.current || accessToken() !== token) return;
       setImportState({ status: "success", skillName: result.skill.name });
       success(`技能 "${result.skill.name}" 导入成功`);
       await onImported();
     } catch (err) {
-      const msg =
-        err instanceof ApiApplicationError
-          ? err.message
-          : "导入失败，请检查 URL 后重试";
+      if (!mounted.current || accessToken() !== token) return;
+      const msg = skillErrorMessage(err, "导入失败，请确认链接中包含有效的 SKILL.md 后重试。");
       setImportState({ status: "error", message: msg });
       showError(msg);
-      console.error("[import] skill import failed:", err);
-    }
+    } finally { pending.current = false; }
   }, [accessToken, url, onImported, success, showError]);
 
   const handleReset = useCallback(() => {
@@ -236,6 +240,7 @@ export function ImportPanel({
               https://registry.npmjs.org/package/-/package-1.0.0.tgz
             </p>
           </div>
+          <p className="text-xs text-muted-foreground">包内必须包含 SKILL.md；README 不会被当作技能。导入前请核对来源、许可和操作说明，安装不代表官方审核通过。</p>
         </div>
       </motion.div>
     </div>

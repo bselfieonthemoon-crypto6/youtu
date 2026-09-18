@@ -1,0 +1,68 @@
+{
+  "slug": "creative-directions",
+  "name": "创意方向探索",
+  "description": "为开放式设计比较不同概念和视觉组织，解释取舍；已有方向或局部纠正不重新发散。",
+  "version": "2.1.0",
+  "category": "design",
+  "iconName": "palette",
+  "license": null,
+  "metadata": {
+    "bundle": "loomic-design-skills-v2",
+    "loomic": {
+      "schemaVersion": 1,
+      "execution": "guidance",
+      "intents": [
+        "concept",
+        "creative-direction",
+        "exploration"
+      ],
+      "outputKinds": [
+        "design-brief"
+      ],
+      "requiredTools": [],
+      "optionalTools": [
+        "inspect_design",
+        "get_design_objects",
+        "update_design_brief",
+        "verify_design_result",
+        "get_brand_kit"
+      ],
+      "models": [
+        {
+          "role": "planner",
+          "required": true,
+          "preferredIds": []
+        }
+      ],
+      "limitations": [
+        "技能不增加运行时工具、模型、权限或预算；用户局部修改不扩展为重设计。",
+        "本包为 Loomic 原创流程，研究来源不是效果 benchmark；未运行上游脚本或自动下载依赖。"
+      ],
+      "examples": [
+        "给这次发布会想两条区别明显的视觉方向，先不要生成图。"
+      ],
+      "sources": [
+        {
+          "title": "SVG concept exploration and small-size inspection",
+          "url": "https://github.com/neonwatty/logo-designer-skill/blob/main/skills/logo-designer/SKILL.md",
+          "license": "MIT",
+          "relation": "inspired-by"
+        },
+        {
+          "title": "Cover art-direction dimensions",
+          "url": "https://github.com/JimLiu/baoyu-skills/blob/main/skills/baoyu-cover-image/SKILL.md",
+          "license": "MIT",
+          "relation": "inspired-by"
+        }
+      ],
+      "composition": {
+        "role": "workflow",
+        "stages": [
+          "design",
+          "reference",
+          "prompt"
+        ]
+      }
+    }
+  }
+}

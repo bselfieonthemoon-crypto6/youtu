@@ -1,0 +1,59 @@
+{
+  "slug": "json-image-prompt",
+  "name": "图像需求结构化",
+  "description": "为确实需要位图生成的任务整理主体、保留项、构图和素材提示；不强制 JSON 格式，也不把改字转成生图。",
+  "version": "2.2.0",
+  "category": "generation",
+  "iconName": "palette",
+  "license": null,
+  "metadata": {
+    "bundle": "loomic-design-skills-v2",
+    "loomic": {
+      "schemaVersion": 1,
+      "execution": "guidance",
+      "intents": [
+        "image-prompt",
+        "raster-generation"
+      ],
+      "outputKinds": [
+        "image-prompt"
+      ],
+      "requiredTools": [],
+      "optionalTools": [
+        "generate_image",
+        "edit_image",
+        "inspect_canvas"
+      ],
+      "models": [
+        {
+          "role": "planner",
+          "required": true,
+          "preferredIds": []
+        }
+      ],
+      "limitations": [
+        "技能不增加运行时工具、模型、权限或预算；用户局部修改不扩展为重设计。",
+        "本包为 Loomic 原创流程，研究来源不是效果 benchmark；未运行上游脚本或自动下载依赖。",
+        "本运行时图片只落无限画布，不传原生设计 target，也不要求旧图片方案确认。"
+      ],
+      "examples": [
+        "给产品背景写可执行图片提示，用户确定的标题逐字保留并按实际结果核对。"
+      ],
+      "sources": [
+        {
+          "title": "Cover art-direction dimensions",
+          "url": "https://github.com/JimLiu/baoyu-skills/blob/main/skills/baoyu-cover-image/SKILL.md",
+          "license": "MIT",
+          "relation": "inspired-by"
+        }
+      ],
+      "composition": {
+        "role": "prompt",
+        "stages": [
+          "design",
+          "prompt"
+        ]
+      }
+    }
+  }
+}

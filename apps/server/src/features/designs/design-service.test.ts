@@ -259,6 +259,61 @@ describe("design service", () => {
     expect(adminClient.rpc).toHaveBeenCalledTimes(2);
   });
 
+  it.each([true, false])(
+    "handles stale user mutation receipt (exact=%s) before applying commands",
+    async (exact) => {
+      const commands = [
+        { action: "canvas.update" as const, background: "#000000" },
+      ];
+      const query = queryResult({ ...documentRow, revision: 1 });
+      const receipt = {
+        select: vi.fn(() => receipt),
+        eq: vi.fn(() => receipt),
+        maybeSingle: vi.fn(async () => ({
+          data: {
+            parent_revision: 0,
+            command_batch: exact ? commands : [],
+            actor_kind: "user",
+            actor_user_id: ids.user,
+          },
+          error: null,
+        })),
+      };
+      const rpc = vi.fn(async () => ({
+        data: {
+          design_id: ids.design,
+          revision: 1,
+          changed_object_ids: [],
+          replayed: true,
+        },
+        error: null,
+      }));
+      const service = createDesignService({
+        createUserClient: () => ({ from: vi.fn(() => query) }) as never,
+        getAdminClient: () => ({ from: vi.fn(() => receipt), rpc }) as never,
+      });
+      const result = service.mutate(user, {
+        design_id: ids.design,
+        expected_revision: 0,
+        idempotency_key: ids.request,
+        commands,
+      });
+      if (exact) {
+        await expect(result).resolves.toMatchObject({
+          replayed: true,
+          revision: 1,
+        });
+        expect(rpc).toHaveBeenCalledWith(
+          "loomic_design_mutate",
+          expect.objectContaining({ p_next_scene: documentRow.scene }),
+        );
+      } else {
+        await expect(result).rejects.toMatchObject({ code: "design_conflict" });
+        expect(rpc).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   it("replays an exact agent mutation before reapplying object versions", async () => {
     const query = queryResult({ ...documentRow, revision: 1 });
     const commands = [

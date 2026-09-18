@@ -125,14 +125,10 @@ export async function registerPaymentWebhookRoute(
           : "Unknown error";
 
       console.error(`[Webhook] Error processing ${eventName}:`, errorMessage);
-
-      // Record error in audit trail
-      {
         await (admin as any)
           .from("payment_events")
           .update({ error_message: errorMessage })
           .eq("delivery_fingerprint", deliveryFingerprint);
-      }
 
       return reply.code(500).send({ error: "Webhook processing failed" });
     }

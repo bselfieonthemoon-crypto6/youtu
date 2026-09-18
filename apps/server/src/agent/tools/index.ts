@@ -1,7 +1,4 @@
-import type { StructuredTool } from "@langchain/core/tools";
-import type { AnyBackendProtocol } from "deepagents";
-import { tool } from "langchain";
-import { z } from "zod";
+import type { MastraAgentTool } from "./tool-run-context.js";
 
 import type { DestructiveConfirmationService } from "../../features/agent-actions/destructive-confirmation-service.js";
 import type {
@@ -9,7 +6,8 @@ import type {
   AvailableVideoModel,
 } from "../../generation/providers/registry.js";
 import type { ConnectionManager } from "../../ws/connection-manager.js";
-import type { SyncBackendFactory } from "../backends/index.js";
+import type { PromptLibraryService } from "../../features/prompt-library/prompt-library-service.js";
+import type { WorkspaceVisionModel } from "../workspace-vision-model.js";
 import { createBrandKitTool } from "./brand-kit.js";
 import {
   type DesignToolDependencies,
@@ -17,18 +15,17 @@ import {
 } from "./design-tools.js";
 import {
   type PersistImageFn,
+  type ImageGenerateInput,
   type SubmitImageJobFn,
   createImageGenerateTool,
+  supportedImageAspectRatioForDimensions,
 } from "./image-generate.js";
-import { createImageGenerationConfirmationTool } from "./image-generation-confirmation.js";
-import { createImageProposalStore } from "../../features/agent-actions/image-proposal-store.js";
 import { createDesignImageTargetValidator } from "./design-image-target.js";
 import { createInspectCanvasTool } from "./inspect-canvas.js";
 import { createDesignDiscoveryTool } from "./design-discovery.js";
 import { createManipulateCanvasTool } from "./manipulate-canvas.js";
-import { createPersistSandboxFileTool } from "./persist-sandbox-file.js";
-import { createProjectSearchTool } from "./project-search.js";
 import { createScreenshotCanvasTool } from "./screenshot-canvas.js";
+import { createReviewImageResultsTool } from "./review-image-results.js";
 import {
   type SubmitVideoJobFn,
   createVideoGenerateTool,
@@ -39,55 +36,69 @@ export { createVideoGenerateTool } from "./video-generate.js";
 export { createInspectCanvasTool } from "./inspect-canvas.js";
 export { createManipulateCanvasTool } from "./manipulate-canvas.js";
 
+export function createDesignImageAspectRatioResolver(deps: {
+  designTools?: DesignToolDependencies;
+}) {
+  if (!deps.designTools) return undefined;
+  return async (
+    target: NonNullable<ImageGenerateInput["target"]>,
+    context: Record<string, any>,
+  ) => {
+    const design = await deps.designTools!.designService.get(
+      {
+        id: context.user_id,
+        accessToken: context.access_token,
+        email: "",
+        userMetadata: {},
+      },
+      target.design_id,
+    );
+    if (design.workspace_id !== context.workspace_id)
+      throw new Error("画板不属于当前工作区");
+    if (design.revision !== target.expected_revision)
+      throw new Error("画板版本已改变，请重新 inspect_design 后生成方案并确认。");
+    return supportedImageAspectRatioForDimensions(design.width, design.height);
+  };
+}
+
 // ---------------------------------------------------------------------------
-// deepagents 内置工具参考 (由 FilesystemMiddleware 自动注入)
+// 工具命名空间说明
 // ---------------------------------------------------------------------------
 //
-// deepagents@1.8.4 通过 createFilesystemMiddleware 自动注入以下工具，
-// 我们自定义的工具名称不能与这些冲突：
+// 历史上 DeepAgents 的 FilesystemMiddleware 会注入 ls / read_file / write_file /
+// edit_file / glob / grep / execute / task / write_todos。该中间件已随 legacy
+// runtime 一起退役，Backends 与虚拟文件系统（/workspace、/memories、/skills）
+// 也已删除。
 //
-//   ls          — 列出目录内容
-//   read_file   — 读取文件内容（支持 offset/limit）
-//   write_file  — 写入文件
-//   edit_file   — 编辑文件（find & replace）
-//   glob        — 按模式匹配文件路径
-//   grep        — 按正则搜索文件内容
-//   execute     — 执行 shell 命令（仅 SandboxBackendProtocol 时可用）
-//   task        — 分发子任务到 subagent
-//   write_todos — 管理 TODO 列表
+// 当前运行时（Mastra）只保留两个自建的文件读取入口：
+//   read_file  — 由 mastra-toolkit.ts 提供，只能读本轮已启用 Skill 的快照切片
+//   （技能目录由 list_skills / use_skill / compose_skills 承载）
 //
-// 开发模式可使用 LocalShellBackend；生产 state 模式使用 StateBackend，
-// 不向多租户 Agent 暴露主机 shell。
-//
-// CompositeBackend 路由互不干扰：
-//   /workspace/  → StoreBackend (PostgresStore) — 文件持久化
-//   /memories/   → StoreBackend (PostgresStore) — agent 记忆
-//   /skills/     → FilesystemBackend            — 系统 skills
-//   default      → StateBackend / dev shell     — 由运行模式决定
+// 自定义工具名不得与上述保留名冲突。
 // ---------------------------------------------------------------------------
 
 export function createMainAgentTools(
-  backend: AnyBackendProtocol | SyncBackendFactory,
   deps: {
     createUserClient: (accessToken: string) => any;
     destructiveConfirmationService?: DestructiveConfirmationService;
     brandKitId?: string | null;
     connectionManager?: ConnectionManager;
     persistImage?: PersistImageFn;
-    sandboxDir?: string;
     submitImageJob?: SubmitImageJobFn;
     submitVideoJob?: SubmitVideoJobFn;
     availableImageModels?: AvailableModel[];
     availableVideoModels?: AvailableVideoModel[];
     designTools?: DesignToolDependencies;
+    visionModel?: WorkspaceVisionModel;
+    currentUserPrompt?: string;
+    promptLibraryService?: PromptLibraryService;
+    resultReviewScope?: { jobId: string; assetIds: string[] };
+    prepareImagePipeline?: (input: ImageGenerateInput, configurable: Record<string, unknown>) => Promise<ImageGenerateInput>;
   },
 ) {
-  const proposalStore = deps.submitImageJob
-    ? createImageProposalStore(deps.createUserClient)
-    : undefined;
   const validateDesignTarget = createDesignImageTargetValidator(deps);
-  const tools: StructuredTool[] = [
-    createProjectSearchTool(backend),
+  const resolveDesignAspectRatio = createDesignImageAspectRatioResolver(deps);
+  const tools: MastraAgentTool[] = [
     createInspectCanvasTool(deps),
     createManipulateCanvasTool({
       createUserClient: deps.createUserClient,
@@ -98,29 +109,6 @@ export function createMainAgentTools(
         : {}),
     }),
   ];
-  if (proposalStore)
-    tools.push(
-      tool(
-        async (_input, config) => {
-          const latest = await proposalStore.latest(
-            (config as any).configurable,
-          );
-          return latest
-            ? {
-                confirmationId: latest.id,
-                status: latest.status,
-                input: latest.input,
-              }
-            : { status: "no_proposal", summary: "当前对话尚无图片方案。" };
-        },
-        {
-          name: "get_image_proposal",
-          description:
-            "Read the latest persisted image proposal in this conversation. Always call before confirming or revising an image proposal; never guess the confirmation ID or target.",
-          schema: z.object({}),
-        },
-      ),
-    );
   if (deps.designTools)
     tools.push(
       ...createDesignTools(deps.designTools),
@@ -135,8 +123,9 @@ export function createMainAgentTools(
   ) {
     tools.push(
       createImageGenerateTool({
-        ...(proposalStore ? { proposalStore } : {}),
+        createUserClient: deps.createUserClient,
         validateDesignTarget,
+        ...(resolveDesignAspectRatio ? { resolveDesignAspectRatio } : {}),
         ...(deps.destructiveConfirmationService
           ? { confirmationService: deps.destructiveConfirmationService }
           : {}),
@@ -145,6 +134,7 @@ export function createMainAgentTools(
         ...(deps.availableImageModels
           ? { availableModels: deps.availableImageModels }
           : {}),
+        ...(deps.prepareImagePipeline ? { prepareImagePipeline: deps.prepareImagePipeline } : {}),
       }),
     );
   }
@@ -161,31 +151,8 @@ export function createMainAgentTools(
       }),
     );
   }
-  // execute 工具由 deepagents FilesystemMiddleware 自动注入，
-  // 因为 CompositeBackend 的 default backend 是 LocalShellBackend。
-  // 不需要在这里手动注册。
-  if (deps.destructiveConfirmationService) {
-    tools.push(
-      createImageGenerationConfirmationTool({
-        confirmationService: deps.destructiveConfirmationService,
-        ...(proposalStore ? { proposalStore } : {}),
-        validateDesignTarget,
-        ...(deps.submitImageJob ? { submitImageJob: deps.submitImageJob } : {}),
-        ...(deps.persistImage ? { persistImage: deps.persistImage } : {}),
-      }),
-    );
-  }
-  // This tool reads a host path and is only safe when a real isolated/dev
-  // sandbox directory is present. Never expose it with the production
-  // StateBackend, where an arbitrary host path would otherwise be accepted.
-  if (deps.sandboxDir) {
-    tools.push(
-      createPersistSandboxFileTool({
-        createUserClient: deps.createUserClient,
-        sandboxDir: deps.sandboxDir,
-      }),
-    );
-  }
+  // `persist_sandbox_file` was retired with the DeepAgents sandbox backend: it
+  // read a host path and had no consumer once the Mastra runtime took over.
   if (deps.brandKitId) {
     tools.push(createBrandKitTool(deps, deps.brandKitId));
   }
@@ -194,19 +161,19 @@ export function createMainAgentTools(
       createScreenshotCanvasTool({
         connectionManager: deps.connectionManager,
         ...(deps.persistImage ? { persistImage: deps.persistImage } : {}),
+        ...(deps.visionModel ? { model: deps.visionModel } : {}),
+        ...(deps.currentUserPrompt !== undefined ? { currentUserPrompt: deps.currentUserPrompt } : {}),
       }),
     );
   }
+  if (deps.visionModel) {
+    tools.push(createReviewImageResultsTool({
+      ...(deps.resultReviewScope ? { resultReviewScope: deps.resultReviewScope } : {}),
+      createUserClient: deps.createUserClient,
+      model: deps.visionModel,
+      ...(deps.currentUserPrompt !== undefined ? { currentUserPrompt: deps.currentUserPrompt } : {}),
+      ...(deps.promptLibraryService ? { promptLibraryService: deps.promptLibraryService } : {}),
+    }));
+  }
   return tools;
-}
-
-/** @deprecated Use createMainAgentTools + sub-agents instead */
-export function createPhaseATools(
-  backend: AnyBackendProtocol | SyncBackendFactory,
-) {
-  return [
-    createProjectSearchTool(backend),
-    createImageGenerateTool(),
-    createVideoGenerateTool(),
-  ] as const;
 }

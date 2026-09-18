@@ -13,7 +13,6 @@ import { ConnectionManager } from "./connection-manager.js";
 import { registerWsRoute } from "./handler.js";
 
 const env: ServerEnv = {
-  agentBackendMode: "state",
   agentModel: "test-model",
   port: 3001,
   version: "test",
@@ -29,7 +28,7 @@ describe("agent.retry_tool", () => {
     await Promise.all(apps.splice(0).map((app) => app.close()));
   });
 
-  it("replays only the server-resolved inspect_canvas input and persists its block", async () => {
+  it("replays only the server-resolved tool input and persists its block", async () => {
     const app = Fastify();
     apps.push(app);
     await app.register(websocket);
@@ -37,7 +36,7 @@ describe("agent.retry_tool", () => {
       id: "00000000-0000-4000-8000-000000000002",
       runId: "00000000-0000-4000-8000-000000000010",
       toolCallId: "retry-call-1",
-      toolName: "inspect_canvas",
+      toolName: "get_design_objects",
       status: "running" as const,
       input: { detail_level: "summary" },
       output: null,
@@ -122,7 +121,7 @@ describe("agent.retry_tool", () => {
       canvasId: "canvas-1",
       input: { detail_level: "summary" },
       threadId: "thread-1",
-      toolName: "inspect_canvas",
+      toolName: "get_design_objects",
       userId: "owner-1",
     });
     expect(messages).toEqual(expect.arrayContaining([
@@ -142,8 +141,9 @@ describe("agent.retry_tool", () => {
       expect.objectContaining({
         contentBlocks: [expect.objectContaining({
           toolExecutionId: execution.id,
-          toolName: "inspect_canvas",
+          toolName: "get_design_objects",
           status: "completed",
+          outputSummary: "Retried get_design_objects successfully.",
         })],
       }),
     );

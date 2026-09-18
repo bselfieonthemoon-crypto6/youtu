@@ -5,7 +5,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ProviderSettingsSection } from "../src/components/settings/provider-settings-section";
+import { modelLimitError, ProviderSettingsSection } from "../src/components/settings/provider-settings-section";
 
 const { fetchMock, createMock, updateMock, deleteMock, testMock, discoverMock } = vi.hoisted(() => ({
   fetchMock: vi.fn(),
@@ -22,7 +22,7 @@ vi.mock("../src/lib/server-api", () => ({
   updateProviderConfig: updateMock,
   deleteProviderConfig: deleteMock,
   testProviderConnection: testMock,
-  discoverProviderModels: discoverMock,
+  discoverDraftProviderModels: discoverMock,
 }));
 
 const config = {
@@ -93,23 +93,22 @@ describe("ProviderSettingsSection", () => {
     await userEvent.click(screen.getByRole("button", { name: "手动添加" }));
     await userEvent.type(screen.getByLabelText("模型 1 ID"), "model-one");
     await userEvent.type(screen.getByLabelText("模型 1 显示名称"), "Model One");
-    await userEvent.click(screen.getByRole("button", { name: "保存并获取模型" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存供应商与模型" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("HTTPS");
     expect(createMock).not.toHaveBeenCalled();
 
     await userEvent.clear(screen.getByLabelText("Base URL"));
     await userEvent.type(screen.getByLabelText("Base URL"), "https://safe.example/v1/");
-    await userEvent.click(screen.getByRole("button", { name: "保存并获取模型" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存供应商与模型" }));
     await waitFor(() => expect(createMock).toHaveBeenCalledWith(
       "token",
       expect.objectContaining({
         baseUrl: "https://safe.example/v1",
         apiKey: "sk-secret-value",
-        models: [expect.objectContaining({ upstreamModelId: "model-one", capabilities: ["text"] })],
+        models: [expect.objectContaining({ upstreamModelId: "model-one" })],
       }),
     ));
-    await waitFor(() => expect(testMock).toHaveBeenCalledWith("token", config.id));
-    expect(discoverMock).toHaveBeenCalledWith("token", config.id);
+    expect(discoverMock).not.toHaveBeenCalled();
   }, 10_000);
 
   it("reports connection-test success and failure in Chinese", async () => {
@@ -121,16 +120,104 @@ describe("ProviderSettingsSection", () => {
     testMock.mockRejectedValueOnce(Object.assign(new Error(), { code: "provider_auth_failed" }));
     await userEvent.click(screen.getByRole("button", { name: "测试连接" }));
     expect(await screen.findByText(/API Key 无效/)).toBeInTheDocument();
+
+    testMock.mockRejectedValueOnce(Object.assign(new Error(), { code: "provider_response_too_large" }));
+    await userEvent.click(screen.getByRole("button", { name: "测试连接" }));
+    expect(await screen.findByText(/超过系统安全上限/)).toBeInTheDocument();
   });
 
-  it("loads the model catalog from the persisted supplier", async () => {
+  it("opens a picker without changing the draft until confirmation", async () => {
     render(<ProviderSettingsSection accessToken="token" />);
     await screen.findByText("API 易");
     await userEvent.click(screen.getByRole("button", { name: "编辑" }));
-    await userEvent.click(screen.getByRole("button", { name: "重新获取" }));
-    expect(await screen.findByLabelText("模型 1 ID")).toHaveValue("gpt-image-2-all");
-    expect(testMock).toHaveBeenCalledWith("token", config.id);
-    expect(discoverMock).toHaveBeenCalledWith("token", config.id);
+    await userEvent.click(screen.getByRole("button", { name: "拉取模型" }));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByLabelText("选择 gpt-image-2-all")).not.toBeChecked();
+    expect(updateMock).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue("gpt-image-2-all")).not.toBeInTheDocument();
+    expect(updateMock).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole("button", { name: "拉取模型" }));
+    await userEvent.click(screen.getByLabelText("选择 gpt-image-2-all"));
+    await userEvent.selectOptions(screen.getByLabelText("gpt-image-2-all 类型"), "video");
+    await userEvent.click(screen.getByRole("button", { name: "确认添加" }));
+    expect(screen.getByLabelText("模型 2 ID")).toHaveValue("gpt-image-2-all");
+    expect(screen.getByLabelText("模型 2 类型")).toHaveValue("video");
+    expect(screen.getByLabelText("模型 2 ID")).toBeEnabled();
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(testMock).not.toHaveBeenCalled();
+    expect(discoverMock).toHaveBeenCalledWith("token", { configId: config.id, baseUrl: config.baseUrl });
+  });
+
+  it("discovers with unsaved connection credentials without persisting them", async () => {
+    render(<ProviderSettingsSection accessToken="token" />);
+    await screen.findByText("API 易");
+    await userEvent.click(screen.getByRole("button", { name: "编辑" }));
+    await userEvent.type(screen.getByLabelText("API Key"), "new-secret-value");
+    await userEvent.click(screen.getByRole("button", { name: "拉取模型" }));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(testMock).not.toHaveBeenCalled();
+    expect(discoverMock).toHaveBeenCalledWith("token", { configId: config.id, baseUrl: config.baseUrl, apiKey: "new-secret-value" });
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it("offers draft discovery before the first save and cancel creates nothing", async () => {
+    render(<ProviderSettingsSection accessToken="token" />);
+    await screen.findByText("API 易");
+    await userEvent.click(screen.getByRole("button", { name: "新增供应商" }));
+    await userEvent.clear(screen.getByLabelText("Base URL"));
+    await userEvent.type(screen.getByLabelText("Base URL"), "https://toapis.cn/v1");
+    await userEvent.type(screen.getByLabelText("API Key"), "unsaved-test-key");
+    await userEvent.click(screen.getByRole("button", { name: "拉取模型" }));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(discoverMock).toHaveBeenCalledWith("token", { baseUrl: "https://toapis.cn/v1", apiKey: "unsaved-test-key" });
+    expect(createMock).not.toHaveBeenCalled();
+    expect(updateMock).not.toHaveBeenCalled();
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it("pages a large catalog and keeps selections when searching", async () => {
+    discoverMock.mockResolvedValueOnce({ models: Array.from({ length: 101 }, (_, index) => ({
+      upstreamModelId: `catalog-${index}`,
+      displayName: `Catalog ${index}`,
+      modality: "text" as const,
+      enabled: false,
+      capabilities: ["text" as const],
+    })) });
+    render(<ProviderSettingsSection accessToken="token" />);
+    await screen.findByText("API 易");
+    await userEvent.click(screen.getByRole("button", { name: "编辑" }));
+    await userEvent.click(screen.getByRole("button", { name: "拉取模型" }));
+    expect(await screen.findByText("第 1/2 页。", { exact: false })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "下一页模型" }));
+    await userEvent.click(screen.getByLabelText("选择 catalog-100"));
+    await userEvent.type(screen.getByLabelText("搜索获取到的模型"), "catalog-0");
+    expect(screen.getByText("第 1/1 页。", { exact: false })).toBeInTheDocument();
+    await userEvent.clear(screen.getByLabelText("搜索获取到的模型"));
+    await userEvent.click(screen.getByRole("button", { name: "下一页模型" }));
+    expect(screen.getByLabelText("选择 catalog-100")).toBeChecked();
+  });
+
+  it("preserves existing models rather than adding discovered duplicates", async () => {
+    discoverMock.mockResolvedValueOnce({ models: [{ ...config.models[0], enabled: false }] });
+    render(<ProviderSettingsSection accessToken="token" />);
+    await screen.findByText("API 易");
+    await userEvent.click(screen.getByRole("button", { name: "编辑" }));
+    await userEvent.click(screen.getByRole("button", { name: "拉取模型" }));
+    await userEvent.click(await screen.findByLabelText("选择 gemini-flash"));
+    await userEvent.click(screen.getByRole("button", { name: "确认添加" }));
+    expect(screen.getByLabelText("模型 1 ID")).toHaveValue("gemini-flash");
+    expect(screen.queryByLabelText("模型 2 ID")).not.toBeInTheDocument();
+  });
+
+  it("reports the cap message used by the picker before persistence", () => {
+    expect(modelLimitError(500, 1)).toContain("最多只能保存 500 个模型");
+    expect(modelLimitError(499, 1)).toBeNull();
   });
 
   it("requires inline confirmation before deleting and removes the card", async () => {

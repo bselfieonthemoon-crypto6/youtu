@@ -22,6 +22,30 @@ function adminWithRpc(
 }
 
 describe("provider snapshot service", () => {
+  const verifiedProfile = { contextWindowTokens: 128000, maxInputTokens: 100000, maxOutputTokens: 16000,
+    profileSource: "verified upstream integration", profileVersion: "v1", verifiedAt: "2026-09-09T00:00:00Z" };
+  const textRow = { snapshot_id: SNAPSHOT_ID, provider_config_id: "config-1", provider_revision: 3,
+    catalog_key: CATALOG_KEY, adapter: "openai_compatible", base_url: "https://example.com/v1",
+    upstream_model_id: "unknown-model", modality: "text", capabilities: ["text"], api_key: "test-only" };
+
+  it.each([null, verifiedProfile])("reads nullable text limits from the frozen scoped snapshot, not the current catalog", async (profile) => {
+    const admin = adminWithRpc(async name => ({ data: name === "loomic_provider_context_profile" ? profile : [textRow], error: null }));
+    const resolved = await createProviderSnapshotService({ getAdminClient: () => admin })
+      .resolveRunSnapshot({ workspaceId: "workspace-1", runId: "run-1" });
+    expect(resolved.contextProfile).toEqual(profile);
+    expect(admin.rpc).toHaveBeenCalledWith("loomic_provider_context_profile", {
+      p_workspace: "workspace-1", p_snapshot: SNAPSHOT_ID,
+    });
+  });
+
+  it.each([{ data: null, error: { message: "private database detail" } },
+    { data: { ...verifiedProfile, maxInputTokens: "100000" }, error: null }])("fails closed when frozen capacity cannot be trusted", async result => {
+    const admin = adminWithRpc(async name => name === "loomic_provider_context_profile" ? result : { data: [textRow], error: null });
+    await expect(createProviderSnapshotService({ getAdminClient: () => admin })
+      .resolveRunSnapshot({ workspaceId: "workspace-1", runId: "run-1" }))
+      .rejects.toMatchObject({ code: "provider_snapshot_unavailable", message: "Model context profile is unavailable." });
+  });
+
   it("creates a job snapshot from only workspace, target, and opaque catalog ref", async () => {
     const admin = adminWithRpc(async () => ({
       data: SNAPSHOT_ID,

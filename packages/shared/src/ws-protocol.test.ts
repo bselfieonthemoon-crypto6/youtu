@@ -2,7 +2,22 @@ import { describe, expect, it } from "vitest";
 
 import { wsCommandSchema } from "./ws-protocol.js";
 
+describe("agent run canvas selection websocket contract", () => {
+  it("uses the shared run schema to preserve optional selection evidence", () => {
+    const command = { type: "command", action: "agent.run", payload: { sessionId: "session", conversationId: "conversation", prompt: "点评这段文字", canvasId: "canvas-1", canvasSelection: { elementIds: ["text-1"] } } };
+    expect(wsCommandSchema.parse(command)).toMatchObject(command);
+    expect(wsCommandSchema.parse({ ...command, payload: { sessionId: "session", conversationId: "conversation", prompt: "聊天" } })).not.toHaveProperty("payload.canvasSelection");
+  });
+
+  it("rejects oversized snapshots before WebSocket dispatch", () => {
+    expect(wsCommandSchema.safeParse({ type: "command", action: "agent.run", payload: { sessionId: "session", conversationId: "conversation", prompt: "test", canvasSelection: { elementIds: Array.from({ length: 101 }, (_, i) => `text-${i}`) } } }).success).toBe(false);
+  });
+});
+
 describe("agent destructive confirmation websocket command", () => {
+  it("accepts refreshed credentials without accepting new operation authority", () => {
+    expect(wsCommandSchema.parse({ type: "command", action: "agent.confirm_action", accessToken: "fresh", requestId: "request-1", payload: { confirmationId: "4b4aa127-751d-4a21-a38d-98a4f568da73", decision: "confirm" } })).toMatchObject({ accessToken: "fresh", requestId: "request-1" });
+  });
   it("accepts only an opaque confirmation id and explicit decision", () => {
     const command = wsCommandSchema.parse({
       type: "command",

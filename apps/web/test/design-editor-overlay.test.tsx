@@ -187,6 +187,25 @@ describe("DesignEditorOverlay", () => {
     );
   });
 
+  it("offers bounded animated GIF export without a raster multiplier", async () => {
+    const onExport = vi.fn(async () => undefined);
+    render(<DesignEditorOverlay {...baseProps} onExport={onExport} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "导出" }));
+    fireEvent.change(screen.getByLabelText("导出格式"), {
+      target: { value: "gif" },
+    });
+
+    expect(screen.getByLabelText("导出倍率")).toBeDisabled();
+    expect(screen.getByText(/最长边自动压缩至 1024px/)).toBeInTheDocument();
+    expect(screen.getByText(/最多 60 帧/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "下载" }));
+
+    await waitFor(() =>
+      expect(onExport).toHaveBeenCalledWith({ format: "gif", multiplier: 1 }),
+    );
+  });
+
   it("keeps the dialog open for a queued large export and shows restored progress", async () => {
     const onExport = vi.fn(async () => "background_queued" as const);
     const onRefreshExportJobs = vi.fn();

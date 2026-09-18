@@ -1,4 +1,5 @@
 import type { CanvasContent } from "@loomic/shared";
+import { mergeCompletedImageReplacement, mergePendingNodeImageSubmission } from "@loomic/shared";
 import { pruneFilesWithoutLiveElements } from "./canvas-asset-references.js";
 
 type CanvasRecord = Record<string, unknown>;
@@ -37,6 +38,21 @@ export function mergeCanvasContent(
   for (const element of incomingElements) {
     if (typeof element.id !== "string") continue;
     const current = byId.get(element.id);
+    const currentData = current?.customData as CanvasRecord | undefined;
+    const incomingData = element.customData as CanvasRecord | undefined;
+    if (current?.isDeleted && currentData?.completedJobId
+      && currentData.completedJobId === currentData.jobId
+      && incomingData?.jobId === currentData.jobId
+      && currentData.type === "image-replacement" && incomingData.type === "image-replacement") {
+      // A finished job's progress node cannot be revived by an older browser
+      // snapshot, even when it has a newer geometry version.
+      byId.set(element.id, { ...current, version: Math.max(versionOf(current), versionOf(element)) });
+      continue;
+    }
+    const completed = current && mergeCompletedImageReplacement(current, element);
+    if (completed) { byId.set(element.id, completed); continue; }
+    const pending = current && mergePendingNodeImageSubmission(element, current);
+    if (pending) { byId.set(element.id, pending); continue; }
     if (!current || versionOf(element) >= versionOf(current)) {
       byId.set(element.id, element);
     }

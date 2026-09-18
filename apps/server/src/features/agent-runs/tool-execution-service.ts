@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import type { Json } from "@loomic/shared";
+import { isUuid, type Json } from "@loomic/shared";
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type {
@@ -216,6 +216,33 @@ export function createToolExecutionService(options: {
           404,
         );
       }
+      // Design reads are workspace-scoped; the retry executor must supply the
+      // same authenticated workspace the original run used.
+      const { data: canvas, error: canvasError } = await client
+        .from("canvases")
+        .select("project_id")
+        .eq("id", session.canvas_id)
+        .maybeSingle();
+      if (canvasError || !canvas) {
+        throw new ToolExecutionServiceError(
+          "tool_execution_not_found",
+          "Tool execution not found or access denied.",
+          404,
+        );
+      }
+      const { data: project, error: projectError } = await client
+        .from("projects")
+        .select("workspace_id")
+        .eq("id", canvas.project_id)
+        .maybeSingle();
+      if (projectError || !project) {
+        throw new ToolExecutionServiceError(
+          "tool_execution_not_found",
+          "Tool execution not found or access denied.",
+          404,
+        );
+      }
+      const workspaceId = project.workspace_id as string;
 
       const existing = await admin
         .from("tool_executions")
@@ -238,6 +265,7 @@ export function createToolExecutionService(options: {
           canvasId: session.canvas_id,
           sessionId: session.id,
           threadId: run.thread_id,
+          workspaceId,
           isNew: false,
         };
       }
@@ -277,6 +305,7 @@ export function createToolExecutionService(options: {
               canvasId: session.canvas_id,
               sessionId: session.id,
               threadId: run.thread_id,
+              workspaceId,
               isNew: false,
             };
           }
@@ -288,17 +317,13 @@ export function createToolExecutionService(options: {
         canvasId: session.canvas_id,
         sessionId: session.id,
         threadId: run.thread_id,
+        workspaceId,
         isNew: true,
       };
     },
   };
 }
 
-function isUuid(value: string) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    value,
-  );
-}
 
 function mapRow(row: Record<string, unknown>): ToolExecution {
   return {

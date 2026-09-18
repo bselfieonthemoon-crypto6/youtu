@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
+import { resolveChatSelection } from "../features/providers/resolve-chat-selection.js";
 
 import {
   applicationErrorResponseSchema,
@@ -21,6 +22,7 @@ import {
 import type { SettingsService } from "../features/settings/settings-service.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
 import type { ProviderSnapshotService, WorkspaceModelCatalogService } from "../features/providers/index.js";
+import { sanitizeErrorForClient } from "../utils/error-sanitizer.js";
 
 export async function registerRunRoutes(
   app: FastifyInstance,
@@ -55,7 +57,7 @@ export async function registerRunRoutes(
           : null;
 
       // Resolve per-workspace model if auth context is available
-      let model: string | undefined;
+      let configuredDefaultModel: string | undefined;
       let workspaceId: string | undefined;
       if (
         authenticatedUser &&
@@ -70,33 +72,13 @@ export async function registerRunRoutes(
             authenticatedUser,
             viewer.workspace.id,
           );
-          if (options.workspaceModelCatalogService) {
-            const textModels = (await options.workspaceModelCatalogService.listPublished(
-              authenticatedUser,
-              viewer.workspace.id,
-            )).filter((entry) => entry.model.modality === "text");
-            model = textModels.some((entry) => entry.model.id === settings.defaultModel)
-              ? settings.defaultModel
-              : textModels[0]?.model.id;
-          } else {
-            model = settings.defaultModel;
-          }
+          configuredDefaultModel = settings.defaultModel;
         } catch {
           // Fall through to server default model if settings lookup fails
         }
       }
 
-      const resolvedModel = payload.model ?? model;
-      if (options.workspaceModelCatalogService && !resolvedModel) {
-        return reply.code(422).send(
-          applicationErrorResponseSchema.parse({
-            error: {
-              code: "model_not_accessible",
-              message: "No enabled text model is configured for this workspace.",
-            },
-          }),
-        );
-      }
+      let resolvedModel: string | undefined;
       if (!workspaceId && options.viewerService) {
         try {
           workspaceId = (await options.viewerService.ensureViewer(authenticatedUser)).workspace.id;
@@ -104,8 +86,30 @@ export async function registerRunRoutes(
           // Workspace-bound models fail closed below; legacy models may continue.
         }
       }
+      try {
+        resolvedModel = await resolveChatSelection({ user: authenticatedUser,
+          ...(workspaceId ? { workspaceId } : {}),
+          ...(payload.model ? { requested: payload.model } : {}),
+          ...(configuredDefaultModel ? { defaultModel: configuredDefaultModel } : {}),
+          ...(options.workspaceModelCatalogService ? { catalog: options.workspaceModelCatalogService } : {}),
+        });
+      } catch {
+          return reply.code(422).send(applicationErrorResponseSchema.parse({
+            error: { code: "model_not_accessible", message: "The selected text model is not available in this workspace." },
+          }));
+      }
+      let routedPayload;
+      try { routedPayload = typeof agentRuns.routeTaskSubmission === "function"
+        ? await agentRuns.routeTaskSubmission(payload, authenticatedUser.id) : payload; }
+      catch (error) {
+        // Keep the client message generic, but never hide a real backend
+        // failure from server logs: "task changed" and an outage look identical
+        // to the caller otherwise.
+        request.log.error({ err: error }, "design task routing failed");
+        return reply.code(409).send({ error: { code: "design_task_rejected", message: "Current task changed; the follow-up was not submitted." } });
+      }
       const response = runCreateResponseSchema.parse(
-        agentRuns.createRun(payload, {
+        agentRuns.createRun(routedPayload, {
           accessToken: authenticatedUser.accessToken,
           userId: authenticatedUser.id,
           ...(workspaceId ? { workspaceId } : {}),
@@ -115,14 +119,22 @@ export async function registerRunRoutes(
       );
 
       if (sessionThread && options.agentRunMetadataService) {
-        await options.agentRunMetadataService.createAcceptedRun({
+        try {
+          await options.agentRunMetadataService.createAcceptedRun({
           createdBy: authenticatedUser.id,
           executionMode: payload.executionMode ?? "fast",
           ...(resolvedModel ? { model: resolvedModel } : {}),
+          prompt: payload.prompt,
+          ...(payload.userMessageId ? { requestMessageId: payload.userMessageId } : {}),
           runId: response.runId,
           sessionId: payload.sessionId,
           threadId: sessionThread.threadId,
-        });
+          });
+        } catch (error) {
+          // The in-memory run must not survive a rejected durable request.
+          agentRuns.cancelRun(response.runId, authenticatedUser.id);
+          throw error;
+        }
       }
 
       if (resolvedModel?.startsWith("workspace:")) {

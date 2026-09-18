@@ -12,6 +12,16 @@ const EXCALIDRAW_CONTEXT_MENU_ZH_CN: Readonly<Record<string, string>> = {
  * visible and accessible labels are replaced.
  */
 export function localizeExcalidrawContextMenus(root: ParentNode): void {
+  // Use the browser top layer, so canvas previews and portal toolbars cannot
+  // cover the menu. Keep its DOM parent and native Excalidraw event handlers.
+  for (const menu of root.querySelectorAll<HTMLElement>(".popover:has(> .context-menu)")) {
+    if (menu.isConnected && typeof menu.showPopover === "function" && !menu.hasAttribute("popover")) {
+      const rect = menu.getBoundingClientRect();
+      menu.setAttribute("popover", "manual");
+      Object.assign(menu.style, { position: "fixed", left: `${rect.left}px`, top: `${rect.top}px`, right: "auto", bottom: "auto", margin: "0" });
+      menu.showPopover();
+    }
+  }
   const labels = root.querySelectorAll<HTMLElement>(
     ".context-menu-item__label",
   );

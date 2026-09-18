@@ -1,0 +1,86 @@
+[
+  {
+    "id": "banana-prompt-quicker",
+    "name": "Banana Prompt Quicker",
+    "url": "https://github.com/glidea/banana-prompt-quicker",
+    "registryPath": "sources/banana-prompt-quicker.json",
+    "license": "MIT",
+    "licenseUrl": "https://github.com/glidea/banana-prompt-quicker/blob/main/LICENSE",
+    "attribution": "glidea / Banana Prompt Quicker；保留各条目作者与原始来源",
+    "status": "available",
+    "note": "2026-09-09：仓库提供 MIT 正文，README 要求引用注明来源。上游快照 323 条。我方归一分类，提示词正文不改写；示例图片按需从原站加载，只保留地址、不转存文件，也不自动成为生成输入。仓库许可不保证第三方品牌、肖像、作品或输出的商用权利；未逐条进行生图验证。",
+    "entryCount": 0
+  },
+  {
+    "id": "davidwu-gpt-image2-prompts",
+    "name": "DavidWu GPT Image 2 Prompts",
+    "url": "https://github.com/davidwuw0811-boop/awesome-gpt-image2-prompts",
+    "registryPath": "sources/davidwu-gpt-image2-prompts.json",
+    "license": "MIT（仅 README 声明，待核实）",
+    "licenseUrl": "https://github.com/davidwuw0811-boop/awesome-gpt-image2-prompts#readme",
+    "attribution": "DavidWu 及各原始作者",
+    "status": "link_only",
+    "note": "2026-09-09 审核：README 声称 MIT，但根目录 LICENSE 返回 404；集合还来自多个上游仓库。上游快照 494 条，本项目不导入提示词正文或示例图片，仅提供来源入口，待取得清晰许可证和上游授权依据后再纳入。",
+    "entryCount": 0
+  },
+  {
+    "id": "freestylefly-gpt-image-2",
+    "name": "Freestylefly GPT Image 2",
+    "url": "https://github.com/freestylefly/awesome-gpt-image-2",
+    "registryPath": "sources/freestylefly-gpt-image-2.json",
+    "license": "MIT（第三方内容另受原始条款约束）",
+    "licenseUrl": "https://github.com/freestylefly/awesome-gpt-image-2/blob/main/LICENSE",
+    "attribution": "freestylefly 及各原始作者 / 平台",
+    "status": "link_only",
+    "note": "2026-09-09 审核：项目代码 MIT，但 README 明示收集内容用于学习研究、不拥有第三方内容，并须遵循 YouMind、OpenNana 等原始来源许可。上游快照 541 条。首期不做整库再分发，仅提供来源入口，待逐项确认权利链。",
+    "entryCount": 0
+  },
+  {
+    "id": "awesome-gpt-image",
+    "name": "Awesome GPT Image",
+    "url": "https://github.com/ZeroLu/awesome-gpt-image",
+    "registryPath": "sources/awesome-gpt-image.json",
+    "license": "许可声明冲突（MIT / CC BY 4.0）",
+    "licenseUrl": "https://github.com/ZeroLu/awesome-gpt-image#license",
+    "attribution": "Zero Lu 及各原始作者",
+    "status": "link_only",
+    "note": "2026-09-09 审核：LICENSE 正文是 MIT，但 README 声称 CC BY 4.0，并说明内容来自互联网；需厘清适用范围。上游快照 53 条，抽样两张 GitHub 附件示例图 HEAD 均为 403。本项目不导入正文或图片，仅提供来源入口。",
+    "entryCount": 0
+  },
+  {
+    "id": "awesome-gpt4o-image-prompts",
+    "name": "Awesome GPT-4o Image Prompts",
+    "url": "https://github.com/ImgEdify/Awesome-GPT4o-Image-Prompts",
+    "registryPath": "sources/awesome-gpt4o-image-prompts.json",
+    "license": "MIT",
+    "licenseUrl": "https://github.com/ImgEdify/Awesome-GPT4o-Image-Prompts/blob/main/LICENSE",
+    "attribution": "Awesome GPT4o Image Prompts / ImgEdify；保留各条目作者与原始来源",
+    "status": "available",
+    "note": "2026-09-09：仓库提供 MIT 正文，上游快照 76 条。我方归一分类，提示词正文不改写；示例图片按需从原站加载，只保留地址、不转存文件，也不自动成为生成输入。原模型 gpt4o 仅作为来源标签，不改变当前模型。第三方作品权利仍需按用途核验，未逐条进行生图验证。",
+    "entryCount": 0
+  },
+  {
+    "id": "youmind-gpt-image-2",
+    "name": "YouMind GPT Image 2",
+    "url": "https://github.com/YouMind-OpenLab/awesome-gpt-image-2",
+    "registryPath": "sources/youmind-gpt-image-2.json",
+    "license": "CC BY 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by/4.0/",
+    "attribution": "YouMind OpenLab (2026)；保留各条目作者与原始来源",
+    "status": "available",
+    "note": "2026-09-09：仓库 LICENSE / README 为 CC BY 4.0，须署名、链接许可、说明改动，不可附加限制。快照仅 126 条，不代表 YouMind 网站全部内容。我方归一分类，原文不改写；示例图片按需从原站加载，只保留地址、不转存文件，也不自动成为生成输入。品牌、肖像等权利仍需核验，未逐条进行生图验证。",
+    "entryCount": 0
+  },
+  {
+    "id": "youmind-nano-banana-pro",
+    "name": "YouMind Nano Banana Pro",
+    "url": "https://github.com/YouMind-OpenLab/awesome-nano-banana-pro-prompts",
+    "registryPath": "sources/youmind-nano-banana-pro.json",
+    "license": "CC BY 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by/4.0/",
+    "attribution": "YouMind OpenLab (2025)；保留各条目作者与原始来源",
+    "status": "available",
+    "note": "2026-09-09：仓库 LICENSE / README 为 CC BY 4.0，须署名、链接许可、说明改动，不可附加限制。快照仅 129 条。我方归一分类，原文不改写；示例图片按需从原站加载，只保留地址、不转存文件，也不自动成为生成输入。nano-banana-pro 仅作为推荐标签，作品其他权利仍需核验，未逐条进行生图验证。",
+    "entryCount": 0
+  }
+]

@@ -1,7 +1,5 @@
-import {
-  DynamicStructuredTool,
-  type StructuredTool,
-} from "@langchain/core/tools";
+import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 import {
   type AgentDesignToolErrorCode,
@@ -27,9 +25,11 @@ import {
   manipulateDesignToolOutputSchema,
   searchDesignResourcesToolInputSchema,
   searchDesignResourcesToolOutputSchema,
+  isUuid,
 } from "@loomic/shared";
 
 import type { DestructiveConfirmationService } from "../../features/agent-actions/destructive-confirmation-service.js";
+import type { DurableActionConfirmation } from "../../features/agent-actions/durable-action-confirmation-store.js";
 import type { DesignResourceService } from "../../features/design-resources/design-resource-service.js";
 import type { DesignTemplateService } from "../../features/design-resources/design-template-service.js";
 import type { DesignExportService } from "../../features/designs/design-export-service.js";
@@ -39,6 +39,9 @@ import {
   DesignServiceError,
 } from "../../features/designs/design-service.js";
 import type { AuthenticatedUser } from "../../supabase/user.js";
+import type { AgentTaskService } from "../../features/agent-tasks/agent-task-service.js";
+import type { ConfirmedActionAppliedEvent } from "../../features/agent-actions/destructive-confirmation-service.js";
+import { createAgentTool, runContextOf, type MastraAgentTool } from "./tool-run-context.js";
 
 export type DesignToolDependencies = {
   designService: DesignService;
@@ -51,23 +54,33 @@ export type DesignToolDependencies = {
   destructiveConfirmationService?: DestructiveConfirmationService | undefined;
 };
 
+/**
+ * Native design tool factory.
+ *
+ * The audit fields stay server-owned: `tool_execution_id` must be a UUID that
+ * matches the durable `tool_executions` ledger row, so it never comes from the
+ * model. The run context is copied and the identifier is injected per call;
+ * nothing here writes back to the shared per-run record.
+ */
 function tool<Input>(
-  handler: (input: Input, config: unknown) => Promise<string>,
+  handler: (input: Input, runContext: Record<string, unknown>) => Promise<string>,
   fields: { name: string; description: string; schema: unknown },
-): StructuredTool {
-  return new DynamicStructuredTool({
-    name: fields.name,
+) {
+  return createAgentTool({
+    id: fields.name,
     description: fields.description,
-    schema: fields.schema as never,
-    func: async (input: Input, runManager, config) =>
-      handler(input, {
-        ...config,
-        configurable: {
-          ...config?.configurable,
-          ...(runManager?.runId ? { tool_execution_id: runManager.runId } : {}),
-        },
-      }),
-  }) as StructuredTool;
+    inputSchema: fields.schema as never,
+    execute: async (input: Input, context: unknown) => {
+      const runContext = runContextOf(context);
+      const toolCallId = runContext.tool_execution_id;
+      return handler(input, {
+        ...runContext,
+        tool_execution_id: typeof toolCallId === "string" && isUuid(toolCallId)
+          ? toolCallId
+          : randomUUID(),
+      });
+    },
+  });
 }
 
 export function createDesignTools(deps: DesignToolDependencies) {
@@ -164,11 +177,12 @@ export function createDesignTools(deps: DesignToolDependencies) {
 
   const manipulate = tool(
     async (input: ManipulateDesignToolInput, config) => {
+      if (contextValue(config, "image_edit_routing")) return failure("validation_error", "本轮修改的是独立图片，不能修改历史设计画板。请使用 generate_image，不传 target。");
       const parsedInput = manipulateDesignToolInputSchema.safeParse(input);
       if (!parsedInput.success)
         return failure(
           "validation_error",
-          "Design commands do not match the strict mutation contract.",
+          mutationValidationGuidance(input, parsedInput.error.issues),
         );
       input = parsedInput.data;
       const user = contextUser(config);
@@ -213,15 +227,16 @@ export function createDesignTools(deps: DesignToolDependencies) {
           const current = await deps.designService.get(user, input.design_id);
           if (current.revision !== input.expected_revision)
             return conflict(current.id, current.revision);
-          const proposal = deps.destructiveConfirmationService.proposeAction({
+          const details = {
+            design_id: current.id,
+            expected_revision: current.revision,
+            actions: input.commands.map((command) => command.action),
+          };
+          const proposal = await deps.destructiveConfirmationService.proposeAction({
             userId: user.id,
             canvasId,
             kind: "design_mutation",
-            details: {
-              design_id: current.id,
-              expected_revision: current.revision,
-              actions: input.commands.map((command) => command.action),
-            },
+            details,
             originRunId: audit.agentRunId,
             execute,
           });
@@ -240,6 +255,27 @@ export function createDesignTools(deps: DesignToolDependencies) {
         }
       }
       try {
+        if (input.commands.every(command => command.action === "object.update")) {
+          const current = await deps.designService.get(user, input.design_id);
+          if (!workspaceMatches(config, current.workspace_id))
+            return failure("design_forbidden", "Design is outside the active workspace.");
+          // Only short-circuit an exact current revision. Stale requests still
+          // reach canonical idempotency/CAS handling, including successful replays.
+          if (current.revision === input.expected_revision && input.commands.every(command => {
+            if (command.action !== "object.update") return false;
+            const object = current.scene.objects.find(candidate => candidate.objectId === command.object_id);
+            return object?.objectVersion === command.expected_object_version
+              && object.type === command.patch.object_type
+              && Object.entries(command.patch).every(([key, value]) => key === "object_type"
+                || isDeepStrictEqual((object as unknown as Record<string, unknown>)[
+                  key.replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase())
+                ], value));
+          })) {
+            return failure("validation_error",
+              "no_change: Every requested patch value already matches the saved design. Nothing was applied and no revision or preview was created. Re-read the intended changes; send the actual differing fields (for typography use font_size/font_weight), then verify the result.",
+              false, current.revision);
+          }
+        }
         return parsedJson(manipulateDesignToolOutputSchema, {
           status: "applied",
           ...(await execute()),
@@ -251,7 +287,7 @@ export function createDesignTools(deps: DesignToolDependencies) {
     {
       name: "manipulate_design",
       description:
-        'Modify a native design document with CAS and idempotency. The JSON schema is authoritative. For a text edit use commands:[{action:"object.update", object_id:"UUID", expected_object_version:1, patch:{object_type:"text", text:"new text"}}]. Execute a complete valid non-destructive request immediately; deletion and full scene replacement require product confirmation.',
+        'Modify a native design document with CAS and idempotency. Every object.update patch requires object_type equal to the inspected object type. Read outputs use camelCase but command patches use snake_case: font_size, font_weight, text_align, line_height, z_index. Example commands:[{action:"object.update",object_id:"UUID",expected_object_version:1,patch:{object_type:"text",font_size:36,font_weight:700,x:40}}]. Only include text when wording should change. Fix every validation error without dropping intended edits. An identical-value patch returns no_change and is not completion. Execute valid non-destructive requests; deletion/full scene replacement require confirmation.',
       schema: manipulateDesignModelInputSchema,
     },
   );
@@ -314,6 +350,7 @@ export function createDesignTools(deps: DesignToolDependencies) {
 
   const applyTemplate = tool(
     async (input: ApplyDesignTemplateToolInput, config) => {
+      if (contextValue(config, "image_edit_routing")) return failure("validation_error", "本轮修改的是独立图片，不能替换设计画板模板。");
       const user = contextUser(config);
       const audit = contextAudit(config);
       const canvasId = contextString(config, "canvas_id");
@@ -473,7 +510,75 @@ export function createDesignTools(deps: DesignToolDependencies) {
     searchResources,
     applyTemplate,
     exportDesign,
-  ] as unknown as StructuredTool[];
+  ] as unknown as MastraAgentTool[];
+}
+
+/** Rebuild the exact confirmed mutation after a process restart. The stored
+ * payload still passes the canonical command schema and design service CAS;
+ * the original idempotency key makes an unknown prior commit replay-safe. */
+export function createDurableDesignMutationExecutor(deps: Pick<
+  DesignToolDependencies,
+  "designService" | "designPreviewService"
+> & { agentTaskService: AgentTaskService }) {
+  return async (action: DurableActionConfirmation, context: unknown) => {
+    const user = context && typeof context === "object" && "user" in context
+      ? (context as { user?: AuthenticatedUser }).user
+      : undefined;
+    if (!user || user.id !== action.userId)
+      throw new Error("confirmation_forbidden");
+    const currentTask = await deps.agentTaskService.assertCurrentRun(action.originRunId);
+    if (
+      !currentTask || currentTask.id !== action.taskId ||
+      currentTask.revision !== action.taskRevision ||
+      currentTask.sessionId !== action.sessionId ||
+      currentTask.canvasId !== action.canvasId
+    ) throw new Error("agent_task_superseded");
+    const input = manipulateDesignToolInputSchema.parse(action.payload);
+    if (input.design_id !== action.details.design_id)
+      throw new Error("agent_confirmation_scope_mismatch");
+    const result = await deps.designService.mutate(user, input, {
+      actorKind: "agent",
+      agentRunId: action.originRunId,
+      toolExecutionId: action.toolExecutionId,
+      operation: "manipulate_design",
+      confirmationId: action.confirmationId,
+      destructiveConfirmed: true,
+    });
+    await enqueuePreviewBestEffort(
+      deps.designPreviewService,
+      user.id,
+      input.design_id,
+      result.revision,
+      input.idempotency_key,
+    );
+    return result as unknown as Record<string, unknown>;
+  };
+}
+
+/** Reconstructed after the legacy workflow-execution module was retired.
+ * Records a confirmed durable design mutation against the current agent task.
+ * Mastra does not create durable tasks, so this resolves to a no-op there. */
+export function createConfirmedActionAppliedHandler(deps: { tasks: AgentTaskService }) {
+  return async (event: ConfirmedActionAppliedEvent): Promise<void> => {
+    const task = await deps.tasks.assertCurrentRun(event.originRunId);
+    if (!task) return;
+    if (task.id !== event.taskId || task.revision !== event.taskRevision) return;
+    if (task.target.kind !== "design") return;
+    const designId = typeof event.outcome.design_id === "string"
+      ? event.outcome.design_id
+      : task.target.designId;
+    if (designId !== task.target.designId) return;
+    const revision = typeof event.outcome.revision === "number" ? event.outcome.revision : undefined;
+    await deps.tasks.updateBrief(event.originRunId, {
+      ...(task.brief ?? {}),
+      confirmedDesignMutation: {
+        confirmationId: event.confirmationId,
+        ...(event.workflowStepId ? { stepId: event.workflowStepId } : {}),
+        designId,
+        ...(revision !== undefined ? { revision } : {}),
+      },
+    });
+  };
 }
 
 function summarizeObject(object: DesignObject, textLimit: number) {
@@ -564,26 +669,17 @@ function workspaceMatches(config: unknown, workspaceId: string) {
 }
 
 function contextString(config: unknown, key: string) {
-  if (!config || typeof config !== "object" || !("configurable" in config))
-    return null;
-  const configurable = config.configurable;
-  if (
-    !configurable ||
-    typeof configurable !== "object" ||
-    !(key in configurable)
-  )
-    return null;
-  const value = configurable[key as keyof typeof configurable];
+  const value = contextValue(config, key);
   return typeof value === "string" && value ? value : null;
 }
 
-function isUuid(value: string | null): value is string {
-  return Boolean(
-    value &&
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-        value,
-      ),
-  );
+/**
+ * Read one per-run value. The runtime owns every key here (see
+ * `tools/tool-run-context.ts`); the model can never supply or override them.
+ */
+function contextValue(config: unknown, key: string): unknown {
+  if (!config || typeof config !== "object") return undefined;
+  return (config as Record<string, unknown>)[key];
 }
 
 function noContext() {
@@ -630,6 +726,47 @@ function designError(error: unknown) {
     code,
     error instanceof Error ? error.message : "Design operation failed.",
   );
+}
+
+function mutationValidationGuidance(input: unknown, issues: readonly unknown[]): string {
+  const problems: string[] = [];
+  const aliases: Record<string, string> = {
+    objectType: "object_type", fontSize: "font_size", fontWeight: "font_weight",
+    fontFamily: "font_family", fontFaceId: "font_face_id", fontStyle: "font_style",
+    textAlign: "text_align", lineHeight: "line_height", charSpacing: "char_spacing",
+    strokeWidth: "stroke_width", zIndex: "z_index",
+  };
+  const commands = input && typeof input === "object" && "commands" in input && Array.isArray(input.commands)
+    ? input.commands : [];
+  for (const [index, command] of commands.entries()) {
+    if (problems.length >= 3) break;
+    if (!command || command.action !== "object.update") continue;
+    const patch = command.patch;
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+      problems.push(`commands[${index}].patch: expected a typed patch object`);
+      continue;
+    }
+    if (typeof patch.object_type !== "string") {
+      problems.push(`commands[${index}].patch.object_type: required; use the inspected type (text/textbox/etc.)`);
+    }
+    for (const [wrong, correct] of Object.entries(aliases)) {
+      if (wrong in patch && problems.length < 3) problems.push(`commands[${index}].patch.${wrong}: use ${correct}`);
+    }
+  }
+  if (!problems.length) {
+    // Never echo command values, user text, URLs or arbitrary Zod messages.
+    // Schema paths and a fixed code explanation are sufficient to locate errors.
+    for (const raw of issues.slice(0, 3)) {
+      const issue = raw as { path?: unknown[]; code?: string };
+      const path = (issue.path ?? []).map(part => typeof part === "number" ? `[${part}]`
+        : typeof part === "string" && /^[a-z_][a-z0-9_]*$/i.test(part) ? `.${part.slice(0, 50)}` : ".field")
+        .join("").replace(/^\./, "") || "commands";
+      problems.push(`${path}: ${issue.code === "unrecognized_keys" ? "unsupported fields; use the strict snake_case patch schema"
+        : issue.code === "too_small" || issue.code === "too_big" ? "value outside the allowed range"
+        : "invalid type, required field or unsupported command shape"}`);
+    }
+  }
+  return `Nothing applied. Fix every invalid command; retain the intended edits. ${problems.join("; ").slice(0, 240)}. Text layout example: patch:{object_type:"text",font_size:36,font_weight:700,x:40}. Use the exact inspected type; font_size/font_weight are not fontSize/fontWeight.`;
 }
 
 function failure(

@@ -200,14 +200,9 @@ function referenceSpecs(kind: DesignCatalogEntityKind, _id: string) {
         kind: "template",
       },
     ],
-    template: [
-      {
-        table: "design_documents",
-        foreignKey: "source_template_id",
-        columns: "id,name",
-        kind: "design",
-      },
-    ],
+    // Instantiation copies the template scene into an independent document.
+    // There is no live template FK (or source_template_id column) to inspect.
+    template: [],
     text_preset: [],
     font_family: [
       {

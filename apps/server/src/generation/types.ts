@@ -11,12 +11,11 @@ export interface ModelInfo {
 }
 
 /**
- * Semantic quality levels — each provider translates to its own resolution param.
- * - standard: ~1K (fastest, preview quality)
- * - hd:       ~2K (default, production quality)
- * - ultra:    ~4K (highest, print quality — not all models support this)
+ * Semantic provider quality levels. Pixel dimensions are selected separately
+ * through ImageResolution where a native provider supports them.
  */
 export type ImageQuality = "standard" | "hd" | "ultra";
+export type ImageResolution = "1k" | "2k" | "4k";
 
 export type OutputFormat = "png" | "jpg" | "webp";
 
@@ -25,13 +24,19 @@ export interface ImageGenerateParams {
   model: string;
   aspectRatio?: string;
   inputImages?: string[];
+  /** PNG alpha mask for image edits; transparent pixels are replaced. */
+  maskImage?: string;
   /** Semantic quality level, provider translates to model-specific resolution */
   quality?: ImageQuality;
+  /** Native output pixel tier. This is independent of provider quality. */
+  resolution?: ImageResolution;
   /** Exact requested output dimensions for providers that support custom sizes. */
   outputWidth?: number;
   outputHeight?: number;
   /** Output format preference */
   outputFormat?: OutputFormat;
+  /** Native GPT Image 2 transparency; unsupported adapters must not silently drop it. */
+  background?: "transparent" | "opaque" | "auto";
   metadata?: Record<string, unknown>;
 }
 
@@ -45,6 +50,8 @@ export interface GeneratedImage {
 export interface ImageProvider {
   readonly name: string;
   readonly models: readonly ModelInfo[];
+  /** Whether this adapter forwards an edit mask instead of silently dropping it. */
+  readonly supportsImageMask?: boolean;
   generate(params: ImageGenerateParams): Promise<GeneratedImage>;
 }
 

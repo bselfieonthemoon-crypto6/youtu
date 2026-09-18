@@ -1,4 +1,6 @@
 "use client";
+import { imageToolOperationModel } from "../../lib/layer-backend";
+import type { SemanticLayerSplitRequest } from "../canvas/image-action-dialog";
 
 import {
   type BackgroundJob,
@@ -22,10 +24,15 @@ import type { WebSocketHandle } from "../../hooks/use-websocket";
 import { fetchAssetBlob } from "../../lib/canvas-elements";
 import type { NormalizedImageRegion } from "../../lib/canvas-image-crop";
 import { createDesignApiClient } from "../../lib/design-api";
+import { waitForDesignPreview } from "../../lib/design-preview-ready";
 import {
   type DesignBrowserExportPort,
   exportDesignInBrowser,
 } from "../../lib/design-browser-export";
+import {
+  DESIGN_GIF_MAX_EDGE,
+  exportAnimatedDesignGifInBrowser,
+} from "../../lib/design-animated-gif-export";
 import {
   DesignCommandHistory,
   type DesignCommandHistoryState,
@@ -78,8 +85,10 @@ type DesignEditorSessionProps = {
   inline?: boolean;
   accessToken: string;
   designId: string;
+  initialObjectId?: string;
   backgroundRoot: HTMLElement;
   onClose: () => void;
+  onPreviewReady?: () => Promise<void>;
   ws?: WebSocketHandle;
 };
 
@@ -123,8 +132,10 @@ export function DesignEditorSession({
   inline = false,
   accessToken,
   designId,
+  initialObjectId,
   backgroundRoot,
   onClose,
+  onPreviewReady,
   ws,
 }: DesignEditorSessionProps) {
   const client = useMemo(() => createDesignApiClient(), []);
@@ -134,6 +145,7 @@ export function DesignEditorSession({
   const pendingResourceWorkRef = useRef<Promise<void>>(Promise.resolve());
   const historyRef = useRef<DesignCommandHistory | null>(null);
   const sceneRef = useRef<LoomicSceneV1 | null>(null);
+  const localRenameRef = useRef(false);
   const editorCommandChainRef = useRef<Promise<void>>(Promise.resolve());
   const missingAssetsRef = useRef(new Set<string>());
   const loadedSceneFontSignatureRef = useRef<string | null>(null);
@@ -170,6 +182,14 @@ export function DesignEditorSession({
   const [templateReplaceError, setTemplateReplaceError] = useState<
     string | null
   >(null);
+  // A design conflict is normally a transient remote revision bump. Rebase the
+  // local edits onto the latest remote scene and retry automatically; only fall
+  // back to the manual banner after a bounded number of failed attempts.
+  const [autoRecoverState, setAutoRecoverState] = useState<
+    "idle" | "recovering" | "exhausted"
+  >("idle");
+  const autoRecoverAttemptsRef = useRef(0);
+  const reloadKeepRef = useRef<() => Promise<void>>(async () => undefined);
 
   const upsertExportJob = useCallback((job: BackgroundJob) => {
     setExportJobs((current) =>
@@ -315,7 +335,7 @@ export function DesignEditorSession({
       editorRef.current?.refreshTextMetrics();
     });
     return () => controller.abort();
-  }, [accessToken, fontSignature, resourceClient, scene]);
+  }, [accessToken, fontSignature, resourceClient]);
 
   const acceptLocalScene = useCallback((nextScene: LoomicSceneV1) => {
     sceneRef.current = nextScene;
@@ -363,6 +383,32 @@ export function DesignEditorSession({
     [captureEditorScene],
   );
 
+  // One submission per persisted revision, including repair of old stale previews.
+  // A preview failure must not turn a successful document mutation into a retry.
+  const previewRequests = useRef(new Map<string, Promise<void>>());
+  const ensurePreview = useCallback((id: string, revision: number) => {
+    const key = `${id}:${revision}`;
+    const existing = previewRequests.current.get(key);
+    if (existing) return existing;
+    const request = client.queueDesignPreview(accessToken, {
+      design_id: id,
+      expected_revision: revision,
+      idempotency_key: crypto.randomUUID(),
+    }).then(() => undefined).catch(() => {
+      previewRequests.current.delete(key);
+      setActionMessage("设计已保存，但预览更新失败，请再次保存重试。");
+    });
+    previewRequests.current.set(key, request);
+    return request;
+  }, [accessToken, client]);
+
+  useEffect(() => {
+    if (loadState.status !== "ready") return;
+    const doc = loadState.document;
+    if (doc.preview_revision < doc.revision || !doc.preview_asset_object_id)
+      void ensurePreview(doc.id, doc.revision);
+  }, [loadState, ensurePreview]);
+
   const installDocument = useCallback(
     (document: DesignDocumentDto) => {
       historyRef.current?.destroy();
@@ -376,6 +422,7 @@ export function DesignEditorSession({
         initialRevision: document.revision,
         mutate: async (request) => {
           const response = await client.mutateDesign(accessToken, request);
+          void ensurePreview(document.id, response.revision);
           setLoadState((current) =>
             current.status === "ready"
               ? {
@@ -416,7 +463,7 @@ export function DesignEditorSession({
       });
       setLoadState({ status: "ready", document, message: null });
     },
-    [accessToken, client, runEditorCommands],
+    [accessToken, client, runEditorCommands, ensurePreview],
   );
 
   const load = useCallback(async () => {
@@ -441,6 +488,7 @@ export function DesignEditorSession({
     if (!ws?.onDesignSync) return;
     return ws.onDesignSync((event) => {
       if (event.designId !== designId) return;
+      if (event.updateType === "renamed" && localRenameRef.current) return;
       if (event.updateType === "preview") {
         if (
           event.previewAssetObjectId !== undefined &&
@@ -493,6 +541,7 @@ export function DesignEditorSession({
             await client.getDesign(accessToken, designId),
           );
           currentHistory.reloadDiscard(authoritative.revision);
+          missingAssetsRef.current.clear();
           await editorRef.current?.loadScene(authoritative.scene, (object) =>
             fetchAssetBlob(accessToken, object.assetObjectId),
           );
@@ -557,24 +606,63 @@ export function DesignEditorSession({
     [captureEditorScene],
   );
 
-  const flushAll = useCallback(async () => {
+  const flushAll = useCallback(async (retrySaveError = false) => {
     await pendingResourceWorkRef.current;
     const history = historyRef.current;
     if (!history) throw new Error("设计保存协调器尚未准备完成。");
+    // A deliberate save retries the frozen request with its original key.
+    // Conflicts still require the explicit revision recovery flow.
+    if (retrySaveError && history.getState().status === "error") {
+      await history.retry();
+    }
     for (;;) {
       const before = history.getState();
       if (before.status === "conflict" || before.status === "error") {
         throw new Error(before.error ?? "保存已暂停，请先处理冲突。");
       }
-      if (!before.dirty) return;
+      if (!before.dirty) {
+        await ensurePreview(designId, before.authoritativeRevision);
+        return;
+      }
       await history.flushNow();
     }
-  }, []);
+  }, [designId, ensurePreview]);
 
   useEffect(() => {
     onBindAgentSave?.(flushAll);
     return () => onBindAgentSave?.(null);
   }, [onBindAgentSave, flushAll]);
+
+  // A design conflict is normally a transient remote revision bump. Rebase the
+  // local edits onto the latest remote scene and retry automatically; only the
+  // manual banner (after bounded attempts) asks the user to intervene.
+  useEffect(() => {
+    if (historyState.status === "clean") {
+      autoRecoverAttemptsRef.current = 0;
+      setAutoRecoverState((current) => (current === "idle" ? current : "idle"));
+    }
+  }, [historyState.status]);
+
+  useEffect(() => {
+    if (historyState.conflictRevision === null) return;
+    if (autoRecoverAttemptsRef.current >= 2) {
+      setAutoRecoverState("exhausted");
+      return;
+    }
+    autoRecoverAttemptsRef.current += 1;
+    setAutoRecoverState("recovering");
+    setActionMessage("远端已更新，正在自动合并本地修改并重试保存…");
+    void reloadKeepRef
+      .current()
+      .then(() => historyRef.current?.flushNow())
+      .then(() => setActionMessage("已自动合并远端更新并保存。"))
+      .catch((error) => {
+        setAutoRecoverState("exhausted");
+        setActionMessage(
+          error instanceof Error ? error.message : "自动合并失败，请手动重试。",
+        );
+      });
+  }, [historyState.conflictRevision]);
 
   const reloadAuthoritativeIfClean = useCallback(
     async (successMessage?: string) => {
@@ -596,6 +684,7 @@ export function DesignEditorSession({
       );
       if (authoritative.revision < state.authoritativeRevision) return false;
       history.reloadDiscard(authoritative.revision);
+      missingAssetsRef.current.clear();
       await editorRef.current?.loadScene(authoritative.scene, (object) =>
         fetchAssetBlob(accessToken, object.assetObjectId),
       );
@@ -749,7 +838,11 @@ export function DesignEditorSession({
         editorRef.current?.updateObject(objectId, patch);
       },
       removeSelection() {
-        editorRef.current?.removeSelection();
+        try {
+          editorRef.current?.removeSelection();
+        } catch (error) {
+          setActionMessage(error instanceof Error ? `删除未完成：${error.message}` : "删除未完成，图层已保留。");
+        }
       },
       flip(axis) {
         const editor = editorRef.current;
@@ -920,6 +1013,26 @@ export function DesignEditorSession({
     setTemplateReplaceBusy(true);
     setTemplateReplaceError(null);
     try {
+      if (current.detail.template.variables.length === 0) {
+        const previous = structuredClone(sceneRef.current!);
+        const next = structuredClone(current.detail.scene);
+        const idMap = new Map(next.objects.map((object) => [object.objectId, crypto.randomUUID()]));
+        for (const object of next.objects) {
+          object.objectId = idMap.get(object.objectId)!;
+          object.objectVersion = 1;
+          if (object.type === "group") object.childObjectIds = object.childObjectIds.map((id) => idMap.get(id)!);
+        }
+        const fonts = await loadDesignSceneFonts({ scene: next, accessToken, client: resourceClient });
+        setFontIssues(fonts.issues);
+        if (fonts.issues.length) throw new Error(fonts.issues.map((issue) => issue.message).join(" "));
+        const command = designCommandSchema.parse({ action: "scene.replace", scene: next });
+        await runEditorCommands([command], "sync");
+        historyRef.current?.recordBatch([{ command, inverse: designCommandSchema.parse({ action: "scene.replace", scene: previous }) }]);
+        await flushAll();
+        setTemplateReplace(null);
+        setActionMessage(`已应用模板「${current.detail.template.name}」，可撤销。`);
+        return;
+      }
       const response = await resourceClient.applyTemplateReplacement(
         accessToken,
         {
@@ -977,6 +1090,10 @@ export function DesignEditorSession({
     options: {
       selectionRegion?: NormalizedImageRegion;
       eraseStrokes?: NormalizedEraseStroke[];
+      layerBackend?: "qwen-image-layered" | "semantic";
+      layerNames?: string[];
+      repairBackground?: true;
+      model?: string;
     } = {},
   ) => {
     setImageJobsError(null);
@@ -995,9 +1112,15 @@ export function DesignEditorSession({
       const response = await client.createDesignImageJob(accessToken, {
         ...(document.project_id ? { project_id: document.project_id } : {}),
         prompt: promptForImageOperation(operation),
-        model: "local:feynobg",
+        ...(options.layerBackend === "semantic" ? { model: options.model } : { model: imageToolOperationModel(operation, options.layerBackend) }),
         operation,
-        quality: "hd",
+        quality: options.layerBackend === "semantic" ? "standard" : "hd",
+        ...(options.layerBackend === "semantic" ? {
+          layer_backend: "semantic" as const,
+          layer_names: options.layerNames,
+          repair_background: options.repairBackground,
+          resolution: "1k" as const,
+        } : {}),
         ...(options.selectionRegion
           ? {
               selection_region: mapRegionThroughCrop(
@@ -1024,12 +1147,12 @@ export function DesignEditorSession({
           expected_object_version: current.objectVersion,
           source_asset_object_id: current.assetObjectId,
           placement: {
-            x: current.x,
+            x: options.layerBackend === "semantic" ? current.x + current.width + 40 : current.x,
             y: current.y,
             width: current.width,
             height: current.height,
             fit: current.fit,
-            replace_object_id: current.objectId,
+            ...(options.layerBackend === "semantic" ? {} : { replace_object_id: current.objectId }),
           },
         },
       });
@@ -1082,23 +1205,34 @@ export function DesignEditorSession({
     setActionMessage(null);
   };
 
+  const enqueueResourceWork = <T,>(operation: () => Promise<T>): Promise<T> => {
+    const work = pendingResourceWorkRef.current.then(operation);
+    pendingResourceWorkRef.current = work.then(
+      () => undefined,
+      () => undefined,
+    );
+    return work;
+  };
+
   const handleUpload = async (file: File) => {
     const editor = editorRef.current;
     if (!editor) throw new Error("设计编辑器尚未准备完成。");
     setUploading(true);
     setUploadError(null);
     try {
-      const uploaded = await uploadFile(accessToken, file, document.project_id);
-      const input = { assetObjectId: uploaded.asset.id, source: file };
-      if (
-        file.type === "image/svg+xml" ||
-        file.name.toLowerCase().endsWith(".svg")
-      ) {
-        await editor.addSvg(input);
-      } else {
-        await editor.addImage(input);
-      }
-      captureEditorScene();
+      await enqueueResourceWork(async () => {
+        const uploaded = await uploadFile(accessToken, file, document.project_id);
+        const input = { assetObjectId: uploaded.asset.id, source: file };
+        if (
+          file.type === "image/svg+xml" ||
+          file.name.toLowerCase().endsWith(".svg")
+        ) {
+          await editor.addSvg(input);
+        } else {
+          await editor.addImage(input);
+        }
+        captureEditorScene();
+      });
     } catch (error) {
       setUploadError(error instanceof Error ? error.message : "资源上传失败。");
       throw error;
@@ -1113,12 +1247,14 @@ export function DesignEditorSession({
     setUploading(true);
     setUploadError(null);
     try {
-      const uploaded = await uploadFile(accessToken, file, document.project_id);
-      await editor.replaceSelectedAsset({
-        assetObjectId: uploaded.asset.id,
-        source: file,
+      await enqueueResourceWork(async () => {
+        const uploaded = await uploadFile(accessToken, file, document.project_id);
+        await editor.replaceSelectedAsset({
+          assetObjectId: uploaded.asset.id,
+          source: file,
+        });
+        captureEditorScene();
       });
-      captureEditorScene();
     } catch (error) {
       setUploadError(error instanceof Error ? error.message : "图片替换失败。");
       throw error;
@@ -1133,14 +1269,16 @@ export function DesignEditorSession({
   ) => {
     const editor = editorRef.current;
     if (!editor) throw new Error("设计编辑器尚未准备完成。");
-    const input = {
-      assetObjectId: resource.asset_object_id,
-      resourceId: resource.id,
-      source,
-    };
-    if (resource.kind === "svg") await editor.addSvg(input);
-    else await editor.addImage(input);
-    captureEditorScene();
+    await enqueueResourceWork(async () => {
+      const input = {
+        assetObjectId: resource.asset_object_id,
+        resourceId: resource.id,
+        source,
+      };
+      if (resource.kind === "svg") await editor.addSvg(input);
+      else await editor.addImage(input);
+      captureEditorScene();
+    });
     setActionMessage(`已插入素材「${resource.name}」`);
   };
 
@@ -1152,7 +1290,18 @@ export function DesignEditorSession({
     const commands = prepared.map((object) =>
       designCommandSchema.parse({ action: "object.add", object }),
     );
+    if (!sceneRef.current) throw new Error("画板尚未准备完成");
+    const fonts = await loadDesignSceneFonts({
+      scene: { ...sceneRef.current, objects: prepared },
+      accessToken,
+      client: resourceClient,
+    });
+    setFontIssues(fonts.issues);
+    if (fonts.issues.length) {
+      throw new Error(`文字模板字体加载失败：${fonts.issues.map((issue) => issue.message).join(" ")}`);
+    }
     await runEditorCommands(commands, "sync");
+    editorRef.current?.refreshTextMetrics();
     historyRef.current?.recordBatch(
       commands.map((command) => ({
         command,
@@ -1222,53 +1371,192 @@ export function DesignEditorSession({
   };
 
   const handleExport = async (options: DesignEditorExportOptions) => {
+    // Resource insertion and command replay can both outlive the UI gesture that
+    // started them. Wait until neither queue advances before taking the export
+    // snapshot so a download cannot silently omit the latest local operation.
+    for (;;) {
+      const resourceWork = pendingResourceWorkRef.current;
+      const editorWork = editorCommandChainRef.current;
+      await resourceWork;
+      await editorWork;
+      if (
+        resourceWork === pendingResourceWorkRef.current &&
+        editorWork === editorCommandChainRef.current
+      )
+        break;
+    }
     const editor = editorRef.current;
     if (!editor) throw new Error("设计编辑器尚未准备完成。");
     if (fontIssues.length > 0)
       throw new Error("设计中有字体未加载，请替换字体后再导出。");
+    const exportScene = editor.serializeScene();
+    if (options.format === "gif") {
+      const [{ Canvas }, { FabricObjectEditor }] = await Promise.all([
+        import("fabric"),
+        import("./fabric-object-editor"),
+      ]);
+      const element = globalThis.document.createElement("canvas");
+      const clonedCanvas = new Canvas(element, {
+        backgroundColor: exportScene.canvas.background ?? "rgba(0,0,0,0)",
+        enableRetinaScaling: false,
+        preserveObjectStacking: true,
+        selection: false,
+      });
+      const clonedEditor = new FabricObjectEditor(clonedCanvas, {
+        topLeftOrigin: true,
+        readOnly: true,
+        logicalWidth: exportScene.canvas.width,
+        logicalHeight: exportScene.canvas.height,
+        maxBackingPixels: DESIGN_GIF_MAX_EDGE ** 2,
+      });
+      const assetSources = new Map<string, Promise<Blob>>();
+      const resolveClonedAsset = (
+        object: Extract<DesignObject, { type: "image" | "svg" }>,
+      ) => {
+        let source = assetSources.get(object.assetObjectId);
+        if (!source) {
+          source = fetchAssetBlob(accessToken, object.assetObjectId);
+          assetSources.set(object.assetObjectId, source);
+        }
+        return source;
+      };
+      let clonedSceneReady = false;
+      try {
+        const result = await exportAnimatedDesignGifInBrowser(
+          { name: document.name, scene: exportScene },
+          {
+            waitForFonts: async () => {
+              await globalThis.document.fonts?.ready;
+            },
+            waitForImages: async () => {
+              await clonedEditor.loadScene(exportScene, resolveClonedAsset);
+              clonedSceneReady = true;
+              const clonedImageState = await clonedEditor.waitForImages();
+              missingAssetsRef.current = new Set(
+                clonedImageState.missingAssetObjectIds,
+              );
+              return clonedImageState;
+            },
+            renderFrame: async (_frameScene, size) => {
+              if (!clonedSceneReady)
+                throw new Error("GIF cloned scene is not ready.");
+              clonedEditor.applyAnimationFrame(size.timeMs);
+              return clonedEditor.renderToImageData(size);
+            },
+          },
+        );
+        setActionMessage(
+          `已导出 ${result.filename}（${result.width}×${result.height}，${result.frameCount} 帧）`,
+        );
+        return;
+      } finally {
+        clonedEditor.dispose();
+        clonedCanvas.off();
+        await clonedCanvas.dispose();
+      }
+    }
+    type StaticExportClone = {
+      canvas: FabricCanvas;
+      editor: FabricObjectEditorApi;
+    };
+    let staticClone: Promise<StaticExportClone> | undefined;
+    const getStaticClone = () => {
+      if (staticClone) return staticClone;
+      staticClone = (async () => {
+        const [{ Canvas }, { FabricObjectEditor }] = await Promise.all([
+          import("fabric"),
+          import("./fabric-object-editor"),
+        ]);
+        const clonedCanvas = new Canvas(
+          globalThis.document.createElement("canvas"),
+          {
+            backgroundColor:
+              exportScene.canvas.background ?? "rgba(0,0,0,0)",
+            enableRetinaScaling: false,
+            preserveObjectStacking: true,
+            selection: false,
+          },
+        );
+        let clonedEditor: FabricObjectEditorApi | undefined;
+        try {
+          clonedEditor = new FabricObjectEditor(clonedCanvas, {
+            topLeftOrigin: true,
+            readOnly: true,
+            logicalWidth: exportScene.canvas.width,
+            logicalHeight: exportScene.canvas.height,
+          });
+          await clonedEditor.loadScene(exportScene, (object) =>
+            fetchAssetBlob(accessToken, object.assetObjectId),
+          );
+          return { canvas: clonedCanvas, editor: clonedEditor };
+        } catch (error) {
+          clonedEditor?.dispose();
+          clonedCanvas.off();
+          await clonedCanvas.dispose();
+          throw error;
+        }
+      })();
+      return staticClone;
+    };
     const port: DesignBrowserExportPort = {
       waitForFonts: async () => {
         await globalThis.document.fonts?.ready;
       },
       waitForImages: async () => {
-        await editor.waitForImages();
-        return { missingAssetObjectIds: [...missingAssetsRef.current] };
+        const cloned = await getStaticClone();
+        const imageState = await cloned.editor.waitForImages();
+        missingAssetsRef.current = new Set(imageState.missingAssetObjectIds);
+        return imageState;
       },
-      renderToBlob: ({ mimeType, multiplier, transparent }) =>
-        editor.renderToBlob({
+      renderToBlob: async ({ mimeType, multiplier, transparent }) => {
+        const cloned = await getStaticClone();
+        return cloned.editor.renderToBlob({
           format: mimeType === "image/jpeg" ? "jpeg" : "png",
           multiplier,
           transparent,
-        }),
-    };
-    const result = await exportDesignInBrowser(
-      {
-        name: document.name,
-        width: scene.canvas.width,
-        height: scene.canvas.height,
-        ...options,
+        });
       },
-      port,
-    );
-    if (result.status === "background_required") {
-      await flushAll();
-      const revision = historyRef.current?.getState().authoritativeRevision;
-      if (revision === undefined)
-        throw new Error("设计版本尚未准备完成，无法提交后台导出。");
-      const response = await client.exportDesign(accessToken, {
-        design_id: document.id,
-        revision,
-        idempotency_key: crypto.randomUUID(),
-        format: options.format === "jpeg" ? "jpeg" : "png",
-        multiplier: options.multiplier,
-        transparent: options.format === "transparent-png",
-      });
-      upsertExportJob(response.job);
-      setExportJobsError(null);
-      setActionMessage("大尺寸导出已提交，可关闭画板后继续处理。");
-      return "background_queued" as const;
+    };
+    try {
+      const result = await exportDesignInBrowser(
+        {
+          name: document.name,
+          width: exportScene.canvas.width,
+          height: exportScene.canvas.height,
+          format: options.format,
+          multiplier: options.multiplier,
+        },
+        port,
+      );
+      if (result.status === "background_required") {
+        await flushAll();
+        const revision = historyRef.current?.getState().authoritativeRevision;
+        if (revision === undefined)
+          throw new Error("设计版本尚未准备完成，无法提交后台导出。");
+        const response = await client.exportDesign(accessToken, {
+          design_id: document.id,
+          revision,
+          idempotency_key: crypto.randomUUID(),
+          format: options.format === "jpeg" ? "jpeg" : "png",
+          multiplier: options.multiplier,
+          transparent: options.format === "transparent-png",
+        });
+        upsertExportJob(response.job);
+        setExportJobsError(null);
+        setActionMessage("大尺寸导出已提交，可关闭画板后继续处理。");
+        return "background_queued" as const;
+      }
+      setActionMessage(`已导出 ${result.filename}`);
+    } finally {
+      const cloned = staticClone
+        ? await staticClone.catch(() => undefined)
+        : undefined;
+      if (cloned) {
+        cloned.editor.dispose();
+        cloned.canvas.off();
+        await cloned.canvas.dispose();
+      }
     }
-    setActionMessage(`已导出 ${result.filename}`);
   };
 
   const handleCancelExportJob = async (job: BackgroundJob) => {
@@ -1388,6 +1676,7 @@ export function DesignEditorSession({
       await client.getDesign(accessToken, document.id),
     );
     historyRef.current?.reloadDiscard(authoritative.revision);
+    missingAssetsRef.current.clear();
     await editorRef.current?.loadScene(authoritative.scene, (object) =>
       fetchAssetBlob(accessToken, object.assetObjectId),
     );
@@ -1405,6 +1694,7 @@ export function DesignEditorSession({
     const history = historyRef.current;
     const dirtyBatches = history?.getState().dirtyBatches ?? [];
     const localRebaser = createRevisionRebaser(authoritative.scene);
+    missingAssetsRef.current.clear();
     await editorRef.current?.loadScene(authoritative.scene, (object) =>
       fetchAssetBlob(accessToken, object.assetObjectId),
     );
@@ -1435,18 +1725,37 @@ export function DesignEditorSession({
     );
   };
 
+  reloadKeepRef.current = reloadKeep;
+
   const handleCanvasReady = (canvas: FabricCanvas) => {
     const syncSelection = () =>
       setSelectedObjectIds(editorRef.current?.getSelectionIds() ?? []);
     canvas.on("selection:created", syncSelection);
     canvas.on("selection:updated", syncSelection);
     canvas.on("selection:cleared", syncSelection);
+    if (initialObjectId && sceneRef.current?.objects.some(object => object.objectId === initialObjectId)) {
+      editorRef.current?.select([initialObjectId]);
+    }
     syncSelection();
   };
 
   const EditorShell = inline ? DesignInlineEditor : DesignEditorOverlay;
   return (
     <EditorShell
+      onRename={async (name) => {
+        localRenameRef.current = true;
+        try {
+        await flushAll();
+        const result = await client.renameDesign(accessToken, { design_id: designId,
+          expected_revision: historyRef.current!.getState().authoritativeRevision,
+          idempotency_key: crypto.randomUUID(), name });
+        // Renaming changes document metadata, not object versions or undo history.
+        historyRef.current!.resumeAfterReload(result.revision);
+        setLoadState(current => current.status === "ready" ? { ...current,
+          document: { ...current.document, name, revision: result.revision } } : current);
+        window.dispatchEvent(new Event("loomic:design-preview-refresh"));
+        } finally { localRenameRef.current = false; }
+      }}
       {...(inline
         ? {
             onDropResource: async (
@@ -1457,7 +1766,7 @@ export function DesignEditorSession({
               const editor = editorRef.current;
               if (!resource || resource.id !== resourceId || !editor)
                 throw new Error("请从当前资源抽屉拖入素材。");
-              const work = pendingResourceWorkRef.current.then(async () => {
+              const work = enqueueResourceWork(async () => {
                 const source = await resourceClient.getResourceContent(
                   accessToken,
                   resource.id,
@@ -1489,7 +1798,6 @@ export function DesignEditorSession({
                 captureEditorScene();
                 draggedResourceRef.current = null;
               });
-              pendingResourceWorkRef.current = work.catch(() => undefined);
               return work;
             },
           }
@@ -1517,8 +1825,30 @@ export function DesignEditorSession({
       uploadError={uploadError}
       onClose={onClose}
       onSave={async () => {
-        await flushAll();
+        await flushAll(true);
         setActionMessage("已保存");
+      }}
+      onFinish={async () => {
+        try {
+          await flushAll(true);
+          for (;;) {
+            await flushAll();
+            const revision = historyRef.current!.getState().authoritativeRevision;
+            setActionMessage("设计已保存，正在更新画布预览…");
+            await waitForDesignPreview(() => client.getDesign(accessToken, designId), revision);
+            if (historyRef.current?.getState().dirty) continue;
+            await onPreviewReady?.();
+            if (historyRef.current?.getState().dirty) continue;
+            setActionMessage("设计与画布预览已更新");
+            break;
+          }
+        } catch (error) {
+          // A failed render must be queueable again when the user retries.
+          for (const key of previewRequests.current.keys()) {
+            if (key.startsWith(`${designId}:`)) previewRequests.current.delete(key);
+          }
+          throw error;
+        }
       }}
       onBackgroundChange={handleBackgroundChange}
       onResize={handleResize}
@@ -1545,6 +1875,9 @@ export function DesignEditorSession({
             if (selectedImage)
               void submitImageOperation(selectedImage.objectId, operation);
           }}
+          accessToken={accessToken}
+          onRunDedicatedLayers={() => { if (selectedImage) void submitImageOperation(selectedImage.objectId, "split_layers", { layerBackend: "qwen-image-layered" }); }}
+          onRunSemanticLayers={(request: SemanticLayerSplitRequest) => { if (selectedImage) void submitImageOperation(selectedImage.objectId, "split_layers", { layerBackend: "semantic", layerNames: request.layerNames, repairBackground: request.repairBackground, model: request.model }); }}
           onStartRegion={() => beginImageInteraction("region")}
           onStartErase={() => beginImageInteraction("erase")}
           onRefresh={() => void refreshImageJobs()}
@@ -1647,7 +1980,9 @@ export function DesignEditorSession({
       onCancelExportJob={(job) => void handleCancelExportJob(job)}
       onRetryExportJob={(job) => void handleRetryExportJob(job)}
       onDownloadExportJob={(job) => void handleDownloadExportJob(job)}
-      conflictRevision={historyState.conflictRevision}
+      conflictRevision={
+        autoRecoverState === "exhausted" ? historyState.conflictRevision : null
+      }
       onRetrySave={async () => {
         await historyRef.current?.retry();
       }}
@@ -1666,6 +2001,7 @@ export function DesignEditorSession({
         <>
           {templateReplace && (
             <DesignTemplateReplaceDialog
+              currentSize={scene.canvas}
               detail={templateReplace.detail}
               preview={templateReplace.preview}
               bindings={templateReplace.bindings}

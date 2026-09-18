@@ -48,6 +48,7 @@ export function ImageTextReplacementPanel({
     activeImageGenerationRef.current = requestedImageGeneration;
     setRecognizing(true);
     setError(null);
+    setRows([]);
     void onRecognizeRef
       .current()
       .then((texts) => {
@@ -56,11 +57,12 @@ export function ImageTextReplacementPanel({
           activeImageGenerationRef.current !== requestedImageGeneration
         )
           return;
+        const lines = texts.flatMap((text) => text.split(/\r?\n/)).filter((text) => text.trim());
         setRows(
-          (texts.length > 0 ? texts : [""]).map((text) => ({
+          (lines.length > 0 ? lines : [""]).map((text) => ({
             id: crypto.randomUUID(),
             original: text,
-            value: text,
+            value: "",
           })),
         );
       })
@@ -133,16 +135,22 @@ export function ImageTextReplacementPanel({
 
   return (
     <div
-      className="fixed z-[100] rounded-2xl border border-border bg-background p-3 shadow-xl"
-      style={{ left, top, width: panelWidth }}
+      role="dialog"
+      aria-label="替换图片文字"
+      className="fixed z-[100] overflow-y-auto rounded-2xl border border-border bg-background p-3 shadow-xl"
+      style={{ left, top, width: panelWidth, maxHeight: Math.max(120, windowHeight - top - 12) }}
       onPointerDown={(event) => event.stopPropagation()}
     >
       <div className="mb-2">
         <h3 className="text-sm font-semibold">替换图片文字</h3>
         <p className="mt-0.5 text-[11px] text-muted-foreground">
-          已识别文字，可直接修改
+          对照识别原文填写替换文字，留空则保持不变
         </p>
       </div>
+      {(image.dataUrl || image.storageUrl) && (
+        <img src={image.dataUrl || image.storageUrl} alt="待替换文字的原图"
+          className="mb-3 max-h-32 w-full rounded-lg object-contain" />
+      )}
       {recognizing ? (
         <div className="flex h-24 items-center justify-center gap-2 text-sm text-muted-foreground">
           <span className="size-3 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-foreground" />
@@ -165,7 +173,12 @@ export function ImageTextReplacementPanel({
           className="grid min-w-0 max-w-full max-h-48 gap-1.5 overflow-x-hidden overflow-y-auto pr-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
         >
           {rows.map((row) => (
-            <div key={row.id} className="flex min-w-0 max-w-full gap-1.5">
+            <div key={row.id} className="min-w-0 max-w-full rounded-lg border border-border p-2">
+              <div className="mb-1 text-[11px] text-muted-foreground">识别原文</div>
+              <p className="mb-2 whitespace-pre-wrap break-words text-sm select-text">
+                {row.original || "未识别到原文，可手动添加文字"}
+              </p>
+              <div className="flex min-w-0 gap-1.5">
               <input
                 aria-label={
                   row.original ? `替换 ${row.original}` : "新增替换文字"
@@ -195,6 +208,7 @@ export function ImageTextReplacementPanel({
               >
                 <Trash2 className="size-4" />
               </button>
+              </div>
             </div>
           ))}
           <button

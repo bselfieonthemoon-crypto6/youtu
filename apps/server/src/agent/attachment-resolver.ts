@@ -1,4 +1,4 @@
-import type { ImageAttachment } from "@loomic/shared";
+import { isUuid, type ImageAttachment } from "@loomic/shared";
 import sharp from "sharp";
 
 import { safeDownload, validateDownloadedBuffer } from "../security/safe-download.js";
@@ -13,7 +13,6 @@ const ALLOWED_IMAGE_MIMES = [
   "image/bmp",
   "image/tiff",
 ];
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 type AttachmentClient = {
   from: (table: string) => any;
@@ -79,9 +78,9 @@ export async function resolveAgentImageAttachment(options: {
     (element) => element.id === attachment.assetId && !element.isDeleted,
   );
   const elementAssetId = canvasElement?.customData?.assetId;
-  const databaseAssetId = UUID_PATTERN.test(attachment.assetId)
+  const databaseAssetId = isUuid(attachment.assetId)
     ? attachment.assetId
-    : typeof elementAssetId === "string" && UUID_PATTERN.test(elementAssetId)
+    : typeof elementAssetId === "string" && isUuid(elementAssetId)
       ? elementAssetId
       : null;
 
@@ -128,12 +127,11 @@ export async function resolveAgentImageAttachment(options: {
   if (attachment.assetId.startsWith("seed-") && options.supabaseUrl) {
     const projectHost = new URL(options.supabaseUrl).hostname;
     const parsed = new URL(attachment.url);
-    const isSupabaseSeedHost =
-      parsed.hostname === projectHost
-      || parsed.hostname === "supabase.co"
-      || parsed.hostname.endsWith(".supabase.co");
+    // Only the project's own storage host may serve product seed images; a
+    // client-supplied `seed-` id must not turn into an arbitrary fetch of any
+    // public Supabase-hosted object.
     if (
-      !isSupabaseSeedHost
+      parsed.hostname !== projectHost
       || !parsed.pathname.startsWith("/storage/v1/object/public/project-assets/home-seeds/")
     ) {
       throw new Error("attachment_seed_url_invalid");
@@ -143,7 +141,7 @@ export async function resolveAgentImageAttachment(options: {
       maxBytes: MAX_AGENT_IMAGE_BYTES,
       timeoutMs: 30_000,
       maxRedirects: 0,
-      allowedHosts: [projectHost, "supabase.co"],
+      allowedHosts: [projectHost],
       allowedMimeTypes: ALLOWED_IMAGE_MIMES,
     });
     return {

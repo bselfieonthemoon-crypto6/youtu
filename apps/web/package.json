@@ -12,6 +12,7 @@
     "clsx": "^2.1.1",
     "fabric": "7.4.0",
     "framer-motion": "^12.38.0",
+    "gifenc": "^1.0.3",
     "lucide-react": "^1.0.1",
     "next": "^15.5.25",
     "next-themes": "^0.4.6",
@@ -39,13 +40,15 @@
     "tailwindcss": "^4.2.2"
   },
   "scripts": {
-    "build": "next build",
+    "build": "pnpm typecheck:production && next build",
     "dev": "next dev -p 3000",
     "test": "vitest run test",
     "test:e2e:stage3": "playwright test e2e/stage3-design-board.spec.ts",
     "test:e2e:stage5": "playwright test e2e/stage5-design-resource.spec.ts",
     "test:e2e:stage6": "playwright test e2e/stage6-agent-design.spec.ts",
     "test:e2e:stage8": "playwright test e2e/stage8-browser-release.spec.ts",
-    "typecheck": "next typegen && tsc -p tsconfig.json --noEmit"
+    "typecheck": "node --max-old-space-size=1536 scripts/run-web-typecheck.mjs",
+    "typecheck:production": "node --max-old-space-size=1536 ../../node_modules/typescript/bin/tsc -p tsconfig.production.json --noEmit",
+    "typecheck:full": "next typegen && tsc -p tsconfig.json --noEmit"
   }
 }

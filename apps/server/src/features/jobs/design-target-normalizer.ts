@@ -7,6 +7,8 @@ import {
   designJobTargetSchema,
   normalizeImageGenerationPayload,
   normalizeVideoGenerationPayload,
+  imageForegroundPolicySchema,
+  imageGenerationInternalContextSchema,
 } from "@loomic/shared";
 
 function record(value: unknown): Record<string, unknown> {
@@ -18,14 +20,21 @@ function record(value: unknown): Record<string, unknown> {
 const imageKeys = [
   "prompt",
   "operation",
+  "layer_backend",
+  "layer_names",
+  "repair_background",
+  "output_format",
+  "background",
   "model",
   "aspect_ratio",
   "quality",
+  "resolution",
   "output_width",
   "output_height",
   "input_images",
   "mask_image",
   "selection_region",
+  "outpaint_margins",
 ] as const;
 const videoKeys = [
   "prompt",
@@ -118,6 +127,11 @@ export function normalizePersistedGenerationJob(
           ...pick(payload, videoKeys),
           target,
         });
+  if (rawJob.job_type === "image_generation" && payload.foreground_policy !== undefined) {
+    Object.assign(normalizedPayload, { foreground_policy: imageForegroundPolicySchema.parse(payload.foreground_policy) });
+  }
+  if (rawJob.job_type === "image_generation") Object.assign(normalizedPayload,
+    imageGenerationInternalContextSchema.parse(pick(payload, ["origin_run_id", "source_element_id", "source_asset_id"])));
   const canonicalTarget = normalizedPayload.target;
   const targetKind =
     rawJob.target_kind === undefined
@@ -168,15 +182,21 @@ export function normalizeGenerationPayloadForCreation(input: {
     input.payload.target === undefined
       ? input.fallbackTarget
       : input.payload.target;
-  return input.jobType === "image_generation"
+  const normalized = input.jobType === "image_generation"
     ? normalizeImageGenerationPayload({
         ...pick(input.payload, imageKeys),
         target,
       })
-    : normalizeVideoGenerationPayload({
+      : normalizeVideoGenerationPayload({
         ...pick(input.payload, videoKeys),
         target,
       });
+  if (input.jobType === "image_generation" && input.payload.foreground_policy !== undefined) {
+    Object.assign(normalized, { foreground_policy: imageForegroundPolicySchema.parse(input.payload.foreground_policy) });
+  }
+  if (input.jobType === "image_generation") Object.assign(normalized,
+    imageGenerationInternalContextSchema.parse(pick(input.payload, ["origin_run_id", "source_element_id", "source_asset_id"])));
+  return normalized;
 }
 
 export function parseDesignTarget(value: unknown) {

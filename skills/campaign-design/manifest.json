@@ -1,0 +1,80 @@
+{
+  "slug": "campaign-design",
+  "name": "活动海报与宣传图",
+  "description": "规划或生成活动海报、推广封面与广告图片，组织准确文案和主视觉；已有定稿小改不重新策划。",
+  "version": "2.2.0",
+  "category": "design",
+  "iconName": "palette",
+  "license": null,
+  "metadata": {
+    "bundle": "loomic-design-skills-v2",
+    "loomic": {
+      "schemaVersion": 1,
+      "execution": "image",
+      "routing": { "keywords": ["活动", "促销", "海报", "宣传", "推广", "banner", "poster", "promo", "cover", "key visual", "主视觉"], "priority": 10 },
+      "intents": [
+        "campaign",
+        "poster",
+        "promotion",
+        "cover"
+      ],
+      "outputKinds": [
+        "raster-image",
+        "image-prompt"
+      ],
+      "requiredTools": [
+        "generate_image",
+        "edit_image"
+      ],
+      "optionalTools": [
+        "inspect_canvas"
+      ],
+      "models": [
+        {
+          "role": "planner",
+          "required": true,
+          "preferredIds": []
+        },
+        {
+          "role": "vision",
+          "required": false,
+          "preferredIds": []
+        },
+        {
+          "role": "image",
+          "required": true,
+          "preferredIds": []
+        }
+      ],
+      "limitations": [
+        "技能不增加运行时工具、模型、权限或预算；局部修改不扩展为重设计或更多尺寸。",
+        "本包为 Loomic 原创流程，研究来源不是效果 benchmark；未运行上游脚本或自动下载依赖。",
+        "本运行时位图只落无限画布，不能创建、修改或导出原生画板；准确文字须按实际结果核对。"
+      ],
+      "examples": [
+        "把活动时间和报名入口排成清晰的竖版宣传海报。"
+      ],
+      "sources": [
+        {
+          "title": "Cover art-direction dimensions",
+          "url": "https://github.com/JimLiu/baoyu-skills/blob/main/skills/baoyu-cover-image/SKILL.md",
+          "license": "MIT",
+          "relation": "inspired-by"
+        },
+        {
+          "title": "Composition and refinement method",
+          "url": "https://github.com/anthropics/skills/blob/main/skills/canvas-design/SKILL.md",
+          "license": "Apache-2.0",
+          "relation": "inspired-by"
+        }
+      ],
+      "composition": {
+        "role": "domain",
+        "stages": [
+          "design",
+          "prompt"
+        ]
+      }
+    }
+  }
+}

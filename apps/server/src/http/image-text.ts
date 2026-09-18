@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 
-import type { CanvasService } from "../features/canvas/canvas-service.js";
+import { CanvasServiceError, type CanvasService } from "../features/canvas/canvas-service.js";
 import type { ImageTextRecognizer } from "../features/images/image-text-recognizer.js";
 import { resolveAgentImageAttachment } from "../agent/attachment-resolver.js";
 import type { RequestAuthenticator, UserSupabaseClient } from "../supabase/user.js";
@@ -42,6 +42,15 @@ export async function registerImageTextRoutes(app: FastifyInstance, options: {
       }, "image text recognition failed");
       if (error instanceof z.ZodError) {
         return reply.code(400).send({ error: { code: "invalid_request", message: "Invalid image recognition request." } });
+      }
+      if (error instanceof CanvasServiceError) {
+        return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
+      }
+      if (error instanceof Error && ["attachment_not_found", "attachment_not_authorized"].includes(error.message)) {
+        return reply.code(404).send({ error: { code: "image_not_found", message: "图片不存在或无权访问。" } });
+      }
+      if (error instanceof Error && error.message === "attachment_too_large") {
+        return reply.code(413).send({ error: { code: "image_too_large", message: "图片超过识别大小限制。" } });
       }
       const code = (error as { code?: string })?.code;
       if (code === "vision_not_configured") {

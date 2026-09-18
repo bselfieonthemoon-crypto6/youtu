@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { modelContextProfileSchema } from "@loomic/shared";
 
+import {
+  createSafeProviderFetch,
+  normalizePublicProviderBaseUrl,
+} from "../../security/safe-provider-fetch.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type {
   AuthenticatedUser,
@@ -7,6 +12,7 @@ import type {
 } from "../../supabase/user.js";
 import type {
   CreateProviderConfigInput,
+  DiscoverProviderModelsDraftInput,
   ProviderConfigService,
   ProviderConnectionTestResult,
   ProviderModelCapability,
@@ -17,14 +23,18 @@ import type {
   WorkspaceProviderModelView,
 } from "./types.js";
 
-const ALLOWED_HOSTS = new Set(["api.apiyi.com"]);
-const MAX_RESPONSE_BYTES = 64 * 1024;
+// `/models` is an intentionally bounded catalog endpoint, not a general
+// provider response.  Some valid upstream catalogs exceed the small health
+// probe limit; retain a finite cap and parse the result before declaring the
+// provider usable.
+const MAX_MODEL_LIST_RESPONSE_BYTES = 4 * 1024 * 1024;
+const MAX_DISCOVERED_MODELS = 10_000;
 const TEST_TIMEOUT_MS = 8_000;
 
 const CONFIG_COLUMNS =
   "id, workspace_id, adapter, display_name, base_url, enabled, api_key_secret_id, api_key_last_four, revision, last_tested_at, last_test_status, created_at, updated_at";
 const MODEL_COLUMNS =
-  "id, provider_config_id, upstream_model_id, display_name, modality, enabled, capabilities";
+  "id, provider_config_id, upstream_model_id, display_name, modality, enabled, capabilities, context_profile";
 
 export class ProviderConfigServiceError extends Error {
   constructor(
@@ -45,12 +55,17 @@ export function createProviderConfigService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
   getAdminClient: () => AdminSupabaseClient;
   fetchFn?: typeof fetch;
+  resolveProviderHost?: (hostname: string) => Promise<string[]>;
   idFactory?: () => string;
   now?: () => string;
 }): ProviderConfigService {
-  const fetchFn = options.fetchFn ?? fetch;
   const idFactory = options.idFactory ?? randomUUID;
   const now = options.now ?? (() => new Date().toISOString());
+
+  const providerFetch = (baseUrl: string) => createSafeProviderFetch(baseUrl, {
+    ...(options.fetchFn ? { fetch: options.fetchFn } : {}),
+    ...(options.resolveProviderHost ? { resolve: options.resolveProviderHost } : {}),
+  });
 
   async function requireManager(user: AuthenticatedUser, workspaceId: string) {
     const { data, error } = await options
@@ -248,7 +263,7 @@ export function createProviderConfigService(options: {
         config.api_key_secret_id as string,
       );
       const testedAt = now();
-      const errorCode = await testConnection(fetchFn, baseUrl, apiKey);
+      const errorCode = await testConnection(providerFetch(baseUrl), baseUrl, apiKey);
       const ok = errorCode === undefined;
       const admin = options.getAdminClient();
       const { error } = await (admin.from("workspace_provider_configs") as any)
@@ -283,7 +298,34 @@ export function createProviderConfigService(options: {
         options.getAdminClient(),
         config.api_key_secret_id as string,
       );
-      return discoverProviderModels(fetchFn, baseUrl, apiKey);
+      return discoverProviderModels(providerFetch(baseUrl), baseUrl, apiKey);
+    },
+
+    async discoverDraftModels(user, workspaceId, rawInput) {
+      // Authorize before looking up a configuration, reading Vault, or making
+      // any provider request.  Draft discovery is intentionally write-free.
+      await requireManager(user, workspaceId);
+      const input = validateDraftDiscoveryInput(rawInput);
+      let apiKey = input.apiKey;
+      if (input.configId && !apiKey) {
+        const config = await findConfig(workspaceId, input.configId);
+        const storedBaseUrl = normalizeBaseUrl(config.base_url);
+        if (new URL(input.baseUrl).origin !== new URL(storedBaseUrl).origin) {
+          throw new ProviderConfigServiceError(
+            "provider_invalid_request",
+            "Changing provider origin requires a new API key.",
+            400,
+          );
+        }
+        apiKey = await readVaultSecret(
+          options.getAdminClient(),
+          config.api_key_secret_id as string,
+        );
+      }
+      if (!apiKey) {
+        throw invalidRequest("An API key is required to discover provider models.");
+      }
+      return discoverProviderModels(providerFetch(input.baseUrl), input.baseUrl, apiKey);
     },
   };
 }
@@ -305,9 +347,10 @@ async function discoverProviderModels(
     throw discoveryError("Unable to fetch provider models.");
   }
   if (!response.ok) throw discoveryError("Provider model discovery failed.");
-  const raw = await response.text();
-  if (Buffer.byteLength(raw) > MAX_RESPONSE_BYTES * 8) {
-    throw discoveryError("Provider model response is too large.");
+  const raw = await readBoundedResponseText(response, MAX_MODEL_LIST_RESPONSE_BYTES);
+  if (raw === null) throw discoveryError("Provider model response is too large.");
+  if (!isJsonContentType(response.headers.get("content-type"))) {
+    throw discoveryError("Provider returned invalid model data.");
   }
   let body: unknown;
   try {
@@ -318,11 +361,20 @@ async function discoverProviderModels(
   const rows = typeof body === "object" && body && "data" in body && Array.isArray((body as { data?: unknown }).data)
     ? (body as { data: unknown[] }).data
     : [];
-  const ids = [...new Set(rows.map((row) =>
-    typeof row === "object" && row && "id" in row
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const id = typeof row === "object" && row && "id" in row
       ? String((row as { id: unknown }).id).trim()
-      : "",
-  ).filter(Boolean))].slice(0, 500);
+      : "";
+    if (!id || seen.has(id)) continue;
+    if (id.length > 200) throw discoveryError("Provider returned invalid model data.");
+    seen.add(id);
+    ids.push(id);
+    if (ids.length > MAX_DISCOVERED_MODELS) {
+      throw discoveryError("Provider model catalog contains too many models.");
+    }
+  }
   return ids.map(inferDiscoveredModel);
 }
 
@@ -381,6 +433,21 @@ function validateUpdateInput(
   };
 }
 
+function validateDraftDiscoveryInput(input: DiscoverProviderModelsDraftInput) {
+  if (!input || typeof input !== "object") {
+    throw invalidRequest("Invalid provider discovery request.");
+  }
+  const apiKey = input.apiKey === undefined ? undefined : normalizeApiKey(input.apiKey);
+  if (input.configId !== undefined && (typeof input.configId !== "string" || input.configId.length === 0)) {
+    throw invalidRequest("Invalid provider discovery request.");
+  }
+  return {
+    baseUrl: normalizeBaseUrl(input.baseUrl),
+    ...(apiKey ? { apiKey } : {}),
+    ...(input.configId ? { configId: input.configId } : {}),
+  };
+}
+
 function normalizeDisplayName(value: string) {
   const result = value?.trim();
   if (!result || result.length > 100) throw invalidRequest("Invalid display name.");
@@ -389,22 +456,7 @@ function normalizeDisplayName(value: string) {
 
 export function normalizeBaseUrl(value: unknown): string {
   try {
-    if (typeof value !== "string" || value.length > 500) throw new Error();
-    const url = new URL(value);
-    if (
-      url.protocol !== "https:" ||
-      url.username ||
-      url.password ||
-      url.search ||
-      url.hash ||
-      (url.port && url.port !== "443") ||
-      !ALLOWED_HOSTS.has(url.hostname.toLowerCase()) ||
-      !["/", "/v1", ""].includes(url.pathname.replace(/\/$/, "") || "/")
-    ) throw new Error();
-    url.hostname = url.hostname.toLowerCase();
-    url.port = "";
-    url.pathname = url.pathname.replace(/\/$/, "");
-    return url.toString().replace(/\/$/, "");
+    return normalizePublicProviderBaseUrl(value);
   } catch {
     throw invalidRequest("Base URL is not allowed.");
   }
@@ -434,6 +486,8 @@ function validateModels(models: ProviderModelInput[]): ProviderModelInput[] {
     const key = `${model.modality}:${upstreamModelId}`;
     if (seen.has(key)) throw invalidRequest("Duplicate provider model.");
     seen.add(key);
+    const profile = model.contextProfile == null ? null : modelContextProfileSchema.safeParse(model.contextProfile);
+    if (profile && (!profile.success || model.modality !== "text")) throw invalidRequest("Invalid model context profile.");
     return {
       upstreamModelId,
       displayName,
@@ -442,6 +496,7 @@ function validateModels(models: ProviderModelInput[]): ProviderModelInput[] {
       ...(model.capabilities
         ? { capabilities: validateCapabilities(model.capabilities) }
         : {}),
+      ...(model.contextProfile !== undefined ? { contextProfile: profile?.success ? profile.data : null } : {}),
     };
   });
 }
@@ -474,6 +529,7 @@ async function replaceModels(
       modality: model.modality,
       enabled: model.enabled,
       capabilities: model.capabilities ?? [],
+      context_profile: model.contextProfile ?? null,
     })),
   );
   if (error) throw mapWriteError(error);
@@ -531,22 +587,12 @@ async function testConnection(
       return "provider_auth_failed";
     }
     if (!response.ok) return "provider_connection_failed";
-    const length = Number(response.headers.get("content-length"));
-    if (Number.isFinite(length) && length > MAX_RESPONSE_BYTES) {
-      return "provider_response_too_large";
-    }
-    if (response.body) {
-      const reader = response.body.getReader();
-      let total = 0;
-      while (true) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        total += chunk.value.byteLength;
-        if (total > MAX_RESPONSE_BYTES) {
-          await reader.cancel();
-          return "provider_response_too_large";
-        }
-      }
+    const raw = await readBoundedResponseText(response, MAX_MODEL_LIST_RESPONSE_BYTES);
+    if (raw === null) return "provider_response_too_large";
+    // A successful HTTP status alone must not publish an HTML login/error page
+    // as a healthy provider.  The bounded body must be a JSON model-list shape.
+    if (!isJsonContentType(response.headers.get("content-type")) || !isModelListJson(raw)) {
+      return "provider_connection_failed";
     }
     return undefined;
   } catch {
@@ -556,6 +602,45 @@ async function testConnection(
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function readBoundedResponseText(response: Response, limit: number): Promise<string | null> {
+  const length = Number(response.headers.get("content-length"));
+  if (Number.isFinite(length) && length > limit) return null;
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      total += chunk.value.byteLength;
+      if (total > limit) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(chunk.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { joined.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder().decode(joined);
+}
+
+function isJsonContentType(value: string | null) {
+  return !!value && /^(application\/(?:json|[a-z0-9.+-]+\+json))(?:\s*;|\s*$)/i.test(value);
+}
+
+function isModelListJson(raw: string) {
+  try {
+    const body: unknown = JSON.parse(raw);
+    return typeof body === "object" && body !== null && "data" in body &&
+      Array.isArray((body as { data?: unknown }).data);
+  } catch { return false; }
 }
 
 function mapViews(
@@ -572,6 +657,7 @@ function mapViews(
       modality: row.modality as WorkspaceProviderModelView["modality"],
       enabled: row.enabled === true,
       capabilities: (row.capabilities ?? []) as ProviderModelCapability[],
+      ...(row.context_profile ? { contextProfile: modelContextProfileSchema.parse(row.context_profile) } : {}),
     };
     modelsByConfig.set(configId, [...(modelsByConfig.get(configId) ?? []), model]);
   }

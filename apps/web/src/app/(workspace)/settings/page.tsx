@@ -112,17 +112,17 @@ export default function SettingsPage() {
   const handleAgentSave = useCallback(
     async (model: string) => {
       const token = getToken();
-      if (!token) return;
+      if (!token) throw new Error("Login required");
       const result = await updateWorkspaceSettings(token, {
         defaultModel: model,
       });
+      if (token !== getToken()) throw new Error("Session changed");
       setDefaultModel(result.settings.defaultModel);
     },
     [getToken],
   );
 
   const stableFetchModels = useCallback(() => fetchModels(getToken()), [getToken]);
-
   if (pageLoading) {
     return <SettingsSkeleton />;
   }
@@ -177,6 +177,7 @@ export default function SettingsPage() {
             defaultModel={defaultModel}
             onSave={handleAgentSave}
             fetchModels={stableFetchModels}
+            canManage={canManageProviders}
           />
         ) : activeTab === "providers" && canManageProviders ? (
           <ProviderSettingsSection accessToken={getToken() ?? ""} />

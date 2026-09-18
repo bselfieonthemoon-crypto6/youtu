@@ -1,25 +1,29 @@
 "use client";
 
-import { ImageUp, Lock, Zap } from "lucide-react";
+import { BookOpen, ImageUp, Lock, Zap } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import { useGenerationErrorHandler } from "../../hooks/use-generation-error-handler";
 import {
-  createExcalidrawImageElement,
-  fetchAsDataURL,
-} from "../../lib/canvas-elements";
-import {
+  getImageGeneratorData,
   type ImageGeneratorData,
   resizeImageGeneratorElement,
   updateImageGeneratorElement,
 } from "../../lib/canvas-image-generator";
+import {
+  NodeImageSubmissionError,
+  acceptNodeImageRequest,
+  nodeImageSubmissionFailure,
+  prepareNodeImageRequest,
+  submitDurableNodeImage,
+} from "../../lib/node-image-generation";
+import { composeLibraryPrompt } from "../../lib/prompt-library-api";
+import { PromptLibraryDialog } from "../prompt-library/prompt-library-dialog";
 import type { ImageModelInfo } from "../../lib/server-api";
 import {
-  createImageGenerationJob,
   fetchImageModels,
-  fetchJob,
-  generateImageDirect,
+  submitNodeImageGeneration,
 } from "../../lib/server-api";
 
 type ImageGeneratorPanelProps = {
@@ -30,6 +34,7 @@ type ImageGeneratorPanelProps = {
   excalidrawApi: any;
   accessToken: string;
   canvasScrollZoom: { scrollX: number; scrollY: number; zoom: number };
+  onPersistCanvas: () => Promise<void>;
   onClose: () => void;
 };
 
@@ -54,7 +59,7 @@ export function ImageGeneratorPanel({
   excalidrawApi,
   accessToken,
   canvasScrollZoom,
-  onClose,
+  onPersistCanvas,
 }: ImageGeneratorPanelProps) {
   const [prompt, setPrompt] = useState(data.prompt);
   const [model, setModel] = useState(data.model);
@@ -68,6 +73,7 @@ export function ImageGeneratorPanel({
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   const [showRatioDropdown, setShowRatioDropdown] = useState(false);
   const [showQualityDropdown, setShowQualityDropdown] = useState(false);
+  const [showPromptLibrary, setShowPromptLibrary] = useState(false);
   const [refImages, setRefImages] = useState<
     Array<{ id: string; dataUrl: string; file: File }>
   >([]);
@@ -77,8 +83,19 @@ export function ImageGeneratorPanel({
   const accessTokenRef = useRef(accessToken);
   accessTokenRef.current = accessToken;
   const { handleGenerationError } = useGenerationErrorHandler();
-  // AbortController for in-flight generation requests so we can cancel on unmount
-  const abortRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(true);
+
+  // Scene data is authoritative: selection, reload and canvas undo must restore
+  // the node's own prompt. Never write from this effect (that would undo undo).
+  useEffect(() => { setPrompt(data.prompt); }, [data.prompt, elementId]);
+  useEffect(() => { setModel(data.model); }, [data.model, elementId]);
+  useEffect(() => { setAspectRatio(data.aspectRatio); }, [data.aspectRatio, elementId]);
+  useEffect(() => { setQuality(data.quality); }, [data.quality, elementId]);
+
+  const changePrompt = useCallback((value: string) => {
+    setPrompt(value);
+    updateImageGeneratorElement(excalidrawApi, elementId, { prompt: value });
+  }, [excalidrawApi, elementId]);
 
   // Fetch available models with error logging
   useEffect(() => {
@@ -87,16 +104,30 @@ export function ImageGeneratorPanel({
       .then((r) => {
         if (cancelled) return;
         setModels(r.models);
-        setModel((current) => {
-          if (r.models.length === 0 || r.models.some((m) => m.id === current)) {
-            return current;
-          }
-          const fallback = r.models[0];
-          if (!fallback) return current;
-          updateImageGeneratorElement(excalidrawApi, elementId, {
-            model: fallback.id,
-          });
-          return fallback.id;
+        // Read at response time: the user may have changed models while this
+        // request was pending. React can replay setState updater functions
+        // during render, so canvas writes must never live inside an updater.
+        const node = excalidrawApi.getSceneElements().find((element: any) =>
+          element.id === elementId && !element.isDeleted &&
+          element.customData?.type === "image-generator",
+        );
+        if (!node) return;
+        const current = node.customData.model;
+        // Once a paid submission identity exists, its model is frozen. Catalog
+        // refreshes must not rewrite the request that an unknown retry replays.
+        if (node.customData.nodeImageRequest) {
+          setModel(current);
+          return;
+        }
+        if (r.models.length === 0 || r.models.some((m) => m.id === current)) {
+          setModel(current);
+          return;
+        }
+        const fallback = r.models[0];
+        if (!fallback) return;
+        setModel(fallback.id);
+        updateImageGeneratorElement(excalidrawApi, elementId, {
+          model: fallback.id,
         });
       })
       .catch((err) => {
@@ -120,12 +151,16 @@ export function ImageGeneratorPanel({
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
-  // Cancel in-flight generation on unmount to prevent memory leaks
   useEffect(() => {
     return () => {
-      abortRef.current?.abort();
+      mountedRef.current = false;
     };
   }, []);
+
+  useEffect(() => {
+    setLoading(data.status === "generating");
+    setError(data.errorMessage ?? null);
+  }, [data.errorMessage, data.status, elementId]);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -141,6 +176,10 @@ export function ImageGeneratorPanel({
   const screenY = (elementBounds.y + elementBounds.height + scrollY) * zoom + 8;
 
   const currentModel = models.find((m) => m.id === model);
+  const currentModelLabel = currentModel?.displayName
+    ?? (model.startsWith("workspace:") ? "当前模型" : model.split("/").pop());
+  const submissionLocked =
+    loading || data.nodeImageRequest?.state === "unknown";
 
   const handleAspectRatioChange = useCallback(
     (ratio: string) => {
@@ -174,157 +213,159 @@ export function ImageGeneratorPanel({
 
   const handleGenerate = useCallback(async () => {
     if (!prompt.trim() || loading) return;
+    // This node endpoint is intentionally text-only. Never silently charge for
+    // a text-only result when the user attached references.
+    if (refImages.length > 0 || (data.inputImages?.length ?? 0) > 0) {
+      setError("当前节点暂不支持参考图生成，请使用图片改图入口；或移除参考图后仅用文字生成。");
+      return;
+    }
 
-    // Cancel any previous in-flight request
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
+    const liveElement = excalidrawApi
+      .getSceneElements()
+      .find((element: any) => element.id === elementId && !element.isDeleted);
+    const liveData = getImageGeneratorData(liveElement);
+    if (!liveData || (liveData.status === "generating" && liveData.jobId)) return;
+    const request = prepareNodeImageRequest(liveData);
 
     setLoading(true);
     setError(null);
     updateImageGeneratorElement(excalidrawApi, elementId, {
       status: "generating",
-      prompt: prompt.trim(),
-      model,
-      aspectRatio,
-      quality,
+      // A terminal job belongs to the previous attempt. Keeping it here would
+      // make read-only recovery skip this new request if its response is lost.
+      jobId: undefined,
+      prompt: request.prompt,
+      model: request.model,
+      aspectRatio: request.aspectRatio,
+      // The saved control is a resolution tier; request.quality is independent.
+      quality: liveData.quality,
+      nodeImageRequest: request,
+      errorMessage: undefined,
     });
 
     try {
-      const result = await generateImageDirect(
-        accessTokenRef.current,
-        prompt.trim(),
-        { model, aspectRatio, quality },
-      );
-
-      // Check if this generation was cancelled while awaiting
-      if (controller.signal.aborted) return;
-
-      // Download and insert as real image element at same position
-      const dataURL = await fetchAsDataURL(result.url);
-      if (controller.signal.aborted) return;
-
-      const fileId = generateId();
-      excalidrawApi.addFiles([
-        {
-          id: fileId,
-          dataURL,
-          mimeType: result.mimeType,
-          created: Date.now(),
-          assetId: result.assetId,
-        },
-      ]);
-
-      const imageElement = createExcalidrawImageElement({
-        fileId,
-        x: elementBounds.x,
-        y: elementBounds.y,
-        width: elementBounds.width,
-        height: elementBounds.height,
-        title: prompt.trim().slice(0, 60),
-        source: "generated",
-        storageUrl: result.url,
-        assetId: result.assetId,
-        mimeType: result.mimeType,
-        prompt: prompt.trim(),
-        model,
-        originalWidth: result.width,
-        originalHeight: result.height,
+      const response = await submitDurableNodeImage({
+        accessToken: accessTokenRef.current,
+        canvasId,
+        elementId,
+        request,
+        persistCanvas: onPersistCanvas,
+        submit: submitNodeImageGeneration,
       });
-
-      // Replace: delete placeholder, add image
-      const elements = excalidrawApi.getSceneElements().map((el: any) => {
-        if (el.id === elementId) return { ...el, isDeleted: true };
-        return el;
+      updateImageGeneratorElement(excalidrawApi, elementId, {
+        status: "generating",
+        jobId: response.job.id,
+        nodeImageRequest: acceptNodeImageRequest(request, response.job.payload),
+        errorMessage: undefined,
       });
-      excalidrawApi.updateScene({
-        elements: [...elements, imageElement],
-        captureUpdate: "IMMEDIATELY",
+      // The server also binds the job atomically. This second save keeps the
+      // current browser scene from later overwriting that binding.
+      await onPersistCanvas().catch((error) => {
+        console.warn("[image-gen] Failed to persist accepted job binding:", error);
       });
-
-      onClose();
     } catch (err) {
-      // Ignore aborted requests (user cancelled or component unmounted)
-      if (controller.signal.aborted) return;
-
       console.error("[image-gen] Generation error:", err);
-      const handled = handleGenerationError(err);
+      const cause = err instanceof NodeImageSubmissionError ? err.cause : err;
+      const handled = handleGenerationError(cause);
+      const failure = nodeImageSubmissionFailure(err, liveData.nodeImageRequest?.state === "unknown");
+      const message = failure.message;
       if (!handled) {
-        setError("图片生成失败，请重试或更换模型。");
+        if (mountedRef.current) setError(message);
       }
-      setLoading(false);
+      if (mountedRef.current) setLoading(false);
       updateImageGeneratorElement(excalidrawApi, elementId, {
         status: "error",
-        errorMessage: "生成失败",
+        nodeImageRequest: { ...request, state: failure.state },
+        errorMessage: message,
       });
     }
   }, [
     prompt,
     loading,
-    model,
-    aspectRatio,
-    quality,
     excalidrawApi,
     elementId,
-    elementBounds,
-    onClose,
+    canvasId,
+    onPersistCanvas,
     handleGenerationError,
+    refImages.length,
+    data.inputImages,
   ]);
 
   return createPortal(
     <div
       ref={panelRef}
+      role="region"
+      aria-label="生图节点设置"
+      data-element-id={elementId}
       style={{ left: screenX, top: screenY }}
       className="fixed z-[100] w-[450px] rounded-xl border-[0.5px] border-border bg-card/95 p-2 shadow-card backdrop-blur-lg"
       onKeyDown={(e) => e.stopPropagation()}
+      onKeyUp={(e) => e.stopPropagation()}
+      onPointerDown={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
       onWheel={(e) => e.stopPropagation()}
     >
       {/* Prompt textarea */}
       <textarea
         ref={textareaRef}
         value={prompt}
-        onChange={(e) => setPrompt(e.target.value)}
+        aria-label="图片生成提示词"
+        onChange={(e) => changePrompt(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey) {
+          if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
             e.preventDefault();
             void handleGenerate();
           }
         }}
         placeholder="今天我们要创作什么"
-        disabled={loading}
+        disabled={submissionLocked}
         style={{ scrollbarWidth: "none" }}
         className="min-h-[74px] max-h-[140px] w-full resize-none border-none bg-transparent p-1 text-[14px] leading-[18px] text-foreground placeholder:text-muted-foreground focus:outline-none [&::-webkit-scrollbar]:hidden"
       />
 
       {error && (
-        <div className="mb-2 rounded-lg bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+        <div role="alert" className="mb-2 rounded-lg bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
           {error}
+        </div>
+      )}
+
+      {(data.inputImages?.length ?? 0) > 0 && (
+        <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-muted px-2 py-1.5 text-xs text-muted-foreground">
+          <span>已保存 {data.inputImages!.length} 张参考图，请使用图片改图入口</span>
+          <button type="button" aria-label="移除已保存参考图" disabled={submissionLocked}
+            className="shrink-0 text-foreground hover:underline"
+            onClick={() => { updateImageGeneratorElement(excalidrawApi, elementId, { inputImages: [] }); setError(null); }}>
+            移除参考图
+          </button>
         </div>
       )}
 
       {/* Bottom toolbar */}
       <div className="mt-1 flex items-center justify-between">
         {/* Left: model + ref image */}
-        <div className="flex items-center">
+        <div className="flex min-w-0 items-center">
           {/* Model selector */}
-          <div className="relative">
+          <div className="relative min-w-0 max-w-[160px]">
             <button
               type="button"
+              aria-label="选择生图模型"
+              title={model}
+              disabled={submissionLocked}
               onClick={() => setShowModelDropdown((v) => !v)}
-              className="flex h-8 items-center gap-1 rounded-lg px-2 text-xs text-muted-foreground transition-colors hover:bg-muted"
+              className="flex h-8 min-w-0 max-w-full items-center gap-1 rounded-lg px-2 text-xs text-muted-foreground transition-colors hover:bg-muted"
             >
               {currentModel?.iconUrl && (
                 <img
                   src={currentModel.iconUrl}
                   alt=""
-                  className="h-3.5 w-3.5 rounded-full"
+                  className="h-3.5 w-3.5 shrink-0 rounded-full"
                 />
               )}
-              <span className="text-foreground">
-                {currentModel?.displayName ?? model.split("/").pop()}
+              <span className="min-w-0 truncate text-foreground">
+                {currentModelLabel}
               </span>
               <svg
-                className="h-3 w-3 text-muted-foreground"
+                className="h-3 w-3 shrink-0 text-muted-foreground"
                 viewBox="0 0 12 24"
                 fill="currentColor"
               >
@@ -407,16 +448,32 @@ export function ImageGeneratorPanel({
           />
           <button
             type="button"
+            disabled={submissionLocked}
             onClick={() => refInputRef.current?.click()}
-            className={`flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-muted ${
+            className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-muted ${
               refImages.length > 0
                 ? "text-foreground"
                 : "text-muted-foreground hover:text-foreground"
             }`}
-            title="Add reference image"
+            title="添加参考图（当前节点尚不支持参考图生成）"
+            aria-label="添加参考图"
           >
             <ImageUp className="h-3.5 w-3.5" />
           </button>
+          <button
+            type="button"
+            disabled={submissionLocked || data.status === "generating"}
+            onClick={() => {
+              setShowModelDropdown(false);
+              setShowRatioDropdown(false);
+              setShowQualityDropdown(false);
+              setShowPromptLibrary(true);
+            }}
+            aria-label="打开提示词库"
+            aria-haspopup="dialog"
+            title="提示词库"
+            className="flex h-8 shrink-0 items-center gap-1 whitespace-nowrap rounded-lg px-2 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+          ><BookOpen className="h-3.5 w-3.5" /><span>提示词</span></button>
           {/* Ref image thumbnails */}
           {refImages.length > 0 && (
             <div className="flex items-center gap-1 ml-1">
@@ -429,6 +486,8 @@ export function ImageGeneratorPanel({
                   />
                   <button
                     type="button"
+                    aria-label="移除参考图"
+                    disabled={submissionLocked}
                     onClick={() =>
                       setRefImages((prev) =>
                         prev.filter((r) => r.id !== img.id),
@@ -445,11 +504,12 @@ export function ImageGeneratorPanel({
         </div>
 
         {/* Right: quality + ratio + generate */}
-        <div className="flex items-center gap-1">
+        <div className="flex shrink-0 items-center gap-1">
           {/* Quality (1K/2K/4K) */}
           <div className="relative">
             <button
               type="button"
+              disabled={submissionLocked}
               onClick={() => setShowQualityDropdown((v) => !v)}
               className="flex h-8 items-center gap-0.5 rounded-lg px-2 text-xs text-muted-foreground transition-colors hover:bg-muted"
             >
@@ -484,6 +544,7 @@ export function ImageGeneratorPanel({
           <div className="relative">
             <button
               type="button"
+              disabled={submissionLocked}
               onClick={() => setShowRatioDropdown((v) => !v)}
               className="flex h-8 items-center gap-0.5 rounded-lg px-2 text-xs text-muted-foreground transition-colors hover:bg-muted"
             >
@@ -515,12 +576,16 @@ export function ImageGeneratorPanel({
           {/* Generate button */}
           <button
             type="button"
+            aria-label="生成图片"
             onClick={() => void handleGenerate()}
+            aria-description={data.nodeImageRequest?.state === "unknown" ? "沿用上次请求编号和参数，不会创建重复任务" : undefined}
             disabled={!prompt.trim() || loading}
             className="flex h-8 min-w-12 items-center justify-center gap-1 rounded-full bg-primary p-2 text-primary-foreground transition-colors hover:bg-primary/80 hover:accent-glow disabled:cursor-not-allowed disabled:bg-muted disabled:text-muted-foreground"
           >
             {loading ? (
               <div className="h-3.5 w-3.5 animate-spin rounded-full border-[1.5px] border-white/30 border-t-white" />
+            ) : data.nodeImageRequest?.state === "unknown" ? (
+              <span className="px-1 text-xs">重试</span>
             ) : (
               <svg
                 className="h-3.5 w-[9.3px] shrink-0"
@@ -533,6 +598,21 @@ export function ImageGeneratorPanel({
           </button>
         </div>
       </div>
+      {showPromptLibrary && <PromptLibraryDialog
+        accessToken={accessToken}
+        currentPrompt={prompt}
+        disabled={loading || data.status === "generating"}
+        onClose={() => setShowPromptLibrary(false)}
+        onApply={(entry, mode) => {
+          // Read the latest scene text so external edits/undo while the library
+          // is open cannot be overwritten by an old React render's draft.
+          const node = excalidrawApi.getSceneElements().find((element: any) => element.id === elementId && !element.isDeleted);
+          if (!node || node.customData?.type !== "image-generator" || node.customData.status === "generating") return;
+          changePrompt(composeLibraryPrompt(node.customData.prompt ?? "", entry.prompt, mode));
+          setShowPromptLibrary(false);
+          textareaRef.current?.focus();
+        }}
+      />}
     </div>,
     document.body,
   );

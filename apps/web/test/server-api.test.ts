@@ -13,6 +13,7 @@ import {
   fetchSessionRuns,
   fetchVideoModels,
   fetchViewer,
+  generateVideoDirect,
   restoreJobToCanvas,
   testProviderConnection,
   updateProviderConfig,
@@ -289,6 +290,39 @@ describe("authenticated server API", () => {
     });
 
     await expect(fetchProjects("expired")).rejects.toThrow("unauthorized");
+  });
+
+  it("sends the durable video idempotency key with the direct request", async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        url: "https://example.test/video.mp4",
+        assetId: "asset-1",
+        prompt: "A calm ocean",
+        mimeType: "video/mp4",
+        width: 1280,
+        height: 720,
+        durationSeconds: 5,
+      }),
+    });
+
+    await generateVideoDirect("token_abc", "A calm ocean", {
+      model: "video-model",
+      idempotencyKey: "submission-key-1",
+    });
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      "http://localhost:3001/api/agent/generate-video",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          Authorization: "Bearer token_abc",
+          "Idempotency-Key": "submission-key-1",
+          "content-type": "application/json",
+        }),
+      }),
+    );
   });
 
   it("fetches a cursor-paginated session run history with bearer auth", async () => {

@@ -1,0 +1,57 @@
+{
+  "slug": "nonstandard-image-size",
+  "name": "非标准图片尺寸",
+  "description": "仅在用户当前明确接受近似尺寸或接近比例时，使用原生图片的自定义 W:H 比例生成；不把近似授权带到新请求。",
+  "version": "1.4.1",
+  "category": "design",
+  "iconName": "aspect-ratio",
+  "license": null,
+  "metadata": {
+    "bundle": "loomic-design-skills-v2",
+    "loomic": {
+      "schemaVersion": 1,
+      "execution": "image",
+      "capabilities": ["nonstandard-ratio"],
+      "intents": [
+        "nonstandard-image-size",
+        "approximate-image-size",
+        "custom-aspect-ratio"
+      ],
+      "outputKinds": [
+        "raster-image"
+      ],
+      "requiredTools": [
+        "generate_image"
+      ],
+      "optionalTools": [
+        "edit_image",
+        "list_skills",
+        "use_skill"
+      ],
+      "models": [
+        {
+          "role": "image",
+          "required": true,
+          "preferredIds": []
+        }
+      ],
+      "limitations": [
+        "技能不增加运行时工具、模型、权限或预算；仅当前请求的明确近似授权或明确使用本技能可用，适配面板本身不构成授权，新请求不继承。",
+        "原生请求尺寸支持 1:3 至 3:1 的自定义 W:H 比例，并在可用原生尺寸中保持不超过 1% 的比例误差；服务商最终输出需按真实结果另行核对，它不承诺接近用户给出的像素宽高。",
+        "小目标生成较大原生图片；不能声称已缩放。仅在技能近似授权下，超宽采用3:1、超高采用1:3，事先说明差异，不自动裁切或拉伸；普通生图与精确要求不替代。",
+        "新图通过 generate_image.aspectRatio 传递选定合法比例，并设 aspectRatioIntent=approximate；编辑仅在用户要求改比例时传真实源图 UUID、合法 aspectRatio 和 approximate 标记；服务端核对本轮技能回执和近似授权。不能虚构 width、height 参数或新工具。",
+        "显式 UI 比例优先；背景、GIF、压缩和原生画板写入不属于本流程。"
+      ],
+      "examples": [
+        "做一张适配这个窄面板的图，尺寸差一点没关系，比例尽量接近 1400:500。"
+      ],
+      "sources": [],
+      "composition": {
+        "role": "domain",
+        "stages": [
+          "design"
+        ]
+      }
+    }
+  }
+}

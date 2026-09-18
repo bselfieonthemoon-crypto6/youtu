@@ -2,8 +2,9 @@
 
 import { useCallback } from "react";
 
-import type { ContentBlock, StreamEvent, ToolBlock } from "@loomic/shared";
+import { clarificationRequestSchema, type ContentBlock, type StreamEvent, type ToolBlock } from "@loomic/shared";
 import type { Message } from "./use-chat-sessions";
+import { agentRunErrorMessage } from "../lib/agent-run-error";
 
 type MessageUpdater = (
   targetSessionId: string,
@@ -187,35 +188,48 @@ export function useChatStream(updateSessionMessages: MessageUpdater) {
             planStepId?: string;
           };
           publishAuthoritativeCreditBalance(event.output);
+          const clarification = event.toolName === "ask_clarification"
+            ? clarificationRequestSchema.safeParse(event.output)
+            : null;
           update((prev) =>
             prev.map((m) => {
               if (m.id !== assistantId) return m;
+              const blocks = m.contentBlocks.map((block) => {
+                if (
+                  block.type === "tool" &&
+                  block.toolCallId === event.toolCallId
+                ) {
+                  return {
+                    ...block,
+                    ...(event.toolExecutionId
+                      ? { toolExecutionId: event.toolExecutionId }
+                      : {}),
+                    status: "completed" as const,
+                    output: event.output,
+                    outputSummary: event.outputSummary,
+                    ...(event.artifacts
+                      ? { artifacts: event.artifacts }
+                      : {}),
+                    ...(relatedEvent.planId ? { planId: relatedEvent.planId } : {}),
+                    ...(relatedEvent.planStepId
+                      ? { planStepId: relatedEvent.planStepId }
+                      : {}),
+                  };
+                }
+                return block;
+              });
+              if (clarification?.success && !blocks.some(block =>
+                block.type === "clarification" && block.clarificationId === event.toolCallId)) {
+                blocks.push({
+                  type: "clarification",
+                  version: 1,
+                  clarificationId: event.toolCallId,
+                  questions: clarification.data.questions,
+                });
+              }
               return {
                 ...m,
-                contentBlocks: m.contentBlocks.map((block) => {
-                  if (
-                    block.type === "tool" &&
-                    block.toolCallId === event.toolCallId
-                  ) {
-                    return {
-                      ...block,
-                      ...(event.toolExecutionId
-                        ? { toolExecutionId: event.toolExecutionId }
-                        : {}),
-                      status: "completed" as const,
-                      output: event.output,
-                      outputSummary: event.outputSummary,
-                      ...(event.artifacts
-                        ? { artifacts: event.artifacts }
-                        : {}),
-                      ...(relatedEvent.planId ? { planId: relatedEvent.planId } : {}),
-                      ...(relatedEvent.planStepId
-                        ? { planStepId: relatedEvent.planStepId }
-                        : {}),
-                    };
-                  }
-                  return block;
-                }),
+                contentBlocks: blocks,
               };
             }),
           );
@@ -255,8 +269,9 @@ export function useChatStream(updateSessionMessages: MessageUpdater) {
           break;
           }
 
-        case "run.failed":
-          console.error("[chat-stream] run.failed:", event.error);
+        case "run.failed": {
+          const failureMessage = agentRunErrorMessage(event.error);
+          console.error("[chat-stream] run.failed:", { code: event.error.code, reasonCode: event.error.details?.reasonCode, message: failureMessage });
           update((prev) =>
             prev.map((m) => {
               if (m.id !== assistantId) return m;
@@ -270,22 +285,25 @@ export function useChatStream(updateSessionMessages: MessageUpdater) {
                     }
                   : block,
               );
-              const hasText = blocks.some((b) => b.type === "text");
+              // Preserve partial useful text but never hide the terminal error.
+              // A replay after reconnect must not append the same notice twice.
+              const alreadyShown = blocks.some((b) => b.type === "text" && b.text === failureMessage);
               return {
                 ...m,
-                contentBlocks: hasText
+                contentBlocks: alreadyShown
                   ? blocks
                   : [
                       ...blocks,
                       {
                         type: "text" as const,
-                        text: "\u62b1\u6b49\uff0c\u5904\u7406\u8fc7\u7a0b\u4e2d\u9047\u5230\u95ee\u9898\uff0c\u8bf7\u91cd\u8bd5\u3002",
+                        text: failureMessage,
                       },
                     ],
               };
             }),
           );
           break;
+        }
 
         case "run.canceled":
           // Clean up running tool blocks when run is aborted (e.g. billing error)

@@ -2,7 +2,7 @@ import Fastify from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { AuthenticatedUser } from "../supabase/user.js";
-import { registerJobRoutes } from "./jobs.js";
+import { registerJobRoutes, resolveBackgroundRemovalModel } from "./jobs.js";
 
 const ids = {
   user: "00000000-0000-4000-8000-000000000001",
@@ -48,6 +48,167 @@ function job(jobType: "image_generation" | "video_generation") {
 describe("job route payment gate", () => {
   const apps: ReturnType<typeof Fastify>[] = [];
   afterEach(async () => Promise.all(apps.splice(0).map((app) => app.close())));
+
+  it.each([
+    [
+      "local repaint",
+      "local_repaint" as const,
+      { mask_image: "data:image/png;base64,bWFzaw==" },
+    ],
+    [
+      "outpaint",
+      "outpaint" as const,
+      { outpaint_margins: { top: 20, right: 40, bottom: 0, left: 0 } },
+    ],
+  ])("uses canvas placeholder replay for paid %s submissions", async (
+    _label,
+    operation,
+    operationFields,
+  ) => {
+    const createJobWithReplay = vi.fn(async () => ({
+      job: job("image_generation"),
+      replayed: false,
+      billingCommitted: false,
+    }));
+    const jobService = {
+      createJob: vi.fn(),
+      createJobWithReplay,
+      setCreditsInfo: vi.fn(),
+      enqueueJob: vi.fn(),
+    };
+    const app = Fastify();
+    apps.push(app);
+    await registerJobRoutes(app, {
+      auth: { authenticate: async () => user },
+      viewerService: {
+        ensureViewer: async () => ({ workspace: { id: ids.workspace } }),
+      } as never,
+      jobService: jobService as never,
+      creditService: {
+        getSubscription: async () => ({ plan: "pro" }),
+        deductCredits: async () => "tx",
+      } as never,
+      tierGuard: {
+        checkModelAccess: vi.fn(),
+        checkResolution: vi.fn(),
+        checkConcurrency: vi.fn(),
+        calculateCreditCost: vi.fn(() => 7),
+      } as never,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/jobs/image-generation",
+      payload: {
+        canvas_id: "00000000-0000-4000-8000-000000000005",
+        placeholder_element_id: "repaint-placeholder-1",
+        placement_x: 100,
+        placement_y: 50,
+        prompt: "Replace the selected flower",
+        operation,
+        model: "gpt-image-2",
+        input_images: ["data:image/png;base64,aWFnZQ=="],
+        ...operationFields,
+      },
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(jobService.createJob).not.toHaveBeenCalled();
+    expect(createJobWithReplay).toHaveBeenCalledWith(
+      user,
+      expect.objectContaining({
+        target: expect.objectContaining({
+          kind: "canvas",
+          element_id: "repaint-placeholder-1",
+        }),
+        payload: expect.objectContaining({ operation, ...operationFields }),
+      }),
+    );
+  });
+
+  it.each([["2k", "hd"], ["4k", "ultra"]])("bills %s pixels independently from low quality", async (resolution, billingQuality) => {
+    const jobService = { createJob: vi.fn(async () => job("image_generation")), setCreditsInfo: vi.fn(), enqueueJob: vi.fn() };
+    const tierGuard = { checkModelAccess: vi.fn(), checkResolution: vi.fn(), checkConcurrency: vi.fn(), calculateCreditCost: vi.fn(() => 7) };
+    const app = Fastify(); apps.push(app);
+    await registerJobRoutes(app, {
+      auth: { authenticate: async () => user }, viewerService: { ensureViewer: async () => ({ workspace: { id: ids.workspace } }) } as never,
+      jobService: jobService as never,
+      creditService: { getSubscription: async () => ({ plan: "pro" }), deductCredits: async () => "tx" } as never,
+      tierGuard: tierGuard as never,
+    });
+    const response = await app.inject({ method: "POST", url: "/api/jobs/image-generation", payload: { model: "gpt-image-2", prompt: "native resolution", quality: "standard", resolution, aspect_ratio: "16:9" } });
+    expect(response.statusCode).toBe(201);
+    expect(tierGuard.checkResolution).toHaveBeenCalledWith("pro", billingQuality);
+    expect(tierGuard.calculateCreditCost).toHaveBeenCalledWith("gpt-image-2", "image_generation", { quality: billingQuality, imageResolution: resolution });
+    expect(jobService.createJob).toHaveBeenCalledWith(user, expect.objectContaining({ payload: expect.objectContaining({ quality: "standard", resolution }) }));
+  });
+
+  it("does not enqueue or deduct when the selected pixel tier is forbidden", async () => {
+    const createJob = vi.fn(), deductCredits = vi.fn();
+    const app = Fastify(); apps.push(app);
+    await registerJobRoutes(app, {
+      auth: { authenticate: async () => user }, viewerService: { ensureViewer: async () => ({ workspace: { id: ids.workspace } }) } as never,
+      jobService: { createJob } as never,
+      creditService: { getSubscription: async () => ({ plan: "free" }), deductCredits } as never,
+      tierGuard: { checkModelAccess: vi.fn(), checkResolution: () => { throw new Error("resolution_not_allowed"); }, checkConcurrency: vi.fn(), calculateCreditCost: vi.fn() } as never,
+    });
+    const response = await app.inject({ method: "POST", url: "/api/jobs/image-generation", payload: { model: "gpt-image-2", prompt: "native resolution", quality: "standard", resolution: "4k" } });
+    expect(response.statusCode).toBeGreaterThanOrEqual(400);
+    expect(createJob).not.toHaveBeenCalled();
+    expect(deductCredits).not.toHaveBeenCalled();
+  });
+
+  it("binds background removal to the exact native workspace model and bills before publishing", async () => {
+    const nativeId = "workspace:00000000-0000-4000-8000-000000000099";
+    const order: string[] = [];
+    const entries = ["gpt-image-2-all", "gpt-image-2-vip", "gpt-image-2", "gpt-image-2.5-flare"].map(upstreamModelId => ({ upstreamModelId, model: { id: upstreamModelId === "gpt-image-2.5-flare" ? nativeId : upstreamModelId, modality: "image", capabilities: ["image_generation"] } }));
+    const catalog = { listPublished: vi.fn(async () => entries), resolvePublishedModel: vi.fn(async () => ({ upstreamModelId: "gpt-image-2.5-flare" })) };
+    const jobService = { createJob: vi.fn(async () => { order.push("create"); return job("image_generation"); }), setCreditsInfo: vi.fn(async () => { order.push("billing"); }), enqueueJob: vi.fn(async () => { order.push("enqueue"); }) };
+    const creditService = { getSubscription: vi.fn(async () => ({ plan: "pro" })), deductCredits: vi.fn(async () => { order.push("deduct"); return "tx"; }) };
+    const app = Fastify(); apps.push(app);
+    await registerJobRoutes(app, {
+      auth: { authenticate: async () => user }, viewerService: { ensureViewer: async () => ({ workspace: { id: ids.workspace } }) } as never,
+      workspaceModelCatalogService: catalog as never, jobService: jobService as never, creditService: creditService as never,
+      tierGuard: { checkModelAccess: vi.fn(), checkResolution: vi.fn(), checkConcurrency: vi.fn(), calculateCreditCost: vi.fn(() => 7) } as never,
+    });
+    const response = await app.inject({ method: "POST", url: "/api/jobs/image-generation", payload: { prompt: "Remove background", operation: "remove_background", model: "gpt-image-2-all", input_images: ["data:image/png;base64,aGVsbG8="] } });
+    expect(response.statusCode).toBe(201);
+    expect(jobService.createJob).toHaveBeenCalledWith(user, expect.objectContaining({ payload: expect.objectContaining({ operation: "remove_background", model: nativeId }) }));
+    expect(order).toEqual(["create", "deduct", "billing", "enqueue"]);
+    expect(catalog.listPublished).toHaveBeenCalledWith(user, ids.workspace);
+  });
+
+  it("fails closed when only all/vip are enabled", async () => {
+    const catalog = { listPublished: async () => ["gpt-image-2-all", "gpt-image-2-vip"].map(upstreamModelId => ({ upstreamModelId, model: { modality: "image", capabilities: ["image_generation"] } })) };
+    await expect(resolveBackgroundRemovalModel(catalog as never, user, ids.workspace)).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("rejects a 17th exact GPT Image 2 reference before creating or billing a job", async () => {
+    const jobService = { createJob: vi.fn(), enqueueJob: vi.fn() };
+    const creditService = { getSubscription: vi.fn(), deductCredits: vi.fn() };
+    const app = Fastify(); apps.push(app);
+    await registerJobRoutes(app, {
+      auth: { authenticate: async () => user },
+      viewerService: { ensureViewer: async () => ({ workspace: { id: ids.workspace } }) } as never,
+      jobService: jobService as never,
+      creditService: creditService as never,
+      tierGuard: { checkModelAccess: vi.fn(), checkConcurrency: vi.fn(), calculateCreditCost: vi.fn() } as never,
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/jobs/image-generation",
+      payload: {
+        prompt: "Combine the supplied references",
+        model: "gpt-image-2",
+        input_images: Array.from({ length: 17 }, (_, index) => `data:image/png;base64,aW1hZ2U${index}`),
+      },
+    });
+    expect(response.statusCode).toBe(422);
+    expect(response.json()).toMatchObject({ error: { code: "image_reference_limit_exceeded" } });
+    expect(jobService.createJob).not.toHaveBeenCalled();
+    expect(creditService.getSubscription).not.toHaveBeenCalled();
+    expect(creditService.deductCredits).not.toHaveBeenCalled();
+  });
 
   it.each([
     [
@@ -103,6 +264,7 @@ describe("job route payment gate", () => {
         creditService: creditService as never,
         tierGuard: {
           checkModelAccess: vi.fn(),
+          checkResolution: vi.fn(),
           checkConcurrency: vi.fn(),
           calculateCreditCost: vi.fn(() => 7),
         } as never,
@@ -183,7 +345,7 @@ describe("job route payment gate", () => {
       url: "/api/jobs/image-generation",
       payload: {
         prompt: "remove background",
-        operation: "remove_background",
+        operation: "split_layers",
         target: {
           kind: "design",
           design_id: designId,
@@ -257,7 +419,7 @@ describe("job route payment gate", () => {
       url: "/api/jobs/image-generation",
       payload: {
         prompt: "remove background",
-        operation: "remove_background",
+        operation: "split_layers",
         target: {
           kind: "design",
           design_id: designId,
@@ -297,6 +459,7 @@ describe("job route payment gate", () => {
       creditService: creditService as never,
       tierGuard: {
         checkModelAccess: vi.fn(),
+        checkResolution: vi.fn(),
         checkConcurrency: vi.fn(),
         calculateCreditCost: vi.fn(() => 7),
       } as never,
@@ -321,7 +484,7 @@ describe("job route payment gate", () => {
   });
 
   it.each([
-    ["remove_background", undefined],
+    ["split_layers", undefined],
     ["smart_erase", "data:image/png;base64,bWFzaw=="],
   ] as const)(
     "queues self-hosted %s without charging generation credits",
@@ -340,6 +503,7 @@ describe("job route payment gate", () => {
       };
       const tierGuard = {
         checkModelAccess: vi.fn(),
+        checkResolution: vi.fn(),
         checkConcurrency: vi.fn(),
         calculateCreditCost: vi.fn(),
       };

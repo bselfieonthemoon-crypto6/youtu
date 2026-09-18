@@ -18,6 +18,7 @@ export type FeynobgSelectionRegion = {
   width: number;
   height: number;
 };
+export type FeynobgSelectionPoint = { x: number; y: number; label: 0 | 1 };
 export type FeynobgLayer = {
   kind: "foreground" | "background" | "element";
   buffer: Buffer;
@@ -28,12 +29,14 @@ export type FeynobgLayer = {
   index?: number;
 };
 export type FeynobgResult = {
+  model?: string;
   width: number;
   height: number;
   layers: FeynobgLayer[];
 };
 
 type WorkerResponse = {
+  model?: string;
   id: string;
   ok: boolean;
   error?: string;
@@ -105,6 +108,7 @@ class PersistentFeynobgWorker {
     mode: FeynobgMode,
     selectionRegion?: FeynobgSelectionRegion,
     maskBuffer?: Buffer,
+    selectionPoints?: FeynobgSelectionPoint[],
   ): Promise<FeynobgResult> {
     const taskDir = await mkdtemp(join(tmpdir(), "loomic-feynobg-"));
     const inputPath = join(taskDir, "input-image");
@@ -118,6 +122,7 @@ class PersistentFeynobgWorker {
         output_dir: outputDir,
         mode,
         ...(selectionRegion ? { selection_region: selectionRegion } : {}),
+        ...(selectionPoints ? { selection_points: selectionPoints } : {}),
         ...(maskPath ? { mask_path: maskPath } : {}),
       });
       if (!response.ok)
@@ -135,7 +140,7 @@ class PersistentFeynobgWorker {
           return { ...file, buffer: await readFile(path) };
         }),
       );
-      return { width: response.width, height: response.height, layers };
+      return { width: response.width, height: response.height, layers, ...(response.model ? { model: response.model } : {}) };
     } finally {
       await rm(taskDir, { recursive: true, force: true }).catch(() => {});
     }
@@ -212,6 +217,7 @@ class PersistentFeynobgWorker {
     output_dir: string;
     mode: FeynobgMode;
     selection_region?: FeynobgSelectionRegion;
+    selection_points?: FeynobgSelectionPoint[];
     mask_path?: string;
   }): Promise<WorkerResponse> {
     const id = randomUUID();
@@ -251,6 +257,7 @@ export function processWithFeynobg(
   mode: FeynobgMode,
   selectionRegion?: FeynobgSelectionRegion,
   maskBuffer?: Buffer,
+  selectionPoints?: FeynobgSelectionPoint[],
 ): Promise<FeynobgResult> {
-  return singleton.process(buffer, mode, selectionRegion, maskBuffer);
+  return singleton.process(buffer, mode, selectionRegion, maskBuffer, selectionPoints);
 }

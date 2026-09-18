@@ -86,7 +86,7 @@ describe("Login page", () => {
         <LoginPage />
       </AuthProvider>,
     );
-    expect((await screen.findByText("Loomic")).textContent).toBe("Loomic");
+    expect((await screen.findByText("Cromic")).textContent).toBe("Cromic");
     expect(screen.getByRole("button", { name: /sign in/i })).toBeInTheDocument();
     expect(screen.getByText(/Use login link instead/i)).toBeInTheDocument();
     expect(screen.queryByText(/Continue with Google/i)).not.toBeInTheDocument();

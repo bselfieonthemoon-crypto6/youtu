@@ -325,7 +325,7 @@ async function resolveFilesFromStorage(
   }
 
   if (ossEntries.length === 0) {
-    return content;
+    return { ...content, files: updatedFiles } as CanvasContent;
   }
 
   // Resolve short-lived private URLs instead of downloading each file.

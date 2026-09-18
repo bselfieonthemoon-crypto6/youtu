@@ -5,17 +5,39 @@ import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRe
 import type { MessageMention } from "@loomic/shared";
 import type { ImageAttachmentState } from "../hooks/use-image-attachments";
 import type { CanvasSelectedElement } from "./canvas-editor";
-import { useImageModelPreference } from "../hooks/use-image-model-preference";
+import {
+  type ImageModelPreference,
+  useImageModelPreference,
+} from "../hooks/use-image-model-preference";
 import { useVideoModelPreference } from "../hooks/use-video-model-preference";
 import { AgentModelSelector } from "./agent-model-selector";
 import { ImageAttachmentBar } from "./image-attachment-bar";
 import { ImageModelPreferencePopover } from "./image-model-preference";
 
+const aspectRatioOptions: ReadonlyArray<{
+  value: NonNullable<ImageModelPreference["aspectRatio"]>;
+  label: string;
+  title?: string;
+}> = [
+  { value: "auto", label: "自动", title: "自动（使用目标画板比例）" },
+  { value: "1:1", label: "1:1" },
+  { value: "4:3", label: "4:3" },
+  { value: "3:4", label: "3:4" },
+  { value: "16:9", label: "16:9" },
+  { value: "9:16", label: "9:16" },
+  { value: "3:2", label: "3:2" },
+  { value: "2:3", label: "2:3" },
+  { value: "4:5", label: "4:5" },
+  { value: "5:4", label: "5:4" },
+  { value: "21:9", label: "21:9" },
+];
+
 type ChatInputProps = {
   accessToken?: string | undefined;
-  onSend: (message: string) => void;
+  onSend: (message: string) => { status: string } | undefined | Promise<{ status: string } | undefined>;
   disabled?: boolean;
   running?: boolean;
+  allowCorrection?: boolean;
   canceling?: boolean;
   onCancel?: () => void;
   attachments?: ImageAttachmentState[];
@@ -34,6 +56,8 @@ export type ChatInputHandle = {
   clearAtQuery: () => void;
   focus: () => void;
   setValue: (value: string) => void;
+  /** Adds an editable skill invitation without discarding an in-progress draft. */
+  prependInvitation: (invitation: string) => void;
 };
 
 export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput({
@@ -41,6 +65,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
   onSend,
   disabled,
   running,
+  allowCorrection,
   canceling,
   onCancel,
   attachments,
@@ -54,11 +79,13 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
   selectedCanvasElements,
 }, ref) {
   const [value, setValue] = useState("");
+  const draftRevisionRef = useRef(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const { preference } = useImageModelPreference();
+  const { preference, setAspectRatio } = useImageModelPreference();
   const { preference: videoPreference } = useVideoModelPreference();
   const [modelPopoverOpen, setModelPopoverOpen] = useState(false);
+  const [aspectRatioOpen, setAspectRatioOpen] = useState(false);
   const modelBtnRef = useRef<HTMLButtonElement>(null);
 
   useImperativeHandle(ref, () => ({
@@ -73,7 +100,15 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
       textareaRef.current?.focus();
     },
     setValue(nextValue: string) {
+      draftRevisionRef.current += 1;
       setValue(nextValue);
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    },
+    prependInvitation(invitation: string) {
+      const trimmedInvitation = invitation.trim();
+      if (!trimmedInvitation) return;
+      draftRevisionRef.current += 1;
+      setValue((current) => current.trim() ? `${trimmedInvitation}\n\n${current}` : trimmedInvitation);
       requestAnimationFrame(() => textareaRef.current?.focus());
     },
   }));
@@ -81,8 +116,20 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
   const handleSubmit = useCallback(() => {
     const trimmed = value.trim();
     if ((!trimmed && (!attachments || attachments.length === 0)) || disabled || isUploading) return;
-    onSend(trimmed);
+    const revision = ++draftRevisionRef.current;
     setValue("");
+    // Preserve a rejected draft, but never overwrite text typed while awaiting
+    // the result of an earlier submission.
+    const restore = () => {
+      if (draftRevisionRef.current === revision) setValue(trimmed);
+    };
+    try {
+      void Promise.resolve(onSend(trimmed)).then(result => {
+        if (result?.status === "failed") restore();
+      }, restore);
+    } catch {
+      restore();
+    }
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
@@ -112,6 +159,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
   const handleChange = useCallback(
     (e: React.ChangeEvent<HTMLTextAreaElement>) => {
       const newValue = e.target.value;
+      draftRevisionRef.current += 1;
       setValue(newValue);
 
       if (!onAtQuery) return;
@@ -278,7 +326,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
           onChange={handleChange}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
-          placeholder='Start with an idea, or type "@" to mention'
+          placeholder={'Start with an idea, or type "@" to mention'}
           aria-label="输入消息"
           rows={1}
           style={{ scrollbarWidth: "none" }}
@@ -338,8 +386,52 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
                 accessToken={accessToken}
               />
             </div>
+            <div className="relative">
+              <button
+                type="button"
+                aria-haspopup="listbox"
+                aria-expanded={aspectRatioOpen}
+                aria-label={`图片比例：${aspectRatioOptions.find((option) => option.value === preference.aspectRatio)?.label ?? "自动"}`}
+                data-testid="image-aspect-ratio-selector"
+                onClick={() => setAspectRatioOpen((prev) => !prev)}
+                title={aspectRatioOptions.find((option) => option.value === preference.aspectRatio)?.title ?? preference.aspectRatio}
+                className="flex h-8 items-center rounded-full border-[0.5px] border-border px-2 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              >
+                {aspectRatioOptions.find((option) => option.value === preference.aspectRatio)?.label ?? "自动"}
+              </button>
+              {aspectRatioOpen && (
+                <div
+                  role="listbox"
+                  aria-label="图片比例"
+                  className="absolute bottom-10 left-0 z-50 grid w-40 grid-cols-2 gap-1 rounded-lg border-[0.5px] border-border bg-card p-1 shadow-card"
+                >
+                  {aspectRatioOptions.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      role="option"
+                      aria-selected={preference.aspectRatio === option.value}
+                      data-testid={`image-aspect-ratio-option-${option.value.replace(":", "-")}`}
+                      title={option.title ?? option.label}
+                      onClick={() => {
+                        setAspectRatio(option.value);
+                        setAspectRatioOpen(false);
+                      }}
+                      className={`rounded-md px-2 py-1.5 text-left text-xs transition-colors ${
+                        preference.aspectRatio === option.value
+                          ? "bg-accent/15 text-accent-foreground"
+                          : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
-          {running ? (
+          <div className="flex items-center gap-1.5">
+          {running && (
             <button
               type="button"
               onClick={onCancel}
@@ -354,7 +446,8 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
                 <span className="h-2.5 w-2.5 rounded-[2px] bg-current" />
               )}
             </button>
-          ) : (
+          )}
+          {(!running || allowCorrection) && (
             <button
               type="button"
               onClick={handleSubmit}
@@ -375,6 +468,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
               </svg>
             </button>
           )}
+          </div>
         </div>
       </div>
     </div>

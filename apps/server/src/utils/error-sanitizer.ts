@@ -2,6 +2,57 @@
  * Sanitize error messages before sending to the frontend.
  * Logs full error detail server-side, returns user-friendly message.
  */
+import { contextErrorForClient } from "./context-error.js";
+
+function providerQuotaErrorForClient(error: unknown): { code: string; message: string } | null {
+  const seen = new Set<unknown>();
+  let current = error;
+  for (let depth = 0; depth < 8 && current && !seen.has(current); depth++) {
+    seen.add(current);
+    const record = typeof current === "object" ? current as Record<string, unknown> : null;
+    const message = record?.message ?? (typeof current === "string" ? current : "");
+    if (record?.code === "insufficient_quota" || (typeof message === "string" && (
+      /\binsufficient_quota\b/i.test(message)
+      || /\bquota\b[\s\S]*\bpreConsumedQuota\b[\s\S]*\bnot enough\b/i.test(message)
+    ))) {
+      return {
+        code: "provider_quota_insufficient",
+        message: "模型服务的可用额度不足，本次请求已停止。请联系管理员检查第三方额度后继续；对话和已有图片会保留，请勿重复提交生成。",
+      };
+    }
+    current = record?.cause;
+  }
+  return null;
+}
+
+/** A malformed tool declaration cannot recover by resubmitting the same request. */
+function toolSchemaErrorForClient(error: unknown): { code: string; message: string } | null {
+  const seen = new Set<unknown>();
+  let current = error;
+  for (let depth = 0; depth < 8 && current && !seen.has(current); depth++) {
+    seen.add(current);
+    const record = typeof current === "object" ? current as Record<string, unknown> : null;
+    const message = record?.message ?? (typeof current === "string" ? current : "");
+    if (record?.code === "provider_tool_schema_unsupported" || (typeof message === "string" && (
+      /invalid (?:json payload|schema)[\s\S]*(?:function_declarations|tools\[|function.*parameters)/i.test(message)
+      || /invalid schema for function/i.test(message)
+    ))) {
+      return { code: "tool_schema_incompatible", message: "当前模型不兼容这次任务的工具参数格式，任务已停止。请联系管理员检查模型适配后再继续；已有生成任务请先查看状态，避免重复提交。" };
+    }
+    current = record?.cause;
+  }
+  return null;
+}
+
+/** Keep the existing stream error enum; detailed reasons live in details. */
+export function sanitizeRunErrorForClient(error: unknown): {
+  code: "run_failed"; message: string; details?: { reasonCode: string; automaticRetry: false };
+} {
+  const context = contextErrorForClient(error) ?? toolSchemaErrorForClient(error) ?? providerQuotaErrorForClient(error);
+  return context
+    ? { code: "run_failed", message: context.message, details: { reasonCode: context.code, automaticRetry: false } }
+    : { code: "run_failed", message: sanitizeErrorForClient(error) };
+}
 
 const PROVIDER_PATTERN =
   /google|vertex|openai|replicate|langchain|gaxios|undici|fetch failed/i;
@@ -13,6 +64,8 @@ const INFRA_PATTERN =
   /econnrefused|econnreset|etimedout|dns|socket|tls|certificate/i;
 
 export function sanitizeErrorForClient(error: unknown): string {
+  const context = contextErrorForClient(error) ?? toolSchemaErrorForClient(error) ?? providerQuotaErrorForClient(error);
+  if (context) return context.message;
   const raw = error instanceof Error ? error.message : String(error);
 
   // Log full detail server-side for debugging

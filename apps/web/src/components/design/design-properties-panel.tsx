@@ -14,6 +14,7 @@ import { createContext, useContext, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import type { UpdateFabricObjectPatch } from "./fabric-object-editor";
+import { ANIMATION_CONTROL_EVENT, ANIMATION_STATUS_EVENT } from "../../lib/design-animation-events";
 
 export type DesignPropertiesActions = {
   updateObject: (objectId: string, patch: UpdateFabricObjectPatch) => void;
@@ -46,6 +47,33 @@ type TextFieldDraftStore = {
 };
 
 const TextFieldDraftContext = createContext<TextFieldDraftStore | null>(null);
+
+function ProportionalScale({object, actions}: {object: DesignObject; actions: DesignPropertiesActions}) {
+  const base = useRef({width: object.width, height: object.height});
+  const applied = useRef(base.current);
+  const [percent, setPercent] = useState(100);
+  useEffect(() => {
+    // Manual resizing or undo establishes a new baseline; our own updates do not compound.
+    if (Math.abs(object.width - applied.current.width) > 0.01 || Math.abs(object.height - applied.current.height) > 0.01) {
+      base.current = {width: object.width, height: object.height};
+      applied.current = base.current;
+      setPercent(100);
+    }
+  }, [object.width, object.height]);
+  return <label className="col-span-2 grid gap-2 rounded-lg border p-2 text-xs">
+    <span className="flex justify-between"><span>等比缩放</span><span>{percent}%</span></span>
+    <input aria-label="对象等比缩放" type="range" min={10} max={300} step={1}
+      value={percent} disabled={object.locked} className="w-full accent-primary"
+      onChange={event => {
+        const next = Number(event.currentTarget.value);
+        const dimensions = {width: base.current.width * next / 100, height: base.current.height * next / 100};
+        applied.current = dimensions;
+        setPercent(next);
+        actions.updateObject(object.objectId, dimensions);
+      }} />
+    <span className="text-muted-foreground">以当前尺寸为 100%，保持宽高比例</span>
+  </label>;
+}
 
 export function DesignPropertiesPanel({
   selectedObjects,
@@ -273,6 +301,8 @@ function SingleObjectProperties({
           />
         ),
       )}
+      <ProportionalScale object={object} actions={actions} />
+      <AnimationProperties object={object} actions={actions} />
       {(object.type === "text" || object.type === "textbox") && (
         <>
           <TextField
@@ -535,6 +565,130 @@ function SingleObjectProperties({
             </select>
           </label>
           <ImageAdvancedProperties object={object} actions={actions} />
+        </>
+      )}
+    </div>
+  );
+}
+
+function AnimationProperties({
+  object,
+  actions,
+}: {
+  object: DesignObject;
+  actions: DesignPropertiesActions;
+}) {
+  const animation = object.animation;
+  const [playing, setPlaying] = useState(false);
+  useEffect(() => {
+    const status = (event: Event) => { const detail = (event as CustomEvent).detail;
+      if (detail?.ids?.includes(object.objectId)) setPlaying(detail.playing === true); };
+    window.addEventListener(ANIMATION_STATUS_EVENT, status);
+    window.dispatchEvent(new CustomEvent(ANIMATION_CONTROL_EVENT, { detail: { objectId: object.objectId, action: "query" } }));
+    return () => window.removeEventListener(ANIMATION_STATUS_EVENT, status);
+  }, [object.objectId]);
+  const [type, setType] = useState<"" | "float" | "scale">(
+    animation?.type ?? "",
+  );
+  const [durationSeconds, setDurationSeconds] = useState(
+    String((animation?.durationMs ?? 2000) / 1000),
+  );
+  const [amount, setAmount] = useState(String(animation?.amount ?? 10));
+
+  useEffect(() => {
+    setType(animation?.type ?? "");
+    setDurationSeconds(String((animation?.durationMs ?? 2000) / 1000));
+    setAmount(String(animation?.amount ?? 10));
+  }, [animation]);
+
+  const commit = (next: {
+    type?: "float" | "scale";
+    durationSeconds?: string;
+    amount?: string;
+  }) => {
+    const nextType = next.type ?? type;
+    if (!nextType) return;
+    const durationMs = Math.min(
+      10_000,
+      Math.max(
+        500,
+        Math.round(Number(next.durationSeconds ?? durationSeconds) * 1000),
+      ),
+    );
+    const nextAmount = Math.min(
+      100,
+      Math.max(1, Math.round(Number(next.amount ?? amount))),
+    );
+    if (!Number.isFinite(durationMs) || !Number.isFinite(nextAmount)) return;
+    actions.updateObject(object.objectId, {
+      animation: { type: nextType, durationMs, amount: nextAmount },
+    });
+  };
+
+  return (
+    <div className="col-span-2 grid grid-cols-2 gap-2 rounded-lg border p-2">
+      <label className="col-span-2 grid gap-1 text-xs">
+        动画
+        <select
+          aria-label="动画"
+          className="h-8 rounded-md border bg-background px-2"
+          value={type}
+          onChange={(event) => {
+            const nextType = event.currentTarget.value as
+              | ""
+              | "float"
+              | "scale";
+            setType(nextType);
+            if (!nextType) {
+              actions.updateObject(object.objectId, { animation: null });
+              return;
+            }
+            commit({ type: nextType });
+          }}
+        >
+          <option value="">无</option>
+          <option value="float">上下浮动</option>
+          <option value="scale">放大缩小</option>
+        </select>
+      </label>
+      {type && (
+        <>
+          <label className="grid gap-1 text-xs">
+            时长（秒）
+            <input
+              aria-label="动画时长（秒）"
+              className="h-8 min-w-0 rounded-md border bg-background px-2"
+              type="number"
+              min={0.5}
+              max={10}
+              step={0.1}
+              value={durationSeconds}
+              onChange={(event) =>
+                setDurationSeconds(event.currentTarget.value)
+              }
+              onBlur={() => commit({ durationSeconds })}
+            />
+          </label>
+          <label className="grid gap-1 text-xs">
+            {type === "float" ? "幅度（像素）" : "幅度（%）"}
+            <input
+              aria-label={
+                type === "float" ? "动画幅度（像素）" : "动画幅度（%）"
+              }
+              className="h-8 min-w-0 rounded-md border bg-background px-2"
+              type="number"
+              min={1}
+              max={100}
+              step={1}
+              value={amount}
+              onChange={(event) => setAmount(event.currentTarget.value)}
+              onBlur={() => commit({ amount })}
+            />
+          </label>
+          <p className="col-span-2 text-[11px] text-muted-foreground">
+            <button type="button" className="mb-2 rounded border px-3 py-1 text-foreground" onClick={() => window.dispatchEvent(new CustomEvent(ANIMATION_CONTROL_EVENT, { detail: { objectId: object.objectId, action: "toggle" } }))}>{playing ? "暂停" : "播放"}</button>
+            <br />可实时预览；退出编辑后也可在画布播放。静态导出不受影响。
+          </p>
         </>
       )}
     </div>

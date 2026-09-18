@@ -236,7 +236,7 @@ export default function HomePage() {
         >
           <LoomicLogo className="size-7 text-foreground md:size-8" />
           <span className="text-lg font-semibold text-foreground md:text-xl">
-            Loomic
+            Cromic
           </span>
         </motion.div>
 

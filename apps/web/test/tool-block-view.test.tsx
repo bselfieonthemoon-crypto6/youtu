@@ -12,10 +12,68 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ToolBlockView } from "../src/components/chat/tool-block-view";
+import { GenerationCanvasPresenceProvider } from "../src/components/chat/generation-canvas-presence";
 
 afterEach(() => cleanup());
 
 describe("ToolBlockView", () => {
+  it.each(["queued", "processing", "succeeded", "finished"])("shows the server image cost receipt for %s", (status) => {
+    render(<ToolBlockView block={{ type: "tool", toolCallId: `cost-${status}`, toolName: "generate_image", status: "completed", output: { status, creditsCost: 7, pricingVersion: "credits-v1", actualQuality: "Low", actualResolution: "1K" } }} />);
+    expect(screen.getByLabelText("图片任务成本回执")).toHaveTextContent("本次任务 7 积分");
+    expect(screen.getByLabelText("图片任务成本回执")).toHaveTextContent("计价 credits-v1");
+  });
+  it.each(["failed", "canceled", "refunded"])("does not call a non-submitted %s result a cost receipt", (status) => {
+    render(<ToolBlockView block={{ type: "tool", toolCallId: `no-cost-${status}`, toolName: "generate_image", status: "failed", output: { status, creditsCost: 7, pricingVersion: "credits-v1", actualQuality: "Low", actualResolution: "1K" } }} />);
+    expect(screen.queryByLabelText("图片任务成本回执")).not.toBeInTheDocument();
+  });
+  it.each([
+    { status: "queued", visible: true }, { status: "processing", visible: true },
+    { status: "succeeded", visible: true }, { status: "finished", visible: true },
+    { status: "failed", visible: false }, { status: "canceled", visible: false },
+    { status: "dead_letter", visible: false }, { status: "refunded", visible: false },
+  ].flatMap(state => ["generate_image", "edit_image"].flatMap(toolName =>
+    [0, 7].map(cost => ({ ...state, toolName, cost })))))
+    ("keeps $toolName $status receipt visibility at $cost credits", ({ status, visible, toolName, cost }) => {
+      render(<ToolBlockView block={{ type: "tool", toolCallId: `cost-${status}`, toolName,
+        status: visible ? "completed" : "failed", output: { status, creditsCost: cost,
+          pricingVersion: "historic-v2", actualQuality: "Medium", actualResolution: "2K" } }} />);
+      const receipt = screen.queryByLabelText("图片任务成本回执");
+      if (!visible) expect(receipt).not.toBeInTheDocument();
+      else {
+        expect(receipt).toHaveTextContent(`本次任务 ${cost} 积分`);
+        expect(receipt).toHaveTextContent("计价 historic-v2");
+        expect(receipt).toHaveTextContent("质量 Medium");
+        expect(receipt).toHaveTextContent("分辨率 2K");
+        expect(receipt).not.toHaveTextContent("已扣");
+      }
+    });
+  it("shows input correction rather than a failed paid generation", () => {
+    render(<ToolBlockView block={{ type: "tool", toolCallId: "invalid", toolName: "edit_image", status: "completed",
+      output: { error: true, message: "Tool input validation failed for edit_image", validationErrors: { errors: ["Unrecognized key"] } } }} />);
+    expect(screen.getByText("参数需要调整")).toBeInTheDocument();
+    expect(screen.queryByText("图片生成失败")).not.toBeInTheDocument();
+  });
+  it("does not show retired visual acceptance copy on an unverified generated image", () => {
+    render(<ToolBlockView block={{ type: "tool", toolCallId: "image-result", toolName: "generate_image", status: "completed",
+      output: { status: "succeeded", visualStatus: "unverified" },
+      artifacts: [{ type: "image", url: "https://example.com/image.png", mimeType: "image/png", width: 512, height: 512 }] }} />);
+    expect(screen.queryByText(/尚未做视觉验收/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/可让 Agent 检查这张结果图/)).not.toBeInTheDocument();
+  });
+  it.each(["status", "jobStatus"])("presents canceled generation from %s without a failure or retry", (key) => {
+    render(<ToolBlockView block={{ type: "tool", toolCallId: "canceled-job", toolName: "confirm_image_generation", status: "failed", output: { jobId: "job", [key]: "canceled", error: "生成任务未完成" } }} />);
+    expect(screen.getByText("图片生成已取消")).toBeInTheDocument();
+    expect(screen.getByText("任务已取消，不会将后续结果放入画布")).toBeInTheDocument();
+    expect(screen.queryByText("图片生成失败")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "继续等待" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "放入画布" })).not.toBeInTheDocument();
+  });
+  it.each(["failed", "completed"] as const)("shows terminal provider errors for %s blocks without a generation placeholder", (status) => {
+    render(<ToolBlockView block={{ type: "tool", toolCallId: "terminal", toolName: "confirm_image_generation", status, output: { jobId: "job", status: "dead_letter", error: "503 渠道不可用，任务已停止" } }} />);
+    expect(screen.getByText("503 渠道不可用，任务已停止")).toBeInTheDocument();
+    expect(screen.queryByText("正在生成图片")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "继续等待" })).not.toBeInTheDocument();
+  });
   it("distinguishes proposal preparation from actual generation", () => {
     render(
       <ToolBlockView
@@ -109,6 +167,97 @@ describe("ToolBlockView", () => {
     ).toBeInTheDocument();
   });
 
+  it("discloses a validated two-provider foreground pipeline before confirmation", () => {
+    const { container } = render(
+      <ToolBlockView
+        block={{
+          type: "tool",
+          toolCallId: "tool-foreground-confirm",
+          toolName: "generate_image",
+          status: "completed",
+          output: {
+            status: "awaiting_confirmation",
+            confirmation: {
+              confirmationId: "confirm-foreground",
+              kind: "image_generation",
+              targets: [],
+              details: {
+                title: "Logo 前景",
+                description: "生成后作为 Logo 图层插入。",
+                model: "workspace:gpt-image-2-all",
+                foregroundPolicy: {
+                  version: 1,
+                  mode: "api_matting",
+                  generationModel: "workspace:gpt-image-2-all",
+                  mattingModel: "workspace:gpt-image-2",
+                  generationCredits: 12,
+                  mattingCredits: 2,
+                  totalCredits: 14,
+                  pricingVersion: "credits-v1",
+                  providerCalls: 2,
+                  summary: "先生成，再调用 gpt-image-2 API 去背景；去背景可能改变主体细节。",
+                  billingNote: "积分按平台配置计算；<script>不会作为 HTML 执行</script>",
+                },
+              },
+            },
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByLabelText("前景处理与费用")).toHaveTextContent(
+      "先生成，再调用 gpt-image-2 API 去背景",
+    );
+    expect(screen.getByText(/服务调用（2 次）/)).toHaveTextContent(
+      "workspace:gpt-image-2-all → workspace:gpt-image-2",
+    );
+    expect(screen.getByText("合计 14 积分")).toBeInTheDocument();
+    expect(screen.getByText(/不会作为 HTML 执行/)).toBeInTheDocument();
+    expect(container.querySelector("script")).toBeNull();
+  });
+
+  it("does not render an incomplete or arithmetically inconsistent foreground disclosure", () => {
+    render(
+      <ToolBlockView
+        block={{
+          type: "tool",
+          toolCallId: "tool-invalid-foreground-confirm",
+          toolName: "generate_image",
+          status: "completed",
+          output: {
+            error: "confirmation_required",
+            confirmation: {
+              confirmationId: "confirm-invalid-foreground",
+              kind: "image_generation",
+              targets: [],
+              details: {
+                title: "普通图片",
+                foregroundPolicy: {
+                  version: 1,
+                  mode: "api_matting",
+                  generationModel: "workspace:gpt-image-2-all",
+                  mattingModel: "workspace:gpt-image-2",
+                  generationCredits: 12,
+                  mattingCredits: 2,
+                  totalCredits: 1,
+                  pricingVersion: "credits-v1",
+                  providerCalls: 2,
+                  summary: "伪造费用",
+                  billingNote: "伪造说明",
+                },
+              },
+            },
+          },
+        }}
+      />,
+    );
+
+    expect(screen.queryByLabelText("前景处理与费用")).not.toBeInTheDocument();
+    expect(screen.queryByText("伪造费用")).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("步骤或费用信息不完整");
+    expect(screen.queryByRole("button", { name: "确认生成" })).not.toBeInTheDocument();
+  });
+
   it("renders a Chinese design result and opens the authoritative design", async () => {
     const onOpenDesign = vi.fn();
     const designId = "10000000-0000-4000-8000-000000000001";
@@ -172,6 +321,88 @@ describe("ToolBlockView", () => {
     expect(screen.getByText(`版本 8 · 对象 ${objectId}`)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "打开设计" }));
     expect(onOpenDesign).toHaveBeenCalledWith(designId);
+  });
+
+  it("shows a retained design image without claiming insertion or offering canvas restore", async () => {
+    const onOpenDesign = vi.fn();
+    const onRestoreGeneration = vi.fn();
+    const designId = "10000000-0000-4000-8000-000000000001";
+    render(
+      <ToolBlockView
+        block={{
+          type: "tool",
+          toolCallId: "tool-design-image-needs-attention",
+          toolName: "generate_image",
+          status: "completed",
+          output: {
+            status: "succeeded",
+            jobId: "30000000-0000-4000-8000-000000000001",
+            design_id: designId,
+            finalization_status: "needs_attention",
+            error: "设计版本已改变，图片素材已保留。",
+          },
+          artifacts: [
+            {
+              type: "image",
+              url: "https://example.test/retained.png",
+              mimeType: "image/png",
+              width: 1024,
+              height: 1024,
+              jobId: "30000000-0000-4000-8000-000000000001",
+            },
+          ],
+        }}
+        onOpenDesign={onOpenDesign}
+        onRestoreGeneration={onRestoreGeneration}
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "图片已生成，但尚未应用到设计",
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "设计版本已改变，图片素材已保留。",
+    );
+    expect(screen.queryByText("图片已插入设计")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "放入画布" }),
+    ).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "打开原设计" }));
+    expect(onOpenDesign).toHaveBeenCalledWith(designId);
+    expect(onRestoreGeneration).not.toHaveBeenCalled();
+  });
+
+  it("does not offer a futile restore for an image rejected by the current-task guard", () => {
+    render(
+      <ToolBlockView
+        block={{
+          type: "tool",
+          toolCallId: "tool-superseded-image",
+          toolName: "generate_image",
+          status: "completed",
+          output: {
+            status: "succeeded",
+            jobId: "job-superseded",
+            attachment_status: "superseded",
+            finalization_status: "needs_attention",
+            error: "图片已生成并保留；任务已更新，未应用到当前画布。",
+          },
+          outputSummary: "图片已生成并保留；任务已更新，未应用到当前画布。",
+          artifacts: [{
+            type: "image",
+            url: "https://example.com/retained.png",
+            mimeType: "image/png",
+            width: 1024,
+            height: 1024,
+            jobId: "job-superseded",
+          }],
+        }}
+        onRestoreGeneration={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/未应用到当前画布/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "放入画布" })).not.toBeInTheDocument();
   });
 
   it("shows a retryable design conflict without a fake retry button", () => {
@@ -470,13 +701,14 @@ describe("ToolBlockView", () => {
         onWaitGeneration={onWaitGeneration}
         onRestoreGeneration={onRestoreGeneration}
       />,
+      { wrapper: ({ children }) => <GenerationCanvasPresenceProvider api={{ getSceneElementsIncludingDeleted: () => [], onChange: () => () => {} }}>{children}</GenerationCanvasPresenceProvider> },
     );
 
     await userEvent.click(screen.getByRole("button", { name: "继续等待" }));
     expect(onWaitGeneration).toHaveBeenCalledTimes(1);
     expect(onWaitGeneration).toHaveBeenCalledWith("job-1");
 
-    const restore = await screen.findByRole("button", { name: "恢复到画布" });
+    const restore = await screen.findByRole("button", { name: "放入画布" });
     await userEvent.click(restore);
     await userEvent.click(restore);
     expect(onRestoreGeneration).toHaveBeenCalledTimes(1);
@@ -489,6 +721,43 @@ describe("ToolBlockView", () => {
       inserted: true,
     });
     expect(await screen.findByText("已恢复到画布")).toBeInTheDocument();
+  });
+
+  it("does not offer top-level canvas restore after observing a succeeded design job", async () => {
+    const onWaitGeneration = vi.fn().mockResolvedValue({
+      status: "succeeded",
+      target_kind: "design",
+      design_id: "10000000-0000-4000-8000-000000000001",
+      result: { object_path: "generated/design-image.png" },
+    });
+    const onRestoreGeneration = vi.fn();
+
+    render(
+      <ToolBlockView
+        block={{
+          type: "tool",
+          toolCallId: "tool-design-timeout",
+          toolName: "generate_image",
+          status: "completed",
+          output: {
+            jobId: "job-design",
+            jobType: "image_generation",
+            error: "Job timed out after 240s",
+          },
+        }}
+        onWaitGeneration={onWaitGeneration}
+        onRestoreGeneration={onRestoreGeneration}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "继续等待" }));
+    await waitFor(() => {
+      expect(onWaitGeneration).toHaveBeenCalledWith("job-design");
+      expect(
+      screen.queryByRole("button", { name: "放入画布" }),
+      ).not.toBeInTheDocument();
+    });
+    expect(onRestoreGeneration).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -526,7 +795,7 @@ describe("ToolBlockView", () => {
           screen.queryByRole("button", { name: "继续等待" }),
         ).not.toBeInTheDocument();
         expect(
-          screen.queryByRole("button", { name: "恢复到画布" }),
+      screen.queryByRole("button", { name: "放入画布" }),
         ).not.toBeInTheDocument();
       });
     },

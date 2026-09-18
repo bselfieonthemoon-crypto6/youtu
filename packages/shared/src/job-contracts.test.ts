@@ -20,6 +20,16 @@ const ids = {
 } as const;
 
 describe("image processing job contracts", () => {
+  it("requires bounded named semantic layers and an explicit repaired background", () => {
+    const valid = { prompt: "Split the image", operation: "split_layers",
+      layer_backend: "semantic", layer_names: ["subject", "text"],
+      repair_background: true, input_images: ["https://example.test/source.png"] };
+    expect(normalizeImageGenerationPayload(valid)).toMatchObject(valid);
+    expect(createImageJobRequestSchema.safeParse({ ...valid, layer_names: ["subject"] }).success).toBe(false);
+    expect(createImageJobRequestSchema.safeParse({ ...valid, layer_names: ["subject", "SUBJECT"] }).success).toBe(false);
+    expect(createImageJobRequestSchema.safeParse({ ...valid, repair_background: false }).success).toBe(false);
+    expect(createImageJobRequestSchema.safeParse({ ...valid, layer_backend: undefined }).success).toBe(false);
+  });
   it("requires a complete authoritative design source binding", () => {
     const target = {
       kind: "design",
@@ -68,6 +78,87 @@ describe("image processing job contracts", () => {
       mask_image: "data:image/png;base64,bWFzaw==",
     });
     expect(result.mask_image).toContain("data:image/png");
+  });
+
+  it("requires one source, a mask, and a meaningful prompt for local repaint", () => {
+    const valid = {
+      prompt: "Replace the flower with a red rose",
+      operation: "local_repaint" as const,
+      input_images: ["data:image/png;base64,aW1hZ2U="],
+      mask_image: "data:image/png;base64,bWFzaw==",
+    };
+    expect(createImageJobRequestSchema.parse(valid).operation).toBe(
+      "local_repaint",
+    );
+    expect(
+      createImageJobRequestSchema.safeParse({ ...valid, prompt: "   " }).success,
+    ).toBe(false);
+    expect(
+      createImageJobRequestSchema.safeParse({ ...valid, mask_image: undefined })
+        .success,
+    ).toBe(false);
+    expect(
+      createImageJobRequestSchema.safeParse({ ...valid, input_images: [] })
+        .success,
+    ).toBe(false);
+  });
+
+  it("accepts canvas outpaint margins and preserves them in the Worker payload", () => {
+    const valid = {
+      prompt: "Continue the beach beyond the original frame",
+      operation: "outpaint" as const,
+      input_images: ["data:image/png;base64,aW1hZ2U="],
+      outpaint_margins: { top: 12, right: 48, bottom: 0, left: 24 },
+      canvas_id: "00000000-0000-4000-8000-000000000001",
+      placeholder_element_id: "outpaint-placeholder-1",
+    };
+
+    expect(createImageJobRequestSchema.parse(valid).operation).toBe("outpaint");
+    expect(normalizeImageGenerationPayload(valid)).toMatchObject({
+      operation: "outpaint",
+      input_images: valid.input_images,
+      outpaint_margins: valid.outpaint_margins,
+      target: {
+        kind: "canvas",
+        element_id: "outpaint-placeholder-1",
+      },
+    });
+  });
+
+  it("rejects invalid outpaint sources, masks, margins, and design targets", () => {
+    const valid = {
+      prompt: "Extend the scenery",
+      operation: "outpaint" as const,
+      input_images: ["data:image/png;base64,aW1hZ2U="],
+      outpaint_margins: { top: 1, right: 0, bottom: 0, left: 0 },
+    };
+    const designTarget = {
+      kind: "design" as const,
+      design_id: "00000000-0000-4000-8000-000000000002",
+      expected_revision: 1,
+      idempotency_key: "00000000-0000-4000-8000-000000000003",
+    };
+
+    for (const candidate of [
+      { ...valid, prompt: "   " },
+      { ...valid, input_images: [] },
+      { ...valid, input_images: [...valid.input_images, "second"] },
+      { ...valid, mask_image: "data:image/png;base64,bWFzaw==" },
+      { ...valid, outpaint_margins: undefined },
+      { ...valid, outpaint_margins: { top: 0, right: 0, bottom: 0, left: 0 } },
+      { ...valid, outpaint_margins: { top: 4097, right: 0, bottom: 0, left: 0 } },
+      { ...valid, outpaint_margins: { top: 0.5, right: 0, bottom: 0, left: 0 } },
+      valid,
+      { ...valid, target: designTarget },
+    ]) {
+      expect(createImageJobRequestSchema.safeParse(candidate).success).toBe(false);
+    }
+    expect(
+      createImageJobRequestSchema.safeParse({
+        prompt: "ordinary generation",
+        outpaint_margins: valid.outpaint_margins,
+      }).success,
+    ).toBe(false);
   });
 
   it("accepts a normalized region for guided matting", () => {
@@ -129,6 +220,11 @@ describe("job routing normalization", () => {
     expect(
       normalizeVideoGenerationPayload({ prompt: "chat video" }).target,
     ).toBeNull();
+  });
+
+  it("preserves the optional native image resolution and rejects unknown tiers", () => {
+    expect(normalizeImageGenerationPayload({ prompt: "native", resolution: "4k" }).resolution).toBe("4k");
+    expect(createImageJobRequestSchema.safeParse({ prompt: "native", resolution: "8k" }).success).toBe(false);
   });
 
   it("normalizes legacy placeholder routing to an opaque canvas element id", () => {

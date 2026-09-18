@@ -44,6 +44,8 @@ import {
   jobTargetSchema,
   loomicDesignNodeMetadataSchema,
   loomicSceneV1Schema,
+  manualCanvasImageImportRequestSchema,
+  manualCanvasImageImportResponseSchema,
   manipulateDesignToolInputSchema,
   manipulateDesignToolOutputSchema,
   platformAdminDtoSchema,
@@ -53,6 +55,7 @@ import {
   searchDesignResourcesToolOutputSchema,
   setDesignCatalogStatusRequestSchema,
   updateDesignResourceRequestSchema,
+  undoManualCanvasImageImportRequestSchema,
 } from "./design-contracts.js";
 import { wsServerMessageSchema } from "./ws-protocol.js";
 
@@ -86,6 +89,74 @@ const base = (objectId: string, zIndex: number, objectVersion = 1) => ({
   zIndex,
   locked: false,
   visible: true,
+});
+
+describe("manual canvas image import contracts", () => {
+  const valid = {
+    request_id: ids.request,
+    design_id: ids.design,
+    expected_design_revision: 2,
+    canvas_id: ids.project,
+    source_element_id: "image-1",
+    expected_source_element_version: 4,
+    board_element_id: "board-1",
+    expected_board_element_version: 7,
+    mode: "copy" as const,
+    placement: {
+      kind: "preserve" as const,
+      scene_pose: { x: 10, y: 20, width: 300, height: 200, angle: 0.5 },
+    },
+  };
+
+  it("accepts a strict transient copy pose and bounded replay response", () => {
+    expect(manualCanvasImageImportRequestSchema.parse(valid)).toEqual(valid);
+    expect(
+      manualCanvasImageImportResponseSchema.parse({
+        operation_id: ids.request,
+        design_id: ids.design,
+        design_revision: 3,
+        object_id: ids.request,
+        object_version: 1,
+        source_canvas_id: ids.project,
+        source_canvas_revision: 9,
+        source_element_id: "image-1",
+        source_element_version: 4,
+        mode: "copy",
+        replayed: true,
+      }),
+    ).toMatchObject({ operation_id: ids.request, replayed: true });
+  });
+
+  it("rejects transient adopt poses and unknown asset authority fields", () => {
+    expect(() =>
+      manualCanvasImageImportRequestSchema.parse({
+        ...valid,
+        mode: "adopt",
+      }),
+    ).toThrow();
+    expect(() =>
+      manualCanvasImageImportRequestSchema.parse({
+        ...valid,
+        asset_object_id: ids.asset,
+      }),
+    ).toThrow();
+  });
+
+  it("requires an explicit object version guard for undo", () => {
+    expect(
+      undoManualCanvasImageImportRequestSchema.parse({
+        idempotency_key: ids.object2,
+        expected_design_revision: 3,
+        expected_object_version: 1,
+      }),
+    ).toMatchObject({ expected_object_version: 1 });
+    expect(() =>
+      undoManualCanvasImageImportRequestSchema.parse({
+        idempotency_key: ids.object2,
+        expected_design_revision: 3,
+      }),
+    ).toThrow();
+  });
 });
 
 describe("design HTTP response DTOs", () => {

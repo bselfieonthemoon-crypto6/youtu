@@ -17,7 +17,7 @@ const EXCALIDRAW_FONT_FAMILY_MAP: Record<number, string> = {
 function measureTextDOM(
   text: string,
   fontSize: number,
-  fontFamily: number = 1,
+  fontFamily = 1,
 ): { width: number; height: number } {
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import { Check, Eraser, RotateCcw, Sparkles, Undo2, X } from "lucide-react";
+import { Check, Eraser, Paintbrush, Redo2, RotateCcw, Sparkles, Trash2, Undo2, X } from "lucide-react";
 
 import type { NormalizedErasePoint, NormalizedEraseStroke } from "../../lib/image-eraser";
 
@@ -12,16 +12,79 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
+function strokeCoversPoint(
+  stroke: NormalizedEraseStroke,
+  x: number,
+  y: number,
+  bounds: { width: number; height: number },
+) {
+  const radius = stroke.radius * Math.min(bounds.width, bounds.height);
+  const points = stroke.points;
+  if (!points.length) return false;
+  const pointDistance = (from: NormalizedErasePoint, to: NormalizedErasePoint) => Math.hypot(
+    (from.x - to.x) * bounds.width,
+    (from.y - to.y) * bounds.height,
+  );
+  const sample = { x, y };
+  if (points.length === 1) return pointDistance(points[0]!, sample) <= radius;
+  for (let index = 1; index < points.length; index += 1) {
+    const start = points[index - 1]!;
+    const end = points[index]!;
+    const segmentX = (end.x - start.x) * bounds.width;
+    const segmentY = (end.y - start.y) * bounds.height;
+    const lengthSquared = segmentX ** 2 + segmentY ** 2;
+    const projectionNumerator = (x - start.x) * bounds.width * segmentX
+      + (y - start.y) * bounds.height * segmentY;
+    const projected = lengthSquared === 0 ? 0 : clamp(
+      projectionNumerator / lengthSquared,
+      0,
+      1,
+    );
+    if (pointDistance({ x: start.x + (end.x - start.x) * projected, y: start.y + (end.y - start.y) * projected }, sample) <= radius) return true;
+  }
+  return false;
+}
+
+/** Mirrors the preview canvas compositing at a small resolution to reject fully erased masks. */
+function hasVisibleMask(strokes: NormalizedEraseStroke[], bounds: { width: number; height: number }) {
+  const probes: NormalizedErasePoint[] = [];
+  const resolution = 64;
+  for (let row = 0; row < resolution; row += 1) {
+    for (let column = 0; column < resolution; column += 1) probes.push({ x: (column + 0.5) / resolution, y: (row + 0.5) / resolution });
+  }
+  for (const stroke of strokes) {
+    if (stroke.operation !== "subtract") probes.push(...stroke.points);
+  }
+  return probes.some((probe) => {
+    let alpha = 0;
+    for (const stroke of strokes) {
+      if (!strokeCoversPoint(stroke, probe.x, probe.y, bounds)) continue;
+      alpha = stroke.operation === "subtract" ? 0 : alpha + (1 - alpha) * 0.62;
+    }
+    return alpha > 0.01;
+  });
+}
+
 export function ImageEraserOverlay({
   bounds,
   angle = 0,
   onCancel,
   onConfirm,
+  repaint = false,
+  busy = false,
+  error,
 }: {
   bounds: { x: number; y: number; width: number; height: number };
   angle?: number;
   onCancel: () => void;
-  onConfirm: (mode: ImageEraseMode, strokes: NormalizedEraseStroke[]) => void;
+  /** The optional prompt is supplied by the canvas repaint experience. */
+  onConfirm: (mode: ImageEraseMode, strokes: NormalizedEraseStroke[], prompt?: string) => void;
+  /** Enables the canvas repaint panel. Omit to retain the legacy eraser UI. */
+  repaint?: boolean;
+  /** Parent-controlled submission state; the panel keeps its draft while this changes. */
+  busy?: boolean;
+  /** Parent-controlled repaint failure message. */
+  error?: string;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [mode, setMode] = useState<ImageEraseMode>("transparent");
@@ -29,6 +92,8 @@ export function ImageEraserOverlay({
   const [brushMode, setBrushMode] = useState<MaskBrushMode>("add");
   const [strokes, setStrokes] = useState<NormalizedEraseStroke[]>([]);
   const [redoStack, setRedoStack] = useState<NormalizedEraseStroke[]>([]);
+  const [prompt, setPrompt] = useState("");
+  const [hasEffectiveMask, setHasEffectiveMask] = useState(false);
   const activePointerRef = useRef<number | null>(null);
 
   const toLocalPoint = (clientX: number, clientY: number): NormalizedErasePoint => {
@@ -83,9 +148,16 @@ export function ImageEraserOverlay({
   }, [bounds.height, bounds.width, strokes]);
 
   useEffect(() => {
+    setHasEffectiveMask(hasVisibleMask(strokes, bounds));
+  }, [bounds, strokes]);
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onCancel();
+      if (event.key === "Escape" && !busy) onCancel();
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+        const target = event.target;
+        if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement || (target instanceof HTMLElement && target.isContentEditable)) return;
+        if (busy) return;
         event.preventDefault();
         setStrokes((current) => {
           const last = current.at(-1);
@@ -97,10 +169,10 @@ export function ImageEraserOverlay({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onCancel]);
+  }, [busy, onCancel]);
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || busy) return;
     event.preventDefault();
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -139,15 +211,35 @@ export function ImageEraserOverlay({
     }
   };
 
-  const panelWidth = Math.min(680, window.innerWidth - 24);
+  const panelWidth = Math.min(repaint ? 560 : 680, Math.max(240, window.innerWidth - 24));
   const panelLeft = clamp(bounds.x + bounds.width / 2 - panelWidth / 2, 12, window.innerWidth - panelWidth - 12);
-  const panelTop = clamp(bounds.y + bounds.height + 12, 12, window.innerHeight - 58);
+  const panelHeight = repaint ? 154 : 58;
+  const belowTop = bounds.y + bounds.height + 12;
+  const panelTop = clamp(belowTop + panelHeight <= window.innerHeight ? belowTop : bounds.y - panelHeight - 12, 12, Math.max(12, window.innerHeight - panelHeight - 12));
+  const canSubmitRepaint = !busy && prompt.trim().length > 0 && hasEffectiveMask;
+
+  const undo = () => setStrokes((current) => {
+    const last = current.at(-1);
+    if (!last) return current;
+    setRedoStack((redo) => [...redo, last]);
+    return current.slice(0, -1);
+  });
+  const redo = () => setRedoStack((current) => {
+    const last = current.at(-1);
+    if (!last) return current;
+    setStrokes((value) => [...value, last]);
+    return current.slice(0, -1);
+  });
+  const clear = () => {
+    setStrokes([]);
+    setRedoStack([]);
+  };
 
   return (
     <div className="pointer-events-none fixed inset-0 z-[110]">
       <canvas
         ref={canvasRef}
-        aria-label="橡皮涂抹区域"
+        aria-label={repaint ? "局部重绘涂抹区域" : "橡皮涂抹区域"}
         className="pointer-events-auto fixed cursor-crosshair touch-none ring-2 ring-primary/70"
         style={{ left: bounds.x, top: bounds.y, width: bounds.width, height: bounds.height, transform: `rotate(${angle}rad)` }}
         onPointerDown={handlePointerDown}
@@ -156,7 +248,38 @@ export function ImageEraserOverlay({
         onPointerCancel={finishStroke}
         onContextMenu={(event) => event.preventDefault()}
       />
-      <div
+      {repaint ? <div
+        className="pointer-events-auto fixed rounded-xl border border-border bg-background/95 p-2 shadow-xl backdrop-blur"
+        style={{ left: panelLeft, top: panelTop, width: panelWidth, maxWidth: "calc(100vw - 24px)" }}
+        onPointerDown={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-start gap-2">
+          <textarea
+            aria-label="修改要求"
+            value={prompt}
+            onChange={(event) => setPrompt(event.target.value)}
+            disabled={busy}
+            placeholder="描述要如何重绘选中的内容…"
+            className="min-h-14 flex-1 resize-none rounded-lg border border-input bg-background px-2 py-1.5 text-xs outline-none placeholder:text-muted-foreground focus:ring-2 focus:ring-primary/50 disabled:opacity-60"
+          />
+          <button type="button" aria-label="移除选中内容" disabled={busy} onClick={() => setPrompt("移除涂抹区域内的内容并自然补全背景")} className="flex h-8 shrink-0 items-center gap-1 rounded-lg px-2 text-xs hover:bg-muted" title="快速填写移除已涂抹内容的重绘要求">
+            <Trash2 className="size-3.5" />移除选中内容
+          </button>
+        </div>
+        <div className="mt-2 flex min-w-0 items-center gap-1.5">
+          <div className="flex shrink-0 rounded-lg bg-muted p-0.5">
+            <button type="button" aria-label="添加涂抹" aria-pressed={brushMode === "add"} disabled={busy} onClick={() => setBrushMode("add")} className={`flex h-7 items-center gap-1 rounded-md px-2 text-xs ${brushMode === "add" ? "bg-background shadow-sm" : "text-muted-foreground"}`}><Paintbrush className="size-3.5" />添加</button>
+            <button type="button" aria-label="减少涂抹" aria-pressed={brushMode === "subtract"} disabled={busy} onClick={() => setBrushMode("subtract")} className={`flex h-7 items-center gap-1 rounded-md px-2 text-xs ${brushMode === "subtract" ? "bg-background shadow-sm" : "text-muted-foreground"}`}><Eraser className="size-3.5" />减少</button>
+          </div>
+          <label className="flex min-w-0 flex-1 items-center gap-1 text-xs text-muted-foreground">大小<input aria-label="重绘画笔大小" disabled={busy} type="range" min="8" max="120" step="2" value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} className="min-w-10 flex-1" /><span className="w-6 text-right tabular-nums">{brushSize}</span></label>
+          <button type="button" aria-label="撤销涂抹" disabled={busy || !strokes.length} onClick={undo} className="flex size-8 shrink-0 items-center justify-center rounded-lg hover:bg-muted disabled:opacity-30"><Undo2 className="size-4" /></button>
+          <button type="button" aria-label="重做涂抹" disabled={busy || !redoStack.length} onClick={redo} className="flex size-8 shrink-0 items-center justify-center rounded-lg hover:bg-muted disabled:opacity-30"><Redo2 className="size-4" /></button>
+          <button type="button" aria-label="清除涂抹" disabled={busy || !strokes.length} onClick={clear} className="flex size-8 shrink-0 items-center justify-center rounded-lg hover:bg-muted disabled:opacity-30"><RotateCcw className="size-4" /></button>
+          <button type="button" aria-label="取消重绘" disabled={busy} onClick={onCancel} className="flex h-8 shrink-0 items-center gap-1 rounded-lg px-2 text-xs hover:bg-muted disabled:opacity-30"><X className="size-3.5" />取消</button>
+          <button type="button" disabled={!canSubmitRepaint} onClick={() => onConfirm("smart", strokes, prompt.trim())} className="flex h-8 shrink-0 items-center gap-1 rounded-lg bg-foreground px-3 text-xs text-background disabled:opacity-40"><Sparkles className="size-3.5" />{busy ? "重绘中…" : "开始重绘"}</button>
+        </div>
+        {error ? <p role="alert" className="mt-1 text-xs text-destructive">{error}</p> : null}
+      </div> : <div
         className="pointer-events-auto fixed flex h-11 items-center gap-1.5 rounded-xl border border-border bg-background/95 px-2 shadow-xl backdrop-blur"
         style={{ left: panelLeft, top: panelTop, width: panelWidth }}
         onPointerDown={(event) => event.stopPropagation()}
@@ -170,8 +293,8 @@ export function ImageEraserOverlay({
           <input aria-label="橡皮粗细" type="range" min="8" max="120" step="2" value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} className="min-w-16 flex-1" />
           <span className="w-7 text-right tabular-nums">{brushSize}</span>
         </label>
-        <button type="button" aria-label="撤销擦除" disabled={!strokes.length} onClick={() => setStrokes((current) => { const last = current.at(-1); if (!last) return current; setRedoStack((redo) => [...redo, last]); return current.slice(0, -1); })} className="flex size-8 items-center justify-center rounded-lg hover:bg-muted disabled:opacity-30"><Undo2 className="size-4" /></button>
-        <button type="button" aria-label="重做擦除" disabled={!redoStack.length} onClick={() => setRedoStack((current) => { const last = current.at(-1); if (!last) return current; setStrokes((value) => [...value, last]); return current.slice(0, -1); })} className="flex size-8 items-center justify-center rounded-lg hover:bg-muted disabled:opacity-30"><RotateCcw className="size-4 scale-x-[-1]" /></button>
+        <button type="button" aria-label="撤销擦除" disabled={!strokes.length} onClick={undo} className="flex size-8 items-center justify-center rounded-lg hover:bg-muted disabled:opacity-30"><Undo2 className="size-4" /></button>
+        <button type="button" aria-label="重做擦除" disabled={!redoStack.length} onClick={redo} className="flex size-8 items-center justify-center rounded-lg hover:bg-muted disabled:opacity-30"><RotateCcw className="size-4 scale-x-[-1]" /></button>
         <button
           type="button"
           aria-label="删除涂抹"
@@ -184,7 +307,7 @@ export function ImageEraserOverlay({
         </button>
         <button type="button" onClick={onCancel} className="flex h-8 items-center gap-1 rounded-lg px-2 text-xs hover:bg-muted"><X className="size-3.5" />取消</button>
         <button type="button" disabled={!strokes.length} onClick={() => onConfirm(mode, strokes)} className="flex h-8 items-center gap-1 rounded-lg bg-foreground px-3 text-xs text-background disabled:opacity-40"><Check className="size-3.5" />应用</button>
-      </div>
+      </div>}
     </div>
   );
 }

@@ -9,6 +9,7 @@ function fakeProvider(): ImageProvider {
   return {
     name: "workspace-image:test",
     models: [{ id: publicModel, displayName: "Workspace image", description: "test" }],
+    supportsImageMask: true,
     generate: vi.fn(async (params) => ({
       url: params.model,
       mimeType: "image/png",
@@ -35,7 +36,6 @@ function snapshot() {
 }
 
 const minimalEnv = {
-  agentBackendMode: "state",
   agentModel: "gpt-4.1",
   port: 1,
   version: "test",
@@ -61,6 +61,7 @@ describe("workspace provider resolver", () => {
       modelId: publicModel,
     });
     expect(result.source).toBe("database_snapshot");
+    expect(result.scope.imageProvider?.supportsImageMask).toBe(true);
     await result.scope.imageProvider?.generate({ prompt: "test", model: publicModel });
     expect(provider.generate).toHaveBeenCalledWith({ prompt: "test", model: "gpt-image-2-all" });
     expect(createImageProvider).toHaveBeenCalledWith(
@@ -101,6 +102,58 @@ describe("workspace provider resolver", () => {
       jobId: "job-1",
       modality: "image",
       modelId: publicModel,
+    })).rejects.toMatchObject({ code: "provider_snapshot_invalid" });
+  });
+
+  it.each(["gpt-image-2-all", "gpt-image-2-vip"])(
+    "rejects a foreground helper snapshot backed by %s",
+    async (upstreamModelId) => {
+      const resolveForegroundSnapshot = vi.fn(async () => ({
+        ...snapshot(),
+        upstreamModelId,
+      }));
+      const resolver = createWorkspaceProviderResolver({
+        env: minimalEnv,
+        providerSnapshotService: {
+          resolveJobSnapshot: vi.fn(),
+          resolveForegroundSnapshot,
+        } as never,
+      });
+
+      await expect(resolver.resolve({
+        workspaceId: "workspace-1",
+        jobId: "job-1",
+        modality: "image",
+        modelId: publicModel,
+        stage: "foreground_matting",
+        requiredUpstreamModel: "gpt-image-2",
+      })).rejects.toMatchObject({ code: "provider_snapshot_invalid" });
+      expect(resolveForegroundSnapshot).toHaveBeenCalledWith({
+        workspaceId: "workspace-1",
+        jobId: "job-1",
+      });
+    },
+  );
+
+  it("rejects a foreground helper snapshot belonging to another public catalog model", async () => {
+    const resolver = createWorkspaceProviderResolver({
+      env: minimalEnv,
+      providerSnapshotService: {
+        resolveForegroundSnapshot: vi.fn(async () => ({
+          ...snapshot(),
+          upstreamModelId: "gpt-image-2",
+          catalogKey: "22222222-2222-4222-8222-222222222222",
+        })),
+      } as never,
+    });
+
+    await expect(resolver.resolve({
+      workspaceId: "workspace-1",
+      jobId: "job-1",
+      modality: "image",
+      modelId: publicModel,
+      stage: "foreground_matting",
+      requiredUpstreamModel: "gpt-image-2",
     })).rejects.toMatchObject({ code: "provider_snapshot_invalid" });
   });
 });

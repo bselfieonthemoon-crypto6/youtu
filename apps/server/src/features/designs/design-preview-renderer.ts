@@ -7,6 +7,8 @@ import {
   loomicSceneV1Schema,
 } from "@loomic/shared";
 import sharp from "sharp";
+import type { Font } from "fontkit";
+import { loadDesignFontBinaries, parseDesignFonts, renderBoundText, splitDesignTextLines } from "./design-font-renderer.js";
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type {
@@ -119,6 +121,7 @@ export function createSupabaseDesignPreviewRenderer(): DesignPreviewRenderer {
         }
       }
 
+      await loadDesignFontBinaries(admin, scene, document.workspace_id, assets);
       await context.renewVt(120);
       const preview = await renderDesignPreviewBuffer(scene, assets);
       const uploaded = await admin.storage
@@ -194,6 +197,7 @@ export function createSupabaseDesignExportRenderer(): DesignExportRenderer {
         document.workspace_id,
         deadlineAt,
       );
+      await loadDesignFontBinaries(admin, scene, document.workspace_id, assets, deadlineAt);
       const assetObjectId = input.job.id;
       const extension = input.payload.format === "jpeg" ? "jpg" : "png";
       const mimeType =
@@ -575,6 +579,7 @@ export async function renderDesignPreviewSvg(
   },
 ): Promise<string> {
   const scene = loomicSceneV1Schema.parse(rawScene);
+  const fonts = parseDesignFonts(scene, assets);
   const scale = Math.min(
     1,
     PREVIEW_MAX_EDGE / Math.max(scene.canvas.width, scene.canvas.height),
@@ -627,7 +632,7 @@ export async function renderDesignPreviewSvg(
   const renderTree = (object: DesignObject, index: number): string => {
     if (!object.visible) return "";
     if (object.type !== "group")
-      return renderObject(object, index, definitions, imageData);
+      return renderObject(object, index, definitions, imageData, fonts);
     const children = object.childObjectIds.flatMap((id) => {
       const child = byId.get(id);
       return child ? [child] : [];
@@ -822,6 +827,7 @@ function renderObject(
   index: number,
   definitions: string[],
   imageData: ReadonlyMap<string, string>,
+  fonts: ReadonlyMap<string, Font>,
 ): string {
   const transform = `rotate(${object.rotation} ${object.x + object.width / 2} ${object.y + object.height / 2})`;
   const common = `opacity="${object.opacity}" transform="${transform}"`;
@@ -892,7 +898,9 @@ function renderObject(
     "shadow" in object && object.shadow
       ? shadowFilter(object.shadow, `shadow-${index}`, definitions)
       : "";
-  const style = `fill="${fill}" stroke="${stroke}" stroke-width="${strokeWidth}" ${shadow} ${common}`;
+  const textPaintOrder = object.type === "text" || object.type === "textbox"
+    ? `paint-order="${object.paintFirst ?? "stroke"}"` : "";
+  const style = `fill="${fill}" stroke="${stroke}" stroke-width="${strokeWidth}" ${textPaintOrder} ${shadow} ${common}`;
   switch (object.type) {
     case "rect":
       return `<rect x="${object.x}" y="${object.y}" width="${object.width}" height="${object.height}" rx="${object.radiusX ?? 0}" ry="${object.radiusY ?? 0}" ${style}/>`;
@@ -919,6 +927,7 @@ function renderObject(
     }
     case "text":
     case "textbox": {
+      if (object.fontFaceId) return renderBoundText(object, fonts.get(object.fontFaceId)!, style);
       const lines =
         object.type === "textbox"
           ? wrapTextbox(
@@ -927,7 +936,7 @@ function renderObject(
               object.fontSize,
               object.charSpacing,
             )
-          : object.text.split("\n");
+          : splitDesignTextLines(object.text);
       const anchor =
         object.textAlign === "center"
           ? "middle"
@@ -1036,7 +1045,7 @@ function wrapTextbox(
   charSpacing: number,
 ) {
   const lines: string[] = [];
-  for (const paragraph of text.split("\n")) {
+  for (const paragraph of splitDesignTextLines(text)) {
     if (!paragraph) {
       lines.push("");
       continue;

@@ -1,6 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import type { CanvasContent } from "@loomic/shared";
+import type {
+  DurableActionConfirmation,
+  DurableActionConfirmationStore,
+} from "./durable-action-confirmation-store.js";
 
 type CanvasElement = Record<string, unknown> & { id: string };
 export type FrozenCanvasOperation = Record<string, unknown> & {
@@ -43,11 +47,31 @@ export type ActionConfirmationProposal = {
   expiresAt: string;
 };
 
+export type ConfirmedActionAppliedEvent = {
+  confirmationId: string;
+  taskId: string;
+  taskRevision: number;
+  originRunId: string;
+  toolExecutionId: string;
+  userId: string;
+  workspaceId: string;
+  sessionId: string;
+  canvasId: string;
+  workflowStepId: string | null;
+  kind: "design_mutation";
+  details: Record<string, unknown>;
+  outcome: Record<string, unknown>;
+};
+
 type StoredActionProposal = ActionConfirmationProposal & {
   userId: string;
   originRunId?: string;
   execute: () => Promise<unknown>;
+  validate?: () => Promise<void>;
+  onApplied?: (result: unknown) => Promise<void>;
   execution?: Promise<unknown>;
+  completion?: Promise<void>;
+  completionDone?: boolean;
   status: "pending" | "executing" | "applied" | "canceled";
   result?: unknown;
 };
@@ -232,13 +256,186 @@ export type DestructiveConfirmationService = ReturnType<
 export function createDestructiveConfirmationService(options?: {
   ttlMs?: number;
   now?: () => number;
+  durableActionStore?: DurableActionConfirmationStore;
+  executeDurableAction?: (
+    action: DurableActionConfirmation,
+    context: unknown,
+  ) => Promise<Record<string, unknown>>;
+  onConfirmedActionApplied?: (event: ConfirmedActionAppliedEvent) => Promise<void>;
 }) {
   const ttlMs = options?.ttlMs ?? 10 * 60_000;
   const now = options?.now ?? Date.now;
   const proposals = new Map<string, StoredProposal>();
   const actionProposals = new Map<string, StoredActionProposal>();
 
+  const completeDurableAction = async (action: DurableActionConfirmation) => {
+    if (action.completionDone) return;
+    if (!options?.onConfirmedActionApplied || !options.durableActionStore) return;
+    if (!action.result) throw new Error("agent_confirmation_result_missing");
+    await options.onConfirmedActionApplied({
+      confirmationId: action.confirmationId,
+      taskId: action.taskId,
+      taskRevision: action.taskRevision,
+      originRunId: action.originRunId,
+      toolExecutionId: action.toolExecutionId,
+      userId: action.userId,
+      workspaceId: action.workspaceId,
+      sessionId: action.sessionId,
+      canvasId: action.canvasId,
+      workflowStepId: action.workflowStepId,
+      kind: action.kind,
+      details: action.details,
+      outcome: action.result,
+    });
+    if (!await options.durableActionStore.complete(action.confirmationId))
+      throw new Error("agent_confirmation_completion_conflict");
+  };
+
+  const completeAppliedAction = async (proposal: StoredActionProposal) => {
+    if (!proposal.onApplied || proposal.completionDone) return;
+    if (proposal.completion) return proposal.completion;
+    const completion = Promise.resolve().then(() => proposal.onApplied!(proposal.result));
+    proposal.completion = completion;
+    try {
+      await completion;
+      proposal.completionDone = true;
+    } finally {
+      delete proposal.completion;
+    }
+  };
+
+  const confirmDurableAction = async (input: {
+    confirmationId: string;
+    userId: string;
+    canvasId: string;
+    context?: unknown;
+  }) => {
+    if (!options?.durableActionStore)
+      throw new Error("durable_confirmation_unavailable");
+    const claim = await options.durableActionStore.claim(
+      input.confirmationId,
+      input.userId,
+      input.canvasId,
+    );
+    if (claim.state === "applied") {
+      await completeDurableAction(claim.action);
+      return claim.action.result;
+    }
+    if (claim.state === "claimed") {
+      if (!options.executeDurableAction)
+        throw new Error("durable_confirmation_executor_unavailable");
+      const token = claim.action.claimToken;
+      if (!token) throw new Error("durable_confirmation_claim_invalid");
+      try {
+        const result = await options.executeDurableAction(
+          claim.action,
+          input.context,
+        );
+        if (!await options.durableActionStore.finishApplied(
+          claim.action.confirmationId,
+          token,
+          result,
+        )) throw new Error("agent_confirmation_claim_lost");
+        await completeDurableAction({
+          ...claim.action,
+          status: "applied",
+          result,
+        });
+        return result;
+      } catch (error) {
+        // confirmed_at remains set when the lease is released. An unattended
+        // recovery tick may therefore replay this exact idempotent mutation,
+        // while a never-confirmed pending proposal remains ineligible.
+        await options.durableActionStore.release(
+          claim.action.confirmationId,
+          token,
+        ).catch(() => false);
+        throw error;
+      }
+    }
+    const code = claim.state === "expired" ? "confirmation_expired"
+      : claim.state === "stale" ? "confirmation_stale"
+        : claim.state === "executing" || claim.state === "canceled"
+          ? "confirmation_consumed"
+          : "confirmation_not_found";
+    throw new DestructiveConfirmationError(code, `Confirmation is ${claim.state}.`);
+  };
+
   return {
+    async resumeAppliedForSession(input: {
+      user: { id: string };
+      sessionId: string;
+    }): Promise<{ completed: number; replayed: number; errors: string[] }> {
+      if (!options?.durableActionStore || !options.onConfirmedActionApplied)
+        throw new Error("durable_confirmation_recovery_unavailable");
+      const actions = await options.durableActionStore.listRecoveryPending(
+        input.user.id,
+        input.sessionId,
+      );
+      let completed = 0;
+      let replayed = 0;
+      const errors: string[] = [];
+      for (const action of actions) {
+        try {
+          await confirmDurableAction({
+            confirmationId: action.confirmationId,
+            userId: input.user.id,
+            canvasId: action.canvasId,
+            context: { user: input.user },
+          });
+          if (action.status === "applied") completed += 1;
+          else replayed += 1;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "recovery_failed";
+          errors.push(`${action.confirmationId}:${message}`);
+        }
+      }
+      return { completed, replayed, errors };
+    },
+
+    async proposeDurableAction(input: {
+      userId: string;
+      workspaceId: string;
+      sessionId: string;
+      canvasId: string;
+      taskId: string;
+      taskRevision: number;
+      originRunId: string;
+      toolExecutionId: string;
+      workflowStepId: string | null;
+      kind: "design_mutation";
+      details: Record<string, unknown>;
+      payload: Record<string, unknown>;
+    }): Promise<ActionConfirmationProposal> {
+      if (!options?.durableActionStore)
+        throw new Error("durable_confirmation_unavailable");
+      const confirmationId = randomUUID();
+      const expiresAt = new Date(now() + ttlMs).toISOString();
+      const action = await options.durableActionStore.create({
+        confirmationId,
+        kind: input.kind,
+        userId: input.userId,
+        workspaceId: input.workspaceId,
+        sessionId: input.sessionId,
+        canvasId: input.canvasId,
+        taskId: input.taskId,
+        taskRevision: input.taskRevision,
+        originRunId: input.originRunId,
+        toolExecutionId: input.toolExecutionId,
+        workflowStepId: input.workflowStepId,
+        details: structuredClone(input.details),
+        payload: structuredClone(input.payload),
+        expiresAt,
+      });
+      return {
+        confirmationId: action.confirmationId,
+        canvasId: action.canvasId,
+        kind: action.kind,
+        details: action.details,
+        expiresAt: action.expiresAt,
+      };
+    },
+
     proposeAction(input: {
       userId: string;
       canvasId: string;
@@ -246,6 +443,8 @@ export function createDestructiveConfirmationService(options?: {
       details: Record<string, unknown>;
       originRunId?: string;
       execute: () => Promise<unknown>;
+      validate?: () => Promise<void>;
+      onApplied?: (result: unknown) => Promise<void>;
     }): ActionConfirmationProposal {
       const confirmationId = randomUUID();
       const proposal: StoredActionProposal = {
@@ -256,6 +455,8 @@ export function createDestructiveConfirmationService(options?: {
         details: structuredClone(input.details),
         ...(input.originRunId ? { originRunId: input.originRunId } : {}),
         execute: input.execute,
+        ...(input.validate ? { validate: input.validate } : {}),
+        ...(input.onApplied ? { onApplied: input.onApplied } : {}),
         expiresAt: new Date(now() + ttlMs).toISOString(),
         status: "pending",
       };
@@ -316,7 +517,15 @@ export function createDestructiveConfirmationService(options?: {
           ? actionProposal
           : undefined
         : (proposals.get(input.confirmationId) ?? actionProposal);
-      if (!proposal) return false;
+      if (!proposal) {
+        if (input.canvasId && options?.durableActionStore)
+          return options.durableActionStore.cancel(
+            input.confirmationId,
+            input.userId,
+            input.canvasId,
+          );
+        return false;
+      }
       if (
         proposal.userId !== input.userId ||
         (input.canvasId !== undefined && proposal.canvasId !== input.canvasId)
@@ -337,6 +546,7 @@ export function createDestructiveConfirmationService(options?: {
       canvasId?: string;
       kind?: ConfirmableActionKind;
       runId?: string;
+      context?: unknown;
     }): Promise<unknown> {
       const actionProposal = actionProposals.get(input.confirmationId);
       if (
@@ -357,6 +567,7 @@ export function createDestructiveConfirmationService(options?: {
         // slow/lost acknowledgement must reuse the in-flight execution or its
         // stored result, never enqueue a second generation job.
         if (actionProposal.status === "applied") {
+          await completeAppliedAction(actionProposal);
           return actionProposal.result;
         }
         if (actionProposal.status === "executing" && actionProposal.execution) {
@@ -386,20 +597,40 @@ export function createDestructiveConfirmationService(options?: {
           );
         }
         actionProposal.status = "executing";
-        const execution = Promise.resolve().then(() =>
-          actionProposal.execute(),
-        );
+        const execution = Promise.resolve()
+          .then(() => actionProposal.validate?.())
+          .then(() => actionProposal.execute())
+          .then(async (result) => {
+            // The destructive effect has committed. From this point onward a
+            // failed workflow/outbox callback may be retried, but the effect
+            // itself must never execute again.
+            actionProposal.result = result;
+            actionProposal.status = "applied";
+            await completeAppliedAction(actionProposal);
+            return result;
+          });
         actionProposal.execution = execution;
         try {
-          const result = await execution;
-          actionProposal.status = "applied";
-          actionProposal.result = result;
-          return result;
+          return await execution;
         } catch (error) {
-          actionProposal.status = "canceled";
+          if ((actionProposal.status as StoredActionProposal["status"]) !== "applied")
+            actionProposal.status = "canceled";
           delete actionProposal.execution;
           throw error;
         }
+      }
+
+      if (
+        (!input.kind || input.kind === "design_mutation") &&
+        input.canvasId &&
+        options?.durableActionStore
+      ) {
+        return confirmDurableAction({
+          confirmationId: input.confirmationId,
+          userId: input.userId,
+          canvasId: input.canvasId,
+          ...(input.context !== undefined ? { context: input.context } : {}),
+        });
       }
 
       if (input.kind) {

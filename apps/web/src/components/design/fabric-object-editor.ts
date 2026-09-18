@@ -14,6 +14,7 @@ import {
 } from "@loomic/shared";
 import {
   util,
+  cache,
   ActiveSelection,
   type Canvas,
   Circle,
@@ -33,9 +34,16 @@ import {
 } from "fabric";
 
 import { DESIGN_BROWSER_EXPORT_MAX_PIXELS } from "../../lib/design-browser-export";
+import { evaluateDesignAnimationTransform } from "../../lib/design-animation-evaluation";
 import { calculateDesignImageLayout } from "../../lib/design-image-layout";
 
 export const FABRIC_EDITOR_MAX_BACKING_PIXELS = 16_000_000;
+
+const SELECTION_OUTLINE_STYLE = {
+  borderColor: "#4b5563",
+  cornerColor: "#4b5563",
+  cornerStrokeColor: "#4b5563",
+};
 
 type RuntimeMetadata = {
   objectId: string;
@@ -83,6 +91,8 @@ export type FabricObjectEditorOptions = {
   readOnly?: boolean;
   logicalWidth?: number;
   logicalHeight?: number;
+  /** Extra logical units rendered around every edge of the design while editing. */
+  viewportPadding?: number;
   maxBackingPixels?: number;
   snapThreshold?: number;
   onAlignmentGuidesChange?: (guides: readonly FabricAlignmentGuide[]) => void;
@@ -133,6 +143,7 @@ export type AddFabricObjectInput =
     };
 
 export type UpdateFabricObjectPatch = Partial<{
+  animation: DesignObject["animation"];
   name: string;
   x: number;
   y: number;
@@ -167,6 +178,7 @@ export type FabricObjectEditorApi = {
     ) => Promise<string | Blob> | string | Blob,
   ): Promise<void>;
   serializeScene(): LoomicSceneV1;
+  setBackground(background: string | null): void;
   applyCommands(
     commands: readonly DesignCommand[],
     source: "undo" | "redo" | "sync",
@@ -224,6 +236,11 @@ export type FabricObjectEditorApi = {
     transparent?: boolean;
     quality?: number;
   }): Promise<Blob>;
+  renderToImageData(options: {
+    width: number;
+    height: number;
+    transparent?: boolean;
+  }): ImageData;
   dispose(): void;
 };
 
@@ -239,17 +256,29 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
   private assetResolver?: Parameters<FabricObjectEditorApi["loadScene"]>[1];
   private logicalWidth: number;
   private logicalHeight: number;
+  private readonly viewportPadding: number;
+  private logicalBackground: string | null;
   private renderScale = 1;
   private readonly selectionListeners = new Set<
     (objectIds: readonly string[]) => void
   >();
   private readonly missingAssetObjectIds = new Set<string>();
+  private readonly animationBaselines = new Map<
+    string,
+    {
+      center: ReturnType<FabricObject["getRelativeCenterPoint"]>;
+      scaleX: number;
+      scaleY: number;
+    }
+  >();
 
   constructor(canvas: Canvas, options: FabricObjectEditorOptions = {}) {
     this.canvas = canvas;
     this.options = options;
     this.logicalWidth = options.logicalWidth ?? canvas.getWidth();
     this.logicalHeight = options.logicalHeight ?? canvas.getHeight();
+    this.viewportPadding = normalizeViewportPadding(options.viewportPadding);
+    this.logicalBackground = normalizeCanvasBackground(canvas.backgroundColor);
     this.resizeBackingStore(this.logicalWidth, this.logicalHeight);
     this.canvas.on("object:modified", this.handleModified);
     this.canvas.on("object:moving", this.handleMoving);
@@ -267,11 +296,16 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
     );
     if (!object) return null;
     const canvasBounds = this.canvas.lowerCanvasEl.getBoundingClientRect();
-    const scaleX = canvasBounds.width / this.logicalWidth;
-    const scaleY = canvasBounds.height / this.logicalHeight;
+    // Mirror Fabric's exact backstore-to-CSS mapping. The backing dimensions
+    // are integer-rounded, so deriving this from the padded logical extent can
+    // otherwise drift by a subpixel at low render scales.
+    const scaleX =
+      (canvasBounds.width / this.canvas.getWidth()) * this.renderScale;
+    const scaleY =
+      (canvasBounds.height / this.canvas.getHeight()) * this.renderScale;
     return {
-      x: canvasBounds.left + object.x * scaleX,
-      y: canvasBounds.top + object.y * scaleY,
+      x: canvasBounds.left + (object.x + this.viewportPadding) * scaleX,
+      y: canvasBounds.top + (object.y + this.viewportPadding) * scaleY,
       width: object.width * scaleX,
       height: object.height * scaleY,
       angle: (object.rotation * Math.PI) / 180,
@@ -291,9 +325,10 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
       this.canvas.discardActiveObject();
       this.canvas.clear();
       this.objects.clear();
+      this.animationBaselines.clear();
       this.missingAssetObjectIds.clear();
       this.resizeBackingStore(scene.canvas.width, scene.canvas.height);
-      this.canvas.backgroundColor = scene.canvas.background ?? "rgba(0,0,0,0)";
+      this.setBackground(scene.canvas.background);
 
       const byId = new Map(
         scene.objects.map((object) => [object.objectId, object]),
@@ -327,6 +362,14 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
       }
       this.canvas.requestRenderAll();
     });
+    for (const [objectId, runtime] of this.objects) {
+      if (!readMetadata(runtime)?.source.animation) continue;
+      this.animationBaselines.set(objectId, {
+        center: runtime.getRelativeCenterPoint(),
+        scaleX: runtime.scaleX,
+        scaleY: runtime.scaleY,
+      });
+    }
     this.previousScene = this.serializeScene();
     this.notifySelection();
   }
@@ -343,21 +386,23 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
       }
     };
     for (const runtime of this.canvas.getObjects()) append(runtime);
-    const background =
-      typeof this.canvas.backgroundColor === "string" &&
-      this.canvas.backgroundColor !== "rgba(0,0,0,0)"
-        ? this.canvas.backgroundColor
-        : null;
     return loomicSceneV1Schema.parse({
       schemaVersion: 1,
       engine: "fabric",
       canvas: {
         width: this.logicalWidth,
         height: this.logicalHeight,
-        background,
+        background: this.logicalBackground,
       },
       objects: ordered,
     });
+  }
+
+  setBackground(background: string | null) {
+    this.assertAlive();
+    this.logicalBackground = background;
+    this.syncCanvasBackground();
+    this.canvas.requestRenderAll();
   }
 
   async applyCommands(
@@ -373,6 +418,7 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
     this.assertAlive();
     for (const runtime of this.objects.values()) {
       if (runtime instanceof IText || runtime instanceof Textbox) {
+        cache.clearFontCache(runtime.fontFamily);
         runtime.initDimensions();
         runtime.setCoords();
       }
@@ -560,6 +606,7 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
       patch.opacity = input.opacity;
     }
     if (input.name !== undefined) patch.name = input.name;
+    if (input.animation !== undefined) patch.animation = input.animation;
     if (input.text !== undefined) patch.text = input.text;
     if (input.fontFamily !== undefined) patch.font_family = input.fontFamily;
     if (input.fontFaceId !== undefined) patch.font_face_id = input.fontFaceId;
@@ -646,29 +693,36 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
     this.assertWritable();
     const selection = [...this.canvas.getActiveObjects()];
     this.canvas.discardActiveObject();
+    const originalOrder = [...this.canvas.getObjects()];
+    const removed = selection.flatMap(object => {
+      const metadata = readMetadata(object);
+      return metadata ? [{ object, metadata }] : [];
+    });
     this.suppressEvents += 1;
     try {
-      for (const object of selection) {
-        const metadata = readMetadata(object);
-        if (!metadata) continue;
+      for (const { object, metadata } of removed) {
         this.canvas.remove(object);
         this.objects.delete(metadata.objectId);
-        this.emit(
-          [
-            {
-              action: "object.remove",
-              object_id: metadata.objectId,
-              expected_object_version: metadata.objectVersion,
-            },
-          ],
-          "api",
-        );
       }
+      // A multi-selection is one history/save transaction, not partial deletes.
+      this.emit(removed.map(({ metadata }) => ({
+        action: "object.remove" as const,
+        object_id: metadata.objectId,
+        expected_object_version: metadata.objectVersion,
+      })), "api");
+    } catch (error) {
+      for (const { object, metadata } of removed) {
+        if (!this.canvas.getObjects().includes(object)) this.canvas.add(object);
+        this.objects.set(metadata.objectId, object);
+      }
+      originalOrder.forEach((object, index) => this.canvas.moveObjectTo(object, index));
+      this.select(removed.map(({ metadata }) => metadata.objectId));
+      throw error;
     } finally {
       this.suppressEvents -= 1;
+      this.canvas.requestRenderAll();
+      this.notifySelection();
     }
-    this.canvas.requestRenderAll();
-    this.notifySelection();
   }
 
   setLocked(objectIds: readonly string[], locked: boolean) {
@@ -934,11 +988,12 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
         `Browser export pixel budget exceeded: ${renderedPixels} > ${DESIGN_BROWSER_EXPORT_MAX_PIXELS}.`,
       );
     }
-    const previousBackground = this.canvas.backgroundColor;
-    if (options.transparent) this.canvas.backgroundColor = "rgba(0,0,0,0)";
+    const previousBackground = this.logicalBackground;
+    if (options.transparent) this.setBackground(null);
     try {
       const output = this.canvas.toCanvasElement(
         requestedMultiplier / this.renderScale,
+        this.exportCrop(),
       );
       return await new Promise<Blob>((resolve, reject) => {
         output.toBlob(
@@ -951,9 +1006,82 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
         );
       });
     } finally {
-      this.canvas.backgroundColor = previousBackground;
+      if (options.transparent) this.setBackground(previousBackground);
       this.canvas.requestRenderAll();
     }
+  }
+
+  renderToImageData(options: {
+    width: number;
+    height: number;
+    transparent?: boolean;
+  }): ImageData {
+    this.assertAlive();
+    if (
+      !Number.isInteger(options.width) ||
+      !Number.isInteger(options.height) ||
+      options.width < 1 ||
+      options.height < 1 ||
+      options.width * options.height > DESIGN_BROWSER_EXPORT_MAX_PIXELS
+    ) {
+      throw new RangeError("Invalid Fabric image-data export dimensions.");
+    }
+    const previousBackground = this.logicalBackground;
+    if (options.transparent) this.setBackground(null);
+    try {
+      const scale = Math.min(
+        options.width / this.logicalWidth,
+        options.height / this.logicalHeight,
+      );
+      const rendered = this.canvas.toCanvasElement(
+        scale / this.renderScale,
+        this.exportCrop(),
+      );
+      if (
+        rendered.width === options.width &&
+        rendered.height === options.height
+      ) {
+        const context = rendered.getContext("2d", { willReadFrequently: true });
+        if (!context) throw new Error("Design export canvas is unavailable.");
+        return context.getImageData(0, 0, options.width, options.height);
+      }
+      const exact = document.createElement("canvas");
+      exact.width = options.width;
+      exact.height = options.height;
+      const context = exact.getContext("2d", { willReadFrequently: true });
+      if (!context) throw new Error("Design export canvas is unavailable.");
+      context.drawImage(rendered, 0, 0, options.width, options.height);
+      return context.getImageData(0, 0, options.width, options.height);
+    } finally {
+      if (options.transparent) this.setBackground(previousBackground);
+    }
+  }
+
+  /** Applies a time sample relative to loadScene, with no cumulative drift. */
+  applyAnimationFrame(timeMs: number) {
+    this.assertAlive();
+    if (!this.options.readOnly) {
+      throw new Error("Animation frames may only be applied to a cloned read-only editor.");
+    }
+    for (const [objectId, runtime] of this.objects) {
+      const baseline = this.animationBaselines.get(objectId);
+      if (!baseline) continue;
+      const animation = readMetadata(runtime)?.source.animation;
+      const transform = evaluateDesignAnimationTransform(animation, timeMs);
+      runtime.set({
+        scaleX: baseline.scaleX * transform.scale,
+        scaleY: baseline.scaleY * transform.scale,
+      });
+      runtime.setPositionByOrigin(
+        baseline.center.add({ x: 0, y: transform.translateY }),
+        "center",
+        "center",
+      );
+      runtime.setCoords();
+      runtime.dirty = true;
+      if (runtime.group) runtime.group.dirty = true;
+    }
+    this.canvas.requestRenderAll();
   }
 
   dispose() {
@@ -1051,7 +1179,10 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
     );
   };
 
-  private handleSelectionChanged = () => this.notifySelection();
+  private handleSelectionChanged = () => {
+    this.canvas.getActiveObject()?.set(SELECTION_OUTLINE_STYLE);
+    this.notifySelection();
+  };
 
   private notifySelection() {
     const selection = this.getSelectionIds();
@@ -1218,6 +1349,7 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
       source: structuredClone(object),
     };
     runtime.set({
+      ...SELECTION_OUTLINE_STYLE,
       visible: object.visible,
       evented: object.visible,
       selectable: object.visible && !object.locked && !this.options.readOnly,
@@ -1364,14 +1496,16 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
   private resizeBackingStore(width: number, height: number) {
     this.logicalWidth = Math.max(1, Math.round(width));
     this.logicalHeight = Math.max(1, Math.round(height));
-    const pixels = this.logicalWidth * this.logicalHeight;
+    const viewportWidth = this.logicalWidth + this.viewportPadding * 2;
+    const viewportHeight = this.logicalHeight + this.viewportPadding * 2;
+    const pixels = viewportWidth * viewportHeight;
     const budget =
       this.options.maxBackingPixels ?? FABRIC_EDITOR_MAX_BACKING_PIXELS;
     this.renderScale = Math.min(1, Math.sqrt(budget / pixels));
     this.canvas.setDimensions(
       {
-        width: Math.max(1, Math.round(this.logicalWidth * this.renderScale)),
-        height: Math.max(1, Math.round(this.logicalHeight * this.renderScale)),
+        width: Math.max(1, Math.round(viewportWidth * this.renderScale)),
+        height: Math.max(1, Math.round(viewportHeight * this.renderScale)),
       },
       { backstoreOnly: true },
     );
@@ -1380,9 +1514,45 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
       0,
       0,
       this.renderScale,
-      0,
-      0,
+      this.viewportPadding * this.renderScale,
+      this.viewportPadding * this.renderScale,
     ]);
+    this.syncCanvasBackground();
+  }
+
+  private exportCrop() {
+    if (!this.viewportPadding) return undefined;
+    return {
+      left: this.viewportPadding * this.renderScale,
+      top: this.viewportPadding * this.renderScale,
+      width: this.logicalWidth * this.renderScale,
+      height: this.logicalHeight * this.renderScale,
+    };
+  }
+
+  private syncCanvasBackground() {
+    if (!this.viewportPadding) {
+      delete this.canvas.backgroundImage;
+      this.canvas.backgroundColor =
+        this.logicalBackground ?? "rgba(0,0,0,0)";
+      return;
+    }
+    this.canvas.backgroundColor = "rgba(0,0,0,0)";
+    if (!this.logicalBackground) {
+      delete this.canvas.backgroundImage;
+      return;
+    }
+    this.canvas.backgroundImage = new Rect({
+      left: 0,
+      top: 0,
+      width: this.logicalWidth,
+      height: this.logicalHeight,
+      originX: "left",
+      originY: "top",
+      fill: this.logicalBackground,
+      selectable: false,
+      evented: false,
+    });
   }
 
   private async suppressed(operation: () => Promise<void>) {
@@ -1393,6 +1563,22 @@ export class FabricObjectEditor implements FabricObjectEditorApi {
       this.suppressEvents -= 1;
     }
   }
+}
+
+function normalizeViewportPadding(value: number | undefined) {
+  if (value === undefined) return 0;
+  if (!Number.isFinite(value) || value < 0) {
+    throw new RangeError(
+      "Fabric editor viewport padding must be a non-negative finite number.",
+    );
+  }
+  return value;
+}
+
+function normalizeCanvasBackground(background: Canvas["backgroundColor"]) {
+  return typeof background === "string" && background !== "rgba(0,0,0,0)"
+    ? background
+    : null;
 }
 
 function readMetadata(object: FabricObject): RuntimeMetadata | null {
@@ -1685,6 +1871,8 @@ function textOptions(
 ) {
   return {
     fontFamily: object.fontFamily,
+    paintFirst: object.paintFirst ?? "stroke",
+    splitByGrapheme: object.splitByGrapheme ?? true,
     fontSize: object.fontSize,
     fontWeight: object.fontWeight,
     fontStyle: object.fontStyle,
@@ -1962,7 +2150,7 @@ function inverseForCommand(
       (object) => object.objectId === command.object_id,
     );
     if (previous)
-      return { action: "object.add", object: structuredClone(previous) };
+      return { action: "object.add", object: { ...structuredClone(previous), objectVersion: 1 } };
   }
   if (command.action === "object.reorder") {
     const previousIndex = previousScene.objects.findIndex(
@@ -2016,7 +2204,7 @@ function inverseForCommand(
           patchToSceneKey[key] ?? key
         ];
         patch[key] =
-          key === "resource_id" && previousValue === undefined
+          (key === "resource_id" || key === "animation") && previousValue === undefined
             ? null
             : previousValue;
       }

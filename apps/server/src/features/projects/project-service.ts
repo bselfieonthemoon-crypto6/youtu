@@ -237,7 +237,9 @@ export function createProjectService(options: {
           "project_id",
           projects.map((project) => project.id),
         )
-        .eq("is_primary", true);
+        .order("is_primary", { ascending: false })
+        .order("created_at", { ascending: true })
+        .order("id", { ascending: true });
 
       if (canvasQueryError) {
         throw new ProjectServiceError(
@@ -247,26 +249,26 @@ export function createProjectService(options: {
         );
       }
 
-      const primaryCanvasByProjectId = new Map(
-        canvases.map((canvas) => [canvas.project_id, canvas]),
-      );
+      // A removed primary canvas must not make every project unreadable.
+      // Prefer the primary, then the oldest accessible remaining canvas. This
+      // is a read-only fallback: never recreate deleted content on a GET.
+      const primaryCanvasByProjectId = new Map<string, (typeof canvases)[number]>();
+      for (const canvas of canvases) {
+        if (!primaryCanvasByProjectId.has(canvas.project_id)) {
+          primaryCanvasByProjectId.set(canvas.project_id, canvas);
+        }
+      }
+      // Empty projects remain stored but have no openable canvas to list.
+      const openableProjects = projects.filter((project) => primaryCanvasByProjectId.has(project.id));
 
       // Generate public thumbnail URLs for projects that have them
       const thumbnailUrls = await generateThumbnailUrls(
         client,
-        projects.filter((p) => p.thumbnail_path),
+        openableProjects.filter((p) => p.thumbnail_path),
       );
 
-      return projects.map((project) => {
-        const canvas = primaryCanvasByProjectId.get(project.id);
-
-        if (!canvas) {
-          throw new ProjectServiceError(
-            "project_query_failed",
-            PROJECT_QUERY_FAILED_MESSAGE,
-            500,
-          );
-        }
+      return openableProjects.map((project) => {
+        const canvas = primaryCanvasByProjectId.get(project.id)!;
 
         return mapProjectSummary({
           canvas,
@@ -345,8 +347,9 @@ export function createProjectService(options: {
 
       const { error: updateError, count } = await client
         .from("projects")
-        .update(payload)
-        .eq("id", projectId);
+        .update(payload, { count: "exact" })
+        .eq("id", projectId)
+        .is("archived_at", null);
 
       if (updateError) {
         throw new ProjectServiceError(

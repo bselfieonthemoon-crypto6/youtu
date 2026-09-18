@@ -1,0 +1,71 @@
+{
+  "slug": "design-review",
+  "name": "设计评审",
+  "description": "对现有设计做有证据的版式、文字、品牌与用途评审；只点评不写入，简单改字不强制全面评审。",
+  "version": "2.1.0",
+  "category": "design",
+  "iconName": "palette",
+  "license": null,
+  "metadata": {
+    "bundle": "loomic-design-skills-v2",
+    "loomic": {
+      "schemaVersion": 1,
+      "execution": "guidance",
+      "intents": [
+        "design-review",
+        "visual-review",
+        "quality"
+      ],
+      "outputKinds": [
+        "design-review"
+      ],
+      "requiredTools": [],
+      "optionalTools": [
+        "inspect_design",
+        "get_design_objects",
+        "update_design_brief",
+        "verify_design_result",
+        "get_brand_kit"
+      ],
+      "models": [
+        {
+          "role": "planner",
+          "required": true,
+          "preferredIds": []
+        },
+        {
+          "role": "vision",
+          "required": false,
+          "preferredIds": []
+        }
+      ],
+      "limitations": [
+        "技能不增加运行时工具、模型、权限或预算；用户局部修改不扩展为重设计。",
+        "本包为 Loomic 原创流程，研究来源不是效果 benchmark；未运行上游脚本或自动下载依赖。"
+      ],
+      "examples": [
+        "只点评这张活动海报哪里影响阅读，不要修改。"
+      ],
+      "sources": [
+        {
+          "title": "Bounded design critique",
+          "url": "https://github.com/pbakaus/impeccable/blob/main/.agents/skills/impeccable/SKILL.md",
+          "license": "Apache-2.0",
+          "relation": "inspired-by"
+        },
+        {
+          "title": "Evidence-based typography review",
+          "url": "https://github.com/pbakaus/impeccable/blob/main/.agents/skills/impeccable/reference/typeset.md",
+          "license": "Apache-2.0",
+          "relation": "inspired-by"
+        }
+      ],
+      "composition": {
+        "role": "workflow",
+        "stages": [
+          "review"
+        ]
+      }
+    }
+  }
+}

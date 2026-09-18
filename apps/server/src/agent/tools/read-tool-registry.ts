@@ -3,6 +3,7 @@ import {
   createDesignTools,
 } from "./design-tools.js";
 import { createInspectCanvasTool } from "./inspect-canvas.js";
+import { toolExecutionContext, type MastraAgentTool } from "./tool-run-context.js";
 
 export type RetryableReadToolExecutor = (input: {
   accessToken: string;
@@ -11,6 +12,8 @@ export type RetryableReadToolExecutor = (input: {
   threadId: string;
   toolName: string;
   userId: string;
+  /** Design reads are workspace-scoped; retry must reuse the run's workspace. */
+  workspaceId: string;
 }) => Promise<Record<string, unknown>>;
 
 export function createRetryableReadToolExecutor(deps: {
@@ -20,10 +23,7 @@ export function createRetryableReadToolExecutor(deps: {
   const inspectCanvas = createInspectCanvasTool({
     createUserClient: deps.createUserClient,
   });
-  const designReads = new Map<
-    string,
-    { invoke(input: Record<string, unknown>, config: unknown): Promise<unknown> }
-  >();
+  const designReads = new Map<string, MastraAgentTool>();
   for (const candidate of deps.designTools
     ? createDesignTools(deps.designTools)
     : []) {
@@ -32,28 +32,29 @@ export function createRetryableReadToolExecutor(deps: {
         "inspect_design",
         "get_design_objects",
         "search_design_resources",
-      ].includes(candidate.name)
+      ].includes(candidate.id)
     ) {
-      designReads.set(candidate.name, candidate as never);
+      designReads.set(candidate.id, candidate as MastraAgentTool);
     }
   }
 
   return async (request) => {
-    const selected =
+    const selected: MastraAgentTool | undefined =
       request.toolName === "inspect_canvas"
         ? inspectCanvas
         : designReads.get(request.toolName);
     if (!selected) {
       throw new Error("Tool is not approved for read-only retry.");
     }
-    const result = await selected.invoke(request.input, {
+    const result = await selected.execute!(request.input, toolExecutionContext({
       configurable: {
         access_token: request.accessToken,
         canvas_id: request.canvasId,
         thread_id: request.threadId,
         user_id: request.userId,
+        workspace_id: request.workspaceId,
       },
-    });
+    }));
     return normalizeToolOutput(result);
   };
 }

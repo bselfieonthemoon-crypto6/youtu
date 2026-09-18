@@ -41,6 +41,18 @@ function createDatabase(options?: { executionVisible?: boolean }) {
         canvas_id: "00000000-0000-4000-8000-000000000030",
       },
     ],
+    canvases: [
+      {
+        id: "00000000-0000-4000-8000-000000000030",
+        project_id: "00000000-0000-4000-8000-000000000040",
+      },
+    ],
+    projects: [
+      {
+        id: "00000000-0000-4000-8000-000000000040",
+        workspace_id: "00000000-0000-4000-8000-000000000060",
+      },
+    ],
   };
 
   function client(isUser: boolean) {

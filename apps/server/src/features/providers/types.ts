@@ -1,4 +1,5 @@
 import type { AuthenticatedUser } from "../../supabase/user.js";
+import type { ModelContextProfile } from "@loomic/shared";
 
 export type ProviderAdapter = "openai_compatible";
 export type ProviderModelModality = "text" | "image" | "video";
@@ -22,6 +23,7 @@ export type ProviderModelInput = {
   modality: ProviderModelModality;
   enabled: boolean;
   capabilities?: ProviderModelCapability[];
+  contextProfile?: ModelContextProfile | null;
 };
 
 export type WorkspaceProviderModelView = ProviderModelInput & {
@@ -43,6 +45,12 @@ export type UpdateProviderConfigInput = {
   apiKey?: string;
   enabled?: boolean;
   models?: ProviderModelInput[];
+};
+
+export type DiscoverProviderModelsDraftInput = {
+  baseUrl: string;
+  apiKey?: string;
+  configId?: string;
 };
 
 export type WorkspaceProviderConfigView = {
@@ -96,5 +104,10 @@ export type ProviderConfigService = {
     user: AuthenticatedUser,
     workspaceId: string,
     configId: string,
+  ): Promise<ProviderModelInput[]>;
+  discoverDraftModels(
+    user: AuthenticatedUser,
+    workspaceId: string,
+    input: DiscoverProviderModelsDraftInput,
   ): Promise<ProviderModelInput[]>;
 };

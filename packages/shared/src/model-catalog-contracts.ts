@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { workspaceModelIdPattern } from "./uuid.js";
 
 import {
   providerCapabilitySchema,
@@ -9,7 +10,7 @@ export const modelCatalogSourceSchema = z.enum(["environment", "workspace"]);
 
 export const workspaceCatalogModelSchema = z
   .object({
-    id: z.string().regex(/^workspace:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
+    id: z.string().regex(workspaceModelIdPattern),
     displayName: z.string().min(1).max(200),
     providerDisplayName: z.string().min(1).max(100),
     modality: providerModelModalitySchema,

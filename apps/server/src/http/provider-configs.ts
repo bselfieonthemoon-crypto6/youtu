@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 
 import {
   providerConfigCreateRequestSchema,
+  providerModelDiscoveryDraftRequestSchema,
   providerConfigErrorResponseSchema,
   providerConfigIdSchema,
   providerConfigListResponseSchema,
@@ -12,6 +13,7 @@ import {
   unauthenticatedErrorResponseSchema,
   type ProviderCapability,
   type ProviderConfigCreateRequest,
+  type ProviderModelDiscoveryDraftRequest,
   type ProviderConfigUpdateRequest,
   type WorkspaceProviderConfig,
 } from "@loomic/shared";
@@ -68,6 +70,27 @@ export async function registerProviderConfigRoutes(
       return sendProviderError(error, reply);
     }
   });
+
+  app.post(
+    "/api/workspace/provider-configs/discover-models",
+    async (request, reply) => {
+      try {
+        const context = await resolveContext(request, reply, options);
+        if (!context) return;
+        const payload = providerModelDiscoveryDraftRequestSchema.parse(request.body);
+        const models = await options.providerConfigService.discoverDraftModels(
+          context.user,
+          context.workspaceId,
+          toServiceDraftDiscoveryInput(payload),
+        );
+        return reply.code(200).send(
+          providerModelDiscoveryResponseSchema.parse({ models }),
+        );
+      } catch (error) {
+        return sendProviderError(error, reply);
+      }
+    },
+  );
 
   app.put("/api/workspace/provider-configs/:id", async (request, reply) => {
     try {
@@ -194,6 +217,14 @@ function toServiceUpdateInput(payload: ProviderConfigUpdateRequest) {
     ...(payload.apiKey !== undefined ? { apiKey: payload.apiKey } : {}),
     ...(payload.enabled !== undefined ? { enabled: payload.enabled } : {}),
     ...(payload.models ? { models: payload.models.map(toServiceModel) } : {}),
+  };
+}
+
+function toServiceDraftDiscoveryInput(payload: ProviderModelDiscoveryDraftRequest) {
+  return {
+    baseUrl: payload.baseUrl,
+    ...(payload.apiKey !== undefined ? { apiKey: payload.apiKey } : {}),
+    ...(payload.configId !== undefined ? { configId: payload.configId } : {}),
   };
 }
 

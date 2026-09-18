@@ -1,12 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  type DesignCommand,
+  type LoomicSceneV1,
   inspectDesignToolOutputSchema,
   manipulateDesignToolOutputSchema,
 } from "@loomic/shared";
 
 import { createDestructiveConfirmationService } from "../../features/agent-actions/destructive-confirmation-service.js";
-import { createDesignTools } from "./design-tools.js";
+import { createDesignTools, createDurableDesignMutationExecutor } from "./design-tools.js";
+import { applyDesignCommands } from "../../features/designs/design-command-applier.js";
+import { toolExecutionContext } from "./tool-run-context.js";
 
 const ids = {
   design: "10000000-0000-4000-8000-000000000001",
@@ -16,6 +20,8 @@ const ids = {
   canvas: "50000000-0000-4000-8000-000000000001",
   request: "60000000-0000-4000-8000-000000000001",
   object: "70000000-0000-4000-8000-000000000001",
+  task: "a0000000-0000-4000-8000-000000000001",
+  session: "b0000000-0000-4000-8000-000000000001",
 } as const;
 
 const design = {
@@ -95,6 +101,99 @@ function toolAt(tools: ReturnType<typeof createDesignTools>, index: number) {
 }
 
 describe("agent design tools", () => {
+  it.each([
+    { patch: { font_size: 36 }, expected: "commands[0].patch.object_type" },
+    { patch: { object_type: "text", fontSize: 36, fontWeight: 700 }, expected: "commands[0].patch.fontSize: use font_size" },
+  ])("returns actionable strict patch validation without losing intended changes ($expected)", async ({ patch, expected }) => {
+    const { tools, mutate } = makeTools();
+    const input = { design_id: ids.design, expected_revision: 4, idempotency_key: ids.request,
+      commands: [{ action: "object.update", object_id: ids.object, expected_object_version: 1,
+        patch: { ...patch, text: "private customer content sk-private-value" } }] };
+    const original = JSON.stringify(input);
+    const output = JSON.parse(String(await toolAt(tools, 2).execute(input, toolExecutionContext(config()))));
+    expect(output).toMatchObject({ status: "error", code: "validation_error" });
+    expect(output.message).toContain(expected);
+    expect(output.message).toContain('object_type:"text",font_size:36,font_weight:700');
+    expect(output.message).toContain("Nothing applied");
+    expect(output.message).not.toContain("private customer content");
+    expect(output.message).not.toContain("sk-private-value");
+    expect(JSON.stringify(input)).toBe(original);
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
+  it("points to the invalid command and rejects the whole batch before applying valid siblings", async () => {
+    const { tools, mutate } = makeTools();
+    const output = JSON.parse(String(await toolAt(tools, 2).execute({
+      design_id: ids.design, expected_revision: 4, idempotency_key: ids.request,
+      commands: [
+        { action: "object.update", object_id: ids.object, expected_object_version: 1, patch: { object_type: "rect", opacity: 0.5 } },
+        { action: "object.update", object_id: ids.object, expected_object_version: 1, patch: { font_size: 36 } },
+      ],
+    }, toolExecutionContext(config()))));
+    expect(output.message).toContain("commands[1].patch.object_type");
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
+  it("applies real typography and layout fields through the canonical command applier", async () => {
+    let savedScene = { ...design.scene, objects: [{ ...design.scene.objects[0]!, type: "text", text: "Keep wording",
+      fontFaceId: null, fontFamily: "Arial", fontSize: 30, fontWeight: 400, fontStyle: "normal", textAlign: "left",
+      lineHeight: 1.2, charSpacing: 0, fill: { kind: "solid", color: "#112233" },
+    }] } as LoomicSceneV1;
+    const mutate = vi.fn(async (_user: unknown, input: { commands: DesignCommand[] }) => {
+      savedScene = applyDesignCommands(savedScene, input.commands);
+      return { design_id: ids.design, revision: 5, changed_object_ids: [ids.object], replayed: false };
+    });
+    const { tools } = makeTools({ designService: { get: vi.fn(async () => ({ ...design, scene: savedScene })), mutate } });
+    const output = JSON.parse(String(await toolAt(tools, 2).execute({
+      design_id: ids.design, expected_revision: 4, idempotency_key: ids.request,
+      commands: [{ action: "object.update", object_id: ids.object, expected_object_version: 1,
+        patch: { object_type: "text", font_size: 36, font_weight: 700, x: 40, y: 50 } }],
+    }, toolExecutionContext(config()))));
+    expect(output.status).toBe("applied");
+    expect(savedScene.objects[0]).toMatchObject({ text: "Keep wording", fontSize: 36, fontWeight: 700, x: 40, y: 50, objectVersion: 2 });
+    expect(mutate).toHaveBeenCalledOnce();
+  });
+
+  it("reports no_change for identical saved text without creating a revision or preview", async () => {
+    const current = { ...design, scene: { ...design.scene, objects: [{ ...design.scene.objects[0]!, type: "text", text: "Already correct" }] } };
+    const mutate = vi.fn();
+    const previews = { enqueue: vi.fn() };
+    const { tools } = makeTools({ designService: { get: vi.fn().mockResolvedValue(current), mutate }, designPreviewService: previews });
+    const output = JSON.parse(String(await toolAt(tools, 2).execute({
+      design_id: ids.design, expected_revision: 4, idempotency_key: ids.request,
+      commands: [{ action: "object.update", object_id: ids.object, expected_object_version: 1,
+        patch: { object_type: "text", text: "Already correct" } }],
+    }, toolExecutionContext(config()))));
+    expect(manipulateDesignToolOutputSchema.parse(output)).toMatchObject({ status: "error", code: "validation_error", current_revision: 4 });
+    expect(output.message).toMatch(/^no_change:/);
+    expect(mutate).not.toHaveBeenCalled();
+    expect(previews.enqueue).not.toHaveBeenCalled();
+  });
+
+  it("preserves canonical idempotent replay when the design advanced after the original request", async () => {
+    const current = { ...design, revision: 5,
+      scene: { ...design.scene, objects: [{ ...design.scene.objects[0]!, opacity: 0.5 }] } };
+    const mutate = vi.fn().mockResolvedValue({ design_id: ids.design, revision: 5, changed_object_ids: [ids.object], replayed: true });
+    const { tools } = makeTools({ designService: { get: vi.fn().mockResolvedValue(current), mutate } });
+    const output = JSON.parse(String(await toolAt(tools, 2).execute({
+      design_id: ids.design, expected_revision: 4, idempotency_key: ids.request,
+      commands: [{ action: "object.update", object_id: ids.object, expected_object_version: 1,
+        patch: { object_type: "rect", opacity: 0.5 } }],
+    }, toolExecutionContext(config()))));
+    expect(output).toMatchObject({ status: "applied", replayed: true });
+    expect(mutate).toHaveBeenCalledOnce();
+  });
+
+  it("blocks artboard mutation during an explicitly bound independent image edit", async () => {
+    const { tools, mutate } = makeTools();
+    const cfg = config();
+    const output = JSON.parse(String(await toolAt(tools, 2).execute({
+      design_id: ids.design, expected_revision: 4, idempotency_key: ids.request,
+      commands: [{ action: "object.update", object_id: ids.object, expected_object_version: 1, patch: { object_type: "rect", opacity: 0.5 } }],
+    }, toolExecutionContext({ ...cfg, configurable: { ...cfg.configurable, image_edit_routing: { assetId: "logo" } } }))));
+    expect(output.status).toBe("error");
+    expect(mutate).not.toHaveBeenCalled();
+  });
   it("paginates beyond 100 layers with a revision guard and explicit layer metadata", async () => {
     const objects = Array.from({ length: 125 }, (_, index) => ({
       ...design.scene.objects[0]!,
@@ -105,7 +204,7 @@ describe("agent design tools", () => {
       get: vi.fn().mockResolvedValue({ ...design, scene: { ...design.scene, objects } }),
     } });
     const read = async (extra: Record<string, unknown>) => JSON.parse(String(
-      await toolAt(tools, 0).invoke({ design_id: ids.design, object_limit: 100, ...extra }, config()),
+      await toolAt(tools, 0).execute({ design_id: ids.design, object_limit: 100, ...extra }, toolExecutionContext(config())),
     ));
     const first = await read({});
     expect(first.next_offset).toBe(100);
@@ -122,15 +221,12 @@ describe("agent design tools", () => {
     const { tools } = makeTools();
     const output = JSON.parse(
       String(
-        await toolAt(tools, 0).invoke(
-          {
+        await toolAt(tools, 0).execute({
             design_id: ids.design,
             selection_object_ids: [ids.object],
             object_limit: 50,
             text_limit: 160,
-          },
-          config(),
-        ),
+          }, toolExecutionContext(config())),
       ),
     );
 
@@ -147,8 +243,7 @@ describe("agent design tools", () => {
     const { tools, mutate } = makeTools({ designPreviewService: previews });
     const output = JSON.parse(
       String(
-        await toolAt(tools, 2).invoke(
-          {
+        await toolAt(tools, 2).execute({
             design_id: ids.design,
             expected_revision: 4,
             idempotency_key: ids.request,
@@ -160,9 +255,7 @@ describe("agent design tools", () => {
                 patch: { object_type: "rect", opacity: 0.5 },
               },
             ],
-          },
-          config(),
-        ),
+          }, toolExecutionContext(config())),
       ),
     );
 
@@ -195,8 +288,7 @@ describe("agent design tools", () => {
     });
     const output = JSON.parse(
       String(
-        await toolAt(tools, 2).invoke(
-          {
+        await toolAt(tools, 2).execute({
             design_id: ids.design,
             expected_revision: 4,
             idempotency_key: ids.request,
@@ -207,9 +299,7 @@ describe("agent design tools", () => {
                 expected_object_version: 1,
               },
             ],
-          },
-          config(),
-        ),
+          }, toolExecutionContext(config())),
       ),
     );
 
@@ -237,18 +327,80 @@ describe("agent design tools", () => {
     );
   });
 
+  it("replays a durable confirmation with the frozen original tool ledger and task scope", async () => {
+    const mutate = vi.fn().mockResolvedValue({
+      design_id: ids.design,
+      revision: 5,
+      changed_object_ids: [ids.object],
+      replayed: false,
+    });
+    const enqueue = vi.fn().mockResolvedValue({});
+    const assertCurrentRun = vi.fn().mockResolvedValue({
+      id: ids.task,
+      revision: 2,
+      runId: ids.run,
+      sessionId: ids.session,
+      canvasId: ids.canvas,
+      goal: "delete",
+      corrections: [],
+      target: { kind: "design", designId: ids.design },
+      brief: {},
+    });
+    const execute = createDurableDesignMutationExecutor({
+      designService: { mutate } as never,
+      designPreviewService: { enqueue } as never,
+      agentTaskService: { assertCurrentRun } as never,
+    });
+    const action = {
+      confirmationId: "c0000000-0000-4000-8000-000000000001",
+      kind: "design_mutation" as const,
+      userId: ids.user,
+      workspaceId: design.workspace_id,
+      sessionId: ids.session,
+      canvasId: ids.canvas,
+      taskId: ids.task,
+      taskRevision: 2,
+      originRunId: ids.run,
+      toolExecutionId: ids.execution,
+      workflowStepId: "delete-old",
+      details: { design_id: ids.design, expected_revision: 4 },
+      payload: {
+        design_id: ids.design,
+        expected_revision: 4,
+        idempotency_key: ids.request,
+        commands: [{ action: "object.remove", object_id: ids.object, expected_object_version: 1 }],
+      },
+      status: "executing" as const,
+      claimToken: "d0000000-0000-4000-8000-000000000001",
+      result: null,
+      completionDone: false,
+      confirmedAt: "2026-09-10T11:00:00.000Z",
+      expiresAt: "2026-09-10T12:00:00.000Z",
+    };
+    const user = { id: ids.user, accessToken: "token", email: "qa@local.test", userMetadata: {} };
+    await expect(execute(action, { user })).resolves.toMatchObject({ revision: 5 });
+    expect(mutate).toHaveBeenCalledWith(user, action.payload, expect.objectContaining({
+      agentRunId: ids.run,
+      toolExecutionId: ids.execution,
+      confirmationId: action.confirmationId,
+      destructiveConfirmed: true,
+    }));
+    expect(enqueue).toHaveBeenCalledOnce();
+
+    assertCurrentRun.mockResolvedValueOnce({ ...(await assertCurrentRun.mock.results[0]!.value), revision: 3 });
+    await expect(execute(action, { user })).rejects.toThrow("agent_task_superseded");
+    expect(mutate).toHaveBeenCalledOnce();
+  });
+
   it("returns a strict revision error before a stale mutation", async () => {
     const { tools, mutate } = makeTools();
     const output = JSON.parse(
       String(
-        await toolAt(tools, 1).invoke(
-          {
+        await toolAt(tools, 1).execute({
             design_id: ids.design,
             expected_revision: 3,
             object_ids: [ids.object],
-          },
-          config(),
-        ),
+          }, toolExecutionContext(config())),
       ),
     );
 
@@ -265,15 +417,12 @@ describe("agent design tools", () => {
   it("passes the active workspace into query-layer resource pagination", async () => {
     const list = vi.fn().mockResolvedValue({ items: [], next_cursor: null });
     const { tools } = makeTools({ designResourceService: { list } });
-    await toolAt(tools, 3).invoke(
-      {
+    await toolAt(tools, 3).execute({
         workspace_id: design.workspace_id,
         query: "logo",
         limit: 20,
         summary_max_chars: 240,
-      },
-      config(),
-    );
+      }, toolExecutionContext(config()));
     expect(list).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ query: "logo", status: "published" }),
@@ -302,17 +451,14 @@ describe("agent design tools", () => {
     });
     const output = JSON.parse(
       String(
-        await toolAt(tools, 4).invoke(
-          {
+        await toolAt(tools, 4).execute({
             design_id: ids.design,
             expected_revision: 4,
             idempotency_key: ids.request,
             template_id: "10000000-0000-4000-8000-000000000099",
             expected_template_revision: 1,
             mode: "replace",
-          },
-          config(),
-        ),
+          }, toolExecutionContext(config())),
       ),
     );
     expect(output).toMatchObject({
@@ -335,17 +481,14 @@ describe("agent design tools", () => {
     });
     const output = JSON.parse(
       String(
-        await toolAt(tools, 5).invoke(
-          {
+        await toolAt(tools, 5).execute({
             design_id: ids.design,
             expected_revision: 4,
             idempotency_key: ids.request,
             format: "png",
             multiplier: 1,
             transparent: true,
-          },
-          config(),
-        ),
+          }, toolExecutionContext(config())),
       ),
     );
     expect(output).toMatchObject({ replayed: true });
@@ -354,8 +497,7 @@ describe("agent design tools", () => {
   it("rejects oversized detailed-object batches before serializing them", async () => {
     const { tools } = makeTools();
     await expect(
-      toolAt(tools, 1).invoke(
-        {
+      toolAt(tools, 1).execute({
           design_id: ids.design,
           expected_revision: 4,
           object_ids: Array.from(
@@ -363,9 +505,7 @@ describe("agent design tools", () => {
             (_, index) =>
               `70000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
           ),
-        },
-        config(),
-      ),
+        }, toolExecutionContext(config())),
     ).rejects.toThrow();
   });
 });

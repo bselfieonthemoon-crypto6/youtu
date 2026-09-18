@@ -145,6 +145,21 @@ export async function fetchAsDataURL(url: string): Promise<string> {
   });
 }
 
+/** Signed URLs from our canvas API already authorize access. Do not send them
+ * through the external-image proxy, which correctly rejects local storage. */
+export async function fetchCanvasStorageAsDataURL(url: string, signal?: AbortSignal): Promise<string> {
+  const response = await fetch(url, { ...(signal ? { signal } : {}), credentials: "omit" });
+  if (!response.ok) throw new Error(`Stored image fetch failed: ${response.status}`);
+  const blob = await response.blob();
+  if (!blob.type.startsWith("image/")) throw new Error("Stored file is not an image");
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(new Error("Failed to decode stored image"));
+    reader.readAsDataURL(blob);
+  });
+}
+
 export async function fetchAssetAsDataURL(
   accessToken: string,
   assetId: string,

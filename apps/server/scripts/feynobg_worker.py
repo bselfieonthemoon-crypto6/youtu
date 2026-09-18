@@ -17,11 +17,14 @@ from PIL import Image
 _runtime = None
 _lama_session = None
 _sam_runtime = None
+_sam_image_cache = None
 
 
 def load_model(model_dir: Path):
     global _runtime
     if _runtime is None:
+        from birefnet_dynamic_matting import release_model
+        release_model()
         import torch
         from nobg import BiRefNet, BiRefNetImageProcessor
 
@@ -35,7 +38,10 @@ def load_model(model_dir: Path):
         torch.set_num_threads(max(1, min(32, configured_threads)))
         # Inter-op parallelism adds memory-hungry worker pools but provides no
         # benefit while this persistent worker serializes inference requests.
-        torch.set_num_interop_threads(1)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass  # Another local tool has already initialized the shared pool.
         # AutoModel queries Hub tags before dispatching and therefore mistakes
         # absolute Windows paths for repository ids. The checkpoint is known to
         # be BiRefNet, so use the concrete loader for fully offline operation.
@@ -65,14 +71,19 @@ def make_cutout(model_dir: Path, image: str | Image.Image) -> Image.Image:
 def make_sam2_mask(
     model_dir: Path,
     source: Image.Image,
-    box: list[int],
+    box: list[int] | None,
     positive_point: list[int] | None = None,
+    points: list[list[int]] | None = None,
+    labels: list[int] | None = None,
 ) -> np.ndarray:
-    global _sam_runtime
+    global _sam_runtime, _sam_image_cache
     import torch
     from transformers import Sam2Model, Sam2Processor
 
     if _sam_runtime is None:
+        # Point-only inference does not load BiRefNet, so configure CPU threads
+        # here as well. No additional weights or external service is needed.
+        torch.set_num_threads(max(1, min(32, int(os.environ.get("LOOMIC_FEYNOBG_CPU_THREADS", "2")))))
         model = Sam2Model.from_pretrained(
             str(model_dir), local_files_only=True
         ).eval().to("cpu")
@@ -81,13 +92,29 @@ def make_sam2_mask(
         )
         _sam_runtime = (model, processor)
     model, processor = _sam_runtime
-    prompt = {"images": source, "input_boxes": [[box]], "return_tensors": "pt"}
-    if positive_point is not None:
+    prompt = {"images": source, "return_tensors": "pt"}
+    if box is not None:
+        prompt["input_boxes"] = [[box]]
+    if points is not None:
+        prompt["input_points"] = [[points]]
+        prompt["input_labels"] = [[labels]]
+    elif positive_point is not None:
         prompt["input_points"] = [[[positive_point]]]
         prompt["input_labels"] = [[[1]]]
     inputs = processor(**prompt)
     with torch.inference_mode():
-        outputs = model(**inputs)
+        if points is not None:
+            # Cache only one image's features; hover changes rerun the prompt
+            # decoder, not the expensive image encoder. Content-addressed so
+            # different images/users can never reuse the wrong features.
+            import hashlib
+            key = (source.size, hashlib.sha256(source.tobytes()).digest())
+            if _sam_image_cache is None or _sam_image_cache[0] != key:
+                _sam_image_cache = (key, model.get_image_embeddings(inputs["pixel_values"]))
+            inputs.pop("pixel_values")
+            outputs = model(**inputs, image_embeddings=_sam_image_cache[1])
+        else:
+            outputs = model(**inputs)
     masks = processor.post_process_masks(
         outputs.pred_masks.cpu(), inputs["original_sizes"]
     )[0][0]
@@ -96,13 +123,73 @@ def make_sam2_mask(
     return masks[best_index].numpy().astype(bool)
 
 
+def point_matting(sam_model_dir: Path, input_path: Path, output_dir: Path, points: list, region: dict | None = None) -> dict:
+    """Local interactive SAM2 segmentation; positive/negative clicks are explicit
+    constraints, not a box inferred from an unrelated saliency model.
+    Return original-sized RGB with the selection mask as alpha. The editor
+    intersects this with original transparency once (never square its alpha).
+    """
+    import math
+    if not isinstance(points, list) or not 1 <= len(points) <= 24:
+        raise ValueError("Point selection requires 1 to 24 points.")
+    for p in points:
+        if (not isinstance(p, dict) or p.get("label") not in (0, 1)
+                or any(not isinstance(p.get(k), (int, float)) or not math.isfinite(p[k])
+                       or not 0 <= p[k] <= 1 for k in ("x", "y"))):
+            raise ValueError("Invalid normalized selection point.")
+    if not any(p["label"] == 1 for p in points):
+        raise ValueError("At least one foreground point is required.")
+    if region is not None:
+        if (not isinstance(region, dict) or any(not isinstance(region.get(k), (int, float))
+                or not math.isfinite(region[k]) or not 0 <= region[k] <= 1 for k in ("x", "y", "width", "height"))
+                or region['width'] <= 0 or region['height'] <= 0
+                or region['x'] + region['width'] > 1.000001 or region['y'] + region['height'] > 1.000001):
+            raise ValueError("Invalid subject box.")
+    source = Image.open(input_path).convert("RGBA")
+    width, height = source.size
+    coords = [[min(width - 1, round(p["x"] * width)), min(height - 1, round(p["y"] * height))] for p in points]
+    labels = [p["label"] for p in points]
+    box = None if region is None else [round(region['x'] * width), round(region['y'] * height),
+        min(width - 1, round((region['x'] + region['width']) * width)),
+        min(height - 1, round((region['y'] + region['height']) * height))]
+    mask = make_sam2_mask(sam_model_dir, source.convert("RGB"), box, points=coords, labels=labels)
+    if not np.any(mask):
+        raise ValueError("未识别到主体，请在主体内部补充保留点后重试。")
+    rgba = np.asarray(source).copy()
+    rgba[:, :, 3] = np.where(mask, 255, 0)
+    name = "point-selected-foreground.png"
+    Image.fromarray(rgba, mode="RGBA").save(output_dir / name, format="PNG", optimize=True)
+    return {"width": width, "height": height,
+            "files": [{"kind": "foreground", "name": name, "x": 0, "y": 0,
+                       "width": width, "height": height}]}
+
+
 def remove_background(model_dir: Path, input_path: Path, output_dir: Path) -> dict:
-    cutout = make_cutout(model_dir, str(input_path)).convert("RGBA")
+    global _runtime, _sam_runtime, _sam_image_cache, _lama_session
+    # This operation does not use selection/inpainting. Do not retain those
+    # models while loading a large matting checkpoint on a local workstation.
+    import gc
+    _sam_runtime = None
+    _sam_image_cache = None
+    _lama_session = None
+    gc.collect()
+    backend = os.environ.get("LOOMIC_BACKGROUND_REMOVAL_MODEL", "feynobg")
+    if backend == "birefnet-dynamic-matting":
+        import gc
+        from birefnet_dynamic_matting import make_cutout as make_dynamic_cutout
+        _runtime = None  # Avoid retaining both large checkpoints on a local PC.
+        gc.collect()
+        cutout = make_dynamic_cutout(input_path)
+    elif backend == "feynobg":
+        cutout = make_cutout(model_dir, str(input_path)).convert("RGBA")
+    else:
+        raise ValueError(f"Unsupported background-removal model: {backend}")
     output_path = output_dir / "foreground.png"
     cutout.save(output_path, format="PNG", optimize=True)
     return {
         "width": cutout.width,
         "height": cutout.height,
+        "model": f"local:{backend}",
         "files": [{"kind": "foreground", "name": output_path.name, "x": 0, "y": 0,
                    "width": cutout.width, "height": cutout.height}],
     }
@@ -429,7 +516,11 @@ def load_erase_mask(mask_path: Path, size: tuple[int, int]) -> np.ndarray:
         raise ValueError("The erase mask is empty.")
     # A subtle feather prevents jagged edges for transparent erasing without
     # expanding the user's stroke beyond its chosen brush radius.
-    return cv2.GaussianBlur(values, (0, 0), 0.65)
+    feathered = cv2.GaussianBlur(values, (0, 0), 0.65)
+    # Gaussian blur has support outside the stroke. Preserve truly unselected
+    # pixels, otherwise even a transparent erase changes neighboring alpha.
+    feathered[values == 0] = 0
+    return feathered
 
 
 def erase_transparent(input_path: Path, mask_path: Path, output_dir: Path) -> dict:
@@ -543,9 +634,12 @@ def handle(request: dict, model_dir: Path, lama_model: Path, sam_model_dir: Path
         result = remove_background(model_dir, input_path, output_dir)
     elif mode == "region_matting":
         selection_region = request.get("selection_region")
-        if not isinstance(selection_region, dict):
+        if request.get("selection_points") is not None:
+            result = point_matting(sam_model_dir, input_path, output_dir, request["selection_points"], selection_region)
+        elif not isinstance(selection_region, dict):
             raise ValueError("Region matting requires selection_region.")
-        result = region_matting(model_dir, sam_model_dir, input_path, output_dir, selection_region)
+        else:
+            result = region_matting(model_dir, sam_model_dir, input_path, output_dir, selection_region)
     elif mode in ("erase_transparent", "smart_erase"):
         mask_path_value = request.get("mask_path")
         if not isinstance(mask_path_value, str) or not mask_path_value:

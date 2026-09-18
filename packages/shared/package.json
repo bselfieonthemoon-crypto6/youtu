@@ -19,7 +19,7 @@
   },
   "scripts": {
     "build": "tsc --build tsconfig.json --force",
-    "test": "vitest run src/contracts.test.ts src/credits.test.ts src/job-contracts.test.ts src/ws-protocol.test.ts src/provider-config-contracts.test.ts src/workspace-member-contracts.test.ts src/design-contracts.test.ts src/design-template-variables.test.ts",
+    "test": "vitest run src/contracts.test.ts src/credits.test.ts src/job-contracts.test.ts src/ws-protocol.test.ts src/provider-config-contracts.test.ts src/model-context-contracts.test.ts src/workspace-member-contracts.test.ts src/design-contracts.test.ts src/design-template-variables.test.ts src/agent-collaboration-contracts.test.ts src/prompt-library-contracts.test.ts src/node-image-contracts.test.ts src/canvas-generation-merge.test.ts src/native-image-size.test.ts src/approximate-native-image-size.test.ts src/image-model-identifiers.test.ts src/uuid.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   }
 }

@@ -15,6 +15,30 @@ const input = {
 };
 
 describe("design catalog admin service", () => {
+  it("reads template references without querying a nonexistent source-template column", async () => {
+    const visible = {
+      select: vi.fn(() => visible),
+      eq: vi.fn(() => visible),
+      maybeSingle: vi.fn(async () => ({
+        data: { id: input.entity_id },
+        error: null,
+      })),
+    };
+    const adminFrom = vi.fn();
+    const service = createDesignCatalogAdminService({
+      getAdminClient: () => ({ from: adminFrom }) as never,
+      createUserClient: () => ({ from: vi.fn(() => visible) }) as never,
+    });
+    await expect(
+      service.references(user as never, "template", input.entity_id),
+    ).resolves.toEqual({
+      entity_kind: "template",
+      entity_id: input.entity_id,
+      references: [],
+    });
+    expect(adminFrom).not.toHaveBeenCalled();
+  });
+
   it("passes actor, request id, and CAS revision to the status RPC", async () => {
     const rpc = vi.fn(async () => ({
       data: {

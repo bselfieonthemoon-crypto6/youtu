@@ -1,3 +1,5 @@
+> 当前 Agent 产品范围：以连续对话和最小执行可靠性为主，不提供无人值守执行。详见 [对话优先需求](docs/conversation-first-reliability.md)。历史自主执行文档不再代表待实现需求。
+
 <p align="center">
   <img src="apps/web/public/logo.svg" alt="Loomic Logo" width="80" />
 </p>
@@ -21,7 +23,7 @@
   <img src="https://img.shields.io/badge/TypeScript-5.7-3178C6?logo=typescript&logoColor=white" alt="TypeScript" />
   <img src="https://img.shields.io/badge/Tailwind_CSS-4-06B6D4?logo=tailwindcss&logoColor=white" alt="Tailwind CSS" />
   <img src="https://img.shields.io/badge/Fastify-5-000000?logo=fastify" alt="Fastify" />
-  <img src="https://img.shields.io/badge/LangGraph-1.2-1C3C3C?logo=langchain&logoColor=white" alt="LangGraph" />
+  <img src="https://img.shields.io/badge/Mastra-1.66-1C3C3C?logo=javascript&logoColor=white" alt="Mastra" />
   <img src="https://img.shields.io/badge/Supabase-PostgreSQL-3FCF8E?logo=supabase&logoColor=white" alt="Supabase" />
   <img src="https://img.shields.io/badge/Excalidraw-Canvas-6965DB?logo=excalidraw&logoColor=white" alt="Excalidraw" />
   <img src="https://img.shields.io/badge/Turborepo-Monorepo-EF4444?logo=turborepo&logoColor=white" alt="Turborepo" />
@@ -40,7 +42,7 @@ CapCut 刚推出了 Video Studio——基于画布的 AI 视频制作空间，Lo
 
 Loomic 做的是同一件事，但完全开源。你在无限画布上跟 AI 对话，它直接生成图片、视频，摆好位置，调好样式。不需要时间轴，不需要模板，不需要学 prompt 工程。说"把左边那张换成暖色调"，AI 就懂了。
 
-从构思、角色设定、故事板、场景生成、细节打磨到导出——整个创作流程在一个画布上完成。底层是 LangGraph 驱动的 Agent，接了 Google Gemini / Vertex AI / OpenAI / Replicate 十几个模型（包括 Veo 3.1、Kling、Seedance、Sora 等），图片视频都能生。
+从构思、角色设定、故事板、场景生成、细节打磨到导出——整个创作流程在一个画布上完成。底层是 **Mastra** 驱动的 Agent（工具层用 `@mastra/core/tools`，模型层统一走 `@ai-sdk/openai-compatible`），通过工作区自配的 OpenAI-compatible 供应商接入图片与视频模型。
 
 开源，可以自己部署，数据全在你手里。
 
@@ -94,7 +96,7 @@ Loomic 做的是同一件事，但完全开源。你在无限画布上跟 AI 对
 ```
 ┌─────────────┐     WebSocket / REST      ┌─────────────────┐
 │   Next.js   │ ◄──────────────────────►  │  Fastify API    │
-│   Frontend  │                           │  + LangGraph    │
+│   Frontend  │                           │  + Mastra       │
 │  (Vercel)   │                           │  Agent (Railway) │
 └─────────────┘                           └────────┬────────┘
                                                    │ PGMQ
@@ -115,11 +117,11 @@ Loomic 做的是同一件事，但完全开源。你在无限画布上跟 AI 对
 | Component | Tech | Role |
 |-----------|------|------|
 | **Frontend** | Next.js 15 + React 19 + Tailwind CSS 4 | Canvas UI, chat panel, workspace |
-| **API Server** | Fastify 5 + LangGraph | Agent runtime, WebSocket, REST API |
+| **API Server** | Fastify 5 + Mastra | Agent runtime, WebSocket, REST API |
 | **Worker** | Node.js poll-based consumer | Async image/video generation jobs |
 | **Database** | Supabase (PostgreSQL) | Data, auth, storage, job queue (PGMQ) |
 | **Canvas** | Excalidraw 0.18 | Infinite canvas rendering |
-| **AI** | LangChain + LangGraph | Agent orchestration, tool calling |
+| **AI** | Mastra 1.66 + AI SDK | Agent orchestration, tool calling, workspace provider snapshots |
 | **Queue** | PGMQ | Reliable async job processing |
 
 ---
@@ -132,10 +134,11 @@ Loomic 做的是同一件事，但完全开源。你在无限画布上跟 AI 对
 | Frontend | Next.js 15 (App Router), React 19, Tailwind CSS 4 |
 | Canvas | Excalidraw |
 | Backend | Node.js, Fastify 5, TypeScript |
-| AI Framework | LangChain 1.2, LangGraph 1.2 |
-| LLM Providers | OpenAI, Google Gemini, Google Vertex AI |
-| Image Generation | Imagen, DALL-E, Replicate (13+ models) |
-| Video Generation | Google Veo 3.x, Replicate (Kling, Sora, Seedance, etc.), Metaso MiniMax H3 |
+| AI Framework | Mastra 1.66 (`@mastra/core`, `@mastra/memory`, `@mastra/pg`) |
+| Model Gateway | `@ai-sdk/openai-compatible` (OpenAI-compatible providers + APIYI gateway) |
+| LLM Providers | Any OpenAI-compatible endpoint, configured per workspace |
+| Image Generation | Workspace-configured OpenAI-compatible image models (e.g. GPT Image family) |
+| Video Generation | Workspace-configured OpenAI-compatible video models, Metaso MiniMax H3 |
 | Database | PostgreSQL (Supabase) |
 | Auth | Supabase Auth (Magic Link + OAuth) |
 | Storage | Supabase Storage (S3-compatible) |
@@ -327,9 +330,11 @@ Loomic/
 │   │
 │   └── server/                 # Fastify API + Worker
 │       ├── src/
-│       │   ├── agent/          #   LangGraph agent, tools, prompts
+│       │   ├── agent/          #   Mastra agent runtime, tools, context, memory
 │       │   ├── generation/     #   Image & video generation providers
-│       │   │   └── providers/  #     Google, OpenAI, Replicate, Vertex AI, Volces
+│       │   │   └── providers/  #     APIYI gateway + workspace-provider snapshots
+│       │   │                   #     (legacy Google/OpenAI/Replicate/Vertex adapters
+│       │   │                   #      remain on disk but are NOT registered)
 │       │   ├── features/       #   Domain services
 │       │   │   ├── credits/    #     Credit system & tier guard
 │       │   │   ├── payments/   #     LemonSqueezy integration
@@ -414,7 +419,6 @@ Loomic/
 |----------|---------|-------------|
 | `LOOMIC_SERVER_PORT` | `3001` | API server port |
 | `LOOMIC_WEB_ORIGIN` | `http://localhost:3000` | Frontend origin (CORS) |
-| `LOOMIC_AGENT_BACKEND_MODE` | `state` | Agent persistence (`state` or `filesystem`) |
 | `LOOMIC_SKILLS_ROOT` | `../../skills` | Path to skills directory |
 | `WORKER_CONCURRENCY` | `3` | Jobs per worker |
 | `WORKER_IMAGE_CONCURRENCY` | `3` | Image generation slots |

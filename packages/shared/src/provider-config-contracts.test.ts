@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   providerConfigCreateRequestSchema,
+  providerModelDiscoveryDraftRequestSchema,
   providerConfigErrorResponseSchema,
   providerConfigUpdateRequestSchema,
   providerModelInputSchema,
@@ -36,6 +37,17 @@ describe("provider config contracts", () => {
     ).toBe(true);
     expect(providerConfigUpdateRequestSchema.safeParse({ apiKey: "" }).success).toBe(false);
     expect(providerConfigUpdateRequestSchema.safeParse({}).success).toBe(false);
+  });
+
+  it("defines a strict draft-discovery request while allowing an existing config key fallback", () => {
+    expect(providerModelDiscoveryDraftRequestSchema.safeParse({
+      baseUrl: "https://api.example.com/v1",
+      configId: "10000000-0000-4000-8000-000000000001",
+    }).success).toBe(true);
+    expect(providerModelDiscoveryDraftRequestSchema.safeParse({
+      baseUrl: "https://api.example.com/v1",
+      ignored: true,
+    }).success).toBe(false);
   });
 
   it("only accepts the closed capability set", () => {

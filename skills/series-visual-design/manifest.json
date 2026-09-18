@@ -1,0 +1,79 @@
+{
+  "slug": "series-visual-design",
+  "name": "系列视觉设计",
+  "description": "规划或生成多张内容不同但身份一致的位图物料；尺寸适配不重复规划成系列，批量制作遵守张数与预算。",
+  "version": "2.2.0",
+  "category": "design",
+  "iconName": "palette",
+  "license": null,
+  "metadata": {
+    "bundle": "loomic-design-skills-v2",
+    "loomic": {
+      "schemaVersion": 1,
+      "execution": "image",
+      "routing": { "keywords": ["系列", "多张", "一套", "整套", "series"], "priority": 40 },
+      "intents": [
+        "series",
+        "visual-system",
+        "multi-design"
+      ],
+      "outputKinds": [
+        "raster-image",
+        "image-prompt"
+      ],
+      "requiredTools": [
+        "generate_image",
+        "edit_image"
+      ],
+      "optionalTools": [
+        "inspect_canvas"
+      ],
+      "models": [
+        {
+          "role": "planner",
+          "required": true,
+          "preferredIds": []
+        },
+        {
+          "role": "vision",
+          "required": false,
+          "preferredIds": []
+        },
+        {
+          "role": "image",
+          "required": true,
+          "preferredIds": []
+        }
+      ],
+      "limitations": [
+        "技能不增加运行时工具、模型、权限或预算；不擅自增加系列成员或整批重跑。",
+        "本包为 Loomic 原创流程，研究来源不是效果 benchmark；未运行上游脚本或自动下载依赖。",
+        "本运行时图片只落无限画布，不创建、修改或导出原生画板；生成一致性须据逐张结果核对。"
+      ],
+      "examples": [
+        "把已有三张发布海报统一字体层级，保留各自内容。"
+      ],
+      "sources": [
+        {
+          "title": "Reusable theme tokens",
+          "url": "https://github.com/anthropics/skills/blob/main/skills/theme-factory/SKILL.md",
+          "license": "Apache-2.0",
+          "relation": "inspired-by"
+        },
+        {
+          "title": "Carousel narrative and information density",
+          "url": "https://github.com/JimLiu/baoyu-skills/blob/main/skills/baoyu-xhs-images/SKILL.md",
+          "license": "MIT",
+          "relation": "inspired-by"
+        }
+      ],
+      "composition": {
+        "role": "workflow",
+        "stages": [
+          "design",
+          "prompt"
+        ]
+      }
+    }
+  }
+}

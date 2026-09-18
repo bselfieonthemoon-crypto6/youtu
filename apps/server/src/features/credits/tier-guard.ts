@@ -3,6 +3,7 @@ import type {
   BackgroundJobType,
   BillingErrorCode,
   ImageQualityLevel,
+  NativeImageResolution,
   SubscriptionPlan,
   VideoResolution,
 } from "@loomic/shared";
@@ -64,6 +65,16 @@ export class TierGuardError extends Error {
   }
 }
 
+/** Pixel resolution is billed independently from provider quality semantics. */
+export function imageResolutionBillingQuality(
+  resolution: NativeImageResolution | undefined,
+  fallback: ImageQualityLevel,
+): ImageQualityLevel {
+  const resolutionTier: ImageQualityLevel = resolution === "4k" ? "ultra" : resolution === "2k" ? "hd" : "standard";
+  const rank: Record<ImageQualityLevel, number> = { standard: 0, hd: 1, ultra: 2 };
+  return rank[resolutionTier] > rank[fallback] ? resolutionTier : fallback;
+}
+
 // ── Types ────────────────────────────────────────────────────
 
 export type TierGuard = {
@@ -77,7 +88,7 @@ export type TierGuard = {
   calculateCreditCost(
     modelId: string,
     jobType: BackgroundJobType,
-    params?: { quality?: ImageQualityLevel; duration?: number; resolution?: VideoResolution },
+    params?: { quality?: ImageQualityLevel; duration?: number; resolution?: VideoResolution; imageResolution?: NativeImageResolution },
   ): number;
 };
 
@@ -107,6 +118,7 @@ export function createTierGuard(options: {
         );
       }
     },
+
 
     checkVideoResolution(plan, resolution) {
       if (!COMMERCIALIZATION_ENFORCEMENT_ENABLED) return;
@@ -152,7 +164,7 @@ export function createTierGuard(options: {
     calculateCreditCost(modelId, jobType, params) {
       if (!COMMERCIALIZATION_ENFORCEMENT_ENABLED) return 0;
       if (jobType === "image_generation") {
-        const quality: ImageQualityLevel = params?.quality ?? "hd";
+        const quality: ImageQualityLevel = imageResolutionBillingQuality(params?.imageResolution, params?.quality ?? "standard");
         return getImageCreditCost(modelId, quality);
       }
       // video_generation

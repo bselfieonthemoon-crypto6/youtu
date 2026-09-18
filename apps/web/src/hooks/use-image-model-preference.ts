@@ -9,7 +9,22 @@ export type ImageModelPreference = ImageGenerationPreference;
 const defaultPreference: ImageModelPreference = {
   mode: "auto",
   models: [],
+  aspectRatio: "auto",
 };
+
+const aspectRatios = new Set<NonNullable<ImageModelPreference["aspectRatio"]>>([
+  "auto",
+  "1:1",
+  "4:3",
+  "3:4",
+  "16:9",
+  "9:16",
+  "3:2",
+  "2:3",
+  "4:5",
+  "5:4",
+  "21:9",
+]);
 
 // Listeners for cross-component reactivity
 const listeners = new Set<() => void>();
@@ -62,6 +77,12 @@ function normalizePreference(
   return {
     mode: preference.mode === "manual" ? "manual" : "auto",
     models,
+    // Older stored preferences did not have an aspect ratio. Treat them as
+    // automatic rather than allowing an unvalidated value into run payloads.
+    aspectRatio:
+      typeof preference.aspectRatio === "string" && aspectRatios.has(preference.aspectRatio as NonNullable<ImageModelPreference["aspectRatio"]>)
+        ? preference.aspectRatio as NonNullable<ImageModelPreference["aspectRatio"]>
+        : "auto",
   };
 }
 
@@ -93,23 +114,31 @@ export function useImageModelPreference() {
         : [...preference.models, model];
 
       setPreference({
+        ...preference,
         mode: "manual",
         models,
       });
     },
-    [preference.models, setPreference],
+    [preference, setPreference],
   );
 
-  const activeImageGenerationPreference =
-    preference.mode === "manual" && preference.models.length > 0
-      ? preference
-      : undefined;
+  const setAspectRatio = useCallback(
+    (aspectRatio: NonNullable<ImageModelPreference["aspectRatio"]>) => {
+      setPreference({ ...preference, aspectRatio });
+    },
+    [preference, setPreference],
+  );
+
+  // Image generation needs the ratio preference even while model selection is
+  // automatic, so a run can distinguish an automatic ratio from a user choice.
+  const activeImageGenerationPreference = preference;
 
   return {
     preference,
     setPreference,
     setMode,
     toggleModel,
+    setAspectRatio,
     activeImageGenerationPreference,
   };
 }

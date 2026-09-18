@@ -30,6 +30,7 @@ export type WorkspaceMemberService = {
 export function createWorkspaceMemberService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
   getAdminClient: () => AdminSupabaseClient;
+  onMembershipInvalidated?: (input: { workspaceId: string; userId: string }) => void;
 }): WorkspaceMemberService {
   async function requireManager(user: AuthenticatedUser, workspaceId: string): Promise<ManagerRole> {
     const { data, error } = await options
@@ -129,6 +130,7 @@ export function createWorkspaceMemberService(options: {
         .eq("workspace_id", workspaceId)
         .eq("user_id", targetUserId);
       if (error) throw persistenceError();
+      options.onMembershipInvalidated?.({ workspaceId, userId: targetUserId });
       return singleView(workspaceId, user.id, targetUserId);
     },
 
@@ -143,6 +145,10 @@ export function createWorkspaceMemberService(options: {
         .eq("workspace_id", workspaceId)
         .eq("user_id", targetUserId);
       if (error) throw persistenceError();
+      // The database trigger durably propagates this to peer instances. Apply
+      // it synchronously here as well so the deleting instance has no polling
+      // window before its already-bound sockets are revoked.
+      options.onMembershipInvalidated?.({ workspaceId, userId: targetUserId });
     },
   };
 }

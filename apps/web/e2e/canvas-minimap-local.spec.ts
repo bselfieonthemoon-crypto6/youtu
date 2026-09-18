@@ -1,0 +1,56 @@
+import { test, expect } from "@playwright/test";
+import { createClient } from "@supabase/supabase-js";
+import { readFile } from "node:fs/promises";
+
+test.use({ trace: "off", video: "off" });
+test("minimap toggles, drags and navigates using placeholder blocks", async ({ page }, info) => {
+  test.skip(process.env.SUPABASE_URL !== "http://127.0.0.1:54421", "Local replica only");
+  test.setTimeout(120000);
+  const report = JSON.parse(await readFile(new URL("../../../artifacts/agent-flow-audit-20260908.json", import.meta.url), "utf8"));
+  const url = process.env.SUPABASE_URL!;
+  const options = { auth: { persistSession: false, autoRefreshToken: false } };
+  const admin = createClient(url, process.env.SUPABASE_SERVICE_ROLE_KEY!, options);
+  const auth = createClient(url, process.env.SUPABASE_ANON_KEY!, options);
+  const account = await admin.auth.admin.getUserById("541006fa-d2a1-4305-be55-b6263c27a1e3");
+  const link = await admin.auth.admin.generateLink({ type: "magiclink", email: account.data.user!.email! });
+  const login = await auth.auth.verifyOtp({ type: "magiclink", token_hash: link.data.properties!.hashed_token });
+  try {
+    await page.addInitScript(({ key, session }) => localStorage.setItem(key, JSON.stringify(session)), { key: `sb-${new URL(url).hostname.split(".")[0]}-auth-token`, session: login.data.session });
+    await page.goto(`/canvas?id=${report.canvasId}&session=${report.canvas.sessionId}`);
+    const toggle = page.getByRole("button", { name: "显示小地图" });
+    await expect(toggle).toBeEnabled({ timeout: 45000 });
+    await toggle.click();
+    const panel = page.getByRole("region", { name: "画布小地图" });
+    await expect(panel).toBeVisible();
+    await expect(panel.locator("[data-minimap-block]").first()).toBeVisible();
+    expect(await panel.locator("img, image").count()).toBe(0);
+    const before = (await panel.boundingBox())!;
+    const handle = (await panel.getByLabel("拖动小地图窗口").boundingBox())!;
+    await page.mouse.move(handle.x + 30, handle.y + 10);
+    await page.mouse.down();
+    await page.mouse.move(handle.x + 150, handle.y - 70, { steps: 8 });
+    await page.mouse.up();
+    const after = (await panel.boundingBox())!;
+    expect(after.x - before.x).toBeCloseTo(120, 0);
+    expect(after.y - before.y).toBeCloseTo(-80, 0);
+    const nav = panel.getByRole("application", { name: "小地图导航" });
+    const viewport = panel.getByTestId("minimap-viewport");
+    const originalX = await viewport.getAttribute("x");
+    await nav.focus();
+    await nav.press("ArrowRight");
+    await expect.poll(() => viewport.getAttribute("x")).not.toBe(originalX);
+    const rect = (await nav.boundingBox())!;
+    await page.mouse.move(rect.x + rect.width / 2, rect.y + rect.height / 2);
+    await page.mouse.down();
+    const initialView = await viewport.getAttribute("x");
+    await page.mouse.move(rect.x + 30, rect.y + 30, { steps: 6 });
+    await expect.poll(() => viewport.getAttribute("x")).not.toBe(initialView);
+    await page.mouse.up();
+    await page.screenshot({ path: info.outputPath("minimap.png") });
+    await page.getByRole("button", { name: "隐藏小地图" }).click();
+    await expect(panel).toHaveCount(0);
+    await page.getByRole("button", { name: "显示小地图" }).click();
+    await page.getByRole("button", { name: "关闭小地图" }).click();
+    await expect(panel).toHaveCount(0);
+  } finally { await auth.auth.signOut({ scope: "local" }); }
+});

@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import type { BackgroundJob } from "@loomic/shared";
+import { createImageJobRequestSchema, type BackgroundJob } from "@loomic/shared";
 
-import { normalizePersistedGenerationJob } from "./design-target-normalizer.js";
+import {
+  normalizeGenerationPayloadForCreation,
+  normalizePersistedGenerationJob,
+} from "./design-target-normalizer.js";
 
 const baseJob: BackgroundJob = {
   id: "10000000-0000-4000-8000-000000000001",
@@ -38,6 +41,17 @@ const baseJob: BackgroundJob = {
 };
 
 describe("design target normalization", () => {
+  it("accepts a durable node job and keeps submission metadata out of provider input", () => {
+    const raw = { ...baseJob, target_kind: "canvas" as const, payload: {
+      prompt: "  原文不变  ", model: "gpt-image-2", quality: "hd", aspect_ratio: "1:1", operation: "generate",
+      node_submission_revision: 42,
+      target: { kind: "canvas", canvas_id: baseJob.canvas_id, element_id: "node-1" },
+    } };
+    const result = normalizePersistedGenerationJob(raw);
+    expect(result.payload).toMatchObject({ prompt: raw.payload.prompt, model: "gpt-image-2", target: raw.payload.target });
+    expect(result.payload).not.toHaveProperty("node_submission_revision");
+    expect(raw.payload.node_submission_revision).toBe(42);
+  });
   it("normalizes a legacy flat Canvas job before Worker parsing", () => {
     const normalized = normalizePersistedGenerationJob(baseJob);
 
@@ -93,5 +107,71 @@ describe("design target normalization", () => {
         target_kind: "design",
       }),
     ).toThrow("design_target_payload_missing");
+  });
+
+  it("preserves authenticated task binding context through creation and persisted normalization", () => {
+    const internalContext = {
+      origin_run_id: "60000000-0000-4000-8000-000000000011",
+      source_element_id: "source-image-1",
+      source_asset_id: "60000000-0000-4000-8000-000000000012",
+    };
+    const target = {
+      kind: "canvas" as const,
+      canvas_id: baseJob.canvas_id!,
+      element_id: "generated-image-1",
+    };
+    const payload = { prompt: "bound image edit", target, ...internalContext };
+
+    expect(normalizeGenerationPayloadForCreation({
+      jobType: "image_generation",
+      payload,
+      fallbackTarget: null,
+    })).toMatchObject(internalContext);
+    expect(normalizePersistedGenerationJob({
+      ...baseJob,
+      target_kind: "canvas",
+      payload,
+    }).payload).toMatchObject(internalContext);
+  });
+
+  it("keeps outpaint margins through creation and Worker replay normalization", () => {
+    const target = {
+      kind: "canvas" as const,
+      canvas_id: baseJob.canvas_id!,
+      element_id: "outpaint-placeholder-1",
+    };
+    const payload = {
+      prompt: "Continue the scenery",
+      operation: "outpaint" as const,
+      input_images: ["data:image/png;base64,aW1hZ2U="],
+      outpaint_margins: { top: 10, right: 20, bottom: 30, left: 40 },
+      target,
+    };
+
+    expect(
+      normalizeGenerationPayloadForCreation({
+        jobType: "image_generation",
+        payload,
+        fallbackTarget: null,
+      }),
+    ).toMatchObject(payload);
+    expect(
+      normalizePersistedGenerationJob({
+        ...baseJob,
+        target_kind: "canvas",
+        payload,
+      }).payload,
+    ).toMatchObject(payload);
+  });
+
+  it.each([
+    ["origin_run_id", "60000000-0000-4000-8000-000000000011"],
+    ["source_element_id", "source-image-1"],
+    ["source_asset_id", "60000000-0000-4000-8000-000000000012"],
+  ])("keeps internal %s out of the public image job request", (field, value) => {
+    expect(() => createImageJobRequestSchema.parse({
+      prompt: "untrusted public request",
+      [field]: value,
+    })).toThrow();
   });
 });

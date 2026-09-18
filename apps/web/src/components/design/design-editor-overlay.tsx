@@ -70,6 +70,7 @@ export type DesignEditorOverlayProps = {
   open: boolean;
   designId: string;
   name: string;
+  onRename?: (name: string) => Promise<void>;
   width: number;
   height: number;
   background: string | null;
@@ -82,6 +83,7 @@ export type DesignEditorOverlayProps = {
   backgroundRoot?: HTMLElement | null;
   onClose: () => void;
   onSave: () => Promise<void>;
+  onFinish?: () => Promise<void>;
   onDirtyChange?: (dirty: boolean) => void;
   onBackgroundChange?: (background: string | null) => void;
   onResize?: (options: DesignResizeOptions) => Promise<void>;
@@ -400,7 +402,7 @@ export function DesignEditorOverlay(props: DesignEditorOverlayProps) {
     try {
       const result = await onExport({
         format: exportFormat,
-        multiplier: exportMultiplier,
+        multiplier: exportFormat === "gif" ? 1 : exportMultiplier,
       });
       if (result !== "background_queued") setExportPrompt(false);
     } catch (error) {
@@ -811,6 +813,7 @@ export function DesignEditorOverlay(props: DesignEditorOverlayProps) {
           </aside>
           <main className="min-h-0 min-w-0">
             <FabricDesignSurface
+              showOverflow
               ref={editorRef}
               width={width}
               height={height}
@@ -895,6 +898,7 @@ export function DesignEditorOverlay(props: DesignEditorOverlayProps) {
                     <option value="png">PNG</option>
                     <option value="transparent-png">透明 PNG</option>
                     <option value="jpeg">JPEG</option>
+                    <option value="gif">动态 GIF</option>
                   </select>
                 </label>
                 <label className="grid gap-1 text-sm">
@@ -902,6 +906,7 @@ export function DesignEditorOverlay(props: DesignEditorOverlayProps) {
                   <select
                     aria-label="导出倍率"
                     value={exportMultiplier}
+                    disabled={exportFormat === "gif"}
                     className="h-9 rounded-lg border bg-background px-2"
                     onChange={(event) =>
                       setExportMultiplier(
@@ -913,6 +918,14 @@ export function DesignEditorOverlay(props: DesignEditorOverlayProps) {
                     <option value={2}>2×</option>
                   </select>
                 </label>
+                {exportFormat === "gif" && (
+                  <p className="text-xs text-muted-foreground">
+                    GIF 会按对象动画逐帧导出；最长边自动压缩至 1024px，最长
+                    10 秒且最多 60 帧；多个动效优先按共同周期完整循环，超过
+                    10 秒会截断。缩放动画在原始大小与设定增幅之间线性往返，
+                    不改变透明度。
+                  </p>
+                )}
               </div>
               {exportError && (
                 <p role="alert" className="mt-3 text-sm text-destructive">

@@ -12,6 +12,7 @@ import { useWebSocket } from "../../hooks/use-websocket";
 import { useJobFallbackPolling } from "../../hooks/use-job-fallback-polling";
 import { CanvasEditor } from "../../components/canvas-editor";
 import { ChatSidebar } from "../../components/chat-sidebar";
+import { GenerationCanvasPresenceProvider } from "../../components/chat/generation-canvas-presence";
 import { CanvasEmptyHint } from "../../components/canvas-empty-hint";
 import { CanvasLogoMenu } from "../../components/canvas-logo-menu";
 import { EditableProjectName } from "../../components/editable-project-name";
@@ -31,6 +32,7 @@ import { CanvasLayersPanel } from "../../components/canvas-layers-panel";
 import { CreditHeaderButton } from "../../components/credits/credit-header-button";
 import type { CanvasImageChatCommand } from "../../components/canvas/image-toolbar-types";
 import { DesignEditorSession } from "../../components/design/design-editor-session";
+import { captureCanvasSelection } from "../../lib/canvas-selection-snapshot";
 
 function CanvasPageContent() {
   const searchParams = useSearchParams();
@@ -71,21 +73,33 @@ function CanvasPageContent() {
   >([]);
   const [imageChatCommand, setImageChatCommand] =
     useState<CanvasImageChatCommand | null>(null);
-  const [activeDesign, setActiveDesign] = useState<{ designId: string } | null>(
+  const [activeDesign, setActiveDesign] = useState<{ designId: string; initialObjectId?: string } | null>(
     null,
   );
   const pageRootRef = useRef<HTMLDivElement>(null);
   const agentDesignSaveRef = useRef<(() => Promise<void>) | null>(null);
+  const canvasSaveRef = useRef<(() => Promise<void>) | null>(null);
+  const bindCanvasSave = useCallback((save: (() => Promise<void>) | null) => {
+    canvasSaveRef.current = save;
+  }, []);
+  const saveBeforeLeaving = async () => {
+    if (activeDesign) {
+      if (!agentDesignSaveRef.current) throw new Error("画板尚未就绪，请稍后再离开。");
+      await agentDesignSaveRef.current();
+    }
+    if (!canvasSaveRef.current) throw new Error("画布尚未就绪，请稍后再离开。");
+    await canvasSaveRef.current();
+  };
   const [designSwitchError, setDesignSwitchError] = useState<string | null>(
     null,
   );
   const designSwitchBusy = useRef(false);
-  const openDesignSafely = async (target: { designId: string }) => {
+  const openDesignSafely = async (target: { designId: string; initialObjectId?: string }) => {
     if (designSwitchBusy.current || target.designId === activeDesign?.designId)
       return;
     designSwitchBusy.current = true;
     try {
-      if (searchParams.get("inlineArtboard") === "1" && activeDesign) {
+      if (activeDesign) {
         if (!agentDesignSaveRef.current)
           throw new Error("画板尚未就绪，暂时不能切换。");
         await agentDesignSaveRef.current();
@@ -112,6 +126,7 @@ function CanvasPageContent() {
   canvasIdRef.current = canvasId;
 
   const excalidrawApiRef = useRef<any>(null);
+  const excalidrawApiCanvasIdRef = useRef<string | null>(null);
   const [excalidrawApi, setExcalidrawApi] = useState<any>(null);
 
   const signOutRef = useRef(signOut);
@@ -156,8 +171,9 @@ function CanvasPageContent() {
 
   const handleApiReady = useCallback((api: any) => {
     excalidrawApiRef.current = api;
+    excalidrawApiCanvasIdRef.current = canvasData?.id ?? null;
     setExcalidrawApi(api);
-  }, []);
+  }, [canvasData?.id]);
 
   const handleImageGenerated = useCallback((artifact: ImageArtifact) => {
     const api = excalidrawApiRef.current;
@@ -176,7 +192,7 @@ function CanvasPageContent() {
   }, []);
 
   // Must be defined BEFORE useJobFallbackPolling which references it
-  const handleCanvasSync = useCallback(async () => {
+  const handleCanvasSync = useCallback(async (requireSuccess = false) => {
     const api = excalidrawApiRef.current;
     const token = accessTokenRef.current;
     if (!api || !token || !canvasData) return;
@@ -256,6 +272,7 @@ function CanvasPageContent() {
       }
     } catch (err) {
       console.warn("Failed to sync canvas:", err);
+      if (requireSuccess) throw new Error("设计已保存，但画布预览同步失败，请重试完成。");
     }
   }, [canvasData, handleCanvasRevisionChange]);
 
@@ -276,13 +293,8 @@ function CanvasPageContent() {
     (sessionId: string) => {
       if (!canvasId) return;
       // Update URL: set session param, remove prompt param to prevent re-send on refresh
-      const inlineFlag =
-        new URLSearchParams(window.location.search).get("inlineArtboard") ===
-        "1"
-          ? "&inlineArtboard=1"
-          : "";
       routerRef.current.replace(
-        `/canvas?id=${canvasId}&session=${sessionId}${inlineFlag}`,
+        `/canvas?id=${canvasId}&session=${sessionId}`,
       );
     },
     [canvasId],
@@ -312,6 +324,10 @@ function CanvasPageContent() {
           mimeType: file?.mimeType ?? "image/png",
         };
       });
+  }, []);
+  const handleRequestCanvasSelection = useCallback((requestedCanvasId: string) => {
+    if (canvasIdRef.current !== requestedCanvasId || excalidrawApiCanvasIdRef.current !== requestedCanvasId) return { elementIds: [] };
+    return captureCanvasSelection(excalidrawApiRef.current);
   }, []);
 
   // Only re-fetch when canvasId changes or on initial auth resolution.
@@ -407,7 +423,7 @@ function CanvasPageContent() {
   if (!canvasData || !accessToken) return null;
 
   return (
-    <div ref={pageRootRef} className="flex h-screen w-screen overflow-hidden">
+    <div ref={pageRootRef} className="flex h-[100dvh] w-screen overflow-hidden">
       {designSwitchError && (
         <div
           role="alert"
@@ -419,6 +435,7 @@ function CanvasPageContent() {
       {/* Top-left navigation bar */}
       <div className="absolute top-3 left-3 z-20 flex items-center gap-1.5">
         <CanvasLogoMenu
+          beforeLeave={saveBeforeLeaving}
           accessToken={accessToken}
           projectId={canvasData.projectId}
           canvasId={canvasData.id}
@@ -447,6 +464,8 @@ function CanvasPageContent() {
           <CreditHeaderButton />
         </div>
         <CanvasEditor
+          editingDesignId={activeDesign?.designId ?? null}
+          onBindSave={bindCanvasSave}
           canvasId={canvasData.id}
           projectId={canvasData.projectId}
           accessToken={accessToken}
@@ -468,6 +487,7 @@ function CanvasPageContent() {
           onOpenChat={handleOpenChat}
         />
         <CanvasBottomBar
+          editingDesign={Boolean(activeDesign)}
           excalidrawApi={excalidrawApi}
           layersOpen={layersOpen}
           onToggleLayers={handleToggleLayers}
@@ -486,8 +506,9 @@ function CanvasPageContent() {
           onClose={handleCloseFiles}
         />
       </div>
+      <GenerationCanvasPresenceProvider api={excalidrawApiCanvasIdRef.current === canvasData.id ? excalidrawApi : null} key={canvasData.id}>
       <ChatSidebar
-        {...(searchParams.get("inlineArtboard") === "1" && activeDesign
+        {...(activeDesign
           ? {
               activeDesignId: activeDesign.designId,
               beforeDesignSend: async () => {
@@ -509,6 +530,7 @@ function CanvasPageContent() {
         initialSessionId={initialSessionId}
         onSessionChange={handleSessionChange}
         onRequestCanvasImages={handleRequestCanvasImages}
+        onRequestCanvasSelection={handleRequestCanvasSelection}
         currentBrandKitId={brandKitId}
         ws={ws}
         selectedCanvasElements={selectedCanvasElements}
@@ -517,14 +539,23 @@ function CanvasPageContent() {
           void openDesignSafely({ designId });
         }}
       />
+      </GenerationCanvasPresenceProvider>
       {activeDesign && pageRootRef.current && (
         <DesignEditorSession
           onBindAgentSave={bindAgentDesignSave}
-          inline={searchParams.get("inlineArtboard") === "1"}
+          inline
           accessToken={accessToken}
           designId={activeDesign.designId}
+          {...(activeDesign.initialObjectId ? { initialObjectId: activeDesign.initialObjectId } : {})}
           backgroundRoot={pageRootRef.current}
-          onClose={() => setActiveDesign(null)}
+          onClose={() => {
+            setActiveDesign(null);
+            window.dispatchEvent(new Event('loomic:design-preview-refresh'));
+          }}
+          onPreviewReady={async () => {
+            await handleCanvasSync(true);
+            window.dispatchEvent(new Event('loomic:design-preview-refresh'));
+          }}
           ws={ws}
         />
       )}

@@ -9,6 +9,7 @@ import {
   ClarificationDialog,
   ConfirmationDialog,
   parseClarificationQuestions,
+  parseStructuredClarificationQuestions,
   parseConfirmationRequest,
 } from "../src/components/chat/clarification-dialog";
 
@@ -30,6 +31,45 @@ describe("clarification dialog", () => {
       "品牌风格",
       "配色偏好",
     ]);
+  });
+
+  it("keeps logo usage scenarios separate from industry choices", () => {
+    const questions = parseClarificationQuestions(`请补充以下问题：
+1. 品牌名称：Logo 上要出现什么文字？
+2. 用途：主要用在 App 图标、门头、名片还是社媒头像？（影响留白和小尺寸识别）`);
+
+    expect(questions[1]).toMatchObject({
+      title: "用途",
+      options: ["App 图标", "门头 / 招牌", "名片 / 印刷品", "社媒头像"],
+    });
+    expect(questions[1]?.options).not.toContain("科技 / 互联网");
+  });
+
+  it("renders the server-provided structured choices without inferring them from prose", () => {
+    const questions = parseStructuredClarificationQuestions([{
+      type: "tool",
+      toolCallId: "ask-1",
+      toolName: "ask_clarification",
+      status: "completed",
+      output: {
+        status: "awaiting_user_input",
+        questions: [{
+          id: 1,
+          title: "用途",
+          prompt: "主要用在 App 图标、门头、名片还是社媒头像？",
+          options: ["App 图标", "门头", "名片", "社媒头像"],
+          allowCustom: true,
+        }],
+      },
+    }]);
+
+    expect(questions).toEqual([{
+      id: 1,
+      title: "用途",
+      prompt: "主要用在 App 图标、门头、名片还是社媒头像？",
+      options: ["App 图标", "门头", "名片", "社媒头像"],
+      allowCustom: true,
+    }]);
   });
 
   it("supports choices, custom answers, navigation, and submission", async () => {
@@ -55,6 +95,24 @@ describe("clarification dialog", () => {
     expect(onSubmit).toHaveBeenCalledWith(
       "1. 品牌名称：Loomic\n2. 所属行业：科技 / 互联网",
     );
+  });
+
+  it("anchors over the composer instead of above it", () => {
+    render(
+      <ClarificationDialog
+        questions={parseClarificationQuestions(text)}
+        onClose={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    const dialog = screen.getByRole("heading", { name: "品牌名称" }).closest(
+      "[data-chat-floating-dialog]",
+    );
+    expect(dialog).toHaveClass("bottom-3");
+    expect(dialog).toHaveClass("inset-x-3");
+    expect(dialog).not.toHaveClass("bottom-0");
+    expect(dialog).not.toHaveClass("bottom-full");
   });
 });
 

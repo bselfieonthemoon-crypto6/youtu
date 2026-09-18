@@ -370,8 +370,11 @@
 
 /* Canvas context menu — compact and aligned with the Loomic UI. */
 .excalidraw .popover:has(> .context-menu) {
-  z-index: 10;
+  z-index: 2147483647;
   padding: 0;
+  border: 0;
+  overflow: visible;
+  background: transparent;
 }
 
 .excalidraw .context-menu {

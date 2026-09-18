@@ -22,15 +22,36 @@ const databaseTypeSource = readFileSync(
 );
 
 describe("@loomic/shared contracts", () => {
+  it("preserves optional send-time selection without inventing authority or defaults", () => {
+    const payload = { sessionId: "session", conversationId: "conversation", prompt: "看看选中的文字", canvasId: "canvas-1" };
+    expect(runCreateRequestSchema.parse(payload)).not.toHaveProperty("canvasSelection");
+    expect(runCreateRequestSchema.parse({ ...payload, canvasSelection: { elementIds: [] } }).canvasSelection).toEqual({ elementIds: [] });
+    const elementIds = Array.from({ length: 100 }, (_, i) => `text-${i}`);
+    expect(runCreateRequestSchema.parse({ ...payload, canvasSelection: { elementIds } }).canvasSelection).toEqual({ elementIds });
+  });
+
+  it.each([
+    { elementIds: Array.from({ length: 101 }, (_, i) => `text-${i}`) },
+    { elementIds: ["same", "same"] },
+    { elementIds: [""] },
+    { elementIds: ["x".repeat(201)] },
+    { elementIds: ["text"], authorized: true },
+    { elementIds: ["text"], canvasId: "foreign-canvas" },
+  ])("rejects invalid or authority-bearing selection metadata: %j", canvasSelection => {
+    expect(runCreateRequestSchema.safeParse({ sessionId: "session", conversationId: "conversation", prompt: "test", canvasSelection }).success).toBe(false);
+  });
+
   it("shares the health response schema for server and web", () => {
     const parsed = healthResponseSchema.parse({
       ok: true,
       service: "loomic-server",
       version: "0.1.0",
+      agentRuntime: "mastra",
     });
 
     expect(parsed.ok).toBe(true);
     expect(parsed.service).toBe("loomic-server");
+    expect(parsed.agentRuntime).toBe("mastra");
   });
 
   it("accepts canvasId as optional field", () => {
@@ -457,6 +478,12 @@ describe("@loomic/shared contracts", () => {
     }
   });
 
+  it("validates image ratio independently of model selection", () => {
+    const request = { sessionId: "session-1", conversationId: "conv-1", prompt: "宣传图", imageGenerationPreference: { mode: "auto", models: [], aspectRatio: "16:9" } };
+    expect(runCreateRequestSchema.parse(request).imageGenerationPreference?.aspectRatio).toBe("16:9");
+    expect(runCreateRequestSchema.safeParse({ ...request, imageGenerationPreference: { ...request.imageGenerationPreference, aspectRatio: "invalid" } }).success).toBe(false);
+  });
+
   it("exposes the authoritative Canvas revision required by design CAS", () => {
     expect(
       canvasDetailSchema.parse({
@@ -552,6 +579,28 @@ describe("@loomic/shared contracts", () => {
     ).toThrow();
   });
 
+  it("validates structured clarification blocks and rejects oversized questionnaires", () => {
+    expect(sharedExports.contentBlockSchema.parse({
+      type: "clarification",
+      version: 1,
+      clarificationId: "clarification-1",
+      questions: [{
+        id: 1,
+        title: "用途",
+        prompt: "主要用在哪里？",
+        options: ["App 图标", "门头"],
+        allowCustom: true,
+      }],
+    })).toMatchObject({ type: "clarification", questions: [{ title: "用途" }] });
+    expect(() => sharedExports.clarificationRequestInputSchema.parse({
+      questions: Array.from({ length: 5 }, (_, index) => ({
+        title: `问题${index + 1}`,
+        prompt: "请回答",
+        options: [],
+      })),
+    })).toThrow();
+  });
+
   it("requires plan links on tool events to appear as a pair", () => {
     const base = {
       runId: "run_123",
@@ -591,7 +640,7 @@ describe("@loomic/shared contracts", () => {
       type: "tool.completed",
       runId: "run_123",
       toolCallId: "tool_123",
-      toolName: "project_search",
+      toolName: "inspect_canvas",
       outputSummary: "Matched 2 files",
       timestamp: "2026-03-23T12:00:01.000Z",
     });
@@ -622,7 +671,7 @@ describe("@loomic/shared contracts", () => {
       streamEventSchema.parse({
         type: "tool.completed",
         runId: "run_123",
-        toolName: "project_search",
+        toolName: "inspect_canvas",
         outputSummary: "Matched 2 files",
         timestamp: "2026-03-23T12:00:01.000Z",
       }),

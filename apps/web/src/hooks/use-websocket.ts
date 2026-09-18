@@ -28,7 +28,8 @@ export type WebSocketHandle = {
   startRun: (
     payload: RunCreateRequest,
     onAck?: (ack: WsCommandAck) => void,
-  ) => void;
+    onError?: (error: Error) => void,
+  ) => void | (() => void);
   cancelRun: (runId: string) => void;
   confirmAction: (
     confirmationId: string,
@@ -76,6 +77,11 @@ export function useWebSocket(getToken: () => string | null): WebSocketHandle {
     new Map(),
   );
   const rpcHandlers = useRef<Map<string, RPCHandler>>(new Map());
+  const pendingRun = useRef<{
+    requestId: string;
+    onAck?: (ack: WsCommandAck) => void;
+    onError?: (error: Error) => void;
+  } | null>(null);
 
   const connect = useCallback(() => {
     const token = getToken();
@@ -147,6 +153,13 @@ export function useWebSocket(getToken: () => string | null): WebSocketHandle {
           }
         }
       } else if (msg.type === "command.ack") {
+        if (msg.action === "agent.run") {
+          const pending = pendingRun.current;
+          if (!pending || msg.requestId !== pending.requestId) return;
+          pendingRun.current = null;
+          pending.onAck?.(msg as unknown as WsCommandAck);
+          return;
+        }
         const cb = ackListeners.current.get(msg.action as string);
         if (cb) {
           const keepConfirmationListener =
@@ -164,17 +177,48 @@ export function useWebSocket(getToken: () => string | null): WebSocketHandle {
         }
       } else if (msg.type === "rpc.request") {
         void handleRpcRequest(ws, msg as unknown as WsRpcRequest);
+      } else if (msg.type === "error") {
+        const pending = pendingRun.current;
+        if (
+          pending &&
+          msg.action === "agent.run" &&
+          msg.requestId === pending.requestId
+        ) {
+          pendingRun.current = null;
+          pending.onError?.(
+            new Error(
+              typeof msg.message === "string"
+                ? msg.message
+                : "Agent 启动失败。",
+            ),
+          );
+        } else if (
+          typeof msg.action === "string" &&
+          msg.action !== "agent.run"
+        ) {
+          const callback = ackListeners.current.get(msg.action);
+          ackListeners.current.delete(msg.action);
+          callback?.({
+            type: "command.ack",
+            action: msg.action,
+            payload: { status: "failed", code: msg.code, message: msg.message },
+          });
+        }
       }
       // Unknown message types are silently ignored -- server may add new types
     };
 
     ws.onclose = (event) => {
+      if (wsRef.current !== ws) return;
+      const pending = pendingRun.current;
+      pendingRun.current = null;
+      pending?.onError?.(
+        new Error("连接已断开，正在重新连接。请先检查任务状态，避免重复提交。"),
+      );
       // Only handle close for the CURRENT connection.
       // React Strict Mode creates two connections; when the server replaces
       // the old one, its close event fires after remount resets disposed=false.
       // Without this guard, we'd enter a reconnect loop.
-      if (wsRef.current !== ws) return;
-
       setConnected(false);
       wsRef.current = null;
 
@@ -244,7 +288,11 @@ export function useWebSocket(getToken: () => string | null): WebSocketHandle {
   }, [connect]);
 
   const sendCommand = useCallback(
-    (action: string, payload: Record<string, unknown>): boolean => {
+    (
+      action: string,
+      payload: Record<string, unknown>,
+      requestId?: string,
+    ): boolean => {
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         console.warn(
@@ -254,7 +302,15 @@ export function useWebSocket(getToken: () => string | null): WebSocketHandle {
         return false;
       }
       try {
-        ws.send(JSON.stringify({ type: "command", action, payload }));
+        ws.send(
+          JSON.stringify({
+            type: "command",
+            action,
+            payload,
+            accessToken: getToken(),
+            ...(requestId ? { requestId } : {}),
+          }),
+        );
         return true;
       } catch (err) {
         // Guard against serialization errors (e.g. circular refs in payload)
@@ -262,22 +318,39 @@ export function useWebSocket(getToken: () => string | null): WebSocketHandle {
         return false;
       }
     },
-    [],
+    [getToken],
   );
 
   const startRun = useCallback(
-    (payload: RunCreateRequest, onAck?: (ack: WsCommandAck) => void) => {
-      if (onAck) {
-        ackListeners.current.set("agent.run", onAck);
+    (
+      payload: RunCreateRequest,
+      onAck?: (ack: WsCommandAck) => void,
+      onError?: (error: Error) => void,
+    ) => {
+      if (pendingRun.current) {
+        onError?.(new Error("上一条请求仍在启动，请稍候。"));
+        return;
       }
+      const requestId = crypto.randomUUID();
+      pendingRun.current = {
+        requestId,
+        ...(onAck ? { onAck } : {}),
+        ...(onError ? { onError } : {}),
+      };
       const sent = sendCommand(
         "agent.run",
         payload as unknown as Record<string, unknown>,
+        requestId,
       );
       if (!sent) {
         // Remove the dangling ack listener so callers don't hang forever
-        ackListeners.current.delete("agent.run");
+        pendingRun.current = null;
+        onError?.(new Error("连接尚未就绪，请等待重新连接后再发送。"));
       }
+      return () => {
+        if (pendingRun.current?.requestId === requestId)
+          pendingRun.current = null;
+      };
     },
     [sendCommand],
   );

@@ -1,3 +1,4 @@
+import { isUuid } from "@loomic/shared";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import { sanitizeErrorForClient } from "../../utils/error-sanitizer.js";
 import type {
@@ -44,11 +45,26 @@ export function createAgentRunMetadataService(options: {
 }): AgentRunMetadataService {
   return {
     async createAcceptedRun(input) {
+      if (!input.requestMessageId && input.prompt !== undefined) {
+        const { error } = await (options.getAdminClient() as any).rpc("loomic_create_run_with_request", {
+          p_run: input.runId, p_session: input.sessionId, p_created_by: input.createdBy ?? null,
+          p_thread: input.threadId, p_model: input.model ?? null,
+          p_execution_mode: input.executionMode ?? "fast", p_prompt: input.prompt,
+        });
+        if (error) throw new AgentRunPersistenceError("Failed to persist accepted run and request.");
+        return;
+      }
       const { error } = await (options.getAdminClient().from("agent_runs") as any).insert({
         created_by: input.createdBy ?? null,
         execution_mode: input.executionMode ?? "fast",
         id: input.runId,
         model: input.model ?? null,
+        ...(input.requestMessageId
+          ? {
+              request_message_id: input.requestMessageId,
+              request_prompt: input.prompt ?? null,
+            }
+          : {}),
         session_id: input.sessionId,
         status: "accepted",
         thread_id: input.threadId,
@@ -197,7 +213,7 @@ function mapRunSummary(row: Record<string, unknown>, toolCounts: AgentRunToolCou
       ? {
           code: errorCode,
           message: errorMessage
-            ? sanitizeErrorForClient(new Error(errorMessage)).slice(0, 500)
+            ? sanitizeErrorForClient(Object.assign(new Error(errorMessage), { code: errorCode })).slice(0, 500)
             : null,
         }
       : null,
@@ -232,7 +248,7 @@ function decodeCursor(value: string): { createdAt: string; id: string } {
       typeof parsed.createdAt !== "string" ||
       !Number.isFinite(parsedDate.getTime()) ||
       typeof parsed.id !== "string" ||
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed.id)
+      !isUuid(parsed.id)
     ) throw new Error("invalid");
     return { createdAt: parsedDate.toISOString(), id: parsed.id };
   } catch {

@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "bundle": "loomic-design-skills-v2",
+  "skills": [
+    "background-removal",
+    "campaign-design",
+    "creative-directions",
+    "design-copywriting",
+    "design-review",
+    "game-promo-visuals",
+    "gpt-image-2-style-library",
+    "image-layer-separation",
+    "json-image-prompt",
+    "logo-design",
+    "nonstandard-image-size",
+    "product-visual",
+    "reference-analysis",
+    "series-visual-design",
+    "social-carousel"
+  ]
+}

@@ -13,6 +13,7 @@ export type BlankDesignInput = {
   height: number;
   background: string | null;
   templateId?: string;
+  name?: string;
 };
 
 type DesignCreatePanelProps = {
@@ -93,7 +94,7 @@ export function DesignCreatePanel({
         width: parsedWidth,
         height: parsedHeight,
         background: transparent ? null : background,
-        ...(selectedTemplate ? { templateId: selectedTemplate.id } : {}),
+        ...(selectedTemplate ? { templateId: selectedTemplate.id, name: selectedTemplate.name } : {}),
       });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "创建设计失败，请重试");

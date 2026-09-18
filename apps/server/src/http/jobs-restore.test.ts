@@ -35,6 +35,7 @@ function makeJob(overrides: Record<string, unknown> = {}) {
     workspace_id: ids.workspace,
     project_id: null,
     canvas_id: ids.canvas,
+    target_kind: "canvas",
     session_id: null,
     thread_id: null,
     queue_name: "image_generation_jobs",
@@ -48,6 +49,7 @@ function makeJob(overrides: Record<string, unknown> = {}) {
       width: 1024,
       height: 1024,
       mime_type: "image/png",
+      canvas_element_id: "legacy-image-element",
     },
     error_code: null,
     error_message: null,
@@ -64,7 +66,10 @@ function makeJob(overrides: Record<string, unknown> = {}) {
   };
 }
 
-async function createApp(job: ReturnType<typeof makeJob>) {
+async function createApp(
+  job: ReturnType<typeof makeJob>,
+  targetFinalization: Record<string, unknown> | null = null,
+) {
   const app = Fastify();
   const assetId =
     (job.result as Record<string, unknown> | null)?.asset_id ??
@@ -104,7 +109,7 @@ async function createApp(job: ReturnType<typeof makeJob>) {
     viewerService: { ensureViewer: vi.fn() } as never,
     jobService: {
       getJob: vi.fn(async () => job),
-      getTargetFinalization: vi.fn(async () => null),
+      getTargetFinalization: vi.fn(async () => targetFinalization),
     } as never,
     createUserClient: vi.fn(() => client as never),
   });
@@ -206,9 +211,72 @@ describe("POST /api/jobs/:jobId/restore-to-canvas", () => {
         canvasId: ids.canvas,
         sourceJobId: ids.job,
         objectPath: "workspace/generated/image.png",
+        rejectDeletedSourceJob: true,
+        knownElementId: "legacy-image-element",
       }),
     );
   });
+
+  it("maps a deleted canvas result to an explicit conflict response", async () => {
+    insertImageElementMock.mockRejectedValueOnce(Object.assign(
+      new Error("deleted canvas result"),
+      { code: "canvas_result_deleted" },
+    ));
+    const app = await createApp(makeJob());
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/jobs/${ids.job}/restore-to-canvas`,
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({
+      error: {
+        code: "canvas_result_deleted",
+        message: "该生成结果此前已从画布删除，不能恢复。",
+      },
+    });
+  });
+
+  it.each([
+    [
+      "completed",
+      "design_job_already_applied",
+      "已经应用到原生设计",
+    ],
+    [
+      "needs_attention",
+      "design_job_requires_attention",
+      "没有应用到原生设计",
+    ],
+  ])(
+    "never restores a %s design-target image as a top-level canvas element",
+    async (finalizationStatus, code, message) => {
+      const app = await createApp(
+        makeJob({
+          target_kind: "design",
+          design_id: "00000000-0000-4000-8000-000000000005",
+          // Keep a historical canvas binding to prove target_kind wins over it.
+          canvas_id: ids.canvas,
+        }),
+        { status: finalizationStatus },
+      );
+      apps.push(app);
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/jobs/${ids.job}/restore-to-canvas`,
+      });
+
+      expect(response.statusCode).toBe(409);
+      expect(response.json()).toMatchObject({
+        error: { code, message: expect.stringContaining(message) },
+      });
+      expect(insertImageElementMock).not.toHaveBeenCalled();
+      expect(insertVideoElementMock).not.toHaveBeenCalled();
+    },
+  );
 
   it("restores video results and preserves an idempotent duplicate response", async () => {
     insertVideoElementMock
@@ -247,7 +315,11 @@ describe("POST /api/jobs/:jobId/restore-to-canvas", () => {
     });
     expect(insertVideoElementMock).toHaveBeenLastCalledWith(
       expect.anything(),
-      expect.objectContaining({ sourceJobId: ids.job, durationSeconds: 8 }),
+      expect.objectContaining({
+        sourceJobId: ids.job,
+        durationSeconds: 8,
+        rejectDeletedSourceJob: true,
+      }),
     );
   });
 

@@ -1,14 +1,15 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { WebSocketHandle } from "../src/hooks/use-websocket";
 import type { StreamEvent, WsCommandAck } from "@loomic/shared";
 import { ChatSidebar } from "../src/components/chat-sidebar";
-import { INITIAL_EXECUTION_MODE_KEY } from "../src/hooks/use-create-project";
+import { INITIAL_ATTACHMENTS_KEY, INITIAL_EXECUTION_MODE_KEY } from "../src/hooks/use-create-project";
+import { fetchModels, fetchWorkspaceSkills } from "../src/lib/server-api";
 
 const {
   createSessionMock,
@@ -130,6 +131,11 @@ describe("ChatSidebar", () => {
       value: vi.fn(),
       writable: true,
     });
+    Object.defineProperty(Element.prototype, "scrollTo", {
+      configurable: true,
+      value: vi.fn(),
+      writable: true,
+    });
     mockWs = createMockWs();
     createSessionMock.mockReset();
     createSessionMock.mockResolvedValue({
@@ -158,11 +164,58 @@ describe("ChatSidebar", () => {
     updateSessionTitleMock.mockResolvedValue(undefined);
     fetchSessionRunsMock.mockReset();
     fetchSessionRunsMock.mockResolvedValue({ runs: [], nextCursor: null });
+    vi.mocked(fetchWorkspaceSkills).mockResolvedValue({ skills: [] });
   });
 
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+  });
+
+  it("selects a skill into the existing composer draft without starting a run", async () => {
+    vi.mocked(fetchWorkspaceSkills).mockResolvedValue({
+      skills: [{
+        id: "poster-skill", slug: "campaign-design", name: "活动海报与宣传图", description: "设计海报",
+        installed: true, enabled: true, metadata: {}, readiness: { status: "ready", reasons: [], models: [] },
+      }],
+    } as never);
+    render(<ChatSidebar accessToken="token_abc" canvasId="canvas-1" open onToggle={() => {}} ws={mockWs} />);
+    const composer = await screen.findByRole("textbox", { name: "输入消息" });
+    fireEvent.change(composer, { target: { value: "保留这段目标" } });
+
+    await userEvent.click(await screen.findByRole("button", { name: "活动海报与宣传图" }));
+
+    expect(composer).toHaveValue("请使用「活动海报与宣传图」技能协助我。\n\n保留这段目标");
+    expect(mockWs.startRun).not.toHaveBeenCalled();
+  });
+
+  it("resends an inline edit with the original references, preserves history and composer draft", async () => {
+    fetchMessagesMock.mockResolvedValue({ messages: [{ id: "original-user", role: "user", content: "原始请求", contentBlocks: [
+      { type: "text", text: "原始请求" },
+      { type: "image", assetId: "old-image", url: "https://example.com/original.png", mimeType: "image/png", source: "upload", name: "Original" },
+      { type: "mention", mentionType: "image-model", id: "workspace:original-model", label: "gpt-image-2" },
+    ] }] });
+    render(<ChatSidebar accessToken="token_abc" canvasId="canvas-1" open onToggle={() => {}} ws={mockWs} />);
+    await screen.findByText("原始请求");
+    const composer = screen.getByRole("textbox");
+    fireEvent.change(composer, { target: { value: "未发送的草稿" } });
+    fireEvent.click(screen.getByRole("button", { name: "编辑消息" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "编辑消息" }), { target: { value: "修改尺寸为800*600" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送编辑后的消息" }));
+    await waitFor(() => expect(mockWs.startRun).toHaveBeenCalledOnce());
+    expect(mockWs.startRun).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: "修改尺寸为800*600", sessionId: "session-real",
+      attachments: [expect.objectContaining({ assetId: "old-image" })],
+      imageGenerationPreference: { mode: "manual", models: ["workspace:original-model"] },
+      mentions: [expect.objectContaining({ id: "workspace:original-model" })],
+    }), expect.any(Function), expect.any(Function));
+    await act(async () => streamListener?.({ type: "run.completed", runId: "run_123", timestamp: new Date().toISOString() }));
+    await waitFor(() => expect(screen.queryByRole("textbox", { name: "编辑消息" })).not.toBeInTheDocument());
+    expect(screen.getByText("原始请求")).toBeInTheDocument();
+    expect(composer).toHaveValue("未发送的草稿");
+    expect(Element.prototype.scrollTo).toHaveBeenCalledWith(expect.objectContaining({ behavior: "smooth" }));
+    expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();
+    expect(saveMessageMock).toHaveBeenCalledWith("token_abc", "session-real", expect.objectContaining({ content: "修改尺寸为800*600" }));
   });
 
   it("starts runs via WebSocket with the active real session id", async () => {
@@ -189,15 +242,145 @@ describe("ChatSidebar", () => {
           executionMode: "thinking",
         }),
         expect.any(Function),
+        expect.any(Function),
       ),
     );
+    const savedMessageId = saveMessageMock.mock.calls[0]![2].id;
+    expect(savedMessageId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(vi.mocked(mockWs.startRun).mock.calls[0]![0].userMessageId).toBe(savedMessageId);
     expect(screen.queryByLabelText("执行模式")).not.toBeInTheDocument();
     expect(mockWs.startRun).not.toHaveBeenCalledWith(
       expect.objectContaining({
         sessionId: "session-canvas-1",
       }),
       expect.anything(),
+      expect.any(Function),
     );
+  });
+
+  it("does not start a run when the authoritative user message cannot be saved", async () => {
+    saveMessageMock.mockRejectedValueOnce(new Error("message persistence unavailable"));
+    render(<ChatSidebar accessToken="token_abc" canvasId="canvas-1" open onToggle={() => {}} ws={mockWs} />);
+    await userEvent.type(screen.getByRole("textbox"), "确认生成{Enter}");
+    await waitFor(() => expect(saveMessageMock).toHaveBeenCalledOnce());
+    expect(mockWs.startRun).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送消息" })).toBeInTheDocument());
+  });
+
+  it("waits for the authoritative message save before starting the run", async () => {
+    let resolveSave!: (value: undefined) => void;
+    saveMessageMock.mockReturnValueOnce(new Promise<undefined>((resolve) => { resolveSave = resolve; }));
+    render(<ChatSidebar accessToken="token_abc" canvasId="canvas-1" open onToggle={() => {}} ws={mockWs} />);
+    await userEvent.type(screen.getByRole("textbox"), "先保存再运行");
+    fireEvent.click(screen.getByRole("button", { name: "发送消息" }));
+    await waitFor(() => expect(saveMessageMock).toHaveBeenCalledOnce());
+    expect(mockWs.startRun).not.toHaveBeenCalled();
+    await act(async () => resolveSave(undefined));
+    await waitFor(() => expect(mockWs.startRun).toHaveBeenCalledOnce());
+  });
+
+  it("blocks a rapid second send while the first message save is pending", async () => {
+    let resolveSave!: (value: undefined) => void;
+    saveMessageMock.mockReturnValueOnce(new Promise<undefined>((resolve) => { resolveSave = resolve; }));
+    render(<ChatSidebar accessToken="token_abc" canvasId="canvas-1" open onToggle={() => {}} ws={mockWs} />);
+    await userEvent.type(screen.getByRole("textbox"), "只发送一次");
+    const send = screen.getByRole("button", { name: "发送消息" });
+    act(() => {
+      fireEvent.click(send);
+      fireEvent.click(send);
+    });
+    await waitFor(() => expect(saveMessageMock).toHaveBeenCalledOnce());
+    expect(mockWs.startRun).not.toHaveBeenCalled();
+    await act(async () => resolveSave(undefined));
+    await waitFor(() => expect(mockWs.startRun).toHaveBeenCalledOnce());
+    expect(saveMessageMock).toHaveBeenCalledOnce();
+  });
+
+  it("shows the server startup rejection immediately and releases the input", async () => {
+    vi.mocked(mockWs.startRun).mockImplementation((_payload, _ack, onError) => {
+      onError?.(new Error("The selected text model is not available in this workspace."));
+    });
+    render(<ChatSidebar accessToken="token_abc" canvasId="canvas-1" open onToggle={() => {}} ws={mockWs} />);
+    await userEvent.type(screen.getByRole("textbox"), "黑色背景改为绿色");
+    await userEvent.click(screen.getByRole("button", { name: "发送消息" }));
+    expect(await screen.findByText(/当前选择的 Agent 模型不可用/)).toBeInTheDocument();
+    expect(screen.queryByText("Failed to get response.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "发送消息" })).toBeInTheDocument();
+  });
+
+  it("captures native canvas selection at send time rather than trusting the cached sidebar selection", async () => {
+    const onRequestCanvasSelection = vi.fn(() => ({ elementIds: ["actual-text"] }));
+    render(<ChatSidebar accessToken="token_abc" canvasId="canvas-1" open onToggle={() => {}} ws={mockWs}
+      selectedCanvasElements={[{ id: "cached-text", type: "text", x: 0, y: 0, width: 100, height: 30 }]}
+      onRequestCanvasSelection={onRequestCanvasSelection} />);
+    await userEvent.type(screen.getByRole("textbox"), "选中的文字改短一点{Enter}");
+    await waitFor(() => expect(mockWs.startRun).toHaveBeenCalledOnce());
+    const payload = vi.mocked(mockWs.startRun).mock.calls[0]![0];
+    expect(onRequestCanvasSelection).toHaveBeenCalledExactlyOnceWith("canvas-1");
+    expect(payload.canvasSelection).toEqual({ elementIds: ["actual-text"] });
+    expect(screen.queryByRole("region", { name: "当前需求" })).not.toBeInTheDocument();
+  });
+
+  it("sends an empty native selection when no current editor is available without guessing from cached props", async () => {
+    render(<ChatSidebar accessToken="token_abc" canvasId="canvas-1" open onToggle={() => {}} ws={mockWs}
+      selectedCanvasElements={[{ id: "stale-text", type: "text", x: 0, y: 0, width: 100, height: 30 }]} />);
+    await userEvent.type(screen.getByRole("textbox"), "聊聊文案{Enter}");
+    await waitFor(() => expect(mockWs.startRun).toHaveBeenCalledOnce());
+    expect(vi.mocked(mockWs.startRun).mock.calls[0]![0].canvasSelection).toEqual({ elementIds: [] });
+    expect(screen.queryByRole("region", { name: "当前需求" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the transmitted selection immutable while an ACK is pending", async () => {
+    mockWs = createMockWs({ deferAck: true });
+    const elementIds = ["first-text"];
+    const onRequestCanvasSelection = vi.fn(() => ({ elementIds }));
+    const props = { accessToken: "token_abc", canvasId: "canvas-1", open: true, onToggle: () => {}, ws: mockWs, onRequestCanvasSelection };
+    const { rerender } = render(<ChatSidebar {...props} />);
+    await userEvent.type(screen.getByRole("textbox"), "修改这段文字{Enter}");
+    await waitFor(() => expect(mockWs.startRun).toHaveBeenCalledOnce());
+    elementIds.splice(0, 1, "later-selected-text");
+    rerender(<ChatSidebar {...props} selectedCanvasElements={[{ id: "later-selected-text", type: "text", x: 0, y: 0, width: 100, height: 30 }]} />);
+    expect(vi.mocked(mockWs.startRun).mock.calls[0]![0].canvasSelection).toEqual({ elementIds: ["first-text"] });
+    expect(onRequestCanvasSelection).toHaveBeenCalledOnce();
+  });
+
+  it("does not bind an open editor without an explicit target selection", async () => {
+    const onRequestCanvasSelection = vi.fn(() => ({ elementIds: ["unrelated-text"] }));
+    render(<ChatSidebar accessToken="token_abc" canvasId="canvas-1" open onToggle={() => {}} ws={mockWs}
+      activeDesignId="11111111-1111-4111-8111-111111111111" onRequestCanvasSelection={onRequestCanvasSelection} />);
+    await userEvent.type(screen.getByRole("textbox"), "修改设计标题{Enter}");
+    await waitFor(() => expect(mockWs.startRun).toHaveBeenCalledOnce());
+    expect(vi.mocked(mockWs.startRun).mock.calls[0]![0]).toEqual(expect.objectContaining({
+      canvasSelection: { elementIds: ["unrelated-text"] },
+    }));
+    expect(onRequestCanvasSelection).toHaveBeenCalledOnce();
+  });
+
+  it("releases a disconnected send when the run finished before reconnect", async () => {
+    const props = { accessToken: "token_abc", canvasId: "canvas-1", open: true, onToggle: () => {} };
+    const { rerender } = render(<ChatSidebar {...props} ws={mockWs} />);
+    await userEvent.type(screen.getByRole("textbox"), "生成图片");
+    await userEvent.click(screen.getByRole("button", { name: "发送消息" }));
+    await waitFor(() => expect(mockWs.startRun).toHaveBeenCalledOnce());
+    const beforeDisconnect = streamListener;
+    rerender(<ChatSidebar {...props} ws={{ ...mockWs, connected: false }} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送消息" })).toBeInTheDocument());
+    expect(streamListener).not.toBe(beforeDisconnect);
+    vi.mocked(mockWs.resumeCanvas).mockImplementation((_id, ack) => ack?.({ type: "command.ack", action: "canvas.resume", payload: { activeRunId: null } }));
+    rerender(<ChatSidebar {...props} ws={mockWs} />);
+    await waitFor(() => expect(mockWs.resumeCanvas).toHaveBeenCalled());
+    expect(mockWs.startRun).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "发送消息" })).toBeInTheDocument();
+  });
+
+  it("never inserts a completed design image again as a loose canvas image", async () => {
+    const onImageGenerated = vi.fn();
+    render(<ChatSidebar accessToken="token_abc" canvasId="canvas-1" open onToggle={() => {}} ws={mockWs} onImageGenerated={onImageGenerated} />);
+    await userEvent.type(screen.getByRole("textbox"), "生成主体");
+    await userEvent.click(screen.getByRole("button", { name: "发送消息" }));
+    await waitFor(() => expect(mockWs.startRun).toHaveBeenCalledOnce());
+    streamListener?.({ type: "tool.completed", runId: "run_123", toolCallId: "tool", toolName: "confirm_image_generation", timestamp: "2026-09-08T00:00:00Z", output: { design_id: "design", status: "succeeded" }, artifacts: [{ type: "image", url: "https://example.test/image.png", mimeType: "image/png", width: 512, height: 512 }] });
+    expect(onImageGenerated).not.toHaveBeenCalled();
   });
 
   it("runs an explicit selected-image toolbar command with its attachment", async () => {
@@ -233,6 +416,7 @@ describe("ChatSidebar", () => {
             }),
           ],
         }),
+        expect.any(Function),
         expect.any(Function),
       ),
     );
@@ -328,6 +512,7 @@ describe("ChatSidebar", () => {
           sessionId: "session-old",
           prompt: "继续旧对话",
         }),
+        expect.any(Function),
         expect.any(Function),
       ),
     );
@@ -446,86 +631,6 @@ describe("ChatSidebar", () => {
     });
   });
 
-  it("requires review of the frozen image proposal and sends its exact ID through a session-bound run", async () => {
-    fetchMessagesMock.mockResolvedValue({
-      messages: [
-        {
-          id: "approval-message",
-          role: "user",
-          content: "可以",
-          contentBlocks: [{ type: "text", text: "可以" }],
-          createdAt: "2026-03-24T00:00:00.000Z",
-        },
-        {
-          id: "structured-proposal",
-          role: "assistant",
-          content: "方案已经冻结，请确认生成。",
-          contentBlocks: [
-            { type: "text", text: "方案已经冻结，请确认生成。" },
-            {
-              type: "tool",
-              toolCallId: "tool-generate",
-              toolName: "generate_image",
-              status: "completed",
-              output: {
-                status: "awaiting_confirmation",
-                confirmation: {
-                  confirmationId: "confirmation-1",
-                  kind: "image_generation",
-                  targets: [],
-                },
-              },
-            },
-          ],
-          createdAt: "2026-03-24T00:00:01.000Z",
-        },
-      ],
-    });
-    const onCanvasSync = vi.fn();
-
-    render(
-      <ChatSidebar
-        accessToken="token_abc"
-        canvasId="canvas-1"
-        open
-        onToggle={() => {}}
-        onCanvasSync={onCanvasSync}
-        ws={mockWs}
-      />,
-    );
-
-    expect(
-      await screen.findByRole("heading", { name: "确认设计方案" }),
-    ).toBeInTheDocument();
-    expect(mockWs.startRun).not.toHaveBeenCalled();
-    await userEvent.click(
-      screen.getByRole("button", { name: /确认方案，继续生成/ }),
-    );
-    await waitFor(() =>
-      expect(mockWs.startRun).toHaveBeenCalledWith(
-        expect.objectContaining({
-          prompt: "确认生成",
-          imageConfirmation: {
-            confirmationId: "confirmation-1",
-            decision: "confirm",
-          },
-        }),
-        expect.any(Function),
-      ),
-    );
-    expect(mockWs.confirmAction).not.toHaveBeenCalled();
-    streamListener?.({
-      type: "run.completed",
-      runId: "run_123",
-      timestamp: new Date().toISOString(),
-    });
-    await waitFor(() =>
-      expect(
-        screen.queryByRole("heading", { name: "确认设计方案" }),
-      ).not.toBeInTheDocument(),
-    );
-  });
-
   it("confirms a design template inline without showing an image generation placeholder", async () => {
     fetchMessagesMock.mockResolvedValue({
       messages: [
@@ -612,6 +717,7 @@ describe("ChatSidebar", () => {
       expect(mockWs.startRun).toHaveBeenCalledWith(
         expect.objectContaining({ executionMode: "thinking" }),
         expect.any(Function),
+        expect.any(Function),
       ),
     );
   });
@@ -635,6 +741,7 @@ describe("ChatSidebar", () => {
           prompt: "design a poster",
           executionMode: "thinking",
         }),
+        expect.any(Function),
         expect.any(Function),
       ),
     );
@@ -706,7 +813,7 @@ describe("ChatSidebar", () => {
       onAck?.({
         type: "command.ack",
         action: "canvas.resume",
-        payload: { activeRunId: "run_resumed" },
+        payload: { activeRunId: "run_resumed", activeSessionId: "session-real" },
       });
     });
     render(
@@ -738,6 +845,7 @@ describe("ChatSidebar", () => {
         ws={mockWs}
         activeDesignId="20000000-0000-4000-8000-000000000001"
         beforeDesignSend={save}
+        selectedCanvasElements={[{ id: "title", type: "text", designId: "20000000-0000-4000-8000-000000000001", x: 0, y: 0, width: 100, height: 30 }]}
       />,
     );
     const input = await screen.findByPlaceholderText(/start with an idea/i);
@@ -761,6 +869,7 @@ describe("ChatSidebar", () => {
         beforeDesignSend={async () => {
           throw new Error("先处理画板冲突");
         }}
+        selectedCanvasElements={[{ id: "title", type: "text", designId: "20000000-0000-4000-8000-000000000001", x: 0, y: 0, width: 100, height: 30 }]}
       />,
     );
     const input = await screen.findByPlaceholderText(/start with an idea/i);
@@ -769,6 +878,75 @@ describe("ChatSidebar", () => {
       expect(screen.getByText(/先处理画板冲突/)).toBeInTheDocument(),
     );
     expect(mockWs.startRun).not.toHaveBeenCalled();
+  });
+
+  it("keeps an ordinary image request unbound while an editor is open", async () => {
+    render(<ChatSidebar accessToken="token_abc" canvasId="canvas-1" open onToggle={() => {}} ws={mockWs} activeDesignId="new-design" />);
+    await screen.findByRole("textbox", { name: "输入消息" });
+    expect(screen.queryByRole("button", { name: "退出补充/纠正" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "补充纠正状态" })).not.toBeInTheDocument();
+    await userEvent.type(screen.getByRole("textbox", { name: "输入消息" }), "生成一张夕阳下的猫咪插画{Enter}");
+    await waitFor(() => expect(mockWs.startRun).toHaveBeenCalledOnce());
+    expect(vi.mocked(mockWs.startRun).mock.calls[0]![0]).not.toHaveProperty("activeDesignId");
+  });
+
+  it("does not fall back to a historic or open board for an explicit uploaded image", async () => {
+    sessionStorage.setItem(INITIAL_ATTACHMENTS_KEY, JSON.stringify([{ assetId: "uploaded-image", url: "https://example.test/upload.png", mimeType: "image/png", source: "upload" }]));
+    render(<ChatSidebar accessToken="token_abc" canvasId="canvas-1" open onToggle={() => {}} ws={mockWs} activeDesignId="open-design" initialPrompt="只分析刚上传的图片" />);
+    await waitFor(() => expect(mockWs.startRun).toHaveBeenCalledOnce());
+    const payload = vi.mocked(mockWs.startRun).mock.calls[0]![0];
+    expect(payload.attachments).toEqual([expect.objectContaining({ assetId: "uploaded-image", source: "upload" })]);
+    expect(payload).not.toHaveProperty("canvasSelection");
+    expect(payload).not.toHaveProperty("activeDesignId");
+  });
+
+  it("never reattaches a just-completed run returned by a racing resume response", async () => {
+    render(<ChatSidebar accessToken="token_abc" canvasId="canvas-1" open onToggle={() => {}} ws={mockWs} />);
+    await userEvent.type(await screen.findByRole("textbox", { name: "输入消息" }), "普通咨询{Enter}");
+    vi.mocked(mockWs.resumeCanvas).mockImplementation((_canvas, ack) => ack?.({ type: "command.ack", action: "canvas.resume", payload: { activeRunId: "run_123", activeSessionId: "session-real" } }));
+    const initialResumes = vi.mocked(mockWs.resumeCanvas).mock.calls.length;
+    act(() => streamListener?.({ type: "run.completed", runId: "run_123", timestamp: "2026-09-09T00:00:00Z" }));
+    await waitFor(() => expect(mockWs.resumeCanvas).toHaveBeenCalledTimes(initialResumes + 2));
+    expect(screen.queryByRole("button", { name: "停止生成" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "发送消息" })).toBeInTheDocument();
+  });
+
+  it.each(["other-session", null, undefined])("refuses resumed runs without matching conversation identity (%s)", async activeSessionId => {
+    vi.mocked(mockWs.resumeCanvas).mockImplementation((_canvas, ack) => ack?.({ type: "command.ack", action: "canvas.resume", payload: { activeRunId: "foreign-run", activeSessionId } }));
+    render(<ChatSidebar accessToken="token_abc" canvasId="canvas-1" open onToggle={() => {}} ws={mockWs} />);
+    await waitFor(() => expect(mockWs.resumeCanvas).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "停止生成" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "补充纠正状态" })).not.toBeInTheDocument();
+    expect(mockWs.onEvent).not.toHaveBeenCalled();
+    expect(mockWs.cancelRun).not.toHaveBeenCalled();
+  });
+
+  it("keeps the submitted design scope when selection changes during save", async () => {
+    let finishSave: (() => void) | undefined;
+    const save = vi.fn(() => new Promise<void>((resolve) => { finishSave = resolve; }));
+    const props = { accessToken: "token_abc", canvasId: "canvas-1", open: true, onToggle: () => {}, ws: mockWs };
+    const originalDesignId = "10000000-0000-4000-8000-000000000001";
+    const selectedCanvasElements = [{ id: "title", type: "text", designId: originalDesignId, x: 0, y: 0, width: 100, height: 30 }];
+    const { rerender } = render(<ChatSidebar {...props} activeDesignId={originalDesignId} beforeDesignSend={save} selectedCanvasElements={selectedCanvasElements} />);
+    await userEvent.type(await screen.findByRole("textbox", { name: "输入消息" }), "更新标题{Enter}");
+    await waitFor(() => expect(save).toHaveBeenCalledOnce());
+    rerender(<ChatSidebar {...props} activeDesignId="20000000-0000-4000-8000-000000000002" selectedCanvasElements={selectedCanvasElements} />);
+    await act(async () => { finishSave?.(); });
+    await waitFor(() => expect(mockWs.startRun).toHaveBeenCalled());
+    expect(vi.mocked(mockWs.startRun).mock.calls[0]![0]).toMatchObject({
+      activeDesignId: originalDesignId,
+    });
+  });
+
+  it("binds a selected unopened design artboard", async () => {
+    const designId = "10000000-0000-4000-8000-000000000001";
+    render(<ChatSidebar accessToken="token_abc" canvasId="canvas-1" open onToggle={() => {}} ws={mockWs}
+      selectedCanvasElements={[{ id: "board-element", type: "rectangle", designId, x: 0, y: 0, width: 100, height: 100 }]} />);
+    await userEvent.type(await screen.findByRole("textbox", { name: "输入消息" }), "改标题{Enter}");
+    await waitFor(() => expect(mockWs.startRun).toHaveBeenCalled());
+    expect(vi.mocked(mockWs.startRun).mock.calls[0]![0]).toMatchObject({
+      activeDesignId: designId,
+    });
   });
 
   it("keeps a new conversation empty when the previous run emits late events", async () => {

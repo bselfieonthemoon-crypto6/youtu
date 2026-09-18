@@ -15,14 +15,14 @@ export const IMAGE_TOOLBAR_ACTIONS: ReadonlyArray<{
   { id: "crop", label: "裁剪", available: true },
   { id: "upscale", label: "高清", available: true },
   { id: "remove-background", label: "去除背景", available: true },
-  { id: "region-matting", label: "框选抠图", available: true },
   { id: "split-layers", label: "图层拆分", available: true },
   { id: "add-to-chat", label: "添加到对话", available: true },
   { id: "details", label: "详细信息", available: true },
   { id: "download", label: "下载", available: true },
   { id: "edit-region", label: "框选编辑", available: false },
   { id: "panorama", label: "生成全景图", available: false },
-  { id: "erase", label: "橡皮", available: true },
+  { id: "erase", label: "局部重绘", available: true },
+  { id: "outpaint", label: "扩图", available: true },
 ] as const;
 
 export type ImageToolbarPreferences = {

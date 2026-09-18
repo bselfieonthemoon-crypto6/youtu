@@ -1,20 +1,25 @@
 import type { ProviderSnapshotService } from "../features/providers/index.js";
-import { OpenAICompatibleChatModel } from "./openai-compatible-chat-model.js";
+import { resolveKnownContextModelProfile } from "./context-budget.js";
+import { type WorkspaceVisionModel, createWorkspaceVisionModel } from "./workspace-vision-model.js";
 
 export async function resolveWorkspaceChatModel(input: {
   modelRef: string;
   providerSnapshotService: ProviderSnapshotService;
   runId: string;
   workspaceId: string;
-}) {
-  let snapshot;
-  try {
-    snapshot = await input.providerSnapshotService.resolveRunSnapshot({
-      workspaceId: input.workspaceId,
-      runId: input.runId,
-    });
-  } catch {
-    throw workspaceModelError();
+  /** Already-resolved snapshot for this run; avoids a second provider RPC. */
+  snapshot?: Awaited<ReturnType<ProviderSnapshotService["resolveRunSnapshot"]>>;
+}): Promise<WorkspaceVisionModel> {
+  let snapshot = input.snapshot;
+  if (!snapshot) {
+    try {
+      snapshot = await input.providerSnapshotService.resolveRunSnapshot({
+        workspaceId: input.workspaceId,
+        runId: input.runId,
+      });
+    } catch {
+      throw workspaceModelError();
+    }
   }
   if (
     snapshot.modality !== "text" ||
@@ -23,13 +28,17 @@ export async function resolveWorkspaceChatModel(input: {
   ) {
     throw workspaceModelError();
   }
-  return new OpenAICompatibleChatModel({
-    model: snapshot.upstreamModelId,
-    apiKey: snapshot.apiKey,
-    configuration: { baseURL: snapshot.baseUrl },
-    streaming: true,
-    streamUsage: false,
-  });
+  try {
+    const contextProfile = snapshot.contextProfile ?? resolveKnownContextModelProfile(snapshot.upstreamModelId, snapshot.baseUrl);
+    return createWorkspaceVisionModel({
+      apiKey: snapshot.apiKey,
+      baseUrl: snapshot.baseUrl,
+      upstreamModelId: snapshot.upstreamModelId,
+      ...(contextProfile ? { contextProfile } : {}),
+    });
+  } catch {
+    throw workspaceModelError();
+  }
 }
 
 function workspaceModelError() {

@@ -54,11 +54,12 @@ describe("ImageActionDialog", () => {
     expect(popover).not.toBeNull();
     expect(screen.queryByRole("dialog")).toBeNull();
     expect((popover as HTMLElement).style.left).toBe("356px");
-    expect(screen.getByText(/是否将图片从/).textContent).toContain(
-      "1024 × 584px 提升为 2048 × 1168px（2K）",
-    );
+    expect(screen.getByText(/提升分辨率/).textContent).toContain("保持原图比例");
     expect(screen.queryByRole("textbox")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "确认高清" }));
-    expect(onConfirm).toHaveBeenCalledWith(expect.stringContaining("2048×1168px"));
+    expect(onConfirm).toHaveBeenLastCalledWith(expect.stringContaining("2K 分辨率"), "hd");
+    fireEvent.change(screen.getByRole("combobox", { name: "高清分辨率" }), { target: { value: "ultra" } });
+    fireEvent.click(screen.getByRole("button", { name: "确认高清" }));
+    expect(onConfirm).toHaveBeenLastCalledWith(expect.stringContaining("4K 分辨率"), "ultra");
   });
 });

@@ -1,0 +1,16 @@
+import {mkdir,copyFile,writeFile} from 'node:fs/promises';
+import sharp from 'sharp';
+import assert from 'node:assert/strict';
+const out='../../artifacts/reference-fusion-320x70-20260915';
+await mkdir(out,{recursive:false});
+const input='C:/Users/lenovo/.codex/generated_images/01a05cc2-e6f6-7681-a19d-0830665ac6fd/exec-7a014a01-e0ca-43ef-9748-d384b0fe9e0b.png';
+await copyFile(input,`${out}/ai-original.png`);
+const source=await sharp(input).metadata();
+const fitted=await sharp(input).resize({height:70}).png().toBuffer();
+const fit=await sharp(fitted).metadata();
+assert(fit.width!<=320);
+await sharp({create:{width:320,height:70,channels:4,background:{r:0,g:0,b:0,alpha:0}}}).composite([{input:fitted,left:320-fit.width!,top:0}]).png().toFile(`${out}/result.png`);
+const result=await sharp(`${out}/result.png`).metadata();assert.equal(result.width,320);assert.equal(result.height,70);
+await writeFile(`${out}/report.json`,JSON.stringify({source:[source.width,source.height],output:[320,70],fitted:[fit.width,fit.height],leftTransparentPadding:320-fit.width!,crop:false,stretch:false,separateSubjectComposite:false,generation:'built-in imagegen reference fusion'},null,2));
+await writeFile(`${out}/index.html`,'<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>参考图融合测试</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto}img{max-width:100%;height:auto;background:repeating-conic-gradient(#ddd 0% 25%,#fff 0% 50%) 0/16px 16px}</style><h1>参考图融合测试</h1><p>AI一次生成主体与背景，未单独叠加主体。主体细节有变化。原图较高，为保留完整皇冠和底座，仅等比缩小并靠右，左侧透明留边；没有裁切、拉伸。尺寸正确不代表满幅比例验证成功。</p><h2>320×70</h2><img src="result.png" width="320" height="70"><h2>AI原图</h2><img src="ai-original.png"><p><a href="result.png">下载320×70</a> · <a href="ai-original.png">下载AI原图</a> · <a href="prompt.txt">生成提示词</a> · <a href="report.json">尺寸报告</a></p></html>');
+console.log(JSON.stringify({source:[source.width,source.height],fitted:[fit.width,fit.height],leftPadding:320-fit.width!,out}));

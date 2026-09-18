@@ -40,6 +40,19 @@ const object = {
 afterEach(cleanup);
 
 describe("DesignPropertiesPanel", () => {
+  it("scales both dimensions live without compounding and rebases after external resize", () => {
+    const actions=actionSpies();
+    const view=render(<DesignPropertiesPanel selectedObjects={[object]} actions={actions}/>);
+    fireEvent.change(screen.getByRole("slider",{name:"对象等比缩放"}),{target:{value:"150"}});
+    expect(actions.updateObject).toHaveBeenLastCalledWith(object.objectId,{width:300,height:90});
+    view.rerender(<DesignPropertiesPanel selectedObjects={[{...object,width:300,height:90}]} actions={actions}/>);
+    fireEvent.change(screen.getByRole("slider",{name:"对象等比缩放"}),{target:{value:"50"}});
+    expect(actions.updateObject).toHaveBeenLastCalledWith(object.objectId,{width:100,height:30});
+    view.rerender(<DesignPropertiesPanel selectedObjects={[{...object,width:400,height:120}]} actions={actions}/>);
+    expect((screen.getByRole("slider",{name:"对象等比缩放"}) as HTMLInputElement).value).toBe("100");
+    fireEvent.change(screen.getByRole("slider",{name:"对象等比缩放"}),{target:{value:"50"}});
+    expect(actions.updateObject).toHaveBeenLastCalledWith(object.objectId,{width:200,height:60});
+  });
   it("commits numeric and text properties through the typed adapter", () => {
     const actions = actionSpies();
     render(
@@ -144,6 +157,59 @@ describe("DesignPropertiesPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: /组合/ }));
     expect(actions.align).toHaveBeenCalledWith("left");
     expect(actions.group).toHaveBeenCalledOnce();
+  });
+
+  it("configures object animations with bounded duration and amplitude", () => {
+    const actions = actionSpies();
+    render(
+      <DesignPropertiesPanel selectedObjects={[object]} actions={actions} />,
+    );
+
+    fireEvent.change(screen.getByLabelText("动画"), {
+      target: { value: "float" },
+    });
+    expect(actions.updateObject).toHaveBeenCalledWith(object.objectId, {
+      animation: { type: "float", durationMs: 2000, amount: 10 },
+    });
+    expect(screen.getByText(/可实时预览；退出编辑后也可在画布播放/)).toBeTruthy();
+    const control = vi.fn();
+    window.addEventListener("cromic:animation-control", control);
+    fireEvent.click(screen.getByRole("button", { name: "播放" }));
+    expect(control.mock.calls[0]?.[0].detail).toEqual({ objectId: object.objectId, action: "toggle" });
+    window.removeEventListener("cromic:animation-control", control);
+    act(() => window.dispatchEvent(new CustomEvent("cromic:animation-status", {
+      detail: { ids: [object.objectId], playing: true },
+    })));
+    expect(screen.getByRole("button", { name: "暂停" })).toBeTruthy();
+
+    const duration = screen.getByLabelText("动画时长（秒）");
+    fireEvent.change(duration, { target: { value: "20" } });
+    fireEvent.blur(duration);
+    const amount = screen.getByLabelText("动画幅度（像素）");
+    fireEvent.change(amount, { target: { value: "0" } });
+    fireEvent.blur(amount);
+
+    expect(actions.updateObject).toHaveBeenCalledWith(object.objectId, {
+      animation: { type: "float", durationMs: 10000, amount: 10 },
+    });
+    expect(actions.updateObject).toHaveBeenCalledWith(object.objectId, {
+      animation: { type: "float", durationMs: 10000, amount: 1 },
+    });
+
+    fireEvent.change(screen.getByLabelText("动画"), {
+      target: { value: "scale" },
+    });
+    expect(actions.updateObject).toHaveBeenCalledWith(object.objectId, {
+      animation: { type: "scale", durationMs: 10000, amount: 1 },
+    });
+    expect(screen.getByLabelText("动画幅度（%）")).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText("动画"), {
+      target: { value: "" },
+    });
+    expect(actions.updateObject).toHaveBeenCalledWith(object.objectId, {
+      animation: null,
+    });
   });
 
   it("commits non-destructive crop, mask and filter controls for images", () => {

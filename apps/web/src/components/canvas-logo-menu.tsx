@@ -39,6 +39,7 @@ interface CanvasLogoMenuProps {
   canvasId: string;
   // biome-ignore lint/suspicious/noExplicitAny: Excalidraw API has no public type definition
   excalidrawApi: any | null;
+  beforeLeave?: () => Promise<void>;
 }
 
 function dispatchKeyToExcalidraw(
@@ -71,12 +72,28 @@ export function CanvasLogoMenu({
   projectId,
   canvasId,
   excalidrawApi,
+  beforeLeave,
 }: CanvasLogoMenuProps) {
   const router = useRouter();
   const { error: toastError } = useToast();
   const { create: createNewProject } = useCreateProject();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const navigatingRef = useRef(false);
+  const importRef = useRef<Promise<void> | null>(null);
+  const navigate = async (path: string) => {
+    if (navigatingRef.current) return;
+    navigatingRef.current = true;
+    try {
+      await importRef.current;
+      await beforeLeave?.();
+      router.push(path);
+    } catch (error) {
+      toastError(error instanceof Error ? error.message : "画布保存失败，请重试后离开。");
+    } finally {
+      navigatingRef.current = false;
+    }
+  };
 
   const handleDuplicateElements = useCallback(() => {
     if (!excalidrawApi) return;
@@ -126,10 +143,20 @@ export function CanvasLogoMenu({
       const file = e.target.files?.[0];
       if (!file || !excalidrawApi) return;
 
+      let imported!: () => void;
+      let failed!: (error: Error) => void;
+      importRef.current = new Promise<void>((resolve, reject) => {
+        imported = resolve;
+        failed = reject;
+      });
+      void importRef.current.catch(() => toastError("图片导入失败，请重新选择图片。"));
+
       const reader = new FileReader();
+      reader.onerror = () => failed(new Error("图片读取失败，请重新导入后再离开。"));
       reader.onload = () => {
         const dataURL = reader.result as string;
         const img = new Image();
+        img.onerror = () => failed(new Error("图片解码失败，请重新导入后再离开。"));
         img.onload = () => {
           const fileId = generateFileId();
 
@@ -160,6 +187,7 @@ export function CanvasLogoMenu({
             elements: [...excalidrawApi.getSceneElements(), element],
             captureUpdate: "IMMEDIATELY",
           });
+          imported();
         };
         img.src = dataURL;
       };
@@ -168,7 +196,7 @@ export function CanvasLogoMenu({
       // Reset input so the same file can be selected again
       e.target.value = "";
     },
-    [excalidrawApi],
+    [excalidrawApi, toastError],
   );
 
   return (
@@ -188,11 +216,11 @@ export function CanvasLogoMenu({
         <DropdownMenuContent align="start" sideOffset={6} className="w-56">
           {/* Group 1 — Navigation */}
           <DropdownMenuGroup>
-            <DropdownMenuItem onClick={() => router.push("/home")}>
+            <DropdownMenuItem onClick={() => void navigate("/home")}>
               <Home className="size-4" />
               主页
             </DropdownMenuItem>
-            <DropdownMenuItem onClick={() => router.push("/projects")}>
+            <DropdownMenuItem onClick={() => void navigate("/projects")}>
               <FolderOpen className="size-4" />
               项目库
             </DropdownMenuItem>
@@ -219,7 +247,7 @@ export function CanvasLogoMenu({
 
           {/* Group 3 — Canvas import */}
           <DropdownMenuGroup>
-            <DropdownMenuItem onClick={() => fileInputRef.current?.click()}>
+            <DropdownMenuItem disabled={!excalidrawApi} onClick={() => fileInputRef.current?.click()}>
               <ImagePlus className="size-4" />
               导入图片
             </DropdownMenuItem>

@@ -10,6 +10,7 @@ import { DesignApiError } from "../src/lib/design-api";
 import {
   DESIGN_AUTOSAVE_DEBOUNCE_MS,
   DesignCommandHistory,
+  type DesignHistoryEdit,
 } from "../src/lib/design-command-history";
 
 const ids = {
@@ -353,6 +354,82 @@ describe("DesignCommandHistory", () => {
     });
   });
 
+  it("persists deletion undo/redo with the recreated object version", async () => {
+    const mutate = vi
+      .fn()
+      .mockResolvedValueOnce(mutationResponse(7))
+      .mockResolvedValueOnce(mutationResponse(8))
+      .mockResolvedValueOnce(mutationResponse(9));
+    const applyLocal = vi.fn();
+    let currentObjectVersion = 7;
+    const preparePersistedCommand = vi.fn((command: DesignCommand) =>
+      command.action === "object.remove"
+        ? { ...command, expected_object_version: currentObjectVersion }
+        : command,
+    );
+    const history = createHistory({
+      mutate,
+      applyLocal: (commands, source) => {
+        applyLocal(commands, source);
+        if (source === "undo") currentObjectVersion = 1;
+      },
+      preparePersistedCommand,
+    });
+    const deletion = removeRectEdit(ids.object1, 7);
+
+    history.record(deletion);
+    await history.flushNow();
+    await settlePromises();
+
+    expect(mutate.mock.calls[0]?.[0]).toMatchObject({
+      expected_revision: 4,
+      commands: [deletion.command],
+    });
+    expect(preparePersistedCommand).not.toHaveBeenCalled();
+
+    expect(history.undo()).toBe(true);
+    expect(applyLocal).toHaveBeenLastCalledWith([deletion.inverse], "undo");
+    await history.flushNow();
+    await settlePromises();
+
+    expect(mutate.mock.calls[1]?.[0]).toMatchObject({
+      expected_revision: 7,
+      commands: [deletion.inverse],
+    });
+    expect(deletion.inverse).toMatchObject({
+      action: "object.add",
+      object: { objectVersion: 1 },
+    });
+
+    expect(history.redo()).toBe(true);
+    expect(applyLocal).toHaveBeenLastCalledWith(
+      [
+        expect.objectContaining({
+          action: "object.remove",
+          expected_object_version: 1,
+        }),
+      ],
+      "redo",
+    );
+    await history.flushNow();
+    await settlePromises();
+
+    expect(mutate.mock.calls[2]?.[0]).toMatchObject({
+      expected_revision: 8,
+      commands: [
+        expect.objectContaining({
+          action: "object.remove",
+          expected_object_version: 1,
+        }),
+      ],
+    });
+    expect(preparePersistedCommand).toHaveBeenCalledTimes(2);
+    expect(history.getState()).toMatchObject({
+      status: "clean",
+      authoritativeRevision: 9,
+    });
+  });
+
   it("starts a new history branch after undo and drops the abandoned redo", () => {
     const history = createHistory();
     history.record(positionEdit(ids.object1, { x: 40 }, { x: 0 }));
@@ -404,6 +481,14 @@ function createHistory(
       commands: readonly DesignCommand[],
       source: "undo" | "redo",
     ) => void;
+    preparePersistedCommand: (
+      command: DesignCommand,
+      context: {
+        direction: "forward" | "inverse";
+        authoritativeRevision: number;
+        entryId: number;
+      },
+    ) => DesignCommand;
   }> = {},
 ) {
   const generatedIds = [ids.request1, ids.request2, ids.request3];
@@ -412,6 +497,9 @@ function createHistory(
     initialRevision: 4,
     mutate: overrides.mutate ?? (async () => mutationResponse(5)),
     applyLocal: overrides.applyLocal ?? vi.fn(),
+    ...(overrides.preparePersistedCommand
+      ? { preparePersistedCommand: overrides.preparePersistedCommand }
+      : {}),
     createId: () => generatedIds.shift() ?? ids.request3,
   });
 }
@@ -457,6 +545,17 @@ function addRectEdit(objectId: string) {
     expected_object_version: 1,
   };
   return { command, inverse };
+}
+
+function removeRectEdit(objectId: string, expectedObjectVersion: number) {
+  const addition = addRectEdit(objectId);
+  return {
+    command: {
+      ...addition.inverse,
+      expected_object_version: expectedObjectVersion,
+    },
+    inverse: addition.command,
+  } satisfies DesignHistoryEdit;
 }
 
 function updateCommand(

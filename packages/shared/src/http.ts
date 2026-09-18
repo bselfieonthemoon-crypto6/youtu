@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { agentCollaborationSettingsUpdateSchema } from "./agent-collaboration-contracts.js";
 
 import {
   assetObjectSchema,
@@ -19,6 +20,7 @@ export const healthResponseSchema = z.object({
   ok: z.literal(true),
   service: z.literal("loomic-server"),
   version: z.string().min(1),
+  agentRuntime: z.literal("mastra"),
 });
 
 export const runCancelResponseSchema = z.object({
@@ -88,6 +90,8 @@ export const applicationErrorCodeSchema = z.enum([
   "session_not_found",
   "settings_not_found",
   "settings_update_failed",
+  "settings_forbidden",
+  "settings_model_not_accessible",
   "upload_failed",
   "asset_not_found",
   "job_not_found",
@@ -104,9 +108,16 @@ export const applicationErrorCodeSchema = z.enum([
   "skill_toggle_failed",
   "skill_import_failed",
   "skill_file_query_failed",
+  "skill_forbidden",
+  "skill_conflict",
+  "skill_invalid_package",
+  "skill_invalid_request",
+  "skill_save_failed",
   "marketplace_search_failed",
   "marketplace_detail_failed",
   "marketplace_install_failed",
+  "marketplace_failed",
+  "marketplace_invalid_request",
   "insufficient_credits",
   "credit_query_failed",
   "credit_claim_failed",
@@ -165,7 +176,9 @@ export const workspaceSettingsResponseSchema = z.object({
   settings: workspaceSettingsSchema,
 });
 
-export const workspaceSettingsUpdateRequestSchema = workspaceSettingsSchema;
+export const workspaceSettingsUpdateRequestSchema = workspaceSettingsSchema.partial()
+  .extend({ agentCollaboration: agentCollaborationSettingsUpdateSchema.optional() }).strict()
+  .refine(value => value.defaultModel !== undefined || value.agentCollaboration !== undefined, "At least one setting is required.");
 
 export const modelListResponseSchema = z.object({
   models: z.array(modelInfoSchema),

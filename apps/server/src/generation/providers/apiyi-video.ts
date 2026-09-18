@@ -5,6 +5,10 @@ import type {
   VideoProvider,
 } from "../types.js";
 import { GenerationError, fetchAsBase64 } from "../utils.js";
+import {
+  createSafeProviderFetch,
+  type SafeProviderFetchDependencies,
+} from "../../security/safe-provider-fetch.js";
 
 const PROVIDER_NAME = "apiyi";
 const REQUEST_TIMEOUT_MS = 60_000;
@@ -47,11 +51,13 @@ export class ApiYiVideoProvider implements VideoProvider {
   readonly models: readonly VideoModelInfo[];
 
   private readonly baseUrl: string;
+  private readonly providerFetch: typeof fetch;
 
   constructor(
     private readonly apiKey: string,
     baseUrl: string,
     models: readonly VideoModelInfo[] = APIYI_VIDEO_MODELS,
+    transport: SafeProviderFetchDependencies = {},
   ) {
     if (!apiKey.trim())
       throw new GenerationError(
@@ -60,6 +66,7 @@ export class ApiYiVideoProvider implements VideoProvider {
         "API key is required",
       );
     this.baseUrl = baseUrl.replace(/\/$/, "");
+    this.providerFetch = createSafeProviderFetch(this.baseUrl, transport);
     this.models = models;
   }
 
@@ -215,7 +222,7 @@ export class ApiYiVideoProvider implements VideoProvider {
     path: string,
     init: RequestInit,
   ): Promise<TaskResponse> {
-    const response = await fetch(`${this.baseUrl}${path}`, {
+    const response = await this.providerFetch(`${this.baseUrl}${path}`, {
       ...init,
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
@@ -244,7 +251,7 @@ export class ApiYiVideoProvider implements VideoProvider {
 
   private async downloadContent(taskId: string): Promise<Buffer> {
     for (let attempt = 0; attempt < 5; attempt += 1) {
-      const response = await fetch(
+      const response = await this.providerFetch(
         `${this.baseUrl}/videos/${encodeURIComponent(taskId)}/content`,
         {
           headers: { Authorization: `Bearer ${this.apiKey}` },

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { designCommandSchema } from "@loomic/shared";
 
 const { FakeObject, FakeText, FakeGroup, FakeActiveSelection, FakeImage } =
   vi.hoisted(() => {
@@ -181,6 +182,7 @@ type FakeObjectInstance = InstanceType<typeof FakeObject>;
 
 class FakeCanvas {
   backgroundColor: string | null = null;
+  backgroundImage: FakeObjectInstance | undefined;
   private width = 800;
   private height = 600;
   private objects: FakeObjectInstance[] = [];
@@ -191,6 +193,17 @@ class FakeCanvas {
   >();
   viewportTransform: number[] = [1, 0, 0, 1, 0, 0];
   lastExportMultiplier = 0;
+  lastExportOptions:
+    | { left?: number; top?: number; width?: number; height?: number }
+    | undefined;
+  lowerCanvasEl = {
+    getBoundingClientRect: () => ({
+      left: 0,
+      top: 0,
+      width: this.width,
+      height: this.height,
+    }),
+  };
 
   on(name: string, listener: (event: { target?: FakeObjectInstance }) => void) {
     const listeners = this.listeners.get(name) ?? new Set();
@@ -217,6 +230,8 @@ class FakeCanvas {
   }
   clear() {
     this.objects = [];
+    this.backgroundImage = undefined;
+    this.backgroundColor = "";
   }
   getObjects() {
     return this.objects;
@@ -254,9 +269,26 @@ class FakeCanvas {
     return this.height;
   }
   requestRenderAll() {}
-  toCanvasElement(multiplier: number) {
+  toCanvasElement(
+    multiplier: number,
+    options?: { left?: number; top?: number; width?: number; height?: number },
+  ) {
     this.lastExportMultiplier = multiplier;
+    this.lastExportOptions = options;
     return {
+      width: (options?.width ?? this.width) * multiplier,
+      height: (options?.height ?? this.height) * multiplier,
+      getContext() {
+        return {
+          getImageData(_x: number, _y: number, width: number, height: number) {
+            return {
+              width,
+              height,
+              data: new Uint8ClampedArray(width * height * 4),
+            };
+          },
+        };
+      },
       toBlob(callback: (blob: Blob | null) => void, type: string) {
         callback(new Blob(["rendered"], { type }));
       },
@@ -301,6 +333,44 @@ describe("FabricObjectEditor", () => {
   });
 
   afterEach(() => vi.unstubAllGlobals());
+
+  it("deletes edited objects as one valid undoable batch", () => {
+    const events: any[] = [];
+    const editor = new FabricObjectEditor(canvas as never, { createId: nextId, onCommand(event) {
+      for (const edit of event.edits) {
+        designCommandSchema.parse(edit.command);
+        designCommandSchema.parse(edit.inverse);
+      }
+      events.push(event);
+    } });
+    const first = editor.addObject({ type: "rect", width: 120, height: 80 });
+    const second = editor.addObject({ type: "rect", width: 100, height: 60 });
+    editor.updateObject(first, { x: 30 });
+    editor.updateObject(second, { x: 60 });
+    events.length = 0;
+    editor.select([first, second]);
+    editor.removeSelection();
+    expect(editor.serializeScene().objects).toHaveLength(0);
+    expect(events).toHaveLength(1);
+    expect(events[0].commands).toHaveLength(2);
+    expect(events[0].edits.every((edit: any) => edit.inverse.object.objectVersion === 1)).toBe(true);
+  });
+
+  it("restores objects, order and selection when recording deletion fails", () => {
+    let reject = false;
+    const editor = new FabricObjectEditor(canvas as never, { createId: nextId, onCommand() {
+      if (reject) throw new Error("history rejected");
+    } });
+    const first = editor.addObject({ type: "rect", width: 120, height: 80 });
+    editor.addObject({ type: "rect", width: 100, height: 60 });
+    editor.updateObject(first, { x: 30 });
+    const before = editor.serializeScene();
+    editor.select([first]);
+    reject = true;
+    expect(() => editor.removeSelection()).toThrow("history rejected");
+    expect(editor.serializeScene()).toEqual(before);
+    expect(editor.getSelectionIds()).toEqual([first]);
+  });
 
   it("adds durable objects and serializes a strict Loomic scene", () => {
     const editor = new FabricObjectEditor(canvas as never, {
@@ -351,6 +421,21 @@ describe("FabricObjectEditor", () => {
       charSpacing: 20,
       strokeWidth: 2,
     });
+  });
+
+  it("persists and clears animation without moving the static object", () => {
+    const onCommand = vi.fn();
+    const editor = new FabricObjectEditor(canvas as never, { createId: nextId, onCommand });
+    const id = editor.addObject({ type: "rect" });
+    const initial = editor.serializeScene().objects[0]!;
+    const animation = { type: "float" as const, durationMs: 2000, amount: 20 };
+    editor.updateObject(id, { animation });
+    const animationEvent = onCommand.mock.calls.at(-1)![0];
+    expect(animationEvent.edits[0].inverse.patch.animation).toBeNull();
+    expect(designCommandSchema.safeParse(animationEvent.edits[0].inverse).success).toBe(true);
+    expect(editor.serializeScene().objects[0]).toMatchObject({ animation, x: initial.x, y: initial.y, width: initial.width, height: initial.height });
+    editor.updateObject(id, { animation: null });
+    expect(editor.serializeScene().objects[0]!.animation).toBeNull();
   });
 
   it("coalesces a multi-selection modification into one structured history event", async () => {
@@ -796,6 +881,120 @@ describe("FabricObjectEditor", () => {
     await expect(editor.renderToBlob()).rejects.toThrow(
       "Browser export pixel budget exceeded",
     );
+  });
+
+  it("adds a symmetric editing viewport without changing logical scene coordinates", () => {
+    const editor = new FabricObjectEditor(canvas as never, {
+      createId: nextId,
+      logicalWidth: 400,
+      logicalHeight: 200,
+      viewportPadding: 200,
+    });
+    const objectId = editor.addObject({
+      type: "rect",
+      x: -100,
+      y: 25,
+      width: 50,
+      height: 40,
+    });
+    canvas.lowerCanvasEl.getBoundingClientRect = () => ({
+      left: 10,
+      top: 20,
+      width: 800,
+      height: 600,
+    });
+
+    expect(canvas.getWidth()).toBe(800);
+    expect(canvas.getHeight()).toBe(600);
+    expect(canvas.viewportTransform).toEqual([1, 0, 0, 1, 200, 200]);
+    expect(editor.serializeScene()).toMatchObject({
+      canvas: { width: 400, height: 200 },
+      objects: [{ x: -100, y: 25, width: 50, height: 40 }],
+    });
+    expect(editor.getObjectViewportBounds(objectId)).toEqual({
+      x: 110,
+      y: 245,
+      width: 50,
+      height: 40,
+      angle: 0,
+    });
+  });
+
+  it("budgets padded backing pixels but exports only the native logical board", async () => {
+    const editor = new FabricObjectEditor(canvas as never, {
+      logicalWidth: 400,
+      logicalHeight: 200,
+      viewportPadding: 200,
+      maxBackingPixels: 120_000,
+    });
+
+    expect(canvas.getWidth()).toBe(400);
+    expect(canvas.getHeight()).toBe(300);
+    expect(canvas.viewportTransform).toEqual([0.5, 0, 0, 0.5, 100, 100]);
+
+    await editor.renderToBlob({ multiplier: 2 });
+
+    expect(canvas.lastExportMultiplier).toBe(4);
+    expect(canvas.lastExportOptions).toEqual({
+      left: 100,
+      top: 100,
+      width: 200,
+      height: 100,
+    });
+
+    const imageData = editor.renderToImageData({ width: 800, height: 400 });
+
+    expect(imageData).toMatchObject({ width: 800, height: 400 });
+    expect(canvas.lastExportMultiplier).toBe(4);
+    expect(canvas.lastExportOptions).toEqual({
+      left: 100,
+      top: 100,
+      width: 200,
+      height: 100,
+    });
+  });
+
+  it("keeps a padded background on the logical board and out of scene objects", async () => {
+    const editor = new FabricObjectEditor(canvas as never, {
+      logicalWidth: 400,
+      logicalHeight: 200,
+      viewportPadding: 200,
+    });
+
+    editor.setBackground("#123456");
+
+    expect(canvas.backgroundColor).toBe("rgba(0,0,0,0)");
+    expect(canvas.backgroundImage).toMatchObject({
+      left: 0,
+      top: 0,
+      width: 400,
+      height: 200,
+      fill: "#123456",
+      selectable: false,
+      evented: false,
+    });
+    expect(canvas.getObjects()).toHaveLength(0);
+    expect(editor.serializeScene()).toMatchObject({
+      canvas: { width: 400, height: 200, background: "#123456" },
+      objects: [],
+    });
+
+    await editor.renderToBlob({ transparent: true });
+
+    expect(canvas.backgroundImage).toMatchObject({ fill: "#123456" });
+    expect(editor.serializeScene().canvas.background).toBe("#123456");
+  });
+
+  it("rejects invalid editing viewport padding", () => {
+    expect(
+      () => new FabricObjectEditor(canvas as never, { viewportPadding: -1 }),
+    ).toThrow("viewport padding must be a non-negative finite number");
+    expect(
+      () =>
+        new FabricObjectEditor(canvas as never, {
+          viewportPadding: Number.POSITIVE_INFINITY,
+        }),
+    ).toThrow("viewport padding must be a non-negative finite number");
   });
 
   it("applies canonical scale-resize without stretching objects", async () => {

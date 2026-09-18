@@ -1,0 +1,79 @@
+{
+  "slug": "social-carousel",
+  "name": "社交轮播图",
+  "description": "规划或生成按阅读顺序排列的社交轮播图片，统一视觉身份并逐页核对文案；普通单张海报不扩成系列。",
+  "version": "2.2.0",
+  "category": "design",
+  "iconName": "palette",
+  "license": null,
+  "metadata": {
+    "bundle": "loomic-design-skills-v2",
+    "loomic": {
+      "schemaVersion": 1,
+      "execution": "image",
+      "routing": { "keywords": ["轮播", "多页", "多图", "九宫格", "carousel", "slides", "slide"], "priority": 50 },
+      "intents": [
+        "carousel",
+        "social-carousel",
+        "xiaohongshu"
+      ],
+      "outputKinds": [
+        "raster-image",
+        "image-prompt"
+      ],
+      "requiredTools": [
+        "generate_image",
+        "edit_image"
+      ],
+      "optionalTools": [
+        "inspect_canvas"
+      ],
+      "models": [
+        {
+          "role": "planner",
+          "required": true,
+          "preferredIds": []
+        },
+        {
+          "role": "vision",
+          "required": false,
+          "preferredIds": []
+        },
+        {
+          "role": "image",
+          "required": true,
+          "preferredIds": []
+        }
+      ],
+      "limitations": [
+        "技能不增加运行时工具、模型、权限或预算；不擅自增加页数或整批重跑。",
+        "本包为 Loomic 原创流程，研究来源不是效果 benchmark；未运行上游脚本或自动下载依赖。",
+        "本运行时只生成无限画布位图，不能创建多页原生画板或保证文字可编辑。"
+      ],
+      "examples": [
+        "将这五条事实整理为四张可编辑轮播，先给分页计划。"
+      ],
+      "sources": [
+        {
+          "title": "Carousel narrative and information density",
+          "url": "https://github.com/JimLiu/baoyu-skills/blob/main/skills/baoyu-xhs-images/SKILL.md",
+          "license": "MIT",
+          "relation": "inspired-by"
+        },
+        {
+          "title": "Reusable theme tokens",
+          "url": "https://github.com/anthropics/skills/blob/main/skills/theme-factory/SKILL.md",
+          "license": "Apache-2.0",
+          "relation": "inspired-by"
+        }
+      ],
+      "composition": {
+        "role": "workflow",
+        "stages": [
+          "design",
+          "prompt"
+        ]
+      }
+    }
+  }
+}

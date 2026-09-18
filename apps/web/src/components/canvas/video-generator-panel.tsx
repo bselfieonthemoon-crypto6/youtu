@@ -75,6 +75,7 @@ export function VideoGeneratorPanel({
   const { handleGenerationError } = useGenerationErrorHandler();
   // AbortController for in-flight generation requests so we can cancel on unmount
   const abortRef = useRef<AbortController | null>(null);
+  const submissionRef = useRef<{ signature: string; key: string } | null>(null);
 
   // Fetch available models with error logging
   useEffect(() => {
@@ -274,6 +275,11 @@ export function VideoGeneratorPanel({
       const inputImages: string[] = [];
       if (firstFrame) inputImages.push(firstFrame.dataUrl);
       if (lastFrame) inputImages.push(lastFrame.dataUrl);
+      const signature = JSON.stringify({ prompt: prompt.trim(), model, duration, resolution,
+        aspectRatio, inputImages });
+      if (submissionRef.current?.signature !== signature) {
+        submissionRef.current = { signature, key: crypto.randomUUID() };
+      }
 
       const result = await generateVideoDirect(
         accessTokenRef.current,
@@ -283,10 +289,10 @@ export function VideoGeneratorPanel({
           duration,
           resolution,
           aspectRatio,
+          idempotencyKey: submissionRef.current.key,
           ...(inputImages.length ? { inputImages } : {}),
         },
       );
-
       // Check if this generation was cancelled while awaiting
       if (controller.signal.aborted) return;
 
@@ -326,6 +332,7 @@ export function VideoGeneratorPanel({
         captureUpdate: "IMMEDIATELY",
       });
 
+      submissionRef.current = null;
       onClose();
     } catch (err) {
       // Ignore aborted requests (user cancelled or component unmounted)

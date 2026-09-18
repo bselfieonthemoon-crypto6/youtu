@@ -205,7 +205,7 @@ export function AppSidebar() {
         {/* Logo */}
         <Link
           href="/home"
-          title="Loomic"
+          title="Cromic"
           className="mb-1 flex h-9 w-9 items-center justify-center"
         >
           <motion.div

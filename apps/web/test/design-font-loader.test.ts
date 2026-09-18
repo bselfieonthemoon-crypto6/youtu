@@ -117,4 +117,15 @@ describe("design font loader", () => {
       }),
     ]);
   });
+  it("loads each family alias of the same font file instead of reusing the wrong registration", async () => {
+    const aliasScene = structuredClone(scene);
+    const alias = { ...aliasScene.objects[0], objectId: "33333333-3333-4333-8333-333333333333", zIndex: 1, fontFamily: "中文字体名" };
+    aliasScene.objects.push(alias as typeof aliasScene.objects[number]);
+    const getFontFaceContent = vi.fn(async () => new Blob(["font"]));
+    expect(collectDesignFontReferences(aliasScene)).toHaveLength(2);
+    await loadDesignSceneFonts({ scene: aliasScene, accessToken: "token", client: { getFontFaceContent } });
+    expect(add).toHaveBeenCalledTimes(2);
+    await loadDesignSceneFonts({ scene: aliasScene, accessToken: "token", client: { getFontFaceContent } });
+    expect(add).toHaveBeenCalledTimes(2);
+  });
 });

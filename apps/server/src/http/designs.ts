@@ -10,12 +10,16 @@ import {
   designErrorResponseSchema,
   designGetResponseSchema,
   designLifecycleResponseSchema,
+  manualCanvasImageImportRequestSchema,
+  manualCanvasImageImportResponseSchema,
   designMutationRequestSchema,
   designMutationResponseSchema,
   designReferencesResponseSchema,
   designUuidSchema,
   renameDesignRequestSchema,
   restoreDesignRequestSchema,
+  undoManualCanvasImageImportRequestSchema,
+  undoManualCanvasImageImportResponseSchema,
   unauthenticatedErrorResponseSchema,
 } from "@loomic/shared";
 
@@ -80,6 +84,53 @@ export async function registerDesignRoutes(
               await options.designService.mutate(user, input),
             ),
           );
+      } catch (error) {
+        return sendDesignError(error, reply);
+      }
+    },
+  );
+
+  app.post<{ Params: { designId: string } }>(
+    "/api/designs/:designId/canvas-image-imports",
+    async (request, reply) => {
+      try {
+        const user = await options.auth.authenticate(request);
+        if (!user) return sendUnauthorized(reply);
+        const designId = designUuidSchema.parse(request.params.designId);
+        const input = manualCanvasImageImportRequestSchema.parse(request.body);
+        assertMatchingDesignId(designId, input.design_id);
+        return reply.code(200).send(
+          manualCanvasImageImportResponseSchema.parse(
+            await options.designService.importCanvasImage(user, input),
+          ),
+        );
+      } catch (error) {
+        return sendDesignError(error, reply);
+      }
+    },
+  );
+
+  app.post<{ Params: { designId: string; operationId: string } }>(
+    "/api/designs/:designId/canvas-image-imports/:operationId/undo",
+    async (request, reply) => {
+      try {
+        const user = await options.auth.authenticate(request);
+        if (!user) return sendUnauthorized(reply);
+        const designId = designUuidSchema.parse(request.params.designId);
+        const operationId = designUuidSchema.parse(request.params.operationId);
+        const input = undoManualCanvasImageImportRequestSchema.parse(
+          request.body,
+        );
+        return reply.code(200).send(
+          undoManualCanvasImageImportResponseSchema.parse(
+            await options.designService.undoCanvasImageImport(
+              user,
+              designId,
+              operationId,
+              input,
+            ),
+          ),
+        );
       } catch (error) {
         return sendDesignError(error, reply);
       }

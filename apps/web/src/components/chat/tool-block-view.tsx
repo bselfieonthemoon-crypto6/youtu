@@ -6,8 +6,11 @@ import { createPortal } from "react-dom";
 
 import type { BackgroundJob, ImageArtifact, ToolBlock } from "@loomic/shared";
 import { readGenerationJobElementId } from "../../hooks/use-job-fallback-polling";
+import { useGenerationCanvasPresence } from "./generation-canvas-presence";
 import type { RestoreJobToCanvasResponse } from "../../lib/server-api";
 import { ChatImage } from "./image-lightbox";
+import { imageProposalDestination } from "../../lib/image-proposal-destination";
+import { isPromptLibraryTool, PromptLibraryResult } from "./prompt-library-result";
 import {
   formatModelDisplayName,
   formatOutputPreview,
@@ -161,6 +164,7 @@ export const ToolBlockView = React.memo(function ToolBlockView({
   onOpenDesign?: (designId: string) => void;
 }) {
   const [panelOpen, setPanelOpen] = useState(false);
+  const readCanvasPresence = useGenerationCanvasPresence();
   const [panelRight, setPanelRight] = useState(416);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -196,7 +200,7 @@ export const ToolBlockView = React.memo(function ToolBlockView({
     (block.output as Record<string, unknown> | undefined)?.status !==
       "submitting";
   const isImageTool =
-    isImageProposalTool || block.toolName === "confirm_image_generation";
+    isImageProposalTool || block.toolName === "edit_image" || block.toolName === "confirm_image_generation";
   const isVideoTool = block.toolName === "generate_video";
   const isMediaTool = isImageTool || isVideoTool;
   const mediaError =
@@ -205,6 +209,10 @@ export const ToolBlockView = React.memo(function ToolBlockView({
           | string
           | undefined)
       : undefined;
+  const inputValidationFailure = isMediaTool && !block.output?.jobId &&
+    !!block.output?.validationErrors &&
+    typeof block.output?.message === "string" &&
+    block.output.message.startsWith("Tool input validation failed");
   const inputData = block.input as Record<string, unknown> | undefined;
   const modelName = inputData?.model as string | undefined;
   const aspectRatio =
@@ -219,17 +227,20 @@ export const ToolBlockView = React.memo(function ToolBlockView({
   );
   const isInternalImageConfirmation =
     block.toolName === "confirm_image_generation" &&
-    (block.status === "failed" ||
-      (block.output as Record<string, unknown> | undefined)?.status ===
-        "awaiting_ui_confirmation");
+    ((block.status === "failed" && !block.output) ||
+      (block.output as Record<string, unknown> | undefined)?.status === "awaiting_ui_confirmation");
   const confirmation = readConfirmation(block);
+  const hasForegroundDisclosure = confirmation?.kind === "image_generation"
+    && confirmation.details.foregroundPolicy !== undefined;
   const designResult = readDesignToolResult(block);
   const generatedDesignTarget = readGeneratedDesignTarget(block);
+  const designFinalizationNotice = readDesignFinalizationNotice(block);
   const displayStatus =
     designResult?.status === "failed" || designResult?.status === "conflict"
       ? "failed"
       : status;
   const billing = readBillingSummary(block.output);
+  const imageCostReceipt = readImageCostReceipt(block.output);
   const generation = readGenerationRecovery(block);
   const [observedJob, setObservedJob] = useState<BackgroundJob | null>(null);
   const [recoveryState, setRecoveryState] = useState<
@@ -284,8 +295,25 @@ export const ToolBlockView = React.memo(function ToolBlockView({
       : (observedElementId ?? generation.elementId);
   const terminalFailure = observedJob
     ? ["failed", "dead_letter", "canceled"].includes(observedJob.status)
-    : generation.terminalFailure;
+    : generation.terminalFailure || status === "failed" || status === "canceled";
+  const generationCanceled = observedJob ? observedJob.status === "canceled" : generation.canceled || status === "canceled";
+  const terminalError = terminalFailure
+    ? generationCanceled ? "任务已取消，不会将后续结果放入画布" : observedJob?.error_message || String(block.output?.error || "生成失败，任务已停止")
+    : null;
   const succeeded = observedJob?.status === "succeeded" || generation.succeeded;
+  const observedResult = observedJob?.result as Record<string, unknown> | null | undefined;
+  const attachmentRejected =
+    (block.output as Record<string, unknown> | undefined)?.attachment_status ===
+      "superseded" || observedResult?.attachment_status === "superseded";
+  const isDesignGeneration =
+    observedJob?.target_kind === "design" ||
+    generatedDesignTarget !== null ||
+    designFinalizationNotice !== null ||
+    Boolean(
+      readNonEmptyString(
+        (block.output as Record<string, unknown> | undefined)?.design_id,
+      ),
+    );
   const showContinueWaiting = Boolean(
     isMediaTool &&
       generation.jobId &&
@@ -294,12 +322,17 @@ export const ToolBlockView = React.memo(function ToolBlockView({
       !succeeded &&
       generation.canContinue,
   );
+  const canvasPresence = readCanvasPresence();
   const showRestore = Boolean(
     isMediaTool &&
       generation.jobId &&
       succeeded &&
       !effectiveElementId &&
-      !terminalFailure,
+      canvasPresence !== null &&
+      !canvasPresence.has(generation.jobId) &&
+      !terminalFailure &&
+      !attachmentRejected &&
+      !isDesignGeneration,
   );
 
   const handleContinueWaiting = useCallback(async () => {
@@ -322,6 +355,8 @@ export const ToolBlockView = React.memo(function ToolBlockView({
   const handleRestore = useCallback(async () => {
     if (!generation.jobId || !onRestoreGeneration) return;
     if (recoveryState === "restoring" || recoveryState === "restored") return;
+    const presence = readCanvasPresence();
+    if (!presence || presence.has(generation.jobId)) return;
     setRecoveryState("restoring");
     setRecoveryError(null);
     try {
@@ -333,7 +368,7 @@ export const ToolBlockView = React.memo(function ToolBlockView({
       );
       setRecoveryState("error");
     }
-  }, [generation.jobId, onRestoreGeneration, recoveryState]);
+  }, [generation.jobId, onRestoreGeneration, recoveryState, readCanvasPresence]);
 
   const handleOpenPanel = useCallback(() => {
     const rect = findSidebarRect(containerRef.current);
@@ -356,7 +391,22 @@ export const ToolBlockView = React.memo(function ToolBlockView({
   // Image preparation is intentionally represented by the assistant's natural
   // language reply. Hiding the internal tool block avoids presenting a proposal
   // as a failed generation or as a technical parameter card.
-  if (isConversationalImageProposal || isInternalImageConfirmation) return null;
+  // An extra paid stage must be visible in the actual generate_image path;
+  // a conversational summary alone is not a reliable cost disclosure.
+  if ((isConversationalImageProposal && !hasForegroundDisclosure) || isInternalImageConfirmation) return null;
+  if (isConversationalImageProposal && hasForegroundDisclosure
+    && !readImageForegroundPolicyDisclosure(confirmation?.details.foregroundPolicy)) {
+    return <p role="alert" className="text-xs text-amber-800">图片处理步骤或费用信息不完整，请重新创建方案后确认；本次未提交生成。</p>;
+  }
+  if (block.toolName === "delegate_design_tasks" || block.toolName === "record_task_workflow" || block.toolName === "select_next_workflow_step") return null;
+  // Read-only catalog output is not a generation artifact or confirmation.
+  // Never expose generic raw JSON, download controls or action callbacks here.
+  if (isPromptLibraryTool(block.toolName)) return (
+    <div ref={containerRef} className={`space-y-1.5 rounded-lg ${highlighted ? "bg-accent/10 shadow-[0_0_0_2px_hsl(var(--accent))]" : ""}`}>
+      <div className="flex items-center gap-1.5 text-[12px] text-muted-foreground"><ToolStatusIcon status={status} /><span className="font-medium">{config.label}{status === "failed" ? " · 失败" : status === "canceled" ? " · 已取消" : ""}</span></div>
+      {isCompleted ? <PromptLibraryResult toolName={block.toolName} output={block.output} /> : status === "failed" || status === "canceled" ? <p className="text-xs text-muted-foreground">{status === "failed" ? "提示词读取未完成，请稍后重试。" : "已取消本次提示词读取。"}</p> : null}
+    </div>
+  );
 
   return (
     <div
@@ -414,7 +464,7 @@ export const ToolBlockView = React.memo(function ToolBlockView({
       )}
 
       {/* Layer 2a: Media generation shimmer placeholder */}
-      {isMediaTool && !isCompleted && !isPreparingImageProposal && (
+      {isMediaTool && !isCompleted && !isPreparingImageProposal && !terminalFailure && (
         <MediaShimmer
           isVideoTool={isVideoTool}
           aspectRatio={aspectRatio}
@@ -423,8 +473,14 @@ export const ToolBlockView = React.memo(function ToolBlockView({
       )}
 
       {/* Layer 2b-err: Media generation failed */}
-      {isMediaTool && isCompleted && !imageArtifact && mediaError && (
-        <MediaErrorCard isVideoTool={isVideoTool} error={mediaError} />
+      {inputValidationFailure && (
+        <div className="rounded-xl border border-border bg-muted/30 p-3 text-sm">
+          <p className="font-medium">参数需要调整</p>
+          <p className="mt-1 text-xs text-muted-foreground">本次调用尚未提交生图，未调用图片接口。Agent 可修正参数后继续。</p>
+        </div>
+      )}
+      {!inputValidationFailure && isMediaTool && (terminalError || (isCompleted && !imageArtifact && mediaError)) && (
+        <MediaErrorCard isVideoTool={isVideoTool} canceled={generationCanceled} error={terminalError ?? mediaError!} />
       )}
 
       {/* Layer 2b: Image generation card with inline preview */}
@@ -433,7 +489,7 @@ export const ToolBlockView = React.memo(function ToolBlockView({
           result={designResult}
           {...(onOpenDesign ? { onOpenDesign } : {})}
         />
-      ) : isImageTool && isCompleted && imageArtifact ? (
+      ) : isImageTool && isCompleted && imageArtifact && !terminalFailure ? (
         <ImageArtifactCard
           artifact={imageArtifact}
           cardTitle={cardTitle}
@@ -484,10 +540,18 @@ export const ToolBlockView = React.memo(function ToolBlockView({
       ) : null}
 
       {isMediaTool && billing && <BillingSummary billing={billing} />}
+      {isMediaTool && imageCostReceipt && <ImageCostReceipt receipt={imageCostReceipt} />}
 
       {generatedDesignTarget ? (
         <GeneratedDesignTargetCard
           target={generatedDesignTarget}
+          {...(onOpenDesign ? { onOpenDesign } : {})}
+        />
+      ) : null}
+
+      {designFinalizationNotice ? (
+        <DesignFinalizationNoticeCard
+          notice={designFinalizationNotice}
           {...(onOpenDesign ? { onOpenDesign } : {})}
         />
       ) : null}
@@ -513,7 +577,7 @@ export const ToolBlockView = React.memo(function ToolBlockView({
               : recoveryState === "restoring"
                 ? "正在恢复到画布…"
                 : showRestore
-                  ? "恢复到画布"
+                  ? "放入画布"
                   : "继续等待"}
           </button>
         </div>
@@ -810,12 +874,17 @@ function readGeneratedDesignTarget(
 ): GeneratedDesignTarget | null {
   if (
     block.status !== "completed" ||
-    (block.toolName !== "generate_image" &&
+    (block.toolName !== "generate_image" && block.toolName !== "edit_image" &&
       block.toolName !== "confirm_image_generation")
   )
     return null;
   const output = block.output;
   if (!output) return null;
+  if (
+    typeof output.finalization_status === "string" &&
+    output.finalization_status !== "completed"
+  )
+    return null;
   const finalization = readRecord(output.finalization);
   const result = readRecord(output.result);
   const designId =
@@ -840,6 +909,68 @@ function readGeneratedDesignTarget(
       readFiniteNumber(result?.revision) ??
       null,
   };
+}
+
+type DesignFinalizationNotice = {
+  designId: string;
+  status: "needs_attention" | "failed";
+  message: string;
+};
+
+function readDesignFinalizationNotice(
+  block: ToolBlock,
+): DesignFinalizationNotice | null {
+  if (
+    block.status !== "completed" ||
+    (block.toolName !== "generate_image" && block.toolName !== "edit_image" &&
+      block.toolName !== "confirm_image_generation")
+  )
+    return null;
+  const output = block.output;
+  if (!output) return null;
+  const status = output.finalization_status;
+  if (status !== "needs_attention" && status !== "failed") return null;
+  const designId =
+    readNonEmptyString(output.design_id) ??
+    readNonEmptyString(readRecord(output.finalization)?.design_id);
+  if (!designId) return null;
+  return {
+    designId,
+    status,
+    message:
+      readNonEmptyString(output.error) ??
+      "图片素材已保存，但没有应用到原生设计。请打开原设计并根据当前版本重新放置；不要重新生成图片。",
+  };
+}
+
+function DesignFinalizationNoticeCard({
+  notice,
+  onOpenDesign,
+}: {
+  notice: DesignFinalizationNotice;
+  onOpenDesign?: (designId: string) => void;
+}) {
+  return (
+    <div role="alert" className="rounded-xl border border-amber-200 bg-amber-50 p-3">
+      <div className="text-sm font-semibold text-amber-950">
+        {notice.status === "failed"
+          ? "图片已生成，但应用到设计失败"
+          : "图片已生成，但尚未应用到设计"}
+      </div>
+      <p className="mt-1 text-[11px] leading-relaxed text-amber-900">
+        {notice.message}
+      </p>
+      {onOpenDesign ? (
+        <button
+          type="button"
+          onClick={() => onOpenDesign(notice.designId)}
+          className="mt-2 rounded-lg border border-amber-200 bg-white px-3 py-1.5 text-xs font-medium text-amber-950 transition-colors hover:bg-amber-100"
+        >
+          打开原设计
+        </button>
+      ) : null}
+    </div>
+  );
 }
 
 function GeneratedDesignTargetCard({
@@ -881,6 +1012,7 @@ type GenerationRecoveryDetails = {
   canContinue: boolean;
   succeeded: boolean;
   terminalFailure: boolean;
+  canceled: boolean;
 };
 
 function readGenerationRecovery(block: ToolBlock): GenerationRecoveryDetails {
@@ -918,6 +1050,7 @@ function readGenerationRecovery(block: ToolBlock): GenerationRecoveryDetails {
       error.toLowerCase().includes("still being generated"),
     succeeded,
     terminalFailure,
+    canceled: reportedStatus === "canceled",
   };
 }
 
@@ -971,6 +1104,26 @@ function BillingSummary({ billing }: { billing: BillingDetails }) {
   );
 }
 
+type ImageCostReceipt = { creditsCost: number; pricingVersion: string; actualQuality: string; actualResolution: string };
+
+/** Direct image tools return this only after durable submission. It is a cost
+ * receipt, not a claim that a preflight failure, cancellation or refund charged. */
+function readImageCostReceipt(output: Record<string, unknown> | undefined): ImageCostReceipt | null {
+  if (!output || !["queued", "processing", "succeeded", "finished"].includes(String(output.status))) return null;
+  const creditsCost = readFiniteNumber(output.creditsCost);
+  const pricingVersion = readNonEmptyString(output.pricingVersion);
+  const actualQuality = readNonEmptyString(output.actualQuality);
+  const actualResolution = readNonEmptyString(output.actualResolution);
+  if (creditsCost === undefined || creditsCost < 0 || !Number.isInteger(creditsCost) || !pricingVersion || !actualQuality || !actualResolution) return null;
+  return { creditsCost, pricingVersion, actualQuality, actualResolution };
+}
+
+function ImageCostReceipt({ receipt }: { receipt: ImageCostReceipt }) {
+  return <div aria-label="图片任务成本回执" className="flex flex-wrap gap-x-3 gap-y-1 rounded-lg bg-muted/60 px-3 py-2 text-[11px] text-muted-foreground">
+    <span>本次任务 {receipt.creditsCost} 积分</span><span>计价 {receipt.pricingVersion}</span><span>质量 {receipt.actualQuality}</span><span>分辨率 {receipt.actualResolution}</span>
+  </div>;
+}
+
 export type ToolConfirmationKind =
   | "delete"
   | "image_generation"
@@ -989,7 +1142,8 @@ function readConfirmation(block: ToolBlock): ConfirmationDetails | null {
   if (!output) return null;
   if (
     output.error !== "confirmation_required" &&
-    output.status !== "confirmation_required"
+    output.status !== "confirmation_required" &&
+    output.status !== "awaiting_confirmation"
   )
     return null;
   const raw = output.confirmation;
@@ -1225,7 +1379,12 @@ function ImageGenerationConfirmationDetails({
 }: {
   details: Record<string, unknown>;
 }) {
+  const destination = imageProposalDestination(details);
+  const foregroundPolicy = readImageForegroundPolicyDisclosure(
+    details.foregroundPolicy,
+  );
   const rows = [
+    ["输出位置", destination],
     ["标题", details.title],
     ["详细描述", details.description],
     ["模型", details.model],
@@ -1245,8 +1404,90 @@ function ImageGenerationConfirmationDetails({
           </div>
         </div>
       ))}
+      {foregroundPolicy ? (
+        <div
+          aria-label="前景处理与费用"
+          className="rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2"
+        >
+          <div className="font-semibold">前景处理与费用</div>
+          <div className="mt-1 whitespace-pre-wrap break-words leading-5">
+            {foregroundPolicy.summary}
+          </div>
+          <div className="mt-1 font-medium">
+            服务调用（{foregroundPolicy.providerCalls} 次）：
+            {foregroundPolicy.mode === "api_matting"
+              ? `${foregroundPolicy.generationModel} → ${foregroundPolicy.mattingModel}`
+              : foregroundPolicy.generationModel}
+          </div>
+          <div className="mt-1 font-semibold">
+            合计 {foregroundPolicy.totalCredits} 积分
+          </div>
+          <div className="mt-1 text-amber-800">
+            {foregroundPolicy.billingNote}
+          </div>
+        </div>
+      ) : null}
     </div>
   );
+}
+
+type ImageForegroundPolicyDisclosure = {
+  mode: "native_transparent" | "api_matting";
+  generationModel: string;
+  mattingModel: string;
+  totalCredits: number;
+  providerCalls: 1 | 2;
+  summary: string;
+  billingNote: string;
+};
+
+/** Confirmation output is untrusted JSON. Only render a complete, internally
+ * consistent server disclosure; React then treats every value as plain text. */
+function readImageForegroundPolicyDisclosure(
+  value: unknown,
+): ImageForegroundPolicyDisclosure | null {
+  const policy = readRecord(value);
+  if (!policy) return null;
+  const mode = policy.mode;
+  const generationModel = readNonEmptyString(policy.generationModel);
+  const mattingModel = readNonEmptyString(policy.mattingModel);
+  const summary = readNonEmptyString(policy.summary);
+  const billingNote = readNonEmptyString(policy.billingNote);
+  const generationCredits = readFiniteNumber(policy.generationCredits);
+  const mattingCredits = readFiniteNumber(policy.mattingCredits);
+  const totalCredits = readFiniteNumber(policy.totalCredits);
+  const providerCalls = readFiniteNumber(policy.providerCalls);
+  if (
+    policy.version !== 1 ||
+    (mode !== "native_transparent" && mode !== "api_matting") ||
+    policy.pricingVersion !== "credits-v1" ||
+    !generationModel ||
+    !mattingModel ||
+    !summary ||
+    !billingNote ||
+    generationCredits === undefined ||
+    mattingCredits === undefined ||
+    totalCredits === undefined ||
+    !Number.isInteger(generationCredits) ||
+    !Number.isInteger(mattingCredits) ||
+    !Number.isInteger(totalCredits) ||
+    generationCredits < 0 ||
+    mattingCredits < 0 ||
+    totalCredits !== generationCredits + mattingCredits ||
+    providerCalls !== (mode === "api_matting" ? 2 : 1) ||
+    (mode === "native_transparent" &&
+      (generationModel !== mattingModel || mattingCredits !== 0))
+  )
+    return null;
+  return {
+    mode,
+    generationModel,
+    mattingModel,
+    totalCredits,
+    providerCalls,
+    summary,
+    billingNote,
+  };
 }
 
 function DesignConfirmationDetails({
@@ -1362,14 +1603,16 @@ const MediaShimmer = React.memo(function MediaShimmer({
 const MediaErrorCard = React.memo(function MediaErrorCard({
   isVideoTool,
   error,
+  canceled = false,
 }: {
   isVideoTool: boolean;
   error: string;
+  canceled?: boolean;
 }) {
   return (
-    <div className="rounded-xl border-[0.5px] border-destructive/30 bg-destructive/5 p-3">
+    <div className={canceled ? "rounded-xl border-[0.5px] border-border bg-muted/30 p-3" : "rounded-xl border-[0.5px] border-destructive/30 bg-destructive/5 p-3"}>
       <div className="flex items-start gap-2.5">
-        <div className="mt-0.5 shrink-0 rounded-lg bg-destructive/10 p-1.5 text-destructive">
+        <div className={canceled ? "mt-0.5 shrink-0 rounded-lg bg-muted p-1.5 text-muted-foreground" : "mt-0.5 shrink-0 rounded-lg bg-destructive/10 p-1.5 text-destructive"}>
           <svg
             className="h-4 w-4"
             viewBox="0 0 24 24"
@@ -1382,11 +1625,11 @@ const MediaErrorCard = React.memo(function MediaErrorCard({
         </div>
         <div className="min-w-0 flex-1">
           <div className="text-sm font-semibold text-foreground">
-            {isVideoTool
+            {canceled ? (isVideoTool ? "视频生成已取消" : "图片生成已取消") : isVideoTool
               ? "\u89c6\u9891\u751f\u6210\u5931\u8d25"
               : "\u56fe\u7247\u751f\u6210\u5931\u8d25"}
           </div>
-          <div className="mt-0.5 text-[12px] text-muted-foreground line-clamp-2">
+          <div className="mt-0.5 whitespace-pre-wrap break-words text-[12px] text-muted-foreground">
             {error}
           </div>
         </div>

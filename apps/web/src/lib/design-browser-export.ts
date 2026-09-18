@@ -1,6 +1,10 @@
 export const DESIGN_BROWSER_EXPORT_MAX_PIXELS = 32_000_000;
 
-export type DesignBrowserExportFormat = "png" | "transparent-png" | "jpeg";
+export type DesignStaticBrowserExportFormat =
+  | "png"
+  | "transparent-png"
+  | "jpeg";
+export type DesignBrowserExportFormat = DesignStaticBrowserExportFormat | "gif";
 
 export type DesignBrowserExportPort = {
   waitForFonts: () => Promise<void>;
@@ -46,7 +50,7 @@ export async function exportDesignInBrowser(
     width: number;
     height: number;
     multiplier: 1 | 2;
-    format: DesignBrowserExportFormat;
+    format: DesignStaticBrowserExportFormat;
   },
   port: DesignBrowserExportPort,
   dependencies: {

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { getVideoCreditCost } from "./credits.js";
+import { getVideoCreditCost, PLAN_CONFIGS } from "./credits.js";
+
+it("disables platform watermarks for every plan during product development", () => {
+  for (const plan of Object.values(PLAN_CONFIGS)) expect(plan.watermark).toBe(false);
+});
 
 describe("getVideoCreditCost", () => {
   it("preserves base-plus-duration pricing for existing models", () => {

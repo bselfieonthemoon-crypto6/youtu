@@ -7,6 +7,20 @@ vi.mock("../src/lib/server-api", () => ({ fetchJob: fetchJobMock }));
 import { waitForGenerationJob } from "../src/hooks/use-job-fallback-polling";
 
 describe("waitForGenerationJob", () => {
+  it("keeps two jobs isolated when one query fails and later succeeds", async () => {
+    vi.useFakeTimers();
+    let secondAttempts = 0;
+    fetchJobMock.mockImplementation(async (_token, id) => {
+      if (id === "second" && ++secondAttempts === 1) throw new Error("Failed to query job.");
+      return { job: { id, status: "succeeded", target_kind: "canvas", result: { canvas_element_id: `node-${id}` } } };
+    });
+    const first = waitForGenerationJob("token", "first");
+    const second = waitForGenerationJob("token", "second");
+    await vi.advanceTimersByTimeAsync(5000);
+    expect((await first).result?.canvas_element_id).toBe("node-first");
+    expect((await second).result?.canvas_element_id).toBe("node-second");
+    expect(secondAttempts).toBe(2);
+  });
   afterEach(() => {
     vi.useRealTimers();
     fetchJobMock.mockReset();

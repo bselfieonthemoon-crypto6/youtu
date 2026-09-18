@@ -12,9 +12,31 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DesignCreatePanel } from "./design-create-panel";
 
+vi.mock("../../lib/design-resource-api", () => ({
+  createDesignResourceApiClient: () => ({
+    listTemplates: async () => ({ items: [{ id: "template-1", name: "首页弹窗 · 600×800", width: 600, height: 800, preview_asset_object_id: null }] }),
+  }),
+}));
+
 afterEach(cleanup);
 
 describe("DesignCreatePanel", () => {
+  it("passes the template name into creation but leaves custom designs unnamed", async () => {
+    const onCreate = vi.fn().mockResolvedValue(undefined);
+    render(<DesignCreatePanel accessToken="test" onClose={vi.fn()} onCreate={onCreate} />);
+    await userEvent.click(await screen.findByRole("button", { name: /^模板$/ }));
+    await userEvent.click(await screen.findByText("首页弹窗 · 600×800"));
+    await userEvent.click(screen.getByRole("button", { name: "使用模板创建" }));
+    const templateRequest = onCreate.mock.calls[0]?.[0];
+    if (!templateRequest) throw new Error("Expected the template creation request.");
+    expect(templateRequest).toMatchObject({ name: "首页弹窗 · 600×800", templateId: "template-1", width: 600, height: 800 });
+    await userEvent.click(screen.getByRole("button", { name: "自定义尺寸" }));
+    await userEvent.click(screen.getByRole("button", { name: "创建设计" }));
+    const customRequest = onCreate.mock.calls[1]?.[0];
+    if (!customRequest) throw new Error("Expected the custom creation request.");
+    expect(customRequest).not.toHaveProperty("name");
+    expect(customRequest).not.toHaveProperty("templateId");
+  });
   it("submits a blank design and keeps the request id stable across retry", async () => {
     const onCreate = vi
       .fn()

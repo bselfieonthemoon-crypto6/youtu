@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  canvasFileSourceKey,
+  canvasFileSourcesKey,
   createCanvasFileLoadQueue,
   visibleCanvasFileIds,
 } from "../src/lib/canvas-file-loader";
@@ -13,6 +15,46 @@ const candidates = (count: number) =>
   }));
 
 describe("canvas file loading", () => {
+  it("keeps the source key stable across equal canvas refreshes", () => {
+    const refreshed = candidates(2).map((candidate) => ({
+      ...candidate,
+      meta: { refreshed: true },
+    }));
+
+    expect(canvasFileSourcesKey(candidates(2))).toBe(
+      canvasFileSourcesKey(refreshed),
+    );
+    expect(
+      canvasFileSourcesKey([
+        { ...refreshed[0]!, assetId: "replacement-asset" },
+      ]),
+    ).not.toBe(canvasFileSourcesKey([refreshed[0]! ]));
+    expect(
+      canvasFileSourceKey({ ...refreshed[0]!, assetId: "replacement-asset" }),
+    ).not.toBe(canvasFileSourceKey(refreshed[0]!));
+  });
+
+  it("aborts active downloads when its owning hydration pass is disposed", async () => {
+    let aborted = false;
+    const queue = createCanvasFileLoadQueue({
+      load(_candidate, signal) {
+        return new Promise<string>((_resolve, reject) => {
+          signal.addEventListener("abort", () => {
+            aborted = true;
+            reject(signal.reason);
+          });
+        });
+      },
+      onLoaded() {},
+    });
+
+    queue.enqueue([candidates(1)[0]!]);
+    queue.dispose();
+    await Promise.resolve();
+
+    expect(aborted).toBe(true);
+  });
+
   it("never exceeds the configured download concurrency", async () => {
     let active = 0;
     let maximum = 0;

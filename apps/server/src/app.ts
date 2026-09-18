@@ -1,14 +1,13 @@
 import multipart from "@fastify/multipart";
 import websocket from "@fastify/websocket";
-import type { BaseLanguageModel } from "@langchain/core/language_models/base";
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
+import { safeRequestLoggerOptions } from "./utils/request-logger.js";
 
-import type { LoomicAgentFactory } from "./agent/deep-agent.js";
-import {
-  type AgentPersistenceService,
-  createAgentPersistenceService,
-} from "./agent/persistence/index.js";
-import { createAgentRunService } from "./agent/runtime.js";
+import { createAgentRunService, resolveAgentRuntimeMode } from "./agent/runtime.js";
+import type { MastraRunFactory } from "./agent/mastra-run-types.js";
+import { createAgentTaskService } from "./features/agent-tasks/agent-task-service.js";
+import { createAgentContextService } from "./features/agent-context/agent-context-service.js";
+import { createPromptLibraryService } from "./features/prompt-library/prompt-library-service.js";
 import {
   type RetryableReadToolExecutor,
   createRetryableReadToolExecutor,
@@ -19,6 +18,8 @@ import {
   resolveDefaultAgentModel,
 } from "./config/env.js";
 import { createDestructiveConfirmationService } from "./features/agent-actions/destructive-confirmation-service.js";
+import { createDurableActionConfirmationStore } from "./features/agent-actions/durable-action-confirmation-store.js";
+import { createConfirmedActionAppliedHandler, createDurableDesignMutationExecutor } from "./agent/tools/design-tools.js";
 import {
   type AgentRunMetadataService,
   createAgentRunMetadataService,
@@ -102,6 +103,12 @@ import {
   type WorkspaceMemberService,
   createWorkspaceMemberService,
 } from "./features/members/index.js";
+import {
+  createSupabaseCanvasAuthorizationCheck,
+  createSupabaseRealtimeFanoutRepository,
+  RealtimeFanoutService as DurableRealtimeFanoutService,
+  startRealtimeFanoutDispatcher,
+} from "./features/realtime/realtime-fanout-service.js";
 import { createLemonSqueezyClient } from "./features/payments/lemon-squeezy-client.js";
 import {
   type PaymentService,
@@ -147,15 +154,20 @@ import { registerImageModelRoutes } from "./http/image-models.js";
 import { registerImageProxyRoute } from "./http/image-proxy.js";
 import { registerImageTextRoutes } from "./http/image-text.js";
 import { registerJobRoutes } from "./http/jobs.js";
+import { registerNodeImageSubmissionRoutes } from "./http/node-image-submissions.js";
+import { createNodeImageSubmissionService } from "./features/jobs/node-image-submission-service.js";
 import { registerModelRoutes } from "./http/models.js";
 import { registerPaymentWebhookRoute } from "./http/payments-webhook.js";
 import { registerPaymentRoutes } from "./http/payments.js";
 import { registerProjectRoutes } from "./http/projects.js";
+import { registerPromptLibraryRoutes } from "./http/prompt-library.js";
 import { registerProviderConfigRoutes } from "./http/provider-configs.js";
 import { registerRunRoutes } from "./http/runs.js";
+import { createAgentTargetScopeService } from "./features/agent-tasks/agent-target-scope-service.js";
 import { registerSettingsRoutes } from "./http/settings.js";
 import { registerMarketplaceRoutes } from "./http/skills-marketplace.js";
 import { registerSkillRoutes } from "./http/skills.js";
+import { evaluateSkillReadiness, catalogDependencyModels, skillCatalogTools } from "./features/skills/skill-readiness.js";
 import { registerUploadRoutes } from "./http/uploads.js";
 import { registerVideoModelRoutes } from "./http/video-models.js";
 import { registerViewerRoutes } from "./http/viewer.js";
@@ -172,9 +184,11 @@ import { CanvasEventBuffer } from "./ws/event-buffer.js";
 import { registerWsRoute } from "./ws/handler.js";
 
 export type BuildAppOptions = {
-  agentFactory?: LoomicAgentFactory;
-  agentModel?: BaseLanguageModel | string;
-  agentPersistenceService?: AgentPersistenceService;
+  /** Explicit orchestration injection for isolated tests. Production defaults
+   * to Mastra. */
+  mastraRunFactory?: MastraRunFactory;
+  /** Model ref override; the Mastra runtime resolves models from the snapshot. */
+  agentModel?: string;
   agentRunMetadataService?: AgentRunMetadataService;
   toolExecutionService?: ToolExecutionService;
   retryReadTool?: RetryableReadToolExecutor;
@@ -195,6 +209,10 @@ export type BuildAppOptions = {
   designOutboxService?: Pick<
     DesignOutboxService,
     "publishBatch" | "reconcile"
+  > | null;
+  realtimeFanoutService?: Pick<
+    DurableRealtimeFanoutService,
+    "initialize" | "publishBatch" | "dispose"
   > | null;
   chatService?: ChatService;
   connectionManager?: ConnectionManager;
@@ -218,12 +236,16 @@ export type BuildAppOptions = {
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const env = loadServerEnv(options.env);
+  // Parse at application construction even when a test injects a factory, so a
+  // misspelled production runtime cannot quietly route requests to legacy.
+  const configuredAgentRuntime = resolveAgentRuntimeMode();
+  console.info("[agent-runtime]", { mode: configuredAgentRuntime });
 
   // Register generation providers (shared with worker.ts)
   registerAllProviders(env);
 
   const app = Fastify({
-    logger: { level: "info" },
+    logger: safeRequestLoggerOptions(),
   });
   void app.register(multipart, {
     limits: { fileSize: 10 * 1024 * 1024 },
@@ -245,6 +267,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       retryReadTool,
       viewerService,
       providerSnapshotService,
+      workspaceModelCatalogService,
     });
   });
   const auth = options.auth ?? createSupabaseRequestAuthenticator(env);
@@ -296,23 +319,35 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const toolExecutionService =
     options.toolExecutionService ??
     createToolExecutionService({ createUserClient, getAdminClient });
-  const agentPersistenceService =
-    options.agentPersistenceService ?? createAgentPersistenceService(env);
+  const providerConfigService =
+    options.providerConfigService ??
+    createProviderConfigService({ createUserClient, getAdminClient });
+  const connectionManager =
+    options.connectionManager ??
+    new ConnectionManager({
+      authorizeCanvas: createSupabaseCanvasAuthorizationCheck(getAdminClient),
+      onAuthorizationError: (error) =>
+        app.log.error(error, "Realtime canvas authorization failed closed"),
+    });
+  const memberService =
+    options.memberService ??
+    createWorkspaceMemberService({
+      createUserClient,
+      getAdminClient,
+      onMembershipInvalidated: ({ workspaceId, userId }) => {
+        connectionManager.revokeWorkspaceUser(workspaceId, userId);
+      },
+    });
+  const workspaceModelCatalogService =
+    options.workspaceModelCatalogService ??
+    createWorkspaceModelCatalogService({ getAdminClient });
   const settingsService =
     options.settingsService ??
     createSettingsService({
       createUserClient,
       defaultModel: resolveDefaultAgentModel(env),
+      workspaceModelCatalogService,
     });
-  const providerConfigService =
-    options.providerConfigService ??
-    createProviderConfigService({ createUserClient, getAdminClient });
-  const memberService =
-    options.memberService ??
-    createWorkspaceMemberService({ createUserClient, getAdminClient });
-  const workspaceModelCatalogService =
-    options.workspaceModelCatalogService ??
-    createWorkspaceModelCatalogService({ getAdminClient });
   const providerSnapshotService =
     options.providerSnapshotService ??
     createProviderSnapshotService({ getAdminClient });
@@ -338,7 +373,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     options.creditService ?? createCreditService({ getAdminClient });
   const tierGuard = options.tierGuard ?? createTierGuard({ getAdminClient });
 
-  // Payment service — only created when Lemon Squeezy is configured
+  // Payment service 鈥?only created when Lemon Squeezy is configured
   let paymentService: PaymentService | undefined = options.paymentService;
   if (!paymentService && env.lemonSqueezyApiKey && env.lemonSqueezyStoreId) {
     const lsClient = createLemonSqueezyClient({
@@ -353,8 +388,6 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     });
   }
 
-  const connectionManager =
-    options.connectionManager ?? new ConnectionManager();
   const designPreviewService =
     options.designPreviewService ??
     (pgmq
@@ -383,6 +416,10 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
         ...(designExportService ? { designExportService } : {}),
       },
     });
+  const designBroadcaster = createConnectionManagerDesignBroadcaster({
+    getAdminClient,
+    connections: connectionManager,
+  });
   const designOutboxService =
     options.designOutboxService === null
       ? undefined
@@ -390,10 +427,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
         (env.supabaseDbUrl
           ? new DesignOutboxService(
               createSupabaseDesignOutboxRepository(getAdminClient),
-              createConnectionManagerDesignBroadcaster({
-                getAdminClient,
-                connections: connectionManager,
-              }),
+              {
+                // The insert trigger has already committed the event to the
+                // per-instance realtime log. This legacy dispatcher now only
+                // settles the design outbox status; broadcasting here would
+                // duplicate the durable fanout path on the claiming instance.
+                broadcast: async () => undefined,
+              },
             )
           : undefined));
   if (designOutboxService) {
@@ -402,12 +442,67 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     });
     app.addHook("onClose", async () => stopDesignOutbox());
   }
+  const realtimeFanoutService =
+    options.realtimeFanoutService === null
+      ? undefined
+      : (options.realtimeFanoutService ??
+        (env.supabaseDbUrl
+          ? new DurableRealtimeFanoutService(
+              createSupabaseRealtimeFanoutRepository(getAdminClient),
+              designBroadcaster,
+              connectionManager,
+            )
+          : undefined));
+  if (realtimeFanoutService) {
+    let stopRealtimeFanout: (() => void) | undefined;
+    // onReady completes before Fastify starts listening, so a peer cannot
+    // connect a socket before this instance has atomically sampled its cursor.
+    app.addHook("onReady", async () => {
+      await realtimeFanoutService.initialize();
+      stopRealtimeFanout = startRealtimeFanoutDispatcher(
+        realtimeFanoutService,
+        {
+          onError: (error) =>
+            app.log.error(error, "Realtime fanout dispatch failed"),
+        },
+      );
+    });
+    app.addHook("onClose", async () => {
+      stopRealtimeFanout?.();
+      await realtimeFanoutService.dispose().catch((error) => {
+        app.log.error(error, "Realtime fanout unregister failed");
+      });
+    });
+  }
   const eventBuffer = new CanvasEventBuffer();
-  const destructiveConfirmationService = createDestructiveConfirmationService();
+  // The UI and Agent query the same curated corpus and source policy.
+  const promptLibraryService = createPromptLibraryService();
+  // Task snapshots support the current user turn only. Do not attach an
+  // autonomy grant or register an automatic post-generation continuation.
+  const taskService = createAgentTaskService({ getAdminClient });
+  const destructiveConfirmationService = createDestructiveConfirmationService({
+    durableActionStore: createDurableActionConfirmationStore(getAdminClient),
+    executeDurableAction: createDurableDesignMutationExecutor({ designService, agentTaskService: taskService,
+      ...(designPreviewService ? { designPreviewService } : {}) }),
+    onConfirmedActionApplied: async event => {
+      const current = await taskService.assertCurrentRun(event.originRunId);
+      const designId = event.outcome.design_id;
+      let service = taskService;
+      if (current && typeof designId === "string" && (current.target.kind !== "design" || current.target.designId !== designId)) {
+        const targets = await targetScopeService.listAuthorizedTargets({ userId: event.userId, task: current });
+        const target = targets.find(item => item.kind === "design" && item.designId === designId);
+        if (!target) throw new Error("agent_target_scope_forbidden");
+        service = (await targetScopeService.resolveExecutionTask({ userId: event.userId, task: current, target, taskService })).service;
+      }
+      await createConfirmedActionAppliedHandler({ tasks: service })(event);
+    },
+  });
+  const targetScopeService = createAgentTargetScopeService({ getAdminClient, taskService });
   setInterval(() => eventBuffer.cleanup(), 5 * 60 * 1000);
   const agentRuns = createAgentRunService({
-    agentPersistenceService,
-    ...(options.agentFactory ? { agentFactory: options.agentFactory } : {}),
+    promptLibraryService,
+    agentContextService: createAgentContextService({ getAdminClient }),
+    ...(options.mastraRunFactory ? { mastraRunFactory: options.mastraRunFactory } : {}),
     agentRunMetadataService,
     connectionManager,
     createUserClient,
@@ -428,7 +523,6 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     ...(jobService ? { jobService } : {}),
     creditService,
     tierGuard,
-    viewerService,
     providerSnapshotService,
     workspaceModelCatalogService,
   });
@@ -465,7 +559,10 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     }
   });
 
-  void registerHealthRoutes(app, env);
+  void registerHealthRoutes(app, env,
+    options.mastraRunFactory ? "mastra"
+      : configuredAgentRuntime);
+  void registerPromptLibraryRoutes(app, { auth, promptLibraryService });
   void registerFontsRoutes(app, { env });
   void registerImageProxyRoute(app);
   void registerImageTextRoutes(app, {
@@ -588,6 +685,11 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   });
   void registerCreditRoutes(app, { auth, creditService, viewerService });
   if (jobService) {
+    void registerNodeImageSubmissionRoutes(app, {
+      auth,
+      service: createNodeImageSubmissionService({ createUserClient, getAdminClient, jobService,
+        creditService, tierGuard, workspaceModelCatalogService }),
+    });
     void registerJobRoutes(app, {
       auth,
       creditService,
@@ -598,14 +700,24 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       workspaceModelCatalogService,
     });
   }
-  void registerSkillRoutes(app, { auth, createUserClient, viewerService });
+  void registerSkillRoutes(app, { auth, createUserClient, viewerService,
+    getSkillReadiness: async (user, rows) => {
+      const viewer = await viewerService.ensureViewer(user);
+      try {
+        const models = catalogDependencyModels(await workspaceModelCatalogService.listPublished(user, viewer.workspace.id));
+        return rows.map(row => evaluateSkillReadiness({ metadata: row.metadata, content: row.skill_content, models, tools: skillCatalogTools(configuredAgentRuntime) }));
+      } catch {
+        return rows.map(row => evaluateSkillReadiness({ metadata: row.metadata, content: row.skill_content, models: [], catalogUnavailable: true }));
+      }
+    },
+  });
   void registerMarketplaceRoutes(app, {
     auth,
     createUserClient,
     viewerService,
   });
 
-  // Payment routes — only registered when Lemon Squeezy is configured
+  // Payment routes 鈥?only registered when Lemon Squeezy is configured
   if (paymentService) {
     void registerPaymentRoutes(app, { auth, paymentService, viewerService });
 

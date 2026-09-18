@@ -21,6 +21,7 @@ import {
   createImageGeneratorElement,
   isImageGeneratorElement,
   getImageGeneratorData,
+  updateImageGeneratorElement,
   type ImageGeneratorData,
 } from "../lib/canvas-image-generator";
 import {
@@ -31,18 +32,20 @@ import {
 } from "../lib/canvas-video-generator";
 import {
   createExcalidrawImageElement,
-  fetchAsDataURL,
   fetchAssetAsDataURL,
-  fetchAssetBlob,
   isVideoUrl,
 } from "../lib/canvas-elements";
 import { ImageGeneratorPanel } from "./canvas/image-generator-panel";
 import { VideoGeneratorPanel } from "./canvas/video-generator-panel";
 import { VideoPlayerPanel } from "./canvas/video-player-panel";
 import { ImageSelectionToolbar } from "./canvas/image-selection-toolbar";
-import { calculate2KResolution } from "./canvas/image-action-dialog";
+import type { SemanticLayerSplitRequest } from "./canvas/image-action-dialog";
+import { ImageOutpaintPanel, type OutpaintSource } from "./canvas/image-outpaint-panel";
+import { CanvasImageBoardActions } from "./canvas/canvas-image-board-actions";
+import { classifyImageBoardPlacement } from "../lib/image-board-placement";
+import { imageToolOperationModel } from "../lib/layer-backend";
+import { buildTextReplacementContent } from "../lib/image-text-replacement-request";
 import { ImageCropResolutionPanel } from "./canvas/image-crop-resolution-panel";
-import { ImageRegionMattingOverlay } from "./canvas/image-region-matting-overlay";
 import {
   ImageEraserOverlay,
   type ImageEraseMode,
@@ -57,12 +60,14 @@ import type {
   SelectedCanvasImage,
 } from "./canvas/image-toolbar-types";
 import { useToast } from "./toast";
+import { prepareCanvasImageOperation, resolveCanvasImageSource, resolveCanvasImageGeometry } from "../lib/canvas-image-source";
 import {
   createImageGenerationJob,
   fetchImageModels,
   fetchJob,
-  getAssetUrl,
+  getNodeImageSubmission,
   recognizeCanvasImageText,
+  uploadFile,
 } from "../lib/server-api";
 import {
   getDesignCopyPlacement,
@@ -83,10 +88,14 @@ import {
   updateImageReplacementElement,
 } from "../lib/canvas-image-replacement";
 import {
+  isNodeImageSubmissionActive,
+  acceptNodeImageRequest,
+  type NodeImageRequestState,
+  NODE_IMAGE_UNKNOWN_MESSAGE,
+} from "../lib/node-image-generation";
+import {
   getImageCropResolution,
   getImageNaturalSize,
-  readImageNaturalSize,
-  renderImageCrop,
   resizeImageCrop,
   setImageNaturalSize,
   type NormalizedImageRegion,
@@ -216,7 +225,7 @@ type RegionMattingSession = {
   angle: number;
 };
 
-type EraserSession = RegionMattingSession;
+type EraserSession = RegionMattingSession & { source: { dataURL: string; width: number; height: number }; placement: { x: number; y: number; width: number; height: number } };
 
 type ToolType =
   | "hand"
@@ -276,9 +285,11 @@ type CanvasToolMenuProps = {
   canvasRevision: number;
   excalidrawApi: any;
   leftPanelOpen?: boolean;
+  editingDesignId?: string | null;
   onImageChatCommand?: (command: CanvasImageChatCommand) => void;
   onCanvasRefreshRequest?: () => Promise<void>;
   onCanvasRevisionChange: (revision: number) => void;
+  onPersistCanvas: () => Promise<void>;
   onOpenDesign?: (target: DesignOpenTarget) => void;
 };
 
@@ -288,16 +299,22 @@ export function CanvasToolMenu({
   canvasRevision,
   excalidrawApi,
   leftPanelOpen,
+  editingDesignId = null,
   onImageChatCommand,
   onCanvasRefreshRequest,
   onCanvasRevisionChange,
+  onPersistCanvas,
   onOpenDesign,
 }: CanvasToolMenuProps) {
   const [activeTool, setActiveTool] = useState<string>("selection");
+  const [outpaintSession, setOutpaintSession] = useState<{source:OutpaintSource;placement:{x:number;y:number;width:number;height:number}} | null>(null);
   const { success: showSuccess, error: showError } = useToast();
   const { preference: imageModelPreference } = useImageModelPreference();
   const [selectedImage, setSelectedImage] =
     useState<SelectedCanvasImage | null>(null);
+  const [imageBoardPickerOpen, setImageBoardPickerOpen] = useState(false);
+  const closeImageBoardPicker = useCallback(() => setImageBoardPickerOpen(false), []);
+  const submittingBackgroundRemovalRef = useRef(false);
   const [selectedImageBounds, setSelectedImageBounds] = useState<{
     x: number;
     y: number;
@@ -310,14 +327,15 @@ export function CanvasToolMenu({
   const cropSessionRef = useRef<CropSession | null>(null);
   const cropSaveGuardRef = useRef(createCropSaveGuard());
   cropSessionRef.current = cropSession;
-  const [regionMattingSession, setRegionMattingSession] =
-    useState<RegionMattingSession | null>(null);
-  const regionMattingSessionRef = useRef<RegionMattingSession | null>(null);
-  regionMattingSessionRef.current = regionMattingSession;
   const [eraserSession, setEraserSession] = useState<EraserSession | null>(
     null,
   );
   const eraserSessionRef = useRef<EraserSession | null>(null);
+  const [repaintBusy, setRepaintBusy] = useState(false);
+  const [repaintError, setRepaintError] = useState<string>();
+  const repaintBusyRef = useRef(false);
+  const repaintJobRef = useRef<{ id: string; placeholderId: string } | null>(null);
+  const repaintSubmissionRef = useRef<{ payload: Parameters<typeof createImageGenerationJob>[1]; placeholderId: string } | null>(null);
   eraserSessionRef.current = eraserSession;
   const [designPanelOpen, setDesignPanelOpen] = useState(false);
   const designElementIdsRef = useRef(new Map<string, string>());
@@ -386,10 +404,14 @@ export function CanvasToolMenu({
       screenY: number;
       screenW: number;
       screenH: number;
+      zoom: number;
       model?: string;
       jobId?: string;
+      nodeImageRequestId?: string;
+      nodeImageRequestState?: NodeImageRequestState;
       label?: string;
       status?: "generating" | "error";
+      canceled?: boolean;
     }>
   >([]);
 
@@ -405,6 +427,7 @@ export function CanvasToolMenu({
   const prevGeneratingKeyRef = useRef("");
   const monitoredGenerationJobsRef = useRef(new Set<string>());
   const activeGenerationMonitorLoopsRef = useRef(new Set<string>());
+  const activeNodeSubmissionRecoveryRef = useRef(new Set<string>());
 
   // Helper: close all generator / player panels
   const closeAllPanels = useCallback(() => {
@@ -457,48 +480,6 @@ export function CanvasToolMenu({
           return { scrollX, scrollY, zoom };
         });
 
-        // Region matting lives in a document.body portal, so it does not
-        // inherit Excalidraw's camera transform. Recompute its screen bounds
-        // from the source element on every canvas change to keep it attached
-        // during pan, zoom, move, resize and rotation.
-        const currentRegionMatting = regionMattingSessionRef.current;
-        if (currentRegionMatting) {
-          const regionElement = elements.find(
-            (element: any) =>
-              element.id === currentRegionMatting.imageId && !element.isDeleted,
-          );
-          if (!regionElement) {
-            setRegionMattingSession(null);
-          } else {
-            const nextRegionBounds = {
-              x: ((regionElement.x ?? 0) + scrollX) * zoom,
-              y: ((regionElement.y ?? 0) + scrollY) * zoom,
-              width: (regionElement.width ?? 0) * zoom,
-              height: (regionElement.height ?? 0) * zoom,
-            };
-            const nextAngle = regionElement.angle ?? 0;
-            setRegionMattingSession((previous) => {
-              if (
-                !previous ||
-                previous.imageId !== currentRegionMatting.imageId
-              )
-                return previous;
-              if (
-                previous.bounds.x === nextRegionBounds.x &&
-                previous.bounds.y === nextRegionBounds.y &&
-                previous.bounds.width === nextRegionBounds.width &&
-                previous.bounds.height === nextRegionBounds.height &&
-                previous.angle === nextAngle
-              )
-                return previous;
-              return {
-                ...previous,
-                bounds: nextRegionBounds,
-                angle: nextAngle,
-              };
-            });
-          }
-        }
 
         const currentEraser = eraserSessionRef.current;
         if (currentEraser) {
@@ -615,11 +596,13 @@ export function CanvasToolMenu({
           } else if (isImageGeneratorElement(sel)) {
             clearSelectedDesign();
             clearSelectedImage();
+            // Include edits/undo on the same selected node, not just selection
+            // changes. The panel persists its draft directly in customData.
+            const currentData = getImageGeneratorData(sel);
+            setGeneratorData((previous) => previous === currentData ? previous : currentData);
             // Only update if the selected generator changed
             if (currentId !== sel.id) {
-              const data = getImageGeneratorData(sel);
               setActiveGeneratorId(sel.id as string);
-              setGeneratorData(data);
               if (currentVideoId) {
                 setActiveVideoGenId(null);
                 setVideoGenData(null);
@@ -799,7 +782,7 @@ export function CanvasToolMenu({
         const genKey = `${scrollX}:${scrollY}:${zoom}|${generatingRaw
           .map(
             (el: any) =>
-              `${el.id}:${el.x}:${el.y}:${el.width}:${el.height}:${el.customData?.status}`,
+              `${el.id}:${el.x}:${el.y}:${el.width}:${el.height}:${el.customData?.status}:${el.customData?.errorMessage ?? ""}:${el.customData?.jobId ?? ""}:${el.customData?.nodeImageRequest?.requestId ?? ""}:${el.customData?.nodeImageRequest?.state ?? ""}`,
           )
           .join("|")}`;
 
@@ -811,11 +794,20 @@ export function CanvasToolMenu({
             screenY: ((el.y as number) + scrollY) * zoom,
             screenW: (el.width as number) * zoom,
             screenH: (el.height as number) * zoom,
+            zoom,
+            canceled: el.customData?.status === "error" && ["生成已取消", "任务已取消"].includes(el.customData?.errorMessage),
             ...(el.customData?.model
               ? { model: el.customData.model as string }
               : {}),
             ...(typeof el.customData?.jobId === "string"
               ? { jobId: el.customData.jobId as string }
+              : {}),
+            ...(typeof el.customData?.nodeImageRequest?.requestId === "string"
+              ? {
+                  nodeImageRequestId: el.customData.nodeImageRequest
+                    .requestId as string,
+                  nodeImageRequestState: el.customData.nodeImageRequest.state,
+                }
               : {}),
             ...(isImageGeneratorElement(el)
               ? {
@@ -843,7 +835,11 @@ export function CanvasToolMenu({
                                 ? "正在应用透明擦除…"
                                 : el.customData.operation === "smart-erase"
                                   ? "正在智能修复…"
-                                  : "正在应用文字…",
+                                  : el.customData.operation === "local-repaint"
+                                    ? "正在局部重绘…"
+                                    : el.customData.operation === "outpaint"
+                                      ? "正在扩图…"
+                                      : "正在应用文字…",
                   status: el.customData.status,
                 }
               : {}),
@@ -896,24 +892,90 @@ export function CanvasToolMenu({
     }
   }, [accessToken, generatingElements, onCanvasRefreshRequest]);
 
+  // A POST response can be lost after the server accepted and charged the
+  // durable job. Resolve that ambiguity with a read-only lookup; never create
+  // or retry paid work from this background recovery path.
+  useEffect(() => {
+    for (const element of generatingElements) {
+      const requestId = element.nodeImageRequestId;
+      if (
+        element.jobId ||
+        !["submitting", "unknown"].includes(
+          element.nodeImageRequestState ?? "",
+        ) ||
+        !requestId ||
+        isNodeImageSubmissionActive(requestId) ||
+        activeNodeSubmissionRecoveryRef.current.has(requestId)
+      ) {
+        continue;
+      }
+      activeNodeSubmissionRecoveryRef.current.add(requestId);
+      void getNodeImageSubmission(accessToken, {
+        requestId,
+        canvasId,
+        elementId: element.id,
+      })
+        .then(async ({ job }) => {
+          const node = excalidrawApi.getSceneElements().find(
+            (candidate: any) =>
+              candidate.id === element.id &&
+              !candidate.isDeleted &&
+              isImageGeneratorElement(candidate),
+          );
+          const request = getImageGeneratorData(node)?.nodeImageRequest;
+          if (!request || request.requestId !== requestId) return;
+          if (!job) {
+            if (request.state === "submitting") {
+              updateImageGeneratorElement(excalidrawApi, element.id, {
+                status: "error",
+                nodeImageRequest: { ...request, state: "unknown" },
+                errorMessage: NODE_IMAGE_UNKNOWN_MESSAGE,
+              });
+            }
+            return;
+          }
+          updateImageGeneratorElement(excalidrawApi, element.id, {
+            status: "generating",
+            jobId: job.id,
+            nodeImageRequest: acceptNodeImageRequest(request, job.payload),
+            errorMessage: undefined,
+          });
+          await onPersistCanvas().catch((error) => {
+            console.warn(
+              `[canvas-generation] Failed to persist recovered job ${job.id}:`,
+              error,
+            );
+          });
+          await onCanvasRefreshRequest?.();
+        })
+        .catch((error) => {
+          console.warn(
+            `[canvas-generation] Failed to recover node request ${requestId}:`,
+            error,
+          );
+        })
+        .finally(() => {
+          activeNodeSubmissionRecoveryRef.current.delete(requestId);
+        });
+    }
+  }, [accessToken, canvasId, excalidrawApi, generatingElements, onCanvasRefreshRequest, onPersistCanvas]);
+
+  const readOperationImage = useCallback(async (elementId: string) => {
+    const element = excalidrawApi?.getSceneElements().find(
+      (item: any) => item.id === elementId && !item.isDeleted && item.type === "image",
+    );
+    if (!element) throw new Error("原图片已不存在，请重新选择后再试。");
+    return prepareCanvasImageOperation(accessToken, element, excalidrawApi.getFiles?.() ?? {});
+  }, [accessToken, excalidrawApi]);
+
   const handleDownloadImage = useCallback(async () => {
     if (!selectedImage) return;
     try {
-      const blob = selectedImage.dataUrl
-        ? await (await fetch(selectedImage.dataUrl)).blob()
-        : selectedImage.assetId
-          ? await fetchAssetBlob(accessToken, selectedImage.assetId)
-          : await (async () => {
-              const source = selectedImage.storageUrl;
-              if (!source) throw new Error("图片数据尚未加载");
-              const response = await fetch(source);
-              if (!response.ok)
-                throw new Error(`图片下载失败 (${response.status})`);
-              return response.blob();
-            })();
-      const extension = selectedImage.mimeType.includes("jpeg")
+      const original = await readOperationImage(selectedImage.id);
+      const blob = await (await fetch(original.dataURL)).blob();
+      const extension = blob.type.includes("jpeg")
         ? "jpg"
-        : (selectedImage.mimeType.split("/")[1]?.split("+")[0] ?? "png");
+        : (blob.type.split("/")[1]?.split("+")[0] ?? "png");
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
@@ -924,7 +986,7 @@ export function CanvasToolMenu({
     } catch (error) {
       showError(error instanceof Error ? error.message : "图片下载失败");
     }
-  }, [accessToken, selectedImage, showError, showSuccess]);
+  }, [readOperationImage, selectedImage, showError, showSuccess]);
 
   const handleCropImage = useCallback(async () => {
     if (!selectedImage || !excalidrawApi) return;
@@ -938,16 +1000,15 @@ export function CanvasToolMenu({
     );
     if (!initialElement || !selectedImageBounds) return;
 
-    let naturalSize = getImageCropResolution(initialElement);
-    const source = selectedImage.dataUrl ?? selectedImage.storageUrl;
-    if (!initialElement.crop && source) {
-      try {
-        naturalSize = await readImageNaturalSize(source);
-      } catch {
-        // Older saved canvases may not have an available source URL. In that
-        // case retain the stored dimensions (or the display-size fallback).
-      }
+    let normalizedElement;
+    try {
+      const source = await resolveCanvasImageSource(accessToken, initialElement, excalidrawApi.getFiles?.() ?? {});
+      normalizedElement = await resolveCanvasImageGeometry(source, initialElement);
+    } catch (error) {
+      showError(error instanceof Error ? error.message : "无法读取原图。");
+      return;
     }
+    const naturalSize = getImageNaturalSize(normalizedElement);
 
     const sceneElements =
       excalidrawApi.getSceneElementsIncludingDeleted?.() ??
@@ -962,8 +1023,8 @@ export function CanvasToolMenu({
     )
       return;
 
-    const cropElement = setImageNaturalSize(element, naturalSize);
-    const resolution = getImageCropResolution(element);
+    const cropElement = { ...element, ...normalizedElement };
+    const resolution = getImageCropResolution(cropElement);
     const session: CropSession = {
       elementId: selectedId,
       originalElement: structuredClone(element),
@@ -990,7 +1051,7 @@ export function CanvasToolMenu({
       },
       captureUpdate: "IMMEDIATELY",
     });
-  }, [excalidrawApi, selectedImage, selectedImageBounds]);
+  }, [accessToken, excalidrawApi, selectedImage, selectedImageBounds, showError]);
 
   const handleSaveCrop = useCallback(
     async (width: number, height: number) => {
@@ -1016,32 +1077,8 @@ export function CanvasToolMenu({
 
       const croppedResult = resizeImageCrop(currentElement, { width, height });
       const files = excalidrawApi.getFiles?.() ?? {};
-      const sourceFile =
-        typeof currentElement.fileId === "string"
-          ? files[currentElement.fileId]
-          : undefined;
-      const storageUrl = currentElement.customData?.storageUrl;
-      let source =
-        typeof sourceFile?.dataURL === "string"
-          ? sourceFile.dataURL
-          : undefined;
       try {
-        const assetId = currentElement.customData?.assetId;
-        if (!source && typeof assetId === "string") {
-          source = await fetchAssetAsDataURL(accessToken, assetId);
-        } else if (!source && typeof storageUrl === "string") {
-          source = await fetchAsDataURL(storageUrl);
-        }
-        if (!isCurrentOperation()) return;
-        if (!source) throw new Error("原图数据尚未加载完成，请稍后重试");
-        const rendered = await renderImageCrop(
-          source,
-          currentElement,
-          { width, height },
-          sourceFile?.mimeType ??
-            currentElement.customData?.mimeType ??
-            "image/png",
-        );
+        const rendered = await prepareCanvasImageOperation(accessToken, croppedResult, files);
         if (!isCurrentOperation()) return;
         const now = Date.now();
         const naturalSize = getImageNaturalSize(currentElement);
@@ -1163,15 +1200,15 @@ export function CanvasToolMenu({
 
   const handleRecognizeImageText = useCallback(async () => {
     if (!selectedImage) return [];
-    const url = selectedImage.dataUrl ?? selectedImage.storageUrl;
-    if (!url) throw new Error("当前图片数据不可用，请重新选择图片后再试。");
+    const original = await readOperationImage(selectedImage.id);
+    const url = original.dataURL;
     const result = await recognizeCanvasImageText(accessToken, canvasId, {
       assetId: selectedImage.assetId ?? selectedImage.id,
       url,
-      mimeType: selectedImage.mimeType,
+      mimeType: original.mimeType,
     });
     return result.texts;
-  }, [accessToken, canvasId, selectedImage]);
+  }, [accessToken, canvasId, selectedImage, readOperationImage]);
 
   const handleDirectImageAction = useCallback(
     async (
@@ -1185,47 +1222,48 @@ export function CanvasToolMenu({
         | "smart-erase",
       prompt: string,
       options?: {
+        quality?: "hd" | "ultra";
         inputImage?: string;
         placement?: { x: number; y: number; width: number; height: number };
         selectionRegion?: NormalizedImageRegion;
         maskImage?: string;
+        layerBackend?: "qwen-image-layered" | "semantic";
+        layerNames?: string[];
+        repairBackground?: true;
+        model?: string;
       },
     ) => {
       if (!selectedImage) {
         showError("当前图片已取消选择，请重新选择图片后再试。");
         return;
       }
-      // The Excalidraw file currently rendered on screen is authoritative. A
-      // locally cropped/edited element can still carry the source assetId in its
-      // metadata, so preferring that id would submit an older image version.
-      const inputImage =
-        options?.inputImage ??
-        selectedImage.dataUrl ??
-        (selectedImage.assetId
-          ? (await getAssetUrl(accessToken, selectedImage.assetId)).url
-          : selectedImage.storageUrl);
+      let inputImage: string;
+      let sourceAspectRatio: string | undefined;
+      try {
+        const source = options?.inputImage && operation !== "upscale" ? null : await readOperationImage(selectedImage.id);
+        inputImage = options?.inputImage ?? source!.dataURL;
+        if (source) sourceAspectRatio = `${source.width}:${source.height}`;
+      } catch (error) {
+        showError(error instanceof Error ? error.message : "无法读取原图。");
+        return;
+      }
       if (!inputImage) {
         showError("当前图片数据尚未加载完成，请稍后重试。");
         return;
       }
-      const isLocalOperation =
+      const usesFixedOperationModel =
         operation === "remove-background" ||
         operation === "region-matting" ||
         operation === "split-layers" ||
         operation === "erase-transparent" ||
         operation === "smart-erase";
-      const availableModels = isLocalOperation
+      const availableModels = usesFixedOperationModel
         ? []
         : (await fetchImageModels(accessToken)).models;
       const preferredModel = imageModelPreference.models[0];
-      const exact2KModel =
-        operation === "upscale"
-          ? availableModels.find((item) => item.supportsExact2K === true)
-          : undefined;
-      const model = isLocalOperation
-        ? "local:feynobg"
-        : (exact2KModel?.id ??
-          availableModels.find((item) => item.id === preferredModel)?.id ??
+      const model = usesFixedOperationModel
+        ? (options?.layerBackend === "semantic" ? options.model : imageToolOperationModel(operation, options?.layerBackend))
+        : (availableModels.find((item) => item.id === preferredModel)?.id ??
           availableModels[0]?.id);
       if (!model) {
         showError("尚未配置可用的图片模型，请先到管理后台同步并启用模型。");
@@ -1243,12 +1281,10 @@ export function CanvasToolMenu({
         operation,
       );
       try {
-        const upscaleResolution =
-          operation === "upscale" ? calculate2KResolution(selectedImage) : null;
         const response = await createImageGenerationJob(accessToken, {
           canvas_id: canvasId,
           prompt,
-          model,
+          ...(model ? { model } : {}),
           operation:
             operation === "remove-background"
               ? "remove_background"
@@ -1261,13 +1297,8 @@ export function CanvasToolMenu({
                     : operation === "smart-erase"
                       ? "smart_erase"
                       : "generate",
-          quality: "hd",
-          ...(upscaleResolution
-            ? {
-                output_width: upscaleResolution.targetWidth,
-                output_height: upscaleResolution.targetHeight,
-              }
-            : {}),
+          quality: options?.layerBackend === "semantic" ? "standard" : usesFixedOperationModel ? "hd" : "standard",
+          ...(operation === "upscale" ? { aspect_ratio: sourceAspectRatio, resolution: options?.quality === "ultra" ? "4k" as const : "2k" as const } : {}),
           input_images: [inputImage],
           placement_x: placement.x,
           placement_y: placement.y,
@@ -1278,14 +1309,22 @@ export function CanvasToolMenu({
             ? { selection_region: options.selectionRegion }
             : {}),
           ...(options?.maskImage ? { mask_image: options.maskImage } : {}),
+          ...(options?.layerBackend === "semantic" ? {
+            layer_backend: "semantic" as const,
+            layer_names: options.layerNames,
+            repair_background: options.repairBackground,
+            resolution: "1k" as const,
+          } : {}),
         });
         updateImageReplacementElement(excalidrawApi, placeholderId, {
           jobId: response.job.id,
         });
         void (async () => {
+          let generationFailed = false;
           try {
-            let job = await waitForGenerationJob(accessToken, response.job.id);
+            let job = await monitorCanvasGenerationJob(accessToken, response.job.id);
             if (job.status !== "succeeded") {
+              generationFailed = true;
               throw new Error(
                 job.error_message ||
                   (operation === "upscale"
@@ -1313,15 +1352,12 @@ export function CanvasToolMenu({
                 "图片已生成，但画布同步尚未完成，后台会继续恢复，请稍后刷新。",
               );
             }
-            updateImageReplacementElement(excalidrawApi, placeholderId, {
-              isDeleted: true,
-            });
             await onCanvasRefreshRequest?.();
             showSuccess(
               operation === "upscale"
                 ? "高清增强完成，新图片已添加到原图右侧"
                 : operation === "remove-background"
-                  ? "背景已去除，透明 PNG 已添加到原图右侧"
+                  ? "背景已去除，透明 PNG 已放入对应节点"
                   : operation === "region-matting"
                     ? "框选主体已提取，其他内容已透明化"
                     : operation === "split-layers"
@@ -1334,7 +1370,7 @@ export function CanvasToolMenu({
             );
           } catch (error) {
             updateImageReplacementElement(excalidrawApi, placeholderId, {
-              status: "error",
+              status: generationFailed ? "error" : "generating",
               errorMessage:
                 error instanceof Error
                   ? error.message
@@ -1400,6 +1436,7 @@ export function CanvasToolMenu({
       excalidrawApi,
       imageModelPreference.models,
       onCanvasRefreshRequest,
+      readOperationImage,
       selectedImage,
       showError,
       showSuccess,
@@ -1412,138 +1449,51 @@ export function CanvasToolMenu({
   );
 
   const handleUpscaleImage = useCallback(
-    (prompt: string) => handleDirectImageAction("upscale", prompt),
+    (prompt: string, quality: "hd" | "ultra" = "hd") => handleDirectImageAction("upscale", prompt, { quality }),
     [handleDirectImageAction],
   );
 
   const handleRemoveImageBackground = useCallback(
-    () =>
-      handleDirectImageAction(
-        "remove-background",
-        "提取主前景并输出透明背景 PNG",
-      ),
-    [handleDirectImageAction],
-  );
-
-  const handleStartRegionMatting = useCallback(() => {
-    if (!excalidrawApi) return;
-    const appState = excalidrawApi.getAppState?.() ?? {};
-    const selectedIds = appState.selectedElementIds ?? {};
-    const selected = (
-      excalidrawApi.getSceneElementsIncludingDeleted?.() ??
-      excalidrawApi.getSceneElements()
-    ).filter(
-      (element: any) =>
-        selectedIds[element.id] &&
-        !element.isDeleted &&
-        element.type === "image",
-    );
-    if (selected.length !== 1) return;
-    const image = selected[0];
-    const zoom = appState.zoom?.value ?? 1;
-    const scrollX = appState.scrollX ?? 0;
-    const scrollY = appState.scrollY ?? 0;
-    setRegionMattingSession({
-      imageId: image.id,
-      bounds: {
-        x: (Number(image.x ?? 0) + scrollX) * zoom,
-        y: (Number(image.y ?? 0) + scrollY) * zoom,
-        width: Number(image.width ?? 0) * zoom,
-        height: Number(image.height ?? 0) * zoom,
-      },
-      angle: image.angle ?? 0,
-    });
-  }, [excalidrawApi]);
-
-  const handleConfirmRegionMatting = useCallback(
-    async (region: NormalizedImageRegion) => {
-      const session = regionMattingSession;
-      setRegionMattingSession(null);
-      if (!session || !excalidrawApi) return;
-      const element = (
-        excalidrawApi.getSceneElementsIncludingDeleted?.() ??
-        excalidrawApi.getSceneElements()
-      ).find(
-        (candidate: any) =>
-          candidate.id === session.imageId && !candidate.isDeleted,
-      );
-      if (!element) {
-        showError("原图片已不存在，请重新选择后再试。");
-        return;
-      }
-
+    async () => {
+      if (submittingBackgroundRemovalRef.current) return;
+      submittingBackgroundRemovalRef.current = true;
       try {
-        const files = excalidrawApi.getFiles?.() ?? {};
-        const file =
-          typeof element.fileId === "string"
-            ? files[element.fileId]
-            : undefined;
-        const elementAssetId =
-          typeof file?.assetId === "string"
-            ? file.assetId
-            : typeof element.customData?.assetId === "string"
-              ? element.customData.assetId
-              : undefined;
-        const elementStorageUrl =
-          typeof element.customData?.storageUrl === "string"
-            ? element.customData.storageUrl
-            : undefined;
-        const source =
-          typeof file?.dataURL === "string"
-            ? file.dataURL
-            : elementAssetId
-              ? await fetchAssetAsDataURL(accessToken, elementAssetId)
-              : elementStorageUrl
-                ? await fetchAsDataURL(elementStorageUrl)
-                : undefined;
-        if (!source) throw new Error("原图数据尚未加载完成，请稍后重试。");
-        // Keep the whole visible image as model context. The normalized box is
-        // sent separately as an explicit foreground hint; cropping first would
-        // turn this back into ordinary global background removal.
-        const visibleResolution = getImageCropResolution(element);
-        const visibleImage = await renderImageCrop(
-          source,
-          element,
-          visibleResolution,
-          "image/webp",
-        );
-        await handleDirectImageAction(
-          "region-matting",
-          "识别用户框选的主体，仅保留该主体并将其他所有内容透明化",
-          {
-            inputImage: visibleImage.dataURL,
-            selectionRegion: region,
-            placement: {
-              x: Number(element.x ?? 0) + Number(element.width ?? 0) + 40,
-              y:
-                Number(element.y ?? 0) + Number(element.height ?? 0) * region.y,
-              width: Math.max(24, Number(element.width ?? 0) * region.width),
-              height: Math.max(24, Number(element.height ?? 0) * region.height),
-            },
-          },
-        );
-      } catch (error) {
-        showError(
-          error instanceof Error ? error.message : "框选抠图失败，请重试。",
-        );
+        await handleDirectImageAction("remove-background", "去除背景，保留主体并输出透明 PNG");
+      } finally {
+        submittingBackgroundRemovalRef.current = false;
       }
     },
-    [
-      accessToken,
-      excalidrawApi,
-      handleDirectImageAction,
-      regionMattingSession,
-      showError,
-    ],
+    [handleDirectImageAction],
   );
 
   const handleSplitImageLayers = useCallback(
     () => handleDirectImageAction("split-layers", "拆分前景元素并修复背景"),
     [handleDirectImageAction],
   );
+  const handleDedicatedSplitImageLayers = useCallback(
+    (request: SemanticLayerSplitRequest) => handleDirectImageAction("split-layers", "将原图拆分成独立的透明图层并补全底图", {
+      layerBackend: "semantic",
+      layerNames: request.layerNames,
+      repairBackground: request.repairBackground,
+      model: request.model,
+    }),
+    [handleDirectImageAction],
+  );
+  const handleQwenSplitImageLayers = useCallback(
+    () => handleDirectImageAction("split-layers", "将原图拆分成独立的透明图层，保留构图和原始内容", { layerBackend: "qwen-image-layered" }),
+    [handleDirectImageAction],
+  );
 
-  const handleStartErase = useCallback(() => {
+  const handleStartErase = useCallback(async () => {
     if (!selectedImage || !selectedImageBounds) return;
+    if (repaintBusyRef.current) return;
+    try {
+    const source = await readOperationImage(selectedImage.id);
+    if (repaintSubmissionRef.current) {
+      showError("前次重绘提交结果尚未确认，请先返回原重绘面板重试查询。");
+      return;
+    }
+    repaintJobRef.current = null; setRepaintError(undefined);
     setEraserSession({
       imageId: selectedImage.id,
       bounds: {
@@ -1553,113 +1503,79 @@ export function CanvasToolMenu({
         height: selectedImageBounds.height,
       },
       angle: selectedImage.angle ?? 0,
+      source,
+      placement: { x: selectedImage.x + selectedImage.width + 40, y: selectedImage.y, width: selectedImage.width, height: selectedImage.height },
     });
-  }, [selectedImage, selectedImageBounds]);
+    } catch (cause) { showError(cause instanceof Error ? cause.message : "无法读取重绘原图。"); }
+  }, [selectedImage, selectedImageBounds, readOperationImage, showError]);
 
   const handleConfirmErase = useCallback(
-    async (mode: ImageEraseMode, strokes: NormalizedEraseStroke[]) => {
+    async (_mode: ImageEraseMode, strokes: NormalizedEraseStroke[], prompt?: string) => {
       const session = eraserSession;
-      setEraserSession(null);
-      if (!session || !excalidrawApi || !strokes.length) return;
-      const element = (
-        excalidrawApi.getSceneElementsIncludingDeleted?.() ??
-        excalidrawApi.getSceneElements()
-      ).find(
-        (candidate: any) =>
-          candidate.id === session.imageId && !candidate.isDeleted,
-      );
-      if (!element) {
-        showError("原图片已不存在，请重新选择后再试。");
-        return;
-      }
+      if (!session || !excalidrawApi || !strokes.length || !prompt?.trim() || repaintBusyRef.current) return;
+      repaintBusyRef.current = true; setRepaintBusy(true); setRepaintError(undefined);
       try {
-        // Resolve from the image element locked into this eraser session. The
-        // generic selectedImage state can change while the overlay is open and
-        // previously caused a neighbouring image to be submitted instead.
-        // Export the selected element through Excalidraw so the submitted pixels
-        // are exactly the ones rendered on the canvas. This is intentionally not
-        // rebuilt from getFiles()[fileId]: Excalidraw can retain a decoded bitmap
-        // while a later canvas refresh updates that file entry, leaving the user
-        // looking at one image while an operation submits another.
-        const { exportToBlob } = await import("@excalidraw/excalidraw");
-        const visibleBlob = await exportToBlob({
-          elements: [element],
-          files: excalidrawApi.getFiles?.() ?? {},
-          appState: { exportBackground: false },
-          exportPadding: 0,
-          mimeType: "image/png",
-        });
-        const visibleImage = await new Promise<{
-          dataURL: string;
-          width: number;
-          height: number;
-        }>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onerror = () => reject(new Error("无法读取画布中的原图。"));
-          reader.onload = async () => {
-            try {
-              const bitmap = await createImageBitmap(visibleBlob);
-              const dimensions = { width: bitmap.width, height: bitmap.height };
-              bitmap.close();
-              resolve({ dataURL: reader.result as string, ...dimensions });
-            } catch (error) {
-              reject(error);
+        if (!repaintJobRef.current) {
+          if (!repaintSubmissionRef.current) {
+            const models = (await fetchImageModels(accessToken)).models;
+            const model = models.find(item => item.id === imageModelPreference.models[0])?.id ?? models[0]?.id;
+            if (!model) throw new Error("尚未配置可用的图片模型。");
+            const placeholderId = createImageReplacementElement(excalidrawApi, session.placement, "local-repaint");
+            repaintSubmissionRef.current = { placeholderId, payload: {
+              canvas_id: canvasId, operation: "local_repaint", model, prompt: prompt.trim(), quality: "standard",
+              input_images: [session.source.dataURL],
+              mask_image: renderEraseMask(strokes, session.source.width, session.source.height),
+              aspect_ratio: `${session.source.width}:${session.source.height}`,
+              placement_x: session.placement.x, placement_y: session.placement.y,
+              placement_width: session.placement.width, placement_height: session.placement.height,
+              placeholder_element_id: placeholderId,
+            } };
+          }
+          const { payload, placeholderId } = repaintSubmissionRef.current;
+          try {
+            const response = await createImageGenerationJob(accessToken, payload);
+            repaintJobRef.current = { id: response.job.id, placeholderId };
+            repaintSubmissionRef.current = null;
+            updateImageReplacementElement(excalidrawApi, placeholderId, { jobId: response.job.id });
+          } catch (cause) {
+            const status = cause && typeof cause === "object" && "status" in cause ? Number(cause.status) : 0;
+            if (status >= 400 && status < 500) {
+              repaintSubmissionRef.current = null;
+              updateImageReplacementElement(excalidrawApi, placeholderId, { isDeleted: true });
+              throw cause;
             }
-          };
-          reader.readAsDataURL(visibleBlob);
-        });
-        const resolution = {
-          width: visibleImage.width,
-          height: visibleImage.height,
-        };
-        const maskImage = renderEraseMask(
-          strokes,
-          resolution.width,
-          resolution.height,
-        );
-        await handleDirectImageAction(
-          mode === "smart" ? "smart-erase" : "erase-transparent",
-          mode === "smart" ? "修复用户涂抹删除的区域" : "将用户涂抹区域透明化",
-          {
-            inputImage: visibleImage.dataURL,
-            maskImage,
-            placement: {
-              x: Number(element.x ?? 0) + Number(element.width ?? 0) + 40,
-              y: Number(element.y ?? 0),
-              width: Number(element.width ?? 0),
-              height: Number(element.height ?? 0),
-            },
-          },
-        );
+            throw new Error("提交结果尚未确认。选区与描述已保留，再次点击会恢复同一请求，请勿另开重绘任务。");
+          }
+        }
+        const active = repaintJobRef.current!;
+        let job = await monitorCanvasGenerationJob(accessToken, active.id);
+        if (job.status !== "succeeded") {
+          updateImageReplacementElement(excalidrawApi, active.placeholderId, { status: "error", errorMessage: job.error_message ?? "局部重绘失败" });
+          if (!String(job.error_code ?? "").includes("unknown")) repaintJobRef.current = null;
+          throw new Error(job.error_message ?? "局部重绘失败，选区和描述已保留。");
+        }
+        for (let attempt = 0; attempt < 30 && typeof job.result?.canvas_element_id !== "string"; attempt++) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          job = (await fetchJob(accessToken, active.id)).job;
+        }
+        if (typeof job.result?.canvas_element_id !== "string") throw new Error("图片已生成，画布仍在同步；再次点击将查询原任务，不会重复生成。");
+        await onCanvasRefreshRequest?.();
+        setEraserSession(null); repaintJobRef.current = null;
+        showSuccess("局部重绘完成，新图片已放在原图旁边，原图保留。");
       } catch (error) {
-        showError(
-          error instanceof Error ? error.message : "橡皮处理失败，请重试。",
-        );
+        setRepaintError(error instanceof Error ? error.message : "局部重绘失败，选区和描述已保留。");
+      } finally {
+        repaintBusyRef.current = false; setRepaintBusy(false);
       }
     },
-    [
-      accessToken,
-      eraserSession,
-      excalidrawApi,
-      handleDirectImageAction,
-      showError,
-    ],
+    [accessToken, canvasId, eraserSession, excalidrawApi, imageModelPreference.models, onCanvasRefreshRequest, showSuccess],
   );
 
   const handleApplyTextReplacement = useCallback(
     async (replacements: Array<{ original: string; replacement: string }>) => {
       if (!selectedImage) throw new Error("当前图片已取消选择。");
-      const inputImage = selectedImage.dataUrl ?? selectedImage.storageUrl;
-      if (!inputImage)
-        throw new Error("当前图片数据不可用，请重新选择图片后再试。");
-      const instructions = replacements
-        .map(({ original, replacement }, index) =>
-          original
-            ? `${index + 1}. 将“${original}”替换为“${replacement}”`
-            : `${index + 1}. 添加文字“${replacement}”`,
-        )
-        .join("\n");
-      const prompt = `编辑参考图片中的文字：\n${instructions}\n严格保持原图的主体、Logo 图形、字体视觉风格、字号、颜色、位置、排版、背景、构图和其他所有内容不变；确保新文字拼写准确、清晰可读。只修改上述文字。`;
+      const source = await readOperationImage(selectedImage.id);
+      const replacementContent = buildTextReplacementContent(source, replacements);
       const availableModels = (await fetchImageModels(accessToken)).models;
       const preferredModel = imageModelPreference.models[0];
       const model =
@@ -1683,10 +1599,9 @@ export function CanvasToolMenu({
       try {
         response = await createImageGenerationJob(accessToken, {
           canvas_id: canvasId,
-          prompt,
+          ...replacementContent,
           model,
-          quality: "hd",
-          input_images: [inputImage],
+          quality: "standard",
           placement_x: placement.x,
           placement_y: placement.y,
           placement_width: placement.width,
@@ -1711,9 +1626,11 @@ export function CanvasToolMenu({
       // The editor panel can close now: the actual canvas node owns the visible
       // generation state and the durable job keeps running independently.
       void (async () => {
+        let generationFailed = false;
         try {
-          let job = await waitForGenerationJob(accessToken, response.job.id);
+          let job = await monitorCanvasGenerationJob(accessToken, response.job.id);
           if (job.status !== "succeeded") {
+            generationFailed = true;
             throw new Error(job.error_message || "文字替换生成失败，请重试。");
           }
           for (let attempt = 0; attempt < 30; attempt += 1) {
@@ -1726,14 +1643,11 @@ export function CanvasToolMenu({
               "图片已生成，但画布同步尚未完成，后台会继续恢复，请稍后刷新。",
             );
           }
-          updateImageReplacementElement(excalidrawApi, placeholderId, {
-            isDeleted: true,
-          });
           await onCanvasRefreshRequest?.();
           showSuccess("文字替换完成，新图片已放在原图右侧");
         } catch (error) {
           updateImageReplacementElement(excalidrawApi, placeholderId, {
-            status: "error",
+            status: generationFailed ? "error" : "generating",
             errorMessage:
               error instanceof Error ? error.message : "文字替换生成失败",
           });
@@ -1754,6 +1668,7 @@ export function CanvasToolMenu({
       selectedImage,
       showError,
       showSuccess,
+      readOperationImage,
     ],
   );
 
@@ -1848,6 +1763,7 @@ export function CanvasToolMenu({
           width: input.width,
           height: input.height,
           background: input.background,
+          ...(input.name ? { name: input.name } : {}),
           ...(input.templateId ? { template_id: input.templateId } : {}),
           node: placement,
         });
@@ -2060,44 +1976,56 @@ export function CanvasToolMenu({
       {/* Image Generator Panel -- floats below the selected placeholder */}
       {selectedImage &&
         selectedImageBounds &&
-        !regionMattingSession &&
-        !eraserSession && (
+        !eraserSession && !outpaintSession && (
           <ImageSelectionToolbar
+            key={`${selectedImage.id}:${Boolean(editingDesignId)}`}
+            boardOnly={Boolean(editingDesignId)}
             image={selectedImage}
             screenBounds={selectedImageBounds}
             onDownload={handleDownloadImage}
+            onAddToBoard={() => setImageBoardPickerOpen(true)}
+            addToBoardLabel={(excalidrawApi?.getSceneElements() ?? []).some((e: any) => !e.isDeleted && readDesignNodeMetadata(e) && classifyImageBoardPlacement(e, selectedImage) === "fully-contained") ? "加入此画板" : "添加到画板"}
             onCrop={handleCropImage}
             onRegenerate={handleRegenerateImage}
             onUpscale={handleUpscaleImage}
             onRemoveBackground={handleRemoveImageBackground}
-            onRegionMatting={handleStartRegionMatting}
             onSplitLayers={handleSplitImageLayers}
+            onSplitLayersDedicated={handleDedicatedSplitImageLayers}
+            onSplitLayersQwen={handleQwenSplitImageLayers}
+            accessToken={accessToken}
             onErase={handleStartErase}
+            onOutpaint={() => {
+              if (!selectedImage || editingDesignId) return;
+              const placement = {x:selectedImage.x,y:selectedImage.y,width:selectedImage.width,height:selectedImage.height};
+              void readOperationImage(selectedImage.id).then(source=>setOutpaintSession({source,placement})).catch(error=>showError(error instanceof Error?error.message:"无法读取扩图原图"));
+            }}
             onChatCommand={handleImageChatCommand}
             onRecognizeText={handleRecognizeImageText}
             onApplyTextReplacement={handleApplyTextReplacement}
           />
         )}
 
-      {regionMattingSession &&
-        createPortal(
-          <ImageRegionMattingOverlay
-            bounds={regionMattingSession.bounds}
-            angle={regionMattingSession.angle}
-            onCancel={() => setRegionMattingSession(null)}
-            onConfirm={(region) => void handleConfirmRegionMatting(region)}
-          />,
-          document.body,
-        )}
 
+      <CanvasImageBoardActions accessToken={accessToken} canvasId={canvasId} api={excalidrawApi}
+        image={selectedImage} open={imageBoardPickerOpen} onClose={closeImageBoardPicker}
+        onPersistCanvas={onPersistCanvas} {...(onCanvasRefreshRequest ? { onCanvasRefreshRequest } : {})}
+        onCanvasRevisionChange={onCanvasRevisionChange} {...(onOpenDesign ? { onOpenDesign } : {})} />
+
+      {outpaintSession && createPortal(<ImageOutpaintPanel source={outpaintSession.source} placement={outpaintSession.placement} api={excalidrawApi} accessToken={accessToken} canvasId={canvasId} preferredModel={imageModelPreference.models[0]} onClose={()=>setOutpaintSession(null)} />,document.body)}
       {eraserSession &&
         createPortal(
           <ImageEraserOverlay
+            repaint
+            busy={repaintBusy}
+            {...(repaintError ? { error: repaintError } : {})}
             bounds={eraserSession.bounds}
             angle={eraserSession.angle}
-            onCancel={() => setEraserSession(null)}
-            onConfirm={(mode, strokes) =>
-              void handleConfirmErase(mode, strokes)
+            onCancel={() => {
+              if (repaintSubmissionRef.current) { setRepaintError("提交结果尚未确认，请先重试恢复原请求，避免重复生成。"); return; }
+              setEraserSession(null);
+            }}
+            onConfirm={(mode, strokes, prompt) =>
+              void handleConfirmErase(mode, strokes, prompt)
             }
           />,
           document.body,
@@ -2105,6 +2033,7 @@ export function CanvasToolMenu({
 
       {activeGeneratorId && generatorData && generatorBounds && (
         <ImageGeneratorPanel
+          key={activeGeneratorId}
           elementId={activeGeneratorId}
           canvasId={canvasId}
           elementBounds={generatorBounds}
@@ -2112,6 +2041,7 @@ export function CanvasToolMenu({
           excalidrawApi={excalidrawApi}
           accessToken={accessToken}
           canvasScrollZoom={canvasScrollZoom}
+          onPersistCanvas={onPersistCanvas}
           onClose={handleCloseGenerator}
         />
       )}

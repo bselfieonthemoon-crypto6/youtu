@@ -49,6 +49,7 @@ function makeService(): ProviderConfigService {
       testedAt: "2026-09-01T00:00:01.000Z",
     }),
     discoverModels: vi.fn().mockResolvedValue([]),
+    discoverDraftModels: vi.fn().mockResolvedValue([]),
   };
 }
 
@@ -145,6 +146,33 @@ describe("provider config HTTP routes", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json().models).toEqual(discovered);
     expect(service.discoverModels).toHaveBeenCalledWith(user, workspaceId, configId);
+  });
+
+  it("discovers a draft without persisting it or echoing its API key", async () => {
+    const discovered = [{ upstreamModelId: "model-one", displayName: "model-one", modality: "text" as const, enabled: false, capabilities: ["text" as const] }];
+    vi.mocked(service.discoverDraftModels).mockResolvedValue(discovered);
+    const response = await (await makeApp(service)).inject({
+      method: "POST",
+      url: "/api/workspace/provider-configs/discover-models",
+      payload: { baseUrl: "https://api.example.test/v1", apiKey: "secret-key-value" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(service.discoverDraftModels).toHaveBeenCalledWith(user, workspaceId, {
+      baseUrl: "https://api.example.test/v1", apiKey: "secret-key-value",
+    });
+    expect(response.body).not.toContain("secret-key-value");
+  });
+
+  it("rejects an invalid draft key without echoing it", async () => {
+    const response = await (await makeApp(service)).inject({
+      method: "POST",
+      url: "/api/workspace/provider-configs/discover-models",
+      payload: { baseUrl: "https://api.example.test/v1", apiKey: "leak" },
+    });
+    expect(response.statusCode).toBe(422);
+    expect(response.json().error.code).toBe("provider_invalid_request");
+    expect(response.body).not.toContain("leak");
+    expect(service.discoverDraftModels).not.toHaveBeenCalled();
   });
 
   it("rejects an explicitly empty update API key with stable 400", async () => {

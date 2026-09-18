@@ -1,4 +1,5 @@
 import { getViewportCenter } from "./canvas-elements";
+import type { NodeImageRequest } from "./node-image-generation";
 
 // Aspect ratio to pixel dimensions mapping (at 1K base)
 const RATIO_DIMENSIONS: Record<string, { w: number; h: number }> = {
@@ -19,8 +20,9 @@ export type ImageGeneratorData = {
   aspectRatio: string;
   quality: string;
   inputImages?: string[];
-  jobId?: string;
-  errorMessage?: string;
+  nodeImageRequest?: NodeImageRequest;
+  jobId?: string | undefined;
+  errorMessage?: string | undefined;
 };
 
 function generateId(): string {
@@ -86,7 +88,7 @@ export function createImageGeneratorElement(
     prompt: "",
     model: options?.model ?? "google/nano-banana-2",
     aspectRatio,
-    quality: options?.quality ?? "hd",
+    quality: options?.quality ?? "standard",
   };
 
   const id = generateId();
@@ -154,8 +156,11 @@ export function updateImageGeneratorElement(
   elementId: string,
   updates: Partial<ImageGeneratorData>,
 ): void {
+  let changed = false;
   const elements = api.getSceneElements().map((el: any) => {
-    if (el.id !== elementId || !isImageGeneratorElement(el)) return el;
+    if (el.id !== elementId || el.isDeleted || !isImageGeneratorElement(el)) return el;
+    if (Object.entries(updates).every(([key, value]) => el.customData[key as keyof ImageGeneratorData] === value)) return el;
+    changed = true;
     return {
       ...el,
       customData: { ...el.customData, ...updates },
@@ -164,7 +169,7 @@ export function updateImageGeneratorElement(
       updated: Date.now(),
     };
   });
-  api.updateScene({ elements, captureUpdate: "IMMEDIATELY" });
+  if (changed) api.updateScene({ elements, captureUpdate: "IMMEDIATELY" });
 }
 
 /**

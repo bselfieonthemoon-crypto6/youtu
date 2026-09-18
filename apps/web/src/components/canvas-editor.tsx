@@ -10,16 +10,20 @@ import type { WebSocketHandle } from "../hooks/use-websocket";
 import { buildInitialCanvasAppState } from "../lib/canvas-app-state";
 import { localizeExcalidrawContextMenus } from "../lib/canvas-context-menu-i18n";
 import {
+  readDesignNodeMetadata,
   type DesignOpenTarget,
   findDesignPreviewOpenTarget,
   tombstonePastedDuplicateDesignNodes,
 } from "../lib/canvas-design";
 import {
   fetchAsDataURL,
+  fetchCanvasStorageAsDataURL,
   fetchAssetAsDataURL,
   isVideoUrl,
 } from "../lib/canvas-elements";
 import {
+  canvasFileSourceKey,
+  canvasFileSourcesKey,
   createCanvasFileLoadQueue,
   visibleCanvasFileIds,
 } from "../lib/canvas-file-loader";
@@ -59,6 +63,7 @@ const MemoizedCanvasToolMenu = memo(CanvasToolMenu);
 
 export type CanvasSelectedElement = {
   id: string;
+  designId?: string;
   type: string;
   x: number;
   y: number;
@@ -75,6 +80,7 @@ export type CanvasSelectedElement = {
 };
 
 type CanvasEditorProps = {
+  editingDesignId?: string | null;
   canvasId: string;
   projectId: string;
   accessToken: string;
@@ -92,12 +98,14 @@ type CanvasEditorProps = {
   onCanvasRefreshRequest?: () => Promise<void>;
   onCanvasRevisionChange: (revision: number) => void;
   onOpenDesign?: (target: DesignOpenTarget) => void;
+  onBindSave?: (save: (() => Promise<void>) | null) => void;
 };
 
 const THUMBNAIL_DEBOUNCE_MS = 10_000;
 const THUMBNAIL_MAX_SIZE = 400;
 
 export function CanvasEditor({
+  editingDesignId = null,
   canvasId,
   projectId,
   accessToken,
@@ -111,6 +119,7 @@ export function CanvasEditor({
   onCanvasRefreshRequest,
   onCanvasRevisionChange,
   onOpenDesign,
+  onBindSave,
 }: CanvasEditorProps) {
   const { resolvedTheme } = useTheme();
   const { error: showError } = useToast();
@@ -122,6 +131,9 @@ export function CanvasEditor({
   const canvasIdRef = useRef(canvasId);
   canvasIdRef.current = canvasId;
   const [excalidrawApi, setExcalidrawApi] = useState<any>(null);
+  // Excalidraw's binary file cache only keys by fileId. Retain the source that
+  // produced each cached entry so a same-id asset replacement is not skipped.
+  const loadedFileSourcesRef = useRef(new Map<string, string>());
   const prevSelectedIdsRef = useRef<string>("");
   const onSelectionChangeRef = useRef(onSelectionChange);
   onSelectionChangeRef.current = onSelectionChange;
@@ -224,6 +236,9 @@ export function CanvasEditor({
     }
     return { inlineFiles: inline, pendingUrls: pending };
   }, [initialContent.elements, initialContent.files]);
+  // Do not tear down the active file queue merely because a canvas refresh
+  // deserializes equal file metadata into new object/array references.
+  const pendingUrlSourcesKey = canvasFileSourcesKey(pendingUrls);
 
   // Load only files near the viewport. The queue bounds concurrency, retries
   // transient failures, and prefers stable authenticated asset URLs over
@@ -246,7 +261,7 @@ export function CanvasEditor({
             },
           );
         }
-        if (candidate.storageUrl) return fetchAsDataURL(candidate.storageUrl);
+        if (candidate.storageUrl) return fetchCanvasStorageAsDataURL(candidate.storageUrl, signal);
         throw new Error("Canvas file has no readable source");
       },
       onLoaded(candidate, dataURL) {
@@ -257,9 +272,16 @@ export function CanvasEditor({
             mimeType:
               detectedMimeType ?? candidate.meta.mimeType ?? "image/png",
             created: candidate.meta.created ?? Date.now(),
+            // Keep the original binding with this file. Toolbar operations
+            // must fetch original bytes instead of processing this preview.
+            ...(candidate.assetId ? { assetId: candidate.assetId } : {}),
             dataURL,
           },
         ]);
+        loadedFileSourcesRef.current.set(
+          candidate.fileId,
+          canvasFileSourceKey(candidate),
+        );
       },
       onFailed(candidate, error) {
         console.warn(
@@ -280,7 +302,11 @@ export function CanvasEditor({
       queue.enqueue(
         visibleIds.flatMap((fileId) => {
           const candidate = pendingById.get(fileId);
-          return candidate && !loaded[fileId] ? [candidate] : [];
+          return candidate && (
+            !loaded[fileId] ||
+            loadedFileSourcesRef.current.get(fileId) !==
+              canvasFileSourceKey(candidate)
+          ) ? [candidate] : [];
         }),
       );
     };
@@ -290,12 +316,14 @@ export function CanvasEditor({
     };
     scheduleVisible();
     const unsubscribe = excalidrawApi.onScrollChange?.(scheduleVisible);
+    const unsubscribeChange = excalidrawApi.onChange?.(scheduleVisible);
     return () => {
       if (frame !== null) cancelAnimationFrame(frame);
       unsubscribe?.();
+      unsubscribeChange?.();
       queue.dispose();
     };
-  }, [excalidrawApi, pendingUrls]);
+  }, [excalidrawApi, pendingUrlSourcesKey]);
 
   const handleExcalidrawApi = useCallback(
     (api: any) => {
@@ -507,6 +535,8 @@ export function CanvasEditor({
                   width: el.width ?? 0,
                   height: el.height ?? 0,
                 };
+                const selectedDesign = readDesignNodeMetadata(el);
+                if (selectedDesign) base.designId = selectedDesign.designId;
                 if (el.type === "text" && el.text) {
                   base.text = el.text;
                 }
@@ -693,6 +723,23 @@ export function CanvasEditor({
   const buildSavePayloadRef = useRef(buildSavePayload);
   buildSavePayloadRef.current = buildSavePayload;
 
+  const persistCanvasNow = useCallback(async () => {
+      if (excalidrawApi?.getAppState().pendingImageElementId)
+        throw new Error("请先点击画布放置图片，再离开。");
+      const payload = buildSavePayloadRef.current();
+      if (!payload) throw new Error("画布尚未就绪，请稍后再离开。");
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      pendingSaveRef.current = payload;
+      const revision = await saveCanvas(accessTokenRef.current, canvasIdRef.current, payload);
+      publishCanvasRevision(revision);
+      if (pendingSaveRef.current === payload) pendingSaveRef.current = null;
+  }, [excalidrawApi, publishCanvasRevision]);
+
+  useEffect(() => {
+    onBindSave?.(persistCanvasNow);
+    return () => onBindSave?.(null);
+  }, [onBindSave, persistCanvasNow]);
+
   // Flush pending save on page close (beforeunload) and component unmount
   useEffect(() => {
     const flushBeforeUnload = () => {
@@ -708,7 +755,7 @@ export function CanvasEditor({
       // it's the best-effort approach -- sendBeacon has the same constraint.
       const url = `${getServerBaseUrl()}/api/canvases/${canvasIdRef.current}`;
       try {
-        fetch(url, {
+        void fetch(url, {
           method: "PUT",
           headers: {
             Authorization: `Bearer ${accessTokenRef.current}`,
@@ -716,6 +763,9 @@ export function CanvasEditor({
           },
           body: JSON.stringify({ content: payload }),
           keepalive: true,
+        }).catch(() => {
+          // A rejected fetch is asynchronous: the surrounding catch only
+          // handles synchronous setup failures, not an offline unload.
         });
       } catch {
         // Best-effort -- nothing we can do if it fails during page teardown
@@ -794,7 +844,14 @@ export function CanvasEditor({
         x: event.clientX,
         y: event.clientY,
       });
-      if (target) onOpenDesignRef.current(target);
+      if (target) {
+        // A design artboard owns this double click. Letting it reach
+        // Excalidraw also opens the rectangle's bound-text editor underneath
+        // Fabric; its blur handler then steals focus from the chat composer.
+        event.preventDefault();
+        event.stopPropagation();
+        onOpenDesignRef.current(target);
+      }
     },
     [excalidrawApi],
   );
@@ -826,12 +883,32 @@ export function CanvasEditor({
         />
         {excalidrawApi && (
           <DesignNodeOverlayLayer
+            editingDesignId={editingDesignId}
             accessToken={accessToken}
             excalidrawApi={excalidrawApi}
+            onNormalizeNode={(elementId, aspectRatio) => {
+              const elements = excalidrawApi.getSceneElements();
+              const target = elements.find((element: any) => element.id === elementId);
+              if (!target || target.isDeleted) return;
+              const resize = aspectRatio && Math.abs(target.width / target.height - aspectRatio) > 0.0001;
+              if (!resize && target.strokeColor === "#d4d4d4" && target.backgroundColor === "#ffffff" && target.opacity === 100 && target.strokeWidth === 1 && target.roughness === 0 && target.roundness === null) return;
+              const edge = Math.max(target.width, target.height);
+              excalidrawApi.updateScene({
+                elements: elements.map((element: any) => element.id !== elementId ? element : {
+                  // The native node owns BOTH its outline and hit area. A second
+                  // DOM border can drift from Excalidraw's selection while dragging.
+                  ...element, strokeColor: "#d4d4d4", backgroundColor: "#ffffff", opacity: 100, strokeWidth: 1, roughness: 0, roundness: null,
+                  ...(resize ? { width: aspectRatio >= 1 ? edge : edge * aspectRatio, height: aspectRatio >= 1 ? edge / aspectRatio : edge } : {}),
+                  version: element.version + 1,
+                }),
+                captureUpdate: "NONE",
+              });
+            }}
           />
         )}
         {excalidrawApi && (
           <MemoizedCanvasToolMenu
+            editingDesignId={editingDesignId}
             accessToken={accessToken}
             canvasId={canvasId}
             canvasRevision={canvasRevision}
@@ -840,6 +917,7 @@ export function CanvasEditor({
             {...(onImageChatCommand ? { onImageChatCommand } : {})}
             {...(onCanvasRefreshRequest ? { onCanvasRefreshRequest } : {})}
             onCanvasRevisionChange={publishCanvasRevision}
+            onPersistCanvas={persistCanvasNow}
             {...(onOpenDesign ? { onOpenDesign } : {})}
           />
         )}

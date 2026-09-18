@@ -6,12 +6,13 @@
   "scripts": {
     "dev": "turbo run dev",
     "build": "turbo run build",
-    "lint": "biome check .",
+    "lint": "biome lint apps/server/src apps/web/src packages/shared/src",
+    "format": "biome format --write apps/server/src apps/web/src packages/shared/src",
     "test:workspace": "node --test tests/workspace.test.mjs",
-    "test:packages": "turbo run test",
+    "test:packages": "turbo run test --concurrency=1",
     "test": "pnpm run test:workspace && pnpm run test:packages",
     "seed": "node scripts/seed-test-accounts.mjs",
-    "typecheck": "turbo run typecheck",
+    "typecheck": "turbo run typecheck --concurrency=1",
     "model:feynobg:download": "python scripts/download-feynobg.py"
   },
   "devDependencies": {

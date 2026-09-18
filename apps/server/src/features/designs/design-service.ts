@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from "node:util";
+
 import {
   type CopyDesignRequest,
   type CreateDesignRequest,
@@ -11,8 +13,12 @@ import {
   type DesignMutationResponse,
   type Json,
   type LoomicSceneV1,
+  type ManualCanvasImageImportRequest,
+  type ManualCanvasImageImportResponse,
   type RenameDesignRequest,
   type RestoreDesignRequest,
+  type UndoManualCanvasImageImportRequest,
+  type UndoManualCanvasImageImportResponse,
   copyDesignRequestSchema,
   createDesignRequestSchema,
   createDesignResponseSchema,
@@ -23,8 +29,12 @@ import {
   designLifecycleResponseSchema,
   designMutationRequestSchema,
   designMutationResponseSchema,
+  manualCanvasImageImportRequestSchema,
+  manualCanvasImageImportResponseSchema,
   renameDesignRequestSchema,
   restoreDesignRequestSchema,
+  undoManualCanvasImageImportRequestSchema,
+  undoManualCanvasImageImportResponseSchema,
 } from "@loomic/shared";
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
@@ -36,6 +46,11 @@ import {
   DesignCommandApplyError,
   applyDesignCommands,
 } from "./design-command-applier.js";
+import {
+  ManualCanvasImageImportBuildError,
+  buildManualCanvasImageObject,
+  manualCanvasImageImportObjectId,
+} from "./manual-canvas-image-import.js";
 
 type DatabaseError = {
   code?: string;
@@ -93,6 +108,16 @@ export type DesignService = {
       destructiveConfirmed?: boolean | undefined;
     },
   ): Promise<DesignMutationResponse>;
+  importCanvasImage(
+    user: AuthenticatedUser,
+    input: ManualCanvasImageImportRequest,
+  ): Promise<ManualCanvasImageImportResponse>;
+  undoCanvasImageImport(
+    user: AuthenticatedUser,
+    designId: string,
+    operationId: string,
+    input: UndoManualCanvasImageImportRequest,
+  ): Promise<UndoManualCanvasImageImportResponse>;
   rename(
     user: AuthenticatedUser,
     input: RenameDesignRequest,
@@ -174,7 +199,36 @@ export function createDesignService(options: {
       }
       let nextScene: LoomicSceneV1;
       try {
-        nextScene = applyDesignCommands(current.scene, input.commands);
+        if (
+          context?.actorKind !== "agent" &&
+          current.revision !== input.expected_revision
+        ) {
+          // A successful add/remove/update cannot be applied a second time to
+          // the latest scene. Validate its durable receipt before reaching the
+          // RPC, which still enforces write permission and returns the replay.
+          const { data: receipt, error: receiptError } = await admin
+            .from("design_document_versions")
+            .select("parent_revision, command_batch, actor_kind, actor_user_id")
+            .eq("design_id", input.design_id)
+            .eq("idempotency_key", input.idempotency_key)
+            .maybeSingle();
+          if (receiptError)
+            throw mapDatabaseError(receiptError, "query", {
+              designId: input.design_id,
+            });
+          if (
+            !receipt ||
+            receipt.parent_revision !== input.expected_revision ||
+            !isDeepStrictEqual(receipt.command_batch, input.commands) ||
+            receipt.actor_kind !== (context?.actorKind ?? "user") ||
+            receipt.actor_user_id !== user.id
+          ) {
+            throw conflictError(input.design_id, current.revision, []);
+          }
+          nextScene = current.scene;
+        } else {
+          nextScene = applyDesignCommands(current.scene, input.commands);
+        }
       } catch (error) {
         if (error instanceof DesignCommandApplyError) {
           if (error.code === "object_version_conflict") {
@@ -267,6 +321,113 @@ export function createDesignService(options: {
         design_id: result.design_id,
         revision: result.revision,
         changed_object_ids: result.changed_object_ids,
+        replayed: result.replayed,
+      });
+    },
+
+    async importCanvasImage(user, rawInput) {
+      const input = manualCanvasImageImportRequestSchema.parse(rawInput);
+      const design = await this.get(user, input.design_id);
+      const admin = options.getAdminClient();
+      const replay = await loadManualCanvasImageImportReplay(
+        admin,
+        input,
+        user.id,
+      );
+      const client = options.createUserClient(user.accessToken);
+      const canvas = await loadImportCanvas(client, input.canvas_id);
+      if (canvas.project_id !== design.project_id) {
+        throw new DesignServiceError(
+          "design_forbidden",
+          "The canvas image and design board are not in the same project.",
+          403,
+        );
+      }
+      if (replay) {
+        const objectId = manualCanvasImageImportObjectId(input);
+        return manualCanvasImageImportResponseSchema.parse({
+          operation_id: objectId,
+          design_id: input.design_id,
+          design_revision: replay.revision,
+          object_id: objectId,
+          object_version: 1,
+          source_canvas_id: input.canvas_id,
+          source_canvas_revision: canvas.revision,
+          source_element_id: input.source_element_id,
+          source_element_version: input.expected_source_element_version,
+          mode: input.mode,
+          replayed: true,
+        });
+      }
+
+      let object;
+      try {
+        object = buildManualCanvasImageObject({
+          request: input,
+          design,
+          elements: readCanvasElements(canvas.content),
+        });
+      } catch (error) {
+        if (error instanceof ManualCanvasImageImportBuildError) {
+          if (error.code === "source_changed" || error.code === "board_changed") {
+            throw new DesignServiceError(
+              "design_conflict",
+              error.message,
+              409,
+              {
+                canvasId: input.canvas_id,
+                latestRevision: canvas.revision,
+                conflictObjectIds: [],
+                retryable: false,
+              },
+            );
+          }
+          throw new DesignServiceError("design_invalid", error.message, 400);
+        }
+        throw error;
+      }
+
+      const result = await this.mutate(user, {
+        design_id: input.design_id,
+        expected_revision: input.expected_design_revision,
+        idempotency_key: input.request_id,
+        commands: [{ action: "object.add", object }],
+      });
+      return manualCanvasImageImportResponseSchema.parse({
+        operation_id: object.objectId,
+        design_id: input.design_id,
+        design_revision: result.revision,
+        object_id: object.objectId,
+        object_version: object.objectVersion,
+        source_canvas_id: input.canvas_id,
+        source_canvas_revision: canvas.revision,
+        source_element_id: input.source_element_id,
+        source_element_version: input.expected_source_element_version,
+        mode: input.mode,
+        replayed: result.replayed,
+      });
+    },
+
+    async undoCanvasImageImport(user, designId, operationId, rawInput) {
+      const input = undoManualCanvasImageImportRequestSchema.parse(rawInput);
+      const result = await this.mutate(user, {
+        design_id: designId,
+        expected_revision: input.expected_design_revision,
+        idempotency_key: input.idempotency_key,
+        commands: [
+          {
+            action: "object.remove",
+            object_id: operationId,
+            expected_object_version: input.expected_object_version,
+          },
+        ],
+      });
+      return undoManualCanvasImageImportResponseSchema.parse({
+        operation_id: operationId,
+        design_id: designId,
+        design_revision: result.revision,
+        object_id: operationId,
+        removed: true,
         replayed: result.replayed,
       });
     },
@@ -455,6 +616,87 @@ async function loadAgentMutationReplay(
     changed_object_ids: version.changed_object_ids,
     replayed: true,
   });
+}
+
+async function loadManualCanvasImageImportReplay(
+  admin: AdminSupabaseClient,
+  input: ManualCanvasImageImportRequest,
+  actorUserId: string,
+): Promise<DesignMutationResponse | null> {
+  const { data: version, error } = await admin
+    .from("design_document_versions")
+    .select(
+      "revision, parent_revision, command_batch, changed_object_ids, actor_kind, actor_user_id",
+    )
+    .eq("design_id", input.design_id)
+    .eq("idempotency_key", input.request_id)
+    .maybeSingle();
+  if (error)
+    throw mapDatabaseError(error, "query", { designId: input.design_id });
+  if (!version) return null;
+  const commands = Array.isArray(version.command_batch)
+    ? version.command_batch
+    : [];
+  const command = commands[0] as Record<string, unknown> | undefined;
+  const object = command?.object as Record<string, unknown> | undefined;
+  const expectedObjectId = manualCanvasImageImportObjectId(input);
+  const same =
+    version.parent_revision === input.expected_design_revision &&
+    version.actor_kind === "user" &&
+    version.actor_user_id === actorUserId &&
+    commands.length === 1 &&
+    command?.action === "object.add" &&
+    object?.type === "image" &&
+    object.objectId === expectedObjectId &&
+    Array.isArray(version.changed_object_ids) &&
+    version.changed_object_ids.includes(expectedObjectId);
+  if (!same) {
+    throw new DesignServiceError(
+      "design_conflict",
+      "The request ID was already used for a different design mutation.",
+      409,
+      {
+        designId: input.design_id,
+        latestRevision: Number(version.revision),
+        conflictObjectIds: [],
+        retryable: false,
+      },
+    );
+  }
+  return designMutationResponseSchema.parse({
+    design_id: input.design_id,
+    revision: version.revision,
+    changed_object_ids: version.changed_object_ids,
+    replayed: true,
+  });
+}
+
+async function loadImportCanvas(
+  client: UserSupabaseClient,
+  canvasId: string,
+) {
+  const { data, error } = await client
+    .from("canvases")
+    .select("id, project_id, revision, content")
+    .eq("id", canvasId)
+    .maybeSingle();
+  if (error) throw mapDatabaseError(error, "query", { canvasId });
+  if (!data) {
+    throw new DesignServiceError(
+      "design_not_found",
+      "Canvas not found.",
+      404,
+    );
+  }
+  return data;
+}
+
+function readCanvasElements(content: unknown): readonly unknown[] {
+  if (!content || typeof content !== "object" || Array.isArray(content)) {
+    return [];
+  }
+  const elements = (content as Record<string, unknown>).elements;
+  return Array.isArray(elements) ? elements : [];
 }
 
 const DESIGN_COLUMNS =

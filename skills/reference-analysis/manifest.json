@@ -1,0 +1,74 @@
+{
+  "slug": "reference-analysis",
+  "name": "参考图分析",
+  "description": "从实际参考图提取构图、色彩角色、字体层级和素材关系；只分析不生成，不凭 URL 编造细节。",
+  "version": "2.1.0",
+  "category": "design",
+  "iconName": "palette",
+  "license": null,
+  "metadata": {
+    "bundle": "loomic-design-skills-v2",
+    "loomic": {
+      "schemaVersion": 1,
+      "execution": "guidance",
+      "intents": [
+        "reference-analysis",
+        "visual-analysis"
+      ],
+      "outputKinds": [
+        "design-brief",
+        "design-review"
+      ],
+      "requiredTools": [],
+      "optionalTools": [
+        "inspect_design",
+        "get_design_objects",
+        "update_design_brief",
+        "verify_design_result",
+        "get_brand_kit"
+      ],
+      "models": [
+        {
+          "role": "planner",
+          "required": true,
+          "preferredIds": []
+        },
+        {
+          "role": "vision",
+          "required": false,
+          "preferredIds": []
+        }
+      ],
+      "limitations": [
+        "技能不增加运行时工具、模型、权限或预算；用户局部修改不扩展为重设计。",
+        "本包为 Loomic 原创流程，研究来源不是效果 benchmark；未运行上游脚本或自动下载依赖。"
+      ],
+      "examples": [
+        "参考这两张图的留白和层级，不要照搬标志。"
+      ],
+      "sources": [
+        {
+          "title": "Composition and refinement method",
+          "url": "https://github.com/anthropics/skills/blob/main/skills/canvas-design/SKILL.md",
+          "license": "Apache-2.0",
+          "relation": "inspired-by"
+        },
+        {
+          "title": "Cover art-direction dimensions",
+          "url": "https://github.com/JimLiu/baoyu-skills/blob/main/skills/baoyu-cover-image/SKILL.md",
+          "license": "MIT",
+          "relation": "inspired-by"
+        }
+      ],
+      "composition": {
+        "role": "reference",
+        "stages": [
+          "design",
+          "reference",
+          "prompt",
+          "review"
+        ]
+      }
+    }
+  }
+}

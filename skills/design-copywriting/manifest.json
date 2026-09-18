@@ -1,0 +1,69 @@
+{
+  "slug": "design-copywriting",
+  "name": "设计文案",
+  "description": "把用户提供的品牌和产品事实组织为标题、卖点与行动引导；排版任务不擅自改定稿。",
+  "version": "2.1.0",
+  "category": "writing",
+  "iconName": "palette",
+  "license": null,
+  "metadata": {
+    "bundle": "loomic-design-skills-v2",
+    "loomic": {
+      "schemaVersion": 1,
+      "execution": "guidance",
+      "intents": [
+        "copywriting",
+        "headline",
+        "cta"
+      ],
+      "outputKinds": [
+        "copy",
+        "design-brief"
+      ],
+      "requiredTools": [],
+      "optionalTools": [
+        "inspect_design",
+        "get_design_objects",
+        "update_design_brief",
+        "verify_design_result",
+        "get_brand_kit"
+      ],
+      "models": [
+        {
+          "role": "planner",
+          "required": true,
+          "preferredIds": []
+        }
+      ],
+      "limitations": [
+        "技能不增加运行时工具、模型、权限或预算；用户局部修改不扩展为重设计。",
+        "本包为 Loomic 原创流程，研究来源不是效果 benchmark；未运行上游脚本或自动下载依赖。"
+      ],
+      "examples": [
+        "用这些已核实卖点写一个标题和三条短文案，价格不能改。"
+      ],
+      "sources": [
+        {
+          "title": "Cover art-direction dimensions",
+          "url": "https://github.com/JimLiu/baoyu-skills/blob/main/skills/baoyu-cover-image/SKILL.md",
+          "license": "MIT",
+          "relation": "inspired-by"
+        },
+        {
+          "title": "Carousel narrative and information density",
+          "url": "https://github.com/JimLiu/baoyu-skills/blob/main/skills/baoyu-xhs-images/SKILL.md",
+          "license": "MIT",
+          "relation": "inspired-by"
+        }
+      ],
+      "composition": {
+        "role": "workflow",
+        "stages": [
+          "design",
+          "prompt",
+          "review"
+        ]
+      }
+    }
+  }
+}
