@@ -295,3 +295,19 @@ describe("extractStyleHints", () => {
     expect(mergeStyleHints("高端、海洋", "海洋")).toBe("高端、海洋");
   });
 });
+
+describe("edit label vocabulary is unchanged by the deferral", () => {
+  it("keeps `local_edit` for a weak verb and for a real change alike", () => {
+    // Fix ① changes DECISIVENESS (needsModel/confidence), never the published
+    // label: `assessDesignTurnIntent` still answers `local_edit` for a bare
+    // generic verb, which is also what a classifier outage falls back to. The
+    // `edit_verb` rule and the broad `EDIT_PATTERN` are untouched — see
+    // `design-turn-intent-classifier.test.ts` for the confidence/model boundary.
+    for (const prompt of [
+      "改天再说", "改主意了",
+      "帮我把标题改成蓝色", "把背景改成白色", "把标题改一下", "调整一下颜色", "把海报上的文字改成蓝色",
+    ]) {
+      expect(classify(prompt), prompt).toBe("local_edit");
+    }
+  });
+});

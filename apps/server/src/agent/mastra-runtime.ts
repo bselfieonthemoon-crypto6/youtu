@@ -163,11 +163,22 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     // all, and any classifier failure/timeout falls back to the regex verdict.
     // The resulting label is a routing hint for method selection only: it never
     // authorizes execution, billing, ratio or image source.
+    //
+    // Skill keyword evidence is computed ONCE, here, BEFORE the turn verdict: it
+    // is the same pure selection the preload below uses (no second match that
+    // could drift), it tells the verdict whether a `no_rule` turn has anything to
+    // route at all, and `explainPrimarySkillSelection` is cheap enough to run on
+    // every turn — it only scores declared keywords.
+    const routingSelection = explainPrimarySkillSelection({ prompt: run.prompt, mentions: run.mentions, skills });
+    const routedHelperSkillSlugs = selectHelperSkills({ prompt: run.prompt, skills });
+    const skillKeywordMatched = Boolean(routingSelection?.mentioned || routingSelection?.keywords.length)
+      || routedHelperSkillSlugs.length > 0;
     const turnIntent = await resolveDesignTurnIntent({
       prompt: run.prompt, mentions: run.mentions,
       activeSkill: designContext?.activeSkill ?? null, hasSeries: Boolean(designContext?.series),
       hasAttachments: run.attachments.length > 0,
       clarificationPending: designContext?.awaitingClarification === true,
+      skillKeywordMatched,
       classifier: turnIntentClassifier, signal: run.signal,
     });
     const designIntent = turnIntent.intent;
@@ -179,9 +190,10 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
         rules: turnIntent.assessment.rules, confidence: turnIntent.confidence, clamped: turnIntent.clamped });
     const enabledSkillSlugs = new Set(skills.map(skill => skill.name));
     // The selection carries its own evidence (matched keywords) so the routing
-    // notice can explain the choice instead of inventing a reason.
-    const primarySelection = designIntent === "new_generation"
-      ? explainPrimarySkillSelection({ prompt: run.prompt, mentions: run.mentions, skills }) : undefined;
+    // notice can explain the choice instead of inventing a reason. Only a
+    // `new_generation` verdict may preload a primary, so only that verdict reads
+    // the selection — the computation above is pure and reused, never re-run.
+    const primarySelection = designIntent === "new_generation" ? routingSelection : undefined;
     const routedSkill = primarySelection?.skill;
     const priorSkill = designContext?.activeSkill && enabledSkillSlugs.has(designContext.activeSkill)
       ? designContext.activeSkill : undefined;
@@ -202,7 +214,7 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     // reach the model in this same turn. The keyword match IS the gate: a review
     // or prompt-optimisation request classifies as non_design yet still needs its
     // guide, so helpers are resolved independently of the turn label.
-    const helperSkills = selectHelperSkills({ prompt: run.prompt, skills })
+    const helperSkills = routedHelperSkillSlugs
       .map(name => skills.find(skill => skill.name === name))
       .filter((skill): skill is (typeof skills)[number] => Boolean(skill) && skill!.name !== activeSkill);
     if (helperSkills.length)
@@ -356,12 +368,20 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
         if (!picked.length) return { sourceAssetIds: [], inputImages: [] };
         return explicitSourceResolver({ context, sourceAssetIds: picked });
       } });
+    // Every Skill whose guide TEXT is injected into this turn's session
+    // instructions. The Skill tools receive this so `use_skill` /
+    // `compose_skills` return that guide's identity, version and role instead of
+    // putting a second copy of the same body in context. Identity still comes
+    // back, so the model can tell the guide is active rather than missing.
+    const preloadedSkillNames = [preloadedSkill?.name, nonstandardSizeSkill?.name,
+      ...helperSkills.map(skill => skill.name)].filter((name): name is string => Boolean(name));
     const toolkit = createMastraToolkit({
       mainToolDependencies: { createUserClient: options.createUserClient, ...(options.designTools ? { designTools: options.designTools } : {}),
         ...(options.destructiveConfirmationService ? { destructiveConfirmationService: options.destructiveConfirmationService } : {}),
         visionModel, availableVideoModels: [], ...(project.data.brand_kit_id ? { brandKitId: project.data.brand_kit_id } : {}),
         ...(options.connectionManager ? { connectionManager: options.connectionManager } : {}), currentUserPrompt: run.prompt },
       workspaceSkills: skills, ...(options.promptLibraryService ? { promptLibraryService: options.promptLibraryService } : {}),
+      ...(preloadedSkillNames.length ? { preloadedSkillNames } : {}),
       nativeImageTools: [
         imageTools.generateImage, imageTools.editImage,
         ...(videos.length ? [createMastraVideoTool({ createUserClient: options.createUserClient,

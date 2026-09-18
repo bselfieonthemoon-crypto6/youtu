@@ -34,8 +34,11 @@ function directTool<TInput, TResult>(tool: { execute?: unknown }) {
 }
 
 /** The three Skill tools with the direct-call contract used below. */
-function skillTools(entries: readonly WorkspaceSkillEntry[]) {
-  const [list, use, compose] = createWorkspaceSkillTools(entries);
+function skillTools(
+  entries: readonly WorkspaceSkillEntry[],
+  options?: { preloadedSkillNames?: readonly string[] },
+) {
+  const [list, use, compose] = createWorkspaceSkillTools(entries, options);
   return [directTool<ListSkillsInput, ListSkillsResult>(list),
     directTool<UseSkillInput, unknown>(use),
     directTool<ComposeSkillsInput, unknown>(compose)] as const;
@@ -110,5 +113,64 @@ describe("explicit skill usage evidence", () => {
     expect(await use.execute({ name: entry.name }, toolExecutionContext({}))).toMatchObject({ status: "loaded", instructions: entry.content });
     expect(await compose.execute({ deliverable: "Logo", stage: "design", primary: entry.name }, toolExecutionContext({})))
       .toMatchObject({ status: "conflict", code: "composition_metadata_missing" });
+  });
+});
+
+describe("guides the runtime already preloaded this turn", () => {
+  /** A composable Skill, so both use_skill and compose_skills can be exercised. */
+  const composable = { ...entry, readiness: { status: "ready" as const, reasons: [], models: [] },
+    metadata: { loomic: { schemaVersion: 1, execution: "native", intents: [], outputKinds: [],
+      requiredTools: [], optionalTools: [], models: [], limitations: [], examples: [], sources: [],
+      composition: { role: "domain", stages: ["design"] } } } };
+
+  it("declares no preload by default, so the body still comes back in full", async () => {
+    // Opt-in: an existing caller keeps the original "return the whole guide".
+    const [list, use, compose] = skillTools([composable]);
+    expect(await use.execute({ name: entry.name }, toolExecutionContext({})))
+      .toMatchObject({ status: "loaded", instructions: entry.content });
+    expect((await list.execute({}, toolExecutionContext({}))).skills[0]).not.toHaveProperty("alreadyPreloaded");
+    expect(await compose.execute({ deliverable: "Logo", stage: "design", primary: entry.name, helpers: [] }, toolExecutionContext({})))
+      .toMatchObject({ status: "composed", alreadyPreloaded: [], primary: { instructions: entry.content } });
+  });
+
+  it("use_skill reports identity instead of a second copy of an already-preloaded body", async () => {
+    const [, use] = skillTools([composable], { preloadedSkillNames: [entry.name] });
+    const result = await use.execute({ name: entry.name }, toolExecutionContext({}));
+    expect(result).toMatchObject({ status: "loaded", alreadyPreloaded: true,
+      // Identity, version and hash are unchanged: only the duplicated text is gone.
+      skill: { name: entry.name, version: "2.0.0", contentHash: hashSkillPackage(entry.content, entry.files) } });
+    expect((result as any).instructions).not.toBe(entry.content);
+    expect((result as any).instructions).toContain("已预载");
+    expect((result as any).instructions).toContain("2.0.0");
+    // The summary must not claim to have loaded text it did not send.
+    expect((result as any).summary).toContain("已预载");
+    expect((result as any).summary).not.toContain("全文并用于当前阶段");
+  });
+
+  it("compose_skills does not repeat a preloaded primary body and names it in the result", async () => {
+    const [, , compose] = skillTools([composable], { preloadedSkillNames: [entry.name] });
+    const result = await compose.execute({ deliverable: "Logo", stage: "design", primary: entry.name, helpers: [] }, toolExecutionContext({}));
+    expect(result).toMatchObject({ status: "composed", alreadyPreloaded: [entry.name],
+      primary: { name: entry.name, alreadyPreloaded: true } });
+    expect((result as any).primary.instructions).not.toBe(entry.content);
+    expect((result as any).primary.instructions).toContain("已预载");
+    expect((result as any).summary).toContain("已预载");
+    // Role and responsibility are composition facts, not guide text: keep them.
+    expect((result as any).primary.role).toBe("domain");
+  });
+
+  it("only suppresses the guide named as preloaded, never a sibling", async () => {
+    // A `domain` package may only lead, so the preloaded one is a workflow helper.
+    const preloadedHelper = { ...entry, name: "design-review", displayName: "设计评审",
+      metadata: { loomic: { schemaVersion: 1, execution: "native", intents: [], outputKinds: [],
+        requiredTools: [], optionalTools: [], models: [], limitations: [], examples: [], sources: [],
+        composition: { role: "workflow", stages: ["design"] } } } };
+    const [, , compose] = skillTools([composable, preloadedHelper], { preloadedSkillNames: ["design-review"] });
+    const result = await compose.execute({ deliverable: "Logo", stage: "design", primary: entry.name, helpers: ["design-review"] }, toolExecutionContext({}));
+    // The primary's body still comes in full; only the preloaded helper is elided.
+    expect(result).toMatchObject({ status: "composed", alreadyPreloaded: ["design-review"],
+      primary: { name: entry.name, instructions: entry.content },
+      helpers: [{ name: "design-review", alreadyPreloaded: true }] });
+    expect((result as any).helpers[0].instructions).not.toBe(entry.content);
   });
 });

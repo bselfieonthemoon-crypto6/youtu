@@ -72,6 +72,27 @@ const GENERATION_PATTERN =
 const EDIT_PATTERN =
   /(?:改(?:成|为|一下|下|掉|小)?|换(?:成|为|个|一下|掉)?(?:颜色|底色|背景|字体|文字|文案|标题|logo|图标|元素)|去掉|去除|删除|移除|擦除|抹掉|挪(?:动|一下)?|移动|位移|调整|微调|放大|缩小|变大|变小|加(?:上|个)?(?:字|文字|标题|logo|图标)|补上|旋转|裁切|裁剪|调(?:整|一下|下)|把.{0,16}(?:改|换|调)|remove|delete|recolou?r|resize|move|tweak|adjust)/i;
 
+/**
+ * The SUBSET of edit evidence that is decisive on its own.
+ *
+ * `EDIT_PATTERN` matches a bare `改` on purpose, so the `edit_verb` rule family
+ * and the `local_edit` label stay broad — but a bare `改` is also the first
+ * character of "改天再说" and "改主意了": turns that POSTPONE or WITHDRAW a
+ * request and contain nothing to edit. Only a real change construction
+ * (`改成` / `修改` / `调整` / `替换` / `改一改`), an object-bearing verb
+ * (`去掉` / `放大` / `换个背景`) or a `把…改/换/调` clause makes the edit reading
+ * decisive; a lone generic one-character verb is deferred to the model instead.
+ *
+ * Enumerating 改天/改主意 is deliberately NOT the fix: that vocabulary is
+ * open-ended, so one narrow target pattern is more honest than an ever longer
+ * blacklist, and the published label vocabulary stays unchanged.
+ *
+ * Deliberately NOT a rule family: `rules` is the telemetry vocabulary, and this
+ * predicate only refines HOW DECISIVE the existing `edit_verb` rule is.
+ */
+const EDIT_TARGET_PATTERN =
+  /(?:改(?:成|为|一下|掉|一改)|修改|调整|微调|替换|换(?:成|为|个|一下|掉)?(?:颜色|底色|背景|字体|文字|文案|标题|logo|图标|元素|风格|色调|配色)|去掉|去除|删除|移除|擦除|抹掉|挪(?:动|一下)?|移动|位移|放大|缩小|变大|变小|加(?:上|个)?(?:字|文字|标题|logo|图标)|补上|旋转|裁切|裁剪|把.{0,16}(?:改|换|调)|remove|delete|recolou?r|resize|move|tweak|adjust|replace)/i;
+
 const NEGATION_PATTERN =
   /(?:不要(?:生成|做|出图|图片)|先不(?:要|做|生成|出图)|别(?:急着|着急|忙)?(?:生成|做|出图)|不用生成|不需要生成|先(?:讨论|聊|说|看看)|只(?:讨论|聊|说)|先别(?:做|生成))/i;
 
@@ -394,7 +415,13 @@ export type DesignTurnIntentAssessment = {
    * spending:
    *   - no rule matched at all, or
    *   - a creation signal and an edit/negation signal both fired, so the fixed
-   *     precedence order is guessing between two plausible readings.
+   *     precedence order is guessing between two plausible readings, or
+   *   - the only edit evidence is a bare generic verb ("改天再说"), which is not
+   *     enough to decide a property edit on its own.
+   *
+   * It is FALSE for an otherwise uncertain `no_rule` turn only when the caller
+   * proved that the model verdict cannot change anything; see
+   * `isProvablyInertNoRuleTurn`.
    */
   needsModel: boolean;
 };
@@ -406,7 +433,82 @@ export type DesignTurnIntentInput = {
   hasSeries: boolean;
   hasAttachments: boolean;
   clarificationPending?: boolean;
+  /**
+   * Whether a Skill routing keyword (or an explicit @Skill mention) matched this
+   * turn. Optional on purpose: `undefined` means the caller supplied NO evidence,
+   * and every proof-based skip below must then stay off so a caller that
+   * predates this field keeps its exact previous behaviour.
+   */
+  skillKeywordMatched?: boolean | undefined;
 };
+
+/**
+ * Closed class of social acknowledgements and greetings.
+ *
+ * Closed and tiny on purpose: these are not design-intent words, so recognising
+ * them can never collide with the continuation vocabulary (`还是老样子`,
+ * `照旧`, `就按之前的`), which no pattern here matches and which genuinely needs
+ * the model verdict.
+ */
+const ACKNOWLEDGEMENT_TOKENS = [
+  "hello", "你好", "您好", "好的", "多谢", "谢谢", "收到", "明白", "嗯嗯", "在吗", "hi", "ok", "好", "嗯",
+] as const;
+
+/** Up to three tokens: "好的好的" and "嗯嗯" are one acknowledgement, not a brief. */
+const ACKNOWLEDGEMENT_PATTERN = new RegExp(`^(?:${ACKNOWLEDGEMENT_TOKENS.join("|")}){1,3}$`);
+
+/**
+ * True only when the WHOLE turn is an acknowledgement, optionally repeated
+ * ("好的好的"). Punctuation, symbols and whitespace are stripped, but the match
+ * is anchored at both ends and is never a substring search: "好的，还是老样子"
+ * is a continuation, NOT an acknowledgement, and must keep reaching the model.
+ */
+function isAcknowledgementOnly(prompt: string): boolean {
+  const normalized = prompt.toLowerCase().replace(/[\s\p{P}\p{S}]/gu, "");
+  return normalized.length > 0 && ACKNOWLEDGEMENT_PATTERN.test(normalized);
+}
+
+/**
+ * The two `no_rule` shapes where one model call provably cannot change anything.
+ *
+ * This is a PROOF, not a heuristic, and it must not be weakened into "no rule +
+ * no keyword ⇒ skip": the ENTIRE natural continuation vocabulary ("还是老样子",
+ * "照旧", "就按之前的", "跟刚才一样" …) is `no_rule` with no keyword match, and
+ * the model verdict is the only thing that recognises those turns. A shortcut of
+ * that shape would silently delete the capability.
+ *
+ * `skillKeywordMatched === undefined` means no evidence was supplied, so nothing
+ * is provable and the conservative `needsModel: true` is kept. `true` means the
+ * keyword match is itself routing evidence, so a `new_generation` verdict could
+ * legitimately preload that Skill.
+ *
+ * (a) Nothing to preload AND nothing to reuse: no keyword matched,
+ *     `activeSkill === null` and no remembered series. Walk all four labels a
+ *     model verdict could return:
+ *       - `non_design` — identical to the deterministic verdict, no change;
+ *       - `new_generation` — the primary slot is filled from a keyword match or
+ *         a current-turn @Skill mention only, and both are absent, so no Skill
+ *         can be preloaded; replacing the remembered series additionally needs a
+ *         real write receipt and there is no series to replace;
+ *       - `series_continuation` — reuse reads `activeSkill` and `series`, and
+ *         both are empty, so nothing is applied;
+ *       - `local_edit` — preloads no Skill and leaves remembered state alone,
+ *         exactly like `non_design` (see the call site: only `new_generation` and
+ *         `series_continuation` preload, and only continuation applies a series).
+ *     Every possible verdict is a no-op, so skipping cannot lose a decision.
+ *
+ * (b) An acknowledgement-only turn that also matched no keyword. An
+ *     acknowledgement carries no design intent of its own: it names no
+ *     deliverable, states no change, and contains nothing to reuse, so there is
+ *     no routing decision for a verdict to make. The class is closed and is
+ *     matched against the WHOLE trimmed turn.
+ */
+function isProvablyInertNoRuleTurn(prompt: string, input: DesignTurnIntentInput): boolean {
+  if (input.skillKeywordMatched === undefined) return false;
+  if (input.skillKeywordMatched) return false;
+  if (input.activeSkill === null && !input.hasSeries) return true;
+  return isAcknowledgementOnly(prompt);
+}
 
 /**
  * Regex pre-filter. Order matters and is unchanged from the original classifier:
@@ -440,6 +542,9 @@ export function assessDesignTurnIntent(input: DesignTurnIntentInput): DesignTurn
   const elementChange = fired("element_change", ELEMENT_CHANGE_PATTERN.test(prompt));
   const generation = fired("generation_verb", GENERATION_PATTERN.test(prompt));
   const edit = fired("edit_verb", EDIT_PATTERN.test(prompt));
+  // Not a rule family (see `EDIT_TARGET_PATTERN`): this only decides whether the
+  // `edit_verb` evidence is decisive or has to be deferred to the model.
+  const editTarget = EDIT_TARGET_PATTERN.test(prompt);
   const deliverable = fired("deliverable_brief", DELIVERABLE_NOUN_PATTERN.test(prompt));
   const interrogative = fired("informational_question", QUESTION_PATTERN.test(prompt));
 
@@ -476,8 +581,21 @@ export function assessDesignTurnIntent(input: DesignTurnIntentInput): DesignTurn
       rule: "generation_verb", rules, needsModel: edit };
   // An edit verb outranks a bare deliverable noun: "把海报上的文字改成蓝色" names
   // the deliverable but is a property edit of an existing object.
-  if (edit)
-    return { intent: "local_edit", reasonCode: "property_edit", confidence: 1, rule: "edit_verb", rules, needsModel: false };
+  //
+  // A bare generic verb is NOT decisive though: `EDIT_PATTERN` matches a lone
+  // `改`, so "改天再说" ("let's talk another day") and "改主意了" ("I changed my
+  // mind") used to be published as a confident `local_edit` with no model call,
+  // and the user was told "按局部修改处理" for a turn about nothing of the sort.
+  // A real change construction, an element/style change or a named target is
+  // what makes the edit reading decisive; otherwise the verdict stays `local_edit`
+  // (label and telemetry vocabulary unchanged) but drops to low confidence and
+  // defers to the model, falling back to that same verdict if the model is down.
+  if (edit) {
+    const editHasTarget = editTarget || elementChange || styleChange || deliverable;
+    return { intent: "local_edit", reasonCode: "property_edit",
+      confidence: editHasTarget ? 1 : 0.4, rule: "edit_verb", rules,
+      needsModel: !editHasTarget };
+  }
   // A brief that only names the deliverable ("游戏活动的产品主图") has no action
   // verb but is unambiguously a creation request. Interrogative prompts were
   // already handled above, so this cannot swallow a question.
@@ -491,7 +609,13 @@ export function assessDesignTurnIntent(input: DesignTurnIntentInput): DesignTurn
   // (the user may just as well have changed their mind), so it is a model case.
   if (input.clarificationPending)
     return { intent: "new_generation", reasonCode: "explicit_creation", confidence: 0.4, rule: "clarification_default", rules, needsModel: true };
-  return { intent: "non_design", reasonCode: "unclear", confidence: 0.3, rule: "no_rule", rules, needsModel: true };
+  // No rule matched, so this is the one shape where the regex truly has nothing
+  // to say — and the continuation vocabulary above lives here, which is why the
+  // model call is normally worth spending. It is skipped only for the two shapes
+  // `isProvablyInertNoRuleTurn` proves cannot change any behaviour, so no
+  // verdict and no latency is lost.
+  return { intent: "non_design", reasonCode: "unclear", confidence: 0.3, rule: "no_rule", rules,
+    needsModel: !isProvablyInertNoRuleTurn(prompt, input) };
 }
 
 /**

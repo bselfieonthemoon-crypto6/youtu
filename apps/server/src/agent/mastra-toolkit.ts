@@ -7,6 +7,7 @@ import { createPromptLibraryTools } from "./tools/prompt-library-tools.js";
 import { createMainAgentTools } from "./tools/index.js";
 import { createWorkspaceSkillTools } from "./tools/workspace-skill-tools.js";
 import { createClarificationTool } from "./tools/clarification-tool.js";
+import { createWriteTodosTool } from "./tools/plan-todos.js";
 import type { WorkspaceSkillEntry } from "./workspace-skills.js";
 import { createAgentTool, type MastraAgentTool } from "./tools/tool-run-context.js";
 
@@ -25,6 +26,12 @@ export type MastraToolkitInput = {
   /** Main-agent tool dependencies. Omit to expose only native/read-only tools. */
   mainToolDependencies?: Parameters<typeof createMainAgentTools>[0];
   workspaceSkills?: readonly WorkspaceSkillEntry[];
+  /**
+   * Skill slugs whose guide bodies this turn already preloaded into the session
+   * instructions. `use_skill` / `compose_skills` return their identity and role
+   * but not a second copy of the text.
+   */
+  preloadedSkillNames?: readonly string[];
   promptLibraryService?: PromptLibraryService;
   /** Native Mastra tools, including the replacement direct image-submit tool. */
   nativeImageTools?: readonly MastraAgentTool[];
@@ -109,6 +116,9 @@ export function createMastraToolkit(input: MastraToolkitInput): MastraToolkit {
     "use_skill",
     "compose_skills",
     "ask_clarification",
+    // Registered below. Recording a plan is a product-UI receipt, never a design
+    // write, so it is deliberately absent from `MASTRA_WRITE_TOOL_NAMES`.
+    "write_todos",
     ...(input.promptLibraryService ? ["search_prompt_library", "get_prompt_library_entry"] : []),
   ]);
   const workspaceSkills = (input.workspaceSkills ?? []).map(skill => {
@@ -117,7 +127,9 @@ export function createMastraToolkit(input: MastraToolkitInput): MastraToolkit {
   });
   const tools: MastraAgentTool[] = [
     createClarificationTool(),
-    ...createWorkspaceSkillTools(workspaceSkills),
+    createWriteTodosTool(),
+    ...createWorkspaceSkillTools(workspaceSkills,
+      input.preloadedSkillNames?.length ? { preloadedSkillNames: input.preloadedSkillNames } : {}),
     createMastraWorkspaceSkillReadTool(workspaceSkills),
     ...mainTools,
     ...nativeTools,

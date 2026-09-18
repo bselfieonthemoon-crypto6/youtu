@@ -55,9 +55,25 @@ export function summarizeWorkspaceSkill(skill: WorkspaceSkillEntry) {
   };
 }
 
+/**
+ * Stands in for a guide body the runtime ALREADY injected into this turn's
+ * session instructions.
+ *
+ * The preload set is per-turn, so this can only ever replace a body the model is
+ * holding in the same turn's system instructions — it is never a pointer to
+ * something that was dropped by an earlier compaction.
+ */
+export function preloadedSkillMarker(name: string, version: string): string {
+  return `本轮已预载 ${name}（${version}）指南全文，内容见本次会话的预载说明，此处不重复返回。按其方法执行，不要据此扩大授权。`;
+}
+
 /** Pure validation/composition over the run's enabled snapshot. No IO, plan
  * persistence, model calls, authority creation or automatic semantic routing. */
-export function composeWorkspaceSkills(entries: readonly WorkspaceSkillEntry[], rawInput: unknown) {
+export function composeWorkspaceSkills(
+  entries: readonly WorkspaceSkillEntry[],
+  rawInput: unknown,
+  options: { preloadedSkillNames?: readonly string[] } = {},
+) {
   const conflict = (code: string, message: string, names: string[] = []) => ({
     status: "conflict" as const, code, message, names,
     authority: "method_suggestions_only" as const, executed: false as const,
@@ -101,18 +117,34 @@ export function composeWorkspaceSkills(entries: readonly WorkspaceSkillEntry[], 
   const compilers = selected.filter(item => item.composition.role === "prompt");
   if (compilers.length > 1)
     return conflict("multiple_prompt_compilers", "Choose exactly one prompt compiler; reference helpers supply material to that compiler instead of writing competing final prompts.", compilers.map(item => item.skill.name));
-  const guides = selected.map(({ skill, composition, position }) => ({
-    ...summarizeWorkspaceSkill(skill), position,
-    role: composition.role, responsibility: responsibilities[composition.role],
-    instructions: skill.content,
-    authority: "method_suggestions_only" as const,
-  }));
+  // A guide the runtime already injected into this turn is NOT repeated here.
+  // Without this the model holds two copies of the same body, and because the
+  // preloaded copy is in the system instructions while this one arrives as a tool
+  // result, the two can disagree after a later edit. Identity, version, hash, role
+  // and responsibility still come back, so the composition itself stays honest.
+  const preloaded = new Set(options.preloadedSkillNames ?? []);
+  const guides = selected.map(({ skill, composition, position }) => {
+    const alreadyPreloaded = preloaded.has(skill.name);
+    // Read the card once: its `version` is the normalized value the client sees
+    // (`skill.version` itself is optional), so the marker cannot disagree with the
+    // identity returned beside it.
+    const card = summarizeWorkspaceSkill(skill);
+    return {
+      ...card, position,
+      role: composition.role, responsibility: responsibilities[composition.role],
+      instructions: alreadyPreloaded ? preloadedSkillMarker(skill.name, card.version) : skill.content,
+      ...(alreadyPreloaded ? { alreadyPreloaded: true as const } : {}),
+      authority: "method_suggestions_only" as const,
+    };
+  });
+  const preloadedNames = selected.filter(item => preloaded.has(item.skill.name)).map(item => item.skill.name);
   const helpers = guides.slice(1).sort((a, b) => roleOrder[a.role] - roleOrder[b.role]);
   return {
     status: "composed" as const, authority: "method_suggestions_only" as const, executed: false as const,
-    summary: `已为“${input.deliverable}”加载 ${guides.map(guide => guide.name).join("、")} 的完整业务指南并组合到 ${input.stage} 阶段；加载不代表已执行或已获授权。`,
+    summary: `已为“${input.deliverable}”组合 ${guides.map(guide => guide.name).join("、")} 到 ${input.stage} 阶段${preloadedNames.length ? `；其中 ${preloadedNames.join("、")} 本轮已预载，未重复返回全文` : ""}；加载不代表已执行或已获授权。`,
     selection: { provenance: "model_selection" as const, deliverable: input.deliverable, stage: input.stage,
       ...(input.outputKind ? { outputKind: input.outputKind } : {}) },
+    alreadyPreloaded: preloadedNames,
     primary: guides[0]!, helpers,
     responsibilities: [...guides].sort((a, b) => roleOrder[a.role] - roleOrder[b.role])
       .map(({ name, role, position, responsibility }) => ({ name, role, position, responsibility })),

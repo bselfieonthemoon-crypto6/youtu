@@ -10,6 +10,7 @@ import { adaptAgentStream } from "./stream-adapter.js";
 import { libraryAssetIdsFromToolResult } from "./mastra-library-tools.js";
 import { compactMastraToolResult } from "./tool-result-projection.js";
 import { createAgentTool, toolRequestContext, type MastraAgentTool } from "./tools/tool-run-context.js";
+import { recordPlanSnapshot, WRITE_TODOS_TOOL_ID, type PlanUpdatedEvent } from "./tools/plan-todos.js";
 import type { MastraRunInput } from "./mastra-run-types.js";
 
 // Re-exported for the existing runtime, tools and tests that import the
@@ -54,7 +55,7 @@ type LegacyMastraEvent = {
 export const CONVERSATIONAL_DESIGN_INSTRUCTIONS = `你是 Cromic 设计助手。通过自然连续对话帮助用户设计、生成和修改图片。
 根据当前原话、历史有效需求、已交付图片理解意图，兼容口语和错别字，不要求固定确认句式。
 用户只说生成logo且缺少品牌文字等关键需求时，一次问清必要信息；用户允许自由发挥则合理默认。
-需求已明确时，新图调用 generate_image，服务端可从当前会话核验并绑定隐式参考来源；该工具不接受来源参数。修改既有图或以既有图作视觉参考时，优先从当前附件、检查结果或 recentJobs 取得工具支持数量内的真实 assetId，再调用 edit_image。不要猜测、自动附带或用纯文字替代来源；不要再要求重复确认，不调用旧任务规划/审批工具。
+需求已明确时，新图调用 generate_image，服务端可从当前会话核验并绑定隐式参考来源；该工具不接受来源参数。修改既有图或以既有图作视觉参考时，优先从当前附件、检查结果或 recentJobs 取得工具支持数量内的真实 assetId，再调用 edit_image。不要猜测、自动附带或用纯文字替代来源；不要再要求重复确认，不调用旧的审批流程。
 用户明确要求视频时，调用 generate_video；仅使用 current_context 中当前工作区可用模型，参考图必须传真实 sourceAssetIds，不能传 URL。processing 表示排队或执行中，未知提交不得改参数再次提交。
 只讨论方案、不执行、取消、先等等时不要提交付费任务。生成失败只代表一次请求失败，不使整段会话失效。未知或进行中任务先查询，不自动再次提交；用户明确要求重新生成才创建新请求。
 图片比例和模型的明确UI选择优先；Auto按用途选择当前已发布可用渠道，logo常用1:1。不得编造模型。
@@ -255,8 +256,25 @@ export async function* streamMastraDesignAgent(options: {
   // Raw tool results for the UI stream, keyed by tool call id. The model sees
   // the compaction installed by `createAgentTool`.
   const rawResults = new Map<string, unknown>();
-  const active = new Set(["generate_image", "edit_image", "generate_video", "get_image_status", "find_library_assets", "ask_clarification", "list_skills", "use_skill", "search_prompt_library", "discover_tools"]);
+  // `plan.updated` is a server-authored product event, not a provider chunk:
+  // `afterToolCall` cannot yield, so a successful `write_todos` receipt queues
+  // its validated event here and the generator at the bottom publishes it.
+  const pendingPlanEvents: PlanUpdatedEvent[] = [];
+  // A tool the model must be able to consider BEFORE it starts acting is
+  // resident, the same as `ask_clarification` and `discover_tools`; tools it
+  // reaches for once it already knows what it needs (`compose_skills`,
+  // `read_file`) stay behind `discover_tools`. Planning is the first kind: a plan
+  // recorded only after the work started, or reachable only through an extra
+  // discovery turn, is not a plan. Its own description bounds it to genuinely
+  // multi-step requests, so residency does not invite plan cards for single
+  // actions.
+  const active = new Set(["generate_image", "edit_image", "generate_video", "get_image_status", "find_library_assets", "ask_clarification", "list_skills", "use_skill", "search_prompt_library", "write_todos", "discover_tools"]);
   for (const original of options.tools) registry[original.id] = original;
+
+  /** Publish every recorded plan snapshot, oldest first. */
+  function* drainPendingPlanEvents() {
+    for (let next = pendingPlanEvents.shift(); next !== undefined; next = pendingPlanEvents.shift()) yield next;
+  }
 
   /**
    * Server-side receipts formerly applied by the LangChain conversion adapter,
@@ -274,6 +292,16 @@ export async function* streamMastraDesignAgent(options: {
     // A failed write submits nothing, so it must not count either.
     if (MASTRA_WRITE_TOOL_NAMES.has(toolName) && !toolResultIsError(result))
       options.configurable.session_design_write_run_id = options.run.runId;
+    // A plan snapshot is a product-UI receipt, not a design write: `write_todos`
+    // is deliberately absent from `MASTRA_WRITE_TOOL_NAMES`, so recording a plan
+    // can never be the write receipt that lets this turn replace the remembered
+    // session series. Only a SUCCESSFUL call queues an event: the hook already
+    // returned above for a thrown tool error, and `toolResultIsError` refuses a
+    // tool-authored rejection, so a failed plan draft never reaches the UI.
+    if (toolName === WRITE_TODOS_TOOL_ID && !toolResultIsError(result)) {
+      const planEvent = recordPlanSnapshot({ configurable: options.configurable, runId: options.run.runId, result });
+      if (planEvent) pendingPlanEvents.push(planEvent);
+    }
     const receipt = toolName === "use_skill" ? compactMastraToolResult(result) : undefined;
     const loadedSkillName = receipt && typeof receipt === "object" && "skill" in receipt
       && receipt.skill && typeof receipt.skill === "object" && "name" in receipt.skill
@@ -623,7 +651,22 @@ export async function* streamMastraDesignAgent(options: {
       }) },
     };
   }
-  yield* adaptAgentStream({ ...options.run, stream: legacyEvents(), now: () => new Date().toISOString() });
+  // The adapted stream only understands the legacy `on_chat_model_*` /
+  // `on_tool_*` envelope and would silently drop a `plan.updated` event carried
+  // inside it, so a recorded plan is published by this generator instead, the
+  // one that consumes the adapted run stream. Draining BEFORE each adapted event
+  // — including the terminal one — keeps the plan inside the open run: a plan
+  // recorded by the final tool step is still delivered before `run.completed`,
+  // and `run.completed` never precedes a snapshot the run already recorded.
+  const adaptedStream = adaptAgentStream({
+    ...options.run,
+    stream: legacyEvents(),
+    now: () => new Date().toISOString(),
+  });
+  for await (const event of adaptedStream) {
+    yield* drainPendingPlanEvents();
+    yield event;
+  }
 }
 
 function safeErrorTag(error: unknown): string {
