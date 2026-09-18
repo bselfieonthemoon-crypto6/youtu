@@ -2,7 +2,7 @@ import { readdir, readFile } from "node:fs/promises";
 
 import { describe, expect, it } from "vitest";
 
-import { classifyDesignTurnIntent, selectPrimarySkill, type SkillRouteSource } from "./design-turn-intent.js";
+import { classifyDesignTurnIntent, matchedSkillHints, type SkillRouteSource } from "./design-turn-intent.js";
 
 const skillRoot = new URL("../../../../skills/", import.meta.url);
 
@@ -25,9 +25,12 @@ async function loadRoutingSkills(): Promise<SkillRouteSource[]> {
 }
 
 /**
- * Deterministic intent -> primary Skill evaluation set. No model call is made:
- * these are the server-side routing guarantees the product relies on. Extend the
- * table when a new deliverable Skill is added.
+ * Deterministic intent -> deliverable CANDIDATE evaluation set. No model call is made.
+ *
+ * The runtime no longer picks a winner — selection belongs to the model, which reads
+ * the catalog — so these cases assert the property a Skill package has to get right to
+ * be reachable at all: its own declared keywords fire for the requests it is for, and it
+ * therefore appears in the candidate set. Extend the table when a new package is added.
  */
 const ROUTING_CASES: ReadonlyArray<{ prompt: string; skill: string }> = [
   { prompt: "设计一个咖啡品牌的logo", skill: "logo-design" },
@@ -64,17 +67,35 @@ const INTENT_CASES: ReadonlyArray<{ prompt: string; hasSeries: boolean; intent: 
   { prompt: "这个大概要花多少钱", hasSeries: false, intent: "non_design" },
 ];
 
-describe("design skill routing evaluation set", () => {
-  it("routes deliverable keywords to the expected primary Skill", async () => {
-    const skills = await loadRoutingSkills();
+const candidatesFor = async (prompt: string) =>
+  matchedSkillHints({ prompt, mentions: [], skills: await loadRoutingSkills() });
+
+describe("design skill candidate evaluation set", () => {
+  it("surfaces the expected deliverable Skill, through its own declared keywords", async () => {
     for (const { prompt, skill } of ROUTING_CASES) {
-      expect(selectPrimarySkill({ prompt, mentions: [], skills }), prompt).toBe(skill);
+      const match = (await candidatesFor(prompt)).find(hint => hint.skill === skill);
+      expect(match, `${prompt} → ${skill}`).toBeDefined();
+      // The candidate surfaced because the package's OWN declaration fired, which is
+      // the property a newly added package has to get right to be reachable.
+      expect(match!.keywords.length, prompt).toBeGreaterThan(0);
     }
   });
 
-  it("leaves non-deliverable requests unrouted", async () => {
+  it("surfaces every Skill the words point at instead of hiding all but one", async () => {
+    // "做一个游戏充值活动图" reaches two packages — the campaign guide (活动) and the
+    // game-promo guide (游戏/充值). A ranking used to report only its winner, so the
+    // model was never told the other applicable guide existed.
+    expect((await candidatesFor("做一个游戏充值活动图")).map(hint => hint.skill).sort())
+      .toEqual(["campaign-design", "game-promo-visuals"]);
+  });
+
+  it("surfaces nothing for a non-deliverable request, and puts a named Skill first", async () => {
     const skills = await loadRoutingSkills();
-    for (const prompt of NO_ROUTE_CASES) expect(selectPrimarySkill({ prompt, mentions: [], skills }), prompt).toBeUndefined();
+    for (const prompt of NO_ROUTE_CASES)
+      expect(matchedSkillHints({ prompt, mentions: [], skills }).map(hint => hint.skill), prompt).toEqual([]);
+    const named = matchedSkillHints({ prompt: "你好", mentions: [{ mentionType: "skill", id: "logo-design",
+      label: "logo-design", slug: "logo-design" }], skills });
+    expect(named[0]).toMatchObject({ skill: "logo-design", mentioned: true });
   });
 
   it("classifies turns so remembered state is applied or reset correctly", () => {

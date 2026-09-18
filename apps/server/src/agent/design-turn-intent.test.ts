@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { MessageMention } from "@loomic/shared";
 
-import { classifyDesignTurnIntent, explainPrimarySkillSelection, extractStyleHints, extractTargetSizes, matchedSkillHints, mergeStyleHints, selectHelperSkills, selectPrimarySkill, shouldReplaceSessionSeries } from "./design-turn-intent.js";
+import { classifyDesignTurnIntent, extractStyleHints, extractTargetSizes, matchedSkillHints, mergeStyleHints, shouldReplaceSessionSeries } from "./design-turn-intent.js";
 
 const skillMention = (slug: string): MessageMention => ({ mentionType: "skill", id: slug, label: slug, slug });
 
@@ -16,8 +16,6 @@ const routingSkills = [
   route("game-promo-visuals", 20, ["游戏", "棋牌", "抽奖", "礼包", "充值", "bonus", "jackpot", "casino", "game promo", "game event"]),
   route("campaign-design", 10, ["活动", "促销", "海报", "宣传", "推广", "banner", "poster", "promo", "cover", "key visual", "主视觉"]),
 ];
-const select = (prompt: string, mentions: MessageMention[] = []) =>
-  selectPrimarySkill({ prompt, mentions, skills: routingSkills });
 
 /** Helper tier: modifiers of a deliverable, declared with tier: "helper". */
 const helperRoute = (name: string, keywords: string[]) =>
@@ -29,9 +27,6 @@ const helperSkills = [
   helperRoute("json-image-prompt", ["提示词", "生图提示"]),
 ];
 const allSkills = [...routingSkills, ...helperSkills];
-const selectHelpers = (prompt: string, max?: number) =>
-  selectHelperSkills({ prompt, skills: allSkills, ...(max !== undefined ? { max } : {}) });
-const selectAny = (prompt: string) => selectPrimarySkill({ prompt, mentions: [], skills: allSkills });
 
 function classify(prompt: string, options: { mentions?: MessageMention[]; activeSkill?: string | null; hasSeries?: boolean } = {}) {
   return classifyDesignTurnIntent({ prompt, mentions: options.mentions ?? [], activeSkill: options.activeSkill ?? null,
@@ -134,80 +129,17 @@ describe("classifyDesignTurnIntent", () => {
   });
 });
 
-describe("selectPrimarySkill", () => {
-  it("prefers the explicit mention over keywords", () => {
-    expect(select("做一张活动海报", [skillMention("logo-design")])).toBe("logo-design");
-  });
-
-  it("routes explicit deliverables to their primary Skill by manifest priority", () => {
-    expect(select("设计一个咖啡品牌的logo")).toBe("logo-design");
-    expect(select("做一张小红书轮播图")).toBe("social-carousel");
-    expect(select("做一套五张的产品物料")).toBe("series-visual-design");
-    expect(select("做商品主图")).toBe("product-visual");
-    expect(select("做一个游戏充值活动图")).toBe("game-promo-visuals");
-    expect(select("做一张促销海报")).toBe("campaign-design");
-  });
-
-  it("returns nothing when no Skill declares a matching keyword", () => {
-    expect(select("你好")).toBeUndefined();
-  });
-
-  it("scores corroborating and specific keywords above one incidental generic hit", () => {
-    // Regression: priority-first-hit routed this to logo-design (priority 60)
-    // even though three keywords point at campaign-design.
-    expect(select("海报上放我们的 logo，做一个活动主视觉")).toBe("campaign-design");
-    // A specific keyword outweighs a short generic one on score.
-    expect(select("做一个游戏活动的宣传海报")).toBe("campaign-design");
-    // Priority still breaks an exact score tie.
-    expect(select("做个logo")).toBe("logo-design");
-  });
-});
-
-describe("selectHelperSkills", () => {
-  it("preloads a matching helper for the turn's own words", () => {
-    // Regression: this used to route nothing at all, so the background-removal
-    // guide only reached the model if it discovered it by itself.
-    expect(selectHelpers("把这张图的背景去掉")).toEqual(["background-removal"]);
-    expect(selectHelpers("写一句海报文案")).toEqual(["design-copywriting"]);
-  });
-
-  it("never lets a helper take the primary deliverable slot", () => {
-    // A prompt carrying only helper keywords has no deliverable, so it must not
-    // be promoted to a primary Skill just because a helper matched.
-    expect(selectAny("把这张图的背景去掉")).toBeUndefined();
-    expect(selectAny("写一句文案")).toBeUndefined();
-    // A real deliverable still wins the primary slot while helpers ride along.
-    expect(selectAny("做一张活动海报，写一句文案")).toBe("campaign-design");
-    expect(selectHelpers("做一张活动海报，写一句文案")).toEqual(["design-copywriting"]);
-  });
-
-  it("caps how many helpers one prompt can pull in", () => {
-    const crowded = "做一张海报，写文案，再点评一下，顺便优化提示词";
-    expect(selectHelpers(crowded)).toHaveLength(2);
-    expect(selectHelpers(crowded, 1)).toHaveLength(1);
-    expect(selectHelpers(crowded, 4).length).toBeGreaterThanOrEqual(3);
-  });
-
-  it("returns nothing when no helper matches", () => {
-    expect(selectHelpers("生成一张促销海报")).toEqual([]);
-    expect(selectHelpers("你好呀")).toEqual([]);
-  });
-
-  it("resolves helpers independently of the turn label", () => {
-    // A review or prompt-optimisation request classifies as non_design yet still
-    // needs its guide, so helper resolution cannot be gated on the turn label.
-    expect(classify("帮我评审一下这版设计")).toBe("non_design");
-    expect(selectHelpers("帮我评审一下这版设计")).toEqual(["design-review"]);
-    expect(selectHelpers("优化一下提示词")).toEqual(["json-image-prompt"]);
-  });
-});
-
 describe("keyword matching", () => {
-  /** Score and evidence for one prompt against a purpose-built route set. */
+  /** Matched keywords for one prompt against a purpose-built route set. */
   const match = (prompt: string, keywords: string[]) => {
-    const selection = explainPrimarySkillSelection({ prompt, mentions: [], skills: [route("probe", 1, keywords)] });
-    return selection ? { score: selection.score, keywords: selection.keywords } : undefined;
+    const [hint] = matchedSkillHints({ prompt, mentions: [], skills: [route("probe", 1, keywords)] });
+    return hint ? { keywords: hint.keywords } : undefined;
   };
+  /** The candidate set the real manifest-shaped fixtures produce. */
+  const candidates = (prompt: string) =>
+    matchedSkillHints({ prompt, mentions: [], skills: routingSkills }).map(hint => hint.skill);
+  const candidatesWithHelpers = (prompt: string) =>
+    matchedSkillHints({ prompt, mentions: [], skills: allSkills }).map(hint => hint.skill);
 
   it("matches an ASCII keyword on word boundaries, not inside a longer word", () => {
     // Regression: campaign-design declares the bare `cover`, and a plain
@@ -217,37 +149,45 @@ describe("keyword matching", () => {
     expect(match("discover a new direction", ["cover"])).toBeUndefined();
     expect(match("improve the coverage", ["cover"])).toBeUndefined();
     // A real standalone occurrence still matches, including next to Chinese.
-    expect(match("做一个cover图", ["cover"])).toEqual({ score: 5, keywords: ["cover"] });
+    expect(match("做一个cover图", ["cover"])).toEqual({ keywords: ["cover"] });
   });
 
   it("accepts ordinary English plurals without accepting longer words", () => {
-    expect(match("做三张 posters", ["poster"])).toEqual({ score: 6, keywords: ["poster"] });
-    expect(match("给我几个 logos", ["logo"])).toEqual({ score: 4, keywords: ["logo"] });
+    expect(match("做三张 posters", ["poster"])).toEqual({ keywords: ["poster"] });
+    expect(match("给我几个 logos", ["logo"])).toEqual({ keywords: ["logo"] });
     // One trailing `s` only: a longer tail is a different word.
     expect(match("posterity", ["poster"])).toBeUndefined();
   });
 
   it("counts a nested keyword once instead of crediting the same occurrence twice", () => {
-    // Regression: a manifest declaring both `poster` and `posters` was credited
-    // for each, so redundant declarations outranked a Skill that genuinely
-    // matched more. Only the longest matched form is kept.
-    expect(match("做三张 posters", ["poster", "posters"])).toEqual({ score: 7, keywords: ["posters"] });
-    expect(match("logo", ["logo", "logotype"])).toEqual({ score: 4, keywords: ["logo"] });
-    expect(match("logotype", ["logo", "logotype"])).toEqual({ score: 8, keywords: ["logotype"] });
+    // Regression: a manifest declaring both `poster` and `posters` was credited for
+    // each, so redundant declarations inflated one Skill over another. Only the
+    // longest matched form is kept.
+    expect(match("做三张 posters", ["poster", "posters"])).toEqual({ keywords: ["posters"] });
+    expect(match("logo", ["logo", "logotype"])).toEqual({ keywords: ["logo"] });
+    expect(match("logotype", ["logo", "logotype"])).toEqual({ keywords: ["logotype"] });
   });
 
   it("drops the ASCII false positive from the real manifest set", () => {
-    // The whole point: the incidental hit used to win the deliverable slot.
-    expect(select("帮我 recover 一下上一版")).toBeUndefined();
-    expect(select("discover a direction")).toBeUndefined();
-    // Real matches and priority tie-breaks are untouched.
-    expect(select("做三张 posters")).toBe("campaign-design");
-    expect(select("给我几个 logos")).toBe("logo-design");
+    // The whole point: the incidental hit used to steer the deliverable choice.
+    expect(candidates("帮我 recover 一下上一版")).toEqual([]);
+    expect(candidates("discover a direction")).toEqual([]);
+    // Real matches are untouched.
+    expect(candidates("做三张 posters")).toEqual(["campaign-design"]);
+    expect(candidates("给我几个 logos")).toEqual(["logo-design"]);
   });
 
   it("leaves CJK substring matching alone, where there is no word boundary", () => {
-    expect(match("写一句标题文案", ["文案", "标题文案"])).toEqual({ score: 4, keywords: ["标题文案"] });
-    expect(selectHelpers("把这张图的背景去掉")).toEqual(["background-removal"]);
+    expect(match("写一句标题文案", ["文案", "标题文案"])).toEqual({ keywords: ["标题文案"] });
+    expect(candidatesWithHelpers("把这张图的背景去掉")).toEqual(["background-removal"]);
+  });
+
+  it("resolves candidates independently of the turn label", () => {
+    // A review request classifies as non_design yet still points at its guide, so
+    // candidate resolution must not be gated on the turn label.
+    expect(classify("帮我评审一下这版设计")).toBe("non_design");
+    expect(candidatesWithHelpers("帮我评审一下这版设计")).toEqual(["design-review"]);
+    expect(candidatesWithHelpers("优化一下提示词")).toEqual(["json-image-prompt"]);
   });
 });
 

@@ -200,7 +200,7 @@ export function extractStyleHints(prompt: string): string | undefined {
 
 export type SkillRouteSource = { name: string; displayName?: string | undefined; metadata?: Record<string, unknown> | undefined };
 export type SkillTier = "primary" | "helper";
-/** `tier` decides which slot a Skill competes for; see `selectHelperSkills`. */
+/** `tier` says whether a Skill is a deliverable or a modifier of one; nothing competes. */
 export type SkillRoute = { skill: string; keywords: string[]; priority: number; tier: SkillTier };
 
 function mentionSkillSlugs(mentions: readonly MessageMention[]): string[] {
@@ -333,37 +333,6 @@ function matchRouteKeywords(text: string, keywords: readonly string[]): string[]
     other !== keyword && other.toLowerCase().includes(keyword.toLowerCase())));
 }
 
-/** Length-weighted keyword score shared by the primary and helper tiers. */
-function routeScore(text: string, keywords: readonly string[]): number {
-  return matchRouteKeywords(text, keywords).reduce((total, keyword) => total + keyword.length, 0);
-}
-
-/**
- * Matching HELPER Skills, highest scoring first.
- *
- * Workflow / reference / prompt / domain guides modify a deliverable rather than
- * being one, so they must never take the single primary slot — but they must
- * still reach the model in the SAME turn. Relying on the model to notice them in
- * the compact catalog is what made Skill dispatch feel unreliable: a weak model
- * simply skipped the extra `list_skills` + `use_skill` round trip.
- *
- * Only the top `max` matches are returned so one broad prompt ("海报文案") cannot
- * flood the context with every guide.
- */
-export function selectHelperSkills(input: {
-  prompt: string; skills: readonly SkillRouteSource[]; max?: number;
-}): string[] {
-  const text = input.prompt;
-  const scored: Array<{ skill: string; score: number }> = [];
-  for (const route of skillRoutesFromMetadata(input.skills)) {
-    if (route.tier !== "helper") continue;
-    const score = routeScore(text, route.keywords);
-    if (score) scored.push({ skill: route.skill, score });
-  }
-  scored.sort((left, right) => right.score - left.score || left.skill.localeCompare(right.skill));
-  return scored.slice(0, input.max ?? 2).map(entry => entry.skill);
-}
-
 /**
  * Session series state may only be REPLACED when this run actually performed a
  * design write.
@@ -380,78 +349,6 @@ export function shouldReplaceSessionSeries(input: {
   performedDesignWrite: boolean;
 }): boolean {
   return input.designIntent === "new_generation" && input.performedDesignWrite;
-}
-
-/**
- * A primary-Skill selection INCLUDING the evidence that produced it.
- *
- * The routing notice (Part ①) has to tell the user which Skill was chosen and
- * why, and the model-side reasoning is not available: the choice is a
- * deterministic keyword score. Returning the matched keywords with the winner
- * keeps that explanation honest instead of inventing a reason.
- */
-export type PrimarySkillSelection = {
-  skill: string;
-  displayName?: string | undefined;
-  score: number;
-  /** Distinct declared keywords actually present in the user's own words. */
-  keywords: string[];
-  /** An explicit @Skill mention decided this, not the score. */
-  mentioned: boolean;
-};
-
-/**
- * Explicit @Skill mention wins. Otherwise each Skill's declared routing keywords
- * are SCORED rather than first-match-wins:
- *
- *   score = sum of the length of every distinct declared keyword present
- *
- * Length stands in for specificity, so a concrete keyword ("主视觉") outweighs a
- * generic one ("logo"), and several corroborating keywords outweigh a single
- * incidental hit. `priority` only breaks an exact score tie.
- *
- * The previous rule — walk routes by descending priority and return the first
- * route with any keyword hit — let one incidental generic keyword hijack a turn:
- * "海报上放我们的 logo，做一个活动主视觉" routed to logo-design (priority 60)
- * even though three keywords pointed at campaign-design.
- */
-export function explainPrimarySkillSelection(input: {
-  prompt: string; mentions: readonly MessageMention[]; skills: readonly SkillRouteSource[];
-}): PrimarySkillSelection | undefined {
-  const mentioned = mentionSkillSlugs(input.mentions);
-  if (mentioned.length) {
-    const skill = input.skills.find(candidate => candidate.name === mentioned[0]);
-    return { skill: mentioned[0]!, ...(skill?.displayName ? { displayName: skill.displayName } : {}),
-      score: 0, keywords: [], mentioned: true };
-  }
-  const text = input.prompt;
-  let best: PrimarySkillSelection & { priority: number } | undefined;
-  for (const route of skillRoutesFromMetadata(input.skills)) {
-    // A helper guide must never take the deliverable slot.
-    if (route.tier === "helper") continue;
-    // The same matcher as the helper tier, so the scores being compared are
-    // produced by one rule set rather than two that can drift apart.
-    const keywords = matchRouteKeywords(text, route.keywords);
-    const score = keywords.reduce((total, keyword) => total + keyword.length, 0);
-    if (!score) continue;
-    // Higher score wins; declaration priority is only a tie-breaker, so it can
-    // no longer override a clearly better-matching Skill.
-    if (!best || score > best.score || (score === best.score && route.priority > best.priority)) {
-      const source = input.skills.find(candidate => candidate.name === route.skill);
-      best = { skill: route.skill, ...(source?.displayName ? { displayName: source.displayName } : {}),
-        score, keywords, mentioned: false, priority: route.priority };
-    }
-  }
-  if (!best) return undefined;
-  const { priority: _priority, ...selection } = best;
-  return selection;
-}
-
-/** The winning primary Skill slug, or `undefined` when nothing matched. */
-export function selectPrimarySkill(input: {
-  prompt: string; mentions: readonly MessageMention[]; skills: readonly SkillRouteSource[];
-}): string | undefined {
-  return explainPrimarySkillSelection(input)?.skill;
 }
 
 /** Frame ratios whose colon pair is a size even though it reads like a time. */
