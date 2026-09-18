@@ -160,13 +160,57 @@ export function skillRoutesFromMetadata(skills: readonly SkillRouteSource[]): Sk
   return routes.sort((left, right) => right.priority - left.priority || left.skill.localeCompare(right.skill));
 }
 
+/** A keyword made only of printable ASCII needs word boundaries; CJK does not. */
+const ASCII_KEYWORD_PATTERN = /^[ -~]+$/;
+const REGEXP_METACHARACTERS = /[.*+?^${}()|[\]\\]/g;
+
+/**
+ * Does an ASCII keyword occur in `text` as a word?
+ *
+ * An optional trailing `s` is part of the word: "logos", "posters" and "banners"
+ * are ordinary requests. It has to be written as a greedy `s?` BEFORE the final
+ * lookahead rather than folded into it — `(?!s?[a-z])` backtracks and lets the
+ * single `s` of "posters" satisfy `[a-z]`, so no plural would ever match.
+ */
+function matchesAsciiWord(text: string, needle: string): boolean {
+  const escaped = needle.replace(REGEXP_METACHARACTERS, "\\$&");
+  return new RegExp(`(?<![a-z])${escaped}s?(?![a-z])`).test(text);
+}
+
+/**
+ * The declared keywords that actually occur in `text`.
+ *
+ * Two rules keep a Skill's score COMPARABLE with another Skill's rather than
+ * merely large, which is what the winner is chosen on:
+ *
+ *   - an ASCII keyword must fall on a word boundary. Campaign-design declares the
+ *     bare `cover`, which `includes` matched inside "recover" and "discover", so
+ *     a request to recover a previous image preloaded the campaign guide;
+ *   - a keyword contained in a longer matched keyword is dropped. A manifest that
+ *     lists both `slide` and `slides` (or `logo` and `logotype`) used to be
+ *     credited twice for one occurrence, so redundant declarations quietly
+ *     outranked a Skill that genuinely matched more.
+ *
+ * CJK has no word delimiter, so it stays a plain substring match.
+ */
+function matchRouteKeywords(text: string, keywords: readonly string[]): string[] {
+  const haystack = text.toLowerCase();
+  const seen = new Set<string>();
+  const matched: string[] = [];
+  for (const keyword of keywords) {
+    const needle = keyword.toLowerCase();
+    if (!needle || seen.has(needle) || !haystack.includes(needle)) continue;
+    seen.add(needle);
+    if (ASCII_KEYWORD_PATTERN.test(needle) && !matchesAsciiWord(haystack, needle)) continue;
+    matched.push(keyword);
+  }
+  return matched.filter(keyword => !matched.some(other =>
+    other !== keyword && other.toLowerCase().includes(keyword.toLowerCase())));
+}
+
 /** Length-weighted keyword score shared by the primary and helper tiers. */
 function routeScore(text: string, keywords: readonly string[]): number {
-  let score = 0;
-  for (const keyword of new Set(keywords)) {
-    if (text.includes(keyword.toLowerCase())) score += keyword.length;
-  }
-  return score;
+  return matchRouteKeywords(text, keywords).reduce((total, keyword) => total + keyword.length, 0);
 }
 
 /**
@@ -184,7 +228,7 @@ function routeScore(text: string, keywords: readonly string[]): number {
 export function selectHelperSkills(input: {
   prompt: string; skills: readonly SkillRouteSource[]; max?: number;
 }): string[] {
-  const text = input.prompt.toLowerCase();
+  const text = input.prompt;
   const scored: Array<{ skill: string; score: number }> = [];
   for (const route of skillRoutesFromMetadata(input.skills)) {
     if (route.tier !== "helper") continue;
@@ -255,12 +299,14 @@ export function explainPrimarySkillSelection(input: {
     return { skill: mentioned[0]!, ...(skill?.displayName ? { displayName: skill.displayName } : {}),
       score: 0, keywords: [], mentioned: true };
   }
-  const text = input.prompt.toLowerCase();
+  const text = input.prompt;
   let best: PrimarySkillSelection & { priority: number } | undefined;
   for (const route of skillRoutesFromMetadata(input.skills)) {
     // A helper guide must never take the deliverable slot.
     if (route.tier === "helper") continue;
-    const keywords = [...new Set(route.keywords)].filter(keyword => text.includes(keyword.toLowerCase()));
+    // The same matcher as the helper tier, so the scores being compared are
+    // produced by one rule set rather than two that can drift apart.
+    const keywords = matchRouteKeywords(text, route.keywords);
     const score = keywords.reduce((total, keyword) => total + keyword.length, 0);
     if (!score) continue;
     // Higher score wins; declaration priority is only a tie-breaker, so it can

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { MessageMention } from "@loomic/shared";
 
-import { classifyDesignTurnIntent, extractStyleHints, extractTargetSizes, mergeStyleHints, selectHelperSkills, selectPrimarySkill, shouldReplaceSessionSeries } from "./design-turn-intent.js";
+import { classifyDesignTurnIntent, explainPrimarySkillSelection, extractStyleHints, extractTargetSizes, mergeStyleHints, selectHelperSkills, selectPrimarySkill, shouldReplaceSessionSeries } from "./design-turn-intent.js";
 
 const skillMention = (slug: string): MessageMention => ({ mentionType: "skill", id: slug, label: slug, slug });
 
@@ -199,6 +199,55 @@ describe("selectHelperSkills", () => {
     expect(classify("帮我评审一下这版设计")).toBe("non_design");
     expect(selectHelpers("帮我评审一下这版设计")).toEqual(["design-review"]);
     expect(selectHelpers("优化一下提示词")).toEqual(["json-image-prompt"]);
+  });
+});
+
+describe("keyword matching", () => {
+  /** Score and evidence for one prompt against a purpose-built route set. */
+  const match = (prompt: string, keywords: string[]) => {
+    const selection = explainPrimarySkillSelection({ prompt, mentions: [], skills: [route("probe", 1, keywords)] });
+    return selection ? { score: selection.score, keywords: selection.keywords } : undefined;
+  };
+
+  it("matches an ASCII keyword on word boundaries, not inside a longer word", () => {
+    // Regression: campaign-design declares the bare `cover`, and a plain
+    // `includes` matched it inside "recover" / "discover" / "coverage", so a
+    // request to recover an earlier design preloaded the campaign guide.
+    expect(match("帮我 recover 上一版的设计", ["cover"])).toBeUndefined();
+    expect(match("discover a new direction", ["cover"])).toBeUndefined();
+    expect(match("improve the coverage", ["cover"])).toBeUndefined();
+    // A real standalone occurrence still matches, including next to Chinese.
+    expect(match("做一个cover图", ["cover"])).toEqual({ score: 5, keywords: ["cover"] });
+  });
+
+  it("accepts ordinary English plurals without accepting longer words", () => {
+    expect(match("做三张 posters", ["poster"])).toEqual({ score: 6, keywords: ["poster"] });
+    expect(match("给我几个 logos", ["logo"])).toEqual({ score: 4, keywords: ["logo"] });
+    // One trailing `s` only: a longer tail is a different word.
+    expect(match("posterity", ["poster"])).toBeUndefined();
+  });
+
+  it("counts a nested keyword once instead of crediting the same occurrence twice", () => {
+    // Regression: a manifest declaring both `poster` and `posters` was credited
+    // for each, so redundant declarations outranked a Skill that genuinely
+    // matched more. Only the longest matched form is kept.
+    expect(match("做三张 posters", ["poster", "posters"])).toEqual({ score: 7, keywords: ["posters"] });
+    expect(match("logo", ["logo", "logotype"])).toEqual({ score: 4, keywords: ["logo"] });
+    expect(match("logotype", ["logo", "logotype"])).toEqual({ score: 8, keywords: ["logotype"] });
+  });
+
+  it("drops the ASCII false positive from the real manifest set", () => {
+    // The whole point: the incidental hit used to win the deliverable slot.
+    expect(select("帮我 recover 一下上一版")).toBeUndefined();
+    expect(select("discover a direction")).toBeUndefined();
+    // Real matches and priority tie-breaks are untouched.
+    expect(select("做三张 posters")).toBe("campaign-design");
+    expect(select("给我几个 logos")).toBe("logo-design");
+  });
+
+  it("leaves CJK substring matching alone, where there is no word boundary", () => {
+    expect(match("写一句标题文案", ["文案", "标题文案"])).toEqual({ score: 4, keywords: ["标题文案"] });
+    expect(selectHelpers("把这张图的背景去掉")).toEqual(["background-removal"]);
   });
 });
 
