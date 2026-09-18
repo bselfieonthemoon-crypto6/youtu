@@ -24,6 +24,7 @@ import {
   useChatSessions,
 } from "../hooks/use-chat-sessions";
 import { useChatStream } from "../hooks/use-chat-stream";
+import { useDesignRoutingNotice } from "../hooks/use-design-routing-notice";
 import { useWorkspaceSkills } from "../hooks/use-workspace-skills";
 import type { CanvasSelectionSnapshot } from "../lib/canvas-selection-snapshot";
 import {
@@ -322,6 +323,9 @@ export function ChatSidebar({
 
   const { showTierLimit } = useTierLimitToast();
   const { toast: showToast } = useToast();
+  // Part ①: one transient toast per turn describing the routing decision the
+  // server already made (selected Skill, reason, preloaded guides, size enable).
+  const { present: presentRoutingNotice } = useDesignRoutingNotice();
   const handleSkillSelect = useCallback((invitation: string) => {
     chatInputRef.current?.prependInvitation(invitation);
   }, []);
@@ -1133,6 +1137,13 @@ export function ChatSidebar({
             );
           }
 
+          // Part ①: the runtime's routing decision for THIS turn, shown once as
+          // a non-blocking notice. Deduplicated per runId by the hook, so a
+          // reconnect replay cannot repeat it.
+          if (event.type === "design.routing") {
+            presentRoutingNotice(event);
+          }
+
           // Billing error: route to appropriate UI, run.canceled will follow
           if (event.type === "billing.error") {
             if (event.code === "insufficient_credits") {
@@ -1726,6 +1737,12 @@ export function ChatSidebar({
           const unsub = ws.onEvent((evt) => {
             if (submissionVersionRef.current !== resumeVersion || evt.runId !== activeRunId) return;
 
+            // A resumed run may still be before its first token, so the routing
+            // notice can arrive here for the first time.
+            if (evt.type === "design.routing") {
+              presentRoutingNotice(evt);
+            }
+
             applyStreamEvent(evt, assistantId, sessionId);
             onStreamEvent?.(evt);
 
@@ -1782,6 +1799,7 @@ export function ChatSidebar({
     canvasId,
     sessionsLoading,
     applyStreamEvent,
+    presentRoutingNotice,
     onStreamEvent,
     onImageGenerated,
     onVideoGenerated,

@@ -367,7 +367,16 @@ export async function* streamMastraDesignAgent(options: {
       // through `runContextOf(context)` (see tools/tool-run-context.ts).
       requestContext: toolRequestContext(options.configurable),
       maxSteps: 16, toolCallConcurrency: 1,
-      modelSettings: { maxOutputTokens: options.maxOutputTokens, maxRetries: 0 },
+      // Bounded retry for the CHAT model only.
+      //
+      // The "never retry" rule in `generation/providers/*` exists because a paid
+      // image request crosses a non-idempotent boundary: a lost response cannot
+      // prove the provider did not create an image. A text completion is
+      // idempotent, so applying that rule here only meant a transient gateway
+      // 502 (observed: `shell_api_error` / 502 with an empty body) killed the
+      // whole turn with no user-visible reason. The AI SDK retries only before
+      // any output has been emitted, so a retry cannot duplicate streamed text.
+      modelSettings: { maxOutputTokens: options.maxOutputTokens, maxRetries: 2 },
       hooks: {
         // Replaces the adapter's per-call `signal.throwIfAborted()` guard: a
         // canceled run must not start another tool.

@@ -39,6 +39,11 @@ const ToastContext = createContext<ToastContextValue | null>(null);
 // ---------------------------------------------------------------------------
 
 const TOAST_DURATION = 3000;
+/**
+ * A multi-line notice (the turn's routing decision) needs longer on screen than
+ * a one-line confirmation; it still auto-dismisses and never blocks input.
+ */
+const MULTILINE_TOAST_DURATION = 5200;
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -52,7 +57,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       // Use crypto.randomUUID() for collision-safe IDs across concurrent renders
       const id = crypto.randomUUID();
       setToasts((prev) => [...prev, { id, message, variant }]);
-      setTimeout(() => remove(id), TOAST_DURATION);
+      setTimeout(
+        () => remove(id),
+        message.includes("\n") ? MULTILINE_TOAST_DURATION : TOAST_DURATION,
+      );
     },
     [remove],
   );
@@ -136,7 +144,7 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: () => void }
       exit={{ opacity: 0, y: -8, scale: 0.95 }}
       transition={{ duration: 0.25, ease: [0.25, 0.46, 0.45, 0.94] }}
       onClick={onDismiss}
-      className={`flex cursor-pointer items-center gap-2.5 rounded-xl px-4 py-3 text-sm font-medium shadow-lg backdrop-blur-sm ${bg}`}
+      className={`flex max-w-[min(92vw,26rem)] cursor-pointer items-start gap-2.5 whitespace-pre-line rounded-xl px-4 py-3 text-left text-sm font-medium shadow-lg backdrop-blur-sm ${bg}`}
     >
       {icon}
       {toast.message}

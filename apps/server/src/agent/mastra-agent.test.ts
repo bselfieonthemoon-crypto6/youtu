@@ -391,7 +391,12 @@ describe("Mastra real SDK stream bridge (synthetic transport, not provider E2E)"
       tools: [createAgentTool({ id: "generate_image", description: "Submit an image", inputSchema: z.object({}), execute: vi.fn() })],
     })) events.push(event);
 
-    expect(calls).toHaveLength(3);
+    // Bounded retry for the CHAT model: the failing recovery attempt is issued
+    // 1 + 2 times, so 2 preparatory calls (main attempt + write-repair
+    // classifier) followed by 3 recovery attempts. Asserting the exact count
+    // keeps the retry budget deliberate: a transient gateway 5xx no longer kills
+    // the turn on the first try, but it must never become unbounded either.
+    expect(calls).toHaveLength(5);
     expect(events).toContainEqual(expect.objectContaining({ type: "run.failed", runId: "run-recovery-failed" }));
     expect(info).toHaveBeenCalledWith("[mastra-write-repair]", expect.objectContaining({
       runId: "run-recovery-failed", stage: "recovery", decision: "write_required", result: "none",

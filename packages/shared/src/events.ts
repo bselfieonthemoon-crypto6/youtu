@@ -127,6 +127,78 @@ export const canvasSyncEventSchema = z.object({
   timestamp: timestampSchema,
 });
 
+// ---------------------------------------------------------------------------
+// Turn routing notice
+// ---------------------------------------------------------------------------
+
+/**
+ * The four turn labels the runtime routes on. Declared here (not in the server)
+ * because the label now travels over the wire: it is shared protocol vocabulary
+ * between the runtime that decides it and the notice that displays it.
+ */
+export const designTurnIntentSchema = z.enum([
+  "new_generation",
+  "series_continuation",
+  "local_edit",
+  "non_design",
+]);
+
+export type DesignTurnIntent = z.infer<typeof designTurnIntentSchema>;
+
+/**
+ * Machine-readable reason behind a turn label. It is deliberately a small,
+ * closed vocabulary so it can be logged, counted and rendered without parsing
+ * prose. It describes method selection ONLY: it is never execution, billing,
+ * image-ratio or image-source authority.
+ */
+export const designTurnReasonCodeSchema = z.enum([
+  "explicit_creation",
+  "deliverable_brief",
+  "series_continuation",
+  "property_edit",
+  "declined_or_hedged",
+  "informational_question",
+  "unclear",
+]);
+
+export type DesignTurnReasonCode = z.infer<typeof designTurnReasonCodeSchema>;
+
+/**
+ * One non-blocking notice per turn describing the routing decision the runtime
+ * already made (selected Skill, preloaded helper guides, non-standard-size
+ * enable). It carries no authority and does not require acknowledgement.
+ *
+ * Why a dedicated variant instead of the previously unused `plan.updated`:
+ * `plan.updated` is a durable multi-step task plan (`planId` + `revision` +
+ * `planStepSchema[]`) which the web maps to an inline `plan` content block in
+ * the transcript. Reusing it would either paint a bogus plan card above the
+ * answer or force the plan schema to carry Skill slugs, destroying both
+ * meanings. A separate variant keeps the plan contract intact and lets the
+ * client treat this as transient UI that is never persisted as message content.
+ */
+export const designRoutingEventSchema = z.object({
+  type: z.literal("design.routing"),
+  runId: runIdSchema,
+  timestamp: timestampSchema,
+  intent: designTurnIntentSchema,
+  reasonCode: designTurnReasonCodeSchema,
+  /** How the verdict was reached: deterministic rule, model refinement, or fallback. */
+  source: z.enum(["deterministic", "model", "fallback"]),
+  /** True when a server safety rule overrode a model verdict. */
+  clamped: z.boolean(),
+  confidence: z.number().min(0).max(1),
+  // Display-ready Chinese copy authored by the server so the client never
+  // re-derives product wording from a machine code.
+  summary: z.string().min(1).max(240),
+  detail: z.string().min(1).max(240).optional(),
+  // Structured form of the same decision, for logs and future UI surfaces.
+  primarySkill: z.string().min(1).optional(),
+  helperSkills: z.array(z.string().min(1)).min(1).max(4).optional(),
+  nonstandardSizeSkill: z.string().min(1).optional(),
+});
+
+export type DesignRoutingEvent = z.infer<typeof designRoutingEventSchema>;
+
 export const billingErrorCodeSchema = z.enum([
   "insufficient_credits",
   "model_not_accessible",
@@ -161,6 +233,7 @@ export const streamEventSchema = z.union([
   runCompletedEventSchema,
   runFailedEventSchema,
   canvasSyncEventSchema,
+  designRoutingEventSchema,
   billingErrorEventSchema,
 ]);
 

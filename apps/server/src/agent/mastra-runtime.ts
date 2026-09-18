@@ -27,7 +27,7 @@ import { compileMastraMemoryContext } from "./mastra-memory-adapter.js";
 import { APIYI_VIDEO_MODELS } from "../generation/providers/apiyi-video.js";
 import { createMastraImageJobScopeQuery, createMastraImageStatusTools } from "./mastra-image-status-tools.js";
 import { createMastraLibraryTools, loadLibraryAssetRows, sampleRandom } from "./mastra-library-tools.js";
-import { classifyDesignTurnIntent, extractStyleHints, extractTargetSizes, mergeStyleHints, selectHelperSkills, selectPrimarySkill, shouldReplaceSessionSeries, skillRoutesFromMetadata } from "./design-turn-intent.js";
+import { createDesignTurnIntentClassifier, describeDesignRouting, explainPrimarySkillSelection, extractStyleHints, extractTargetSizes, mergeStyleHints, resolveDesignTurnIntent, selectHelperSkills, shouldReplaceSessionSeries, skillRoutesFromMetadata } from "./design-turn-intent.js";
 import { explicitNonstandardRatio } from "./image-ratio-intent.js";
 import { formatEnabledSkillCatalog } from "./design-skill-catalog.js";
 import { loadSessionDesignContext, saveSessionDesignContext, sessionSkillMemoryEnabled } from "./session-design-context.js";
@@ -135,6 +135,9 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     // to any live design on this canvas; other workspace designs stay excluded.
     const scopeImageJobs = createMastraImageJobScopeQuery(run.canvasId, liveDesignIds);
     const model = createMastraWorkspaceModel(snapshot);
+    // Lazy by design: the underlying Agent is only constructed when an uncertain
+    // turn actually needs the structured-output routing verdict.
+    const turnIntentClassifier = createDesignTurnIntentClassifier(model);
     const budget = createContextBudget(snapshot.contextProfile ?? undefined, resolveContextOperatingPolicy(snapshot.upstreamModelId));
     const images = catalog.filter(entry => entry.model.modality === "image" && entry.model.capabilities.includes("image_generation"))
       .map(entry => ({ id: entry.model.id, displayName: entry.model.displayName, description: entry.model.displayName,
@@ -154,12 +157,32 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     // Session-level sticky Skill + series state. Method routing only: the
     // output is a hint and never authorizes execution or billing.
     const designContext = sessionMemoryOn ? loadedDesignContext : null;
-    const designIntent = classifyDesignTurnIntent({ prompt: run.prompt, mentions: run.mentions,
+    // ── Turn routing (R1) ────────────────────────────────────────────────────
+    // The regex pre-filter runs for free; ONE structured-output model call is
+    // spent only when that pre-filter reports a genuine conflict or no match at
+    // all, and any classifier failure/timeout falls back to the regex verdict.
+    // The resulting label is a routing hint for method selection only: it never
+    // authorizes execution, billing, ratio or image source.
+    const turnIntent = await resolveDesignTurnIntent({
+      prompt: run.prompt, mentions: run.mentions,
       activeSkill: designContext?.activeSkill ?? null, hasSeries: Boolean(designContext?.series),
-      hasAttachments: run.attachments.length > 0, clarificationPending: designContext?.awaitingClarification === true });
+      hasAttachments: run.attachments.length > 0,
+      clarificationPending: designContext?.awaitingClarification === true,
+      classifier: turnIntentClassifier, signal: run.signal,
+    });
+    const designIntent = turnIntent.intent;
+    // Only a model-assisted or fallback verdict is worth a log line; the
+    // deterministic path is already covered by the eval set.
+    if (turnIntent.source !== "deterministic")
+      console.info("[design-turn-intent]", { runId: run.runId, source: turnIntent.source,
+        intent: designIntent, reasonCode: turnIntent.reasonCode, rule: turnIntent.assessment.rule,
+        rules: turnIntent.assessment.rules, confidence: turnIntent.confidence, clamped: turnIntent.clamped });
     const enabledSkillSlugs = new Set(skills.map(skill => skill.name));
-    const routedSkill = designIntent === "new_generation"
-      ? selectPrimarySkill({ prompt: run.prompt, mentions: run.mentions, skills }) : undefined;
+    // The selection carries its own evidence (matched keywords) so the routing
+    // notice can explain the choice instead of inventing a reason.
+    const primarySelection = designIntent === "new_generation"
+      ? explainPrimarySkillSelection({ prompt: run.prompt, mentions: run.mentions, skills }) : undefined;
+    const routedSkill = primarySelection?.skill;
     const priorSkill = designContext?.activeSkill && enabledSkillSlugs.has(designContext.activeSkill)
       ? designContext.activeSkill : undefined;
     // No confidence, no guess. When a NEW brief matches no deliverable Skill we
@@ -561,6 +584,50 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     // wording, material reuse) lives in the Skill body, which is preloaded above.
     const sessionInstructions = [toolkit.instructions, skillCatalog, preloadedSkillInstruction,
       nonstandardSizeInstruction, helperSkillInstruction, seriesInstruction].filter(Boolean).join("\n\n");
+    // ── Routing notice (Part ①) ──────────────────────────────────────────────
+    // One transient event per turn, emitted before the first token, describing
+    // the decisions the user cannot otherwise see: the selected deliverable
+    // Skill, the preloaded helper guides and the non-standard-size enable. It is
+    // a notice, never authority, and it is omitted entirely for a turn with no
+    // design decision at all (a plain "你好呀" must stay silent).
+    // The notice names the Skill that was actually preloaded this turn, which
+    // covers both the fresh-routing branch (with its matched keywords) and the
+    // continuation branch, where the sticky Skill is reused without re-matching.
+    const noticeSkillRef = preloadedSkill
+      ? { name: preloadedSkill.name,
+          ...(preloadedSkill.displayName ? { displayName: preloadedSkill.displayName } : {}) }
+      : undefined;
+    const routingNotice = describeDesignRouting({
+      intent: designIntent, reasonCode: turnIntent.reasonCode, source: turnIntent.source,
+      confidence: turnIntent.confidence,
+      ...(noticeSkillRef ? { primarySkill: noticeSkillRef,
+        ...(primarySelection ? { matchedKeywords: primarySelection.keywords } : {}) } : {}),
+      ...(helperSkills.length ? { helperSkills: helperSkills.map(skill => ({ name: skill.name,
+        ...(skill.displayName ? { displayName: skill.displayName } : {}) })) } : {}),
+      ...(nonstandardSizeSkill ? { nonstandardSizeSkill: { name: nonstandardSizeSkill.name,
+        ...(nonstandardSizeSkill.displayName ? { displayName: nonstandardSizeSkill.displayName } : {}) } } : {}),
+      ...(seriesApplied ? { seriesApplied: true } : {}),
+    });
+    if (routingNotice) {
+      console.info("[design-routing-notice]", { runId: run.runId, intent: designIntent,
+        reasonCode: turnIntent.reasonCode, source: turnIntent.source, summary: routingNotice.summary,
+        primarySkill: routingNotice.primarySkill ?? null, helperSkills: routingNotice.helperSkills ?? [] });
+      yield {
+        type: "design.routing",
+        runId: run.runId,
+        timestamp: new Date().toISOString(),
+        intent: designIntent,
+        reasonCode: turnIntent.reasonCode,
+        source: turnIntent.source,
+        clamped: turnIntent.clamped,
+        confidence: turnIntent.confidence,
+        summary: routingNotice.summary,
+        ...(routingNotice.detail ? { detail: routingNotice.detail } : {}),
+        ...(routingNotice.primarySkill ? { primarySkill: routingNotice.primarySkill } : {}),
+        ...(routingNotice.helperSkills?.length ? { helperSkills: routingNotice.helperSkills } : {}),
+        ...(routingNotice.nonstandardSizeSkill ? { nonstandardSizeSkill: routingNotice.nonstandardSizeSkill } : {}),
+      };
+    }
     try {
       for await (const event of streamMastraDesignAgent({ run, model, messages, tools: toolkit.tools, configurable,
         skillMetadata, contextBudget: budget,
