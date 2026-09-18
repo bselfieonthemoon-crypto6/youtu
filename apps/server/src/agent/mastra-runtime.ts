@@ -126,6 +126,30 @@ export function buildUnfinishedWorkInstruction(entries: readonly SessionUnfinish
     + JSON.stringify(entries).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
 }
 
+/**
+ * Whether this run must consult the workspace material library.
+ *
+ * The rule is "what the turn DECLARES, or what the model ADOPTED" — never "what the
+ * request's words resemble". A keyword candidate is a hint for the model to look at,
+ * so enabling a package's behavior from the words alone would restore the runtime
+ * routing this design removed: a run could attach a Skill's library references while
+ * having read none of its method.
+ *
+ * `declaredSkills` covers the Skill the user NAMED and the one a continuation had
+ * already adopted; `mentionedSkills` is the same user decision expressed as an
+ * @mention. Adoption by reading is recorded separately, by the run itself, on
+ * `configurable.promo_library_auto_run_id` (`mastra-agent.ts`), and it wins whether the
+ * model read the guide with `use_skill` or with `compose_skills`.
+ */
+export function declaresWorkspaceLibrary(input: {
+  declaredSkills: readonly string[];
+  mentionedSkills: readonly string[];
+  metadata: Record<string, { attachWorkspaceLibrary: boolean }>;
+}): boolean {
+  return [...input.declaredSkills, ...input.mentionedSkills]
+    .some(name => input.metadata[name]?.attachWorkspaceLibrary === true);
+}
+
 export function createMastraRunFactory(options: CreateAgentRuntimeOptions): MastraRunFactory {
   return async function* (run) {
     if (!run.userId || !run.accessToken || !run.workspaceId || !run.canvasId || !options.createUserClient ||
@@ -260,33 +284,40 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
       ? await analyzeAgentVisionAttachments({ images: visionInputs, model: visionModel, prompt: run.prompt, signal: run.signal })
       : "";
     const constraint = buildImageGenerationModelConstraint(run.imageGenerationPreference, run.mentions);
-    // The runtime never knows a specific Skill slug: routing, capabilities and
-    // the library-attachment behavior all come from each Skill's manifest.
+    // No Skill slug is hardcoded in this file: routing, capabilities and the
+    // library-attachment behavior all come from each Skill's own manifest.
     const skillMetadata: Record<string, { capabilities: string[]; attachWorkspaceLibrary: boolean }> = {};
     for (const skill of skills) skillMetadata[skill.name] = {
       capabilities: skillLoomicCapabilities(skill.metadata),
       attachWorkspaceLibrary: skillLoomicFlag(skill.metadata, "attachWorkspaceLibrary"),
     };
-    // Enabled when ANY Skill the request points at declares it, or the user named one
-    // that does. A candidate set rather than the scored winner: this is a declared
-    // capability of a package the user's own words reached, so it must not depend on
-    // which Skill a ranking happened to put first.
-    const attachWorkspaceLibrary = Boolean(candidateHints.some(hint => skillMetadata[hint.skill]?.attachWorkspaceLibrary)
-      || run.mentions.some(mention => mention.mentionType === "skill" && skillMetadata[mention.slug]?.attachWorkspaceLibrary === true));
+    // Enabled when the turn DECLARES such a Skill — the user named it, or the session
+    // already adopted it on a continuation — or when the model reads one during this
+    // run, which `mastra-agent.ts` records from the read receipt before any submission.
+    //
+    // Deliberately NOT enabled from the keyword candidate set. A candidate is a hint
+    // for the model to look at, and a Skill the model never read is a Skill it is not
+    // using; enabling a package's behavior from the words alone would make the runtime
+    // the router again, which is exactly what this runtime stopped doing.
+    const attachWorkspaceLibrary = declaresWorkspaceLibrary({
+      declaredSkills: settledSkill ? [settledSkill.name] : [],
+      mentionedSkills: run.mentions.filter(mention => mention.mentionType === "skill").map(mention => mention.slug),
+      metadata: skillMetadata });
     // Deterministic capability enable for non-standard output sizes.
     //
-    // The turn classifier routes at most ONE primary Skill, and
-    // `nonstandard-image-size` declares no routing keywords, so it can never be
-    // auto-routed. A request such as "尺寸 658×176" would therefore depend on the
-    // model volunteering an extra `list_skills` + `use_skill` round trip before
-    // the ratio gate opens — and a weak model skips it, leaving the paid
-    // submission rejected with `image_nonstandard_size_skill_required` even
-    // though the user's own words already stated the exact target.
+    // `nonstandard-image-size` declares no routing keywords, so the candidate set
+    // cannot surface it and it never appears in the notice. A request such as
+    // "尺寸 658×176" would therefore depend on the model volunteering an extra
+    // `list_skills` + `use_skill` round trip before the ratio gate opens — and a
+    // weak model skips it, leaving the paid submission rejected with
+    // `image_nonstandard_size_skill_required` even though the user's own words
+    // already stated the exact target.
     //
     // Mirror the workspace-library auto path above: when the user's OWN words in
-    // THIS turn state a non-standard or out-of-range size, enable the capability
-    // for this run and preload the guide so the first submission already carries
-    // the correct method (nearest legal ratio + disclosed deviation).
+    // THIS turn state a non-standard or out-of-range size, record that the METHOD
+    // was available this run. The guide body is still NOT injected — the model has
+    // to read it — but the receipt lets the first submission carry the correct
+    // method (nearest legal ratio + disclosed deviation).
     //
     // Two independent gates stay intact and are NOT relaxed here:
     //   - this flag only records that the METHOD was available this run;
@@ -297,12 +328,12 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     const nonstandardSizeSkill = explicitNonstandardRatio(run.prompt)
       ? skills.find(skill => skillLoomicCapabilities(skill.metadata).includes("nonstandard-ratio")
           // A Skill the catalog itself reports as unavailable must not have its
-          // method enabled or preloaded.
+          // method enabled either.
           && skill.readiness?.status !== "unavailable")
       : undefined;
-    // Helper-tier slugs. They may be preloaded alongside the deliverable Skill,
-    // but they must never occupy the primary slot — including through the
-    // sticky-memory path below.
+    // Helper-tier slugs. They modify a deliverable rather than being one, so they
+    // must never become the sticky primary — including through the sticky-memory
+    // path below.
     const helperSkillNames = new Set(skillRoutesFromMetadata(skills)
       .filter(route => route.tier === "helper").map(route => route.skill));
     const configurable: Record<string, unknown> = { user_id: run.userId, workspace_id: run.workspaceId, canvas_id: run.canvasId,
@@ -380,14 +411,16 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
         if (!picked.length) return { sourceAssetIds: [], inputImages: [] };
         return explicitSourceResolver({ context, sourceAssetIds: picked });
       } });
-    // Skills the user's own words point at this turn. HINTS for the closure report
-    // only: the runtime injects no guide text, so these are never handed to the
-    // Skill tools as "already in context" — that would answer a use_skill call with
-    // a "已预载" marker instead of the body the model just asked for, and the model
-    // would never receive the method. The mechanism that could do that has been
-    // deleted outright rather than left unused, so it cannot be switched on by
+    // The Skills this turn DECLARES without the model having to find them: the one
+    // the user named or the session already adopted, the capability the runtime
+    // enabled, and the helper candidates the notice lists. Reported in the dispatch
+    // outcome only. The runtime injects no guide text, so these are never handed to
+    // the Skill tools as "already in context" — that would answer a use_skill call
+    // with a "已预载" marker instead of the body the model just asked for, and the
+    // model would never receive the method. The mechanism that could do that has
+    // been deleted outright rather than left unused, so it cannot be switched on by
     // accident.
-    const hintedSkillNames = [settledSkill?.name, nonstandardSizeSkill?.name,
+    const declaredSkillNames = [settledSkill?.name, nonstandardSizeSkill?.name,
       ...helperSkills.map(skill => skill.name)].filter((name): name is string => Boolean(name));
     const toolkit = createMastraToolkit({
       mainToolDependencies: { createUserClient: options.createUserClient, ...(options.designTools ? { designTools: options.designTools } : {}),
@@ -638,15 +671,16 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
       seriesInstruction, unfinishedInstruction, imageBudgetInstruction].filter(Boolean).join("\n\n");
     // ── Routing notice (Part ①) ──────────────────────────────────────────────
     // One transient event per turn, emitted before the first token, describing
-    // the decisions the user cannot otherwise see: the selected deliverable
-    // Skill, the preloaded helper guides and the non-standard-size enable. It is
-    // a notice, never authority, and it is omitted entirely for a turn with no
+    // what the user cannot otherwise see: the candidate Skills this turn's words
+    // point at, the helper candidates, the non-standard-size enable and — when the
+    // user named a Skill or the session already adopted one — that Skill itself. It
+    // is a notice, never authority, and it is omitted entirely for a turn with no
     // design decision at all (a plain "你好呀" must stay silent).
-    // The notice names the CANDIDATE this turn's words point at — nothing is
-    // preloaded any more, so it must not read as a selection the runtime made. It
-    // covers both the fresh-match branch (with its matched keywords) and the
-    // continuation branch, where the session's own Skill is reported without
-    // re-matching.
+    // Nothing it names is a selection the runtime made: nothing is preloaded and
+    // nothing is chosen, so every Skill it reports is a candidate the model may
+    // confirm by reading the guide or disregard. It covers both the fresh-match
+    // branch (with its matched keywords) and the continuation branch, where the
+    // session's own Skill is reported without re-matching.
     const noticeSkillRef = settledSkill
       ? { name: settledSkill.name,
           ...(settledSkill.displayName ? { displayName: settledSkill.displayName } : {}) }
@@ -784,17 +818,22 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
           });
         }
         // Dispatch outcome. Selection now belongs to the model, so the only way to
-        // know whether a Skill is reachable is to report what the run actually
-        // read. `hintedNeverRead` is the maintenance signal: those are the Skills
-        // whose declared keywords fired while the model chose something else (or
-        // nothing), which means the package's own "when to use" text and keywords
-        // need work — not that the runtime needs another rule.
+        // know whether a Skill is reachable is to report what the run actually read,
+        // against the two different sets that can prompt a read:
+        //   - `candidates`: the Skills the user's OWN words point at. A candidate the
+        //     model never read is the maintenance signal — the package's declared
+        //     keywords fired while the model read something else (or nothing), so its
+        //     "when to use" text and keywords need work, not another runtime rule.
+        //   - `declared`: what this turn names outright or the session already
+        //     adopted. A model that does not re-read one of these is ordinary
+        //     behaviour, so it is reported but never counted as a defect.
         const read = new Set((Array.isArray(configurable.session_read_skill_slugs)
           ? configurable.session_read_skill_slugs as unknown[] : [])
           .filter((value): value is string => typeof value === "string"));
+        const candidateSkillNames = candidateHints.map(hint => hint.skill);
         console.info("[skill-dispatch-outcome]", { runId: run.runId, intent: designIntent,
-          hinted: hintedSkillNames, read: [...read],
-          hintedNeverRead: hintedSkillNames.filter(name => !read.has(name)),
+          candidates: candidateSkillNames, declared: declaredSkillNames, read: [...read],
+          candidatesNeverRead: candidateSkillNames.filter(name => !read.has(name)),
           readNothing: read.size === 0 });
       }
     }

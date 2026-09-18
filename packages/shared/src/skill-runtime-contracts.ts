@@ -54,16 +54,30 @@ export const skillRuntimeMetadataSchema = z.object({
    * loads the Skill body (that still requires use_skill/compose_skills).
    */
   whenToUse: z.string().trim().min(1).max(SKILL_WHEN_TO_USE_MAX_CHARS).optional(),
-  /** Deliverable keywords used to auto-select this Skill as the primary one. */
+  /**
+   * Selection vocabulary for this package, used by `matchedSkillHints`.
+   *
+   * These keywords no longer select anything by themselves: the runtime reports every
+   * package the user's own words point at as a CANDIDATE, and the model decides which
+   * guide to read from the always-on catalog. The candidate set is what the routing
+   * notice shows the user, and a candidate the model never reads is logged in
+   * `[skill-dispatch-outcome]` — which is how a package whose keywords are wrong or
+   * whose `whenToUse` text does not describe its situations gets found and fixed.
+   *
+   * Matching is on word boundaries for ASCII keywords (a singular keyword also
+   * accepts one trailing `s`), so a package declaring `cover` cannot be surfaced by
+   * "recover"; CJK keywords are matched as substrings, where there is no boundary.
+   */
   routing: z.object({
     keywords: z.array(z.string().min(1).max(60)).min(1).max(30),
     priority: z.number().int().min(0).max(1000),
     /**
-     * `primary` (the default) Skills compete for the single routed deliverable
-     * slot. `helper` Skills never compete for it: workflow / reference / prompt /
-     * domain guides are modifiers of a deliverable, not deliverables, so the
-     * runtime preloads every matching helper ALONGSIDE the primary Skill. Making
-     * them primaries instead would let a modifier hijack a turn's main Skill.
+     * `primary` (the default) marks a package as a deliverable; `helper` marks a
+     * modifier of one (workflow / reference / prompt guides). The tier decides how
+     * the candidate is reported — helpers are listed separately in the notice, because
+     * they modify a deliverable rather than being one — and it keeps a helper from
+     * becoming the session's remembered deliverable. It no longer decides any
+     * competition: nothing competes, since the runtime ranks nothing.
      */
     tier: z.enum(["primary", "helper"]).optional(),
   }).strict().optional(),

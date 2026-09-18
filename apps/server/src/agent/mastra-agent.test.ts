@@ -25,7 +25,7 @@ function structuredResponse(object: unknown) {
   }), { headers: { "content-type": "application/json" } });
 }
 
-describe("dispatch closure: which preloaded guides the run actually read", () => {
+describe("dispatch closure: which guides the run actually read", () => {
   it("accumulates reads in order, deduplicated and bounded", () => {
     expect(mergeReadSkillSlugs(undefined, ["logo-design"])).toEqual(["logo-design"]);
     // A guide read again, or named twice in one composition, is one entry.
@@ -90,23 +90,43 @@ describe("Mastra real SDK stream bridge (synthetic transport, not provider E2E)"
     expect(providerFetch).toHaveBeenCalledOnce();
   });
   it("marks a current approximate-size run only after the actual enabled Skill returns loaded", async () => {
+    // The package declares a composition role/stage so the compose variant can lead
+    // the design stage, exactly as a real package does.
     const toolkit = createMastraToolkit({ workspaceSkills: [{
       name: "nonstandard-image-size", path: "/workspace-skills/nonstandard-image-size/SKILL.md",
       description: "Approximate native size", content: "FULL CURRENT GUIDE", files: [], version: "1.1.0",
+      metadata: { loomic: { schemaVersion: 1, execution: "image", intents: ["sizing"], outputKinds: ["raster-image"],
+        requiredTools: [], optionalTools: [], models: [], limitations: [], examples: [], sources: [],
+        composition: { role: "workflow", stages: ["design"] } } },
     }] });
     const toolStream = (name: string, args: string, id: string) => new Response(
       `data: ${JSON.stringify({ id: "test", object: "chat.completion.chunk", created: 1, model: "test",
         choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id, type: "function", function: { name, arguments: args } }] }, finish_reason: "tool_calls" }] })}\n\ndata: [DONE]\n\n`,
       { headers: { "content-type": "text/event-stream" } },
     );
-    for (const load of [false, true]) {
+    // `read` is how the model loads one guide; `compose` is the path the agent
+    // instructions encourage and the only one that can load a primary with helpers.
+    // Both must enable the same capability, or a model that followed the documented
+    // flow had its paid submission refused as if it had read nothing.
+    for (const load of ["none", "read", "compose"] as const) {
+      // `compose_skills` is not resident, so the model has to activate it first.
+      const plan = load === "none" ? ["list_skills"]
+        : load === "read" ? ["list_skills", "use_skill"]
+        : ["list_skills", "discover_tools", "compose_skills"];
       let calls = 0;
       const model = createOpenAICompatible({ name: "test", baseURL: "https://test.invalid/v1",
         fetch: async () => {
           calls += 1;
-          if (calls === 1) return toolStream("list_skills", "{}", "call_list");
-          if (calls === 2 && load) return toolStream("use_skill", '{"name":"nonstandard-image-size"}', "call_guide");
-          if (calls <= (load ? 3 : 2)) return textStream("已读取目录。");
+          if (calls <= plan.length) {
+            const step = plan[calls - 1];
+            if (step === "list_skills") return toolStream("list_skills", "{}", "call_list");
+            if (step === "use_skill") return toolStream("use_skill", '{"name":"nonstandard-image-size"}', "call_guide");
+            if (step === "discover_tools")
+              return toolStream("discover_tools", '{"names":["compose_skills"]}', "call_discover");
+            return toolStream("compose_skills",
+              '{"deliverable":"尺寸图","stage":"design","primary":"nonstandard-image-size"}', "call_compose");
+          }
+          if (calls === plan.length + 1) return textStream("已读取目录。");
           return structuredResponse({ decision: "no_write_required", reasonCode: "clarification" });
         },
       }).chatModel("test");
@@ -120,8 +140,14 @@ describe("Mastra real SDK stream bridge (synthetic transport, not provider E2E)"
         configurable, maxOutputTokens: 1_000, tools: toolkit.tools as any, instructions: toolkit.instructions,
         skillMetadata: { "nonstandard-image-size": { capabilities: ["nonstandard-ratio"], attachWorkspaceLibrary: false } },
       })) if (event.type === "tool.completed") completed.push(event.toolName);
-      expect(completed).toEqual(load ? ["list_skills", "use_skill"] : ["list_skills"]);
-      expect(configurable.nonstandard_size_skill_loaded_run_id).toBe(load ? "size-run" : undefined);
+      expect(completed, load).toEqual(plan);
+      expect(configurable.nonstandard_size_skill_loaded_run_id, load).toBe(load === "none" ? undefined : "size-run");
+      // A composition adopts its PRIMARY for session stickiness; a bare listing must
+      // not, and neither may a helper overwrite it.
+      expect(configurable.session_loaded_skill_slug, load)
+        .toBe(load === "none" ? undefined : "nonstandard-image-size");
+      expect(configurable.session_read_skill_slugs, load)
+        .toEqual(load === "none" ? undefined : ["nonstandard-image-size"]);
     }
   });
   it("loads the complete background-removal Skill for an existing-image cutout before any paid image call", async () => {
@@ -627,13 +653,18 @@ describe("Mastra real SDK stream bridge (synthetic transport, not provider E2E)"
     });
     const projected = compactMastraStepToolContext([
       call("guide", "use_skill", { status: "loaded", instructions: "GUIDE-METHOD" }),
+      call("composed", "compose_skills", { status: "composed",
+        primary: { name: "campaign-design", instructions: "COMPOSED-METHOD" }, helpers: [] }),
       call("canvas-1", "inspect_canvas", { rows: "x".repeat(5_000) }),
       call("canvas-2", "inspect_canvas", { rows: "y".repeat(5_000) }),
     ] as any, { totalBytes: 2_000, resultBytes: 1_200, argsBytes: 300 });
     const kept = projected.flatMap(item => item.content.parts)
       .filter((part: any) => part.type === "tool-invocation") as any[];
+    // Both read tools, because both deliver guide bodies.
     expect(kept.some(part => part.toolInvocation.toolCallId === "guide")).toBe(true);
     expect(JSON.stringify(kept)).toContain("GUIDE-METHOD");
+    expect(kept.some(part => part.toolInvocation.toolCallId === "composed")).toBe(true);
+    expect(JSON.stringify(kept)).toContain("COMPOSED-METHOD");
   });
 
   it("sizes the default result budget so a real guide composition arrives whole", () => {

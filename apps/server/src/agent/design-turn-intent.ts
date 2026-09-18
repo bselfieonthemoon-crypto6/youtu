@@ -101,9 +101,9 @@ const QUESTION_PATTERN = /(?:怎么|如何|为什么|能不能|可不可以|可�
 /**
  * Explanatory questions ask HOW/WHY something works. They are informational even
  * when they contain an action verb: "怎么生成一张高质量的海报？" must not be
- * classified as a generation request, because a `new_generation` verdict
- * preloads a Skill and sediments a new series — so a question would silently
- * overwrite what the session had remembered.
+ * classified as a generation request, because a `new_generation` verdict reports a
+ * new round and — once the turn really writes — sediments a new series, so a
+ * question would silently overwrite what the session had remembered.
  */
 const EXPLANATORY_QUESTION_PATTERN =
   /(?:怎么|如何|为什么|为何|是什么|哪些|哪种|多少|需要多久|why\b|how\s+(?:do|does|to|can|should)|what\s+(?:is|are))/i;
@@ -561,8 +561,9 @@ export function assessDesignTurnIntent(input: DesignTurnIntentInput): DesignTurn
       : { intent: "new_generation", reasonCode: "explicit_creation", confidence: 0.8, rule, rules, needsModel: false };
   }
   // A creation verb and an edit verb in one turn ("做一版海报，把标题改成蓝色")
-  // is the second genuine conflict: the fixed order would silently prefer
-  // creation and preload a deliverable Skill.
+  // is the second genuine conflict: the fixed order would silently prefer creation,
+  // which reports a new round, never applies the continuation briefing, and — when
+  // the turn also performs a design write — replaces the remembered series.
   if (generation)
     return { intent: "new_generation", reasonCode: "explicit_creation", confidence: edit ? 0.4 : 1,
       rule: "generation_verb", rules, needsModel: edit };
@@ -590,10 +591,10 @@ export function assessDesignTurnIntent(input: DesignTurnIntentInput): DesignTurn
     return { intent: "new_generation", reasonCode: "deliverable_brief", confidence: 0.9, rule: "deliverable_brief", rules, needsModel: false };
   if (interrogative)
     return { intent: "non_design", reasonCode: "informational_question", confidence: 1, rule: "informational_question", rules, needsModel: false };
-  // A short factual answer to a pending clarification is a generation request,
-  // so the server preloads the skill and captures the series instead of relying
-  // on the model to re-select from the catalog. This default is weak by design
-  // (the user may just as well have changed their mind), so it is a model case.
+  // A short factual answer to a pending clarification is a generation request, so
+  // the turn is treated as a new round and its series is captured rather than left
+  // as an unclear chat turn. This default is weak by design (the user may just as
+  // well have changed their mind), so it is a model case.
   if (input.clarificationPending)
     return { intent: "new_generation", reasonCode: "explicit_creation", confidence: 0.4, rule: "clarification_default", rules, needsModel: true };
   // No rule matched, so this is the one shape where the regex truly has nothing
@@ -773,9 +774,9 @@ export async function resolveDesignTurnIntent(
     if (!isConsistentReply(reply)) throw new Error("design_turn_intent_reply_inconsistent");
     // Safety floor. A hedged negation may be refined by the model into a local
     // edit or a continuation, but it may never be upgraded to `new_generation`:
-    // that is the only label that preloads a deliverable Skill and (given a real
-    // write receipt) replaces the remembered series. A question and an explicit
-    // decline are the two states the product promises never to overwrite.
+    // that is the only label that (given a real write receipt) replaces the
+    // remembered series and skips the continuation briefing. A question and an
+    // explicit decline are the two states the product promises never to overwrite.
     if (assessment.rule === "hedged_negation" && reply.intent === "new_generation")
       return { ...deterministicResolution(assessment), source: "model", clamped: true };
     return { intent: reply.intent, reasonCode: reply.reasonCode, confidence: reply.confidence,

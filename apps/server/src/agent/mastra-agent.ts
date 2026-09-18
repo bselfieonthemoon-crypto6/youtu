@@ -360,18 +360,31 @@ export async function* streamMastraDesignAgent(options: {
       && receipt.skill && typeof receipt.skill === "object" && "name" in receipt.skill
       ? (receipt.skill as { name?: unknown }).name : undefined;
     const loadedReceipt = receipt && typeof receipt === "object" && "status" in receipt && receipt.status === "loaded";
-    // A catalog listing or model claim is not a loaded guide. Only this
-    // completed, current-run use_skill receipt may enable server-recognized
-    // capabilities; the runtime never compares a Skill slug.
-    const loadedMetadata = typeof loadedSkillName === "string" ? options.skillMetadata?.[loadedSkillName] : undefined;
-    if (toolName === "use_skill" && loadedReceipt && loadedMetadata?.capabilities.includes("nonstandard-ratio")
-      && "instructions" in (receipt as object) && typeof (receipt as { instructions?: unknown }).instructions === "string")
-      options.configurable.nonstandard_size_skill_loaded_run_id = options.run.runId;
-    // A loaded guide that declares workspace-library attachment enables the
-    // deterministic library reference path even when the model skips the
-    // read-only lookup.
-    if (toolName === "use_skill" && loadedReceipt && loadedMetadata?.attachWorkspaceLibrary)
-      options.configurable.promo_library_auto_run_id = options.run.runId;
+    // A catalog listing or a model claim is not a loaded guide. Only a receipt that
+    // actually carried a guide BODY may enable a server-recognized capability, and
+    // the runtime never compares a Skill slug.
+    //
+    // BOTH read tools go through this one function. `compose_skills` is the path the
+    // agent instructions encourage and the only one that can load a primary together
+    // with its helpers, so a capability reachable only through `use_skill` was
+    // unreachable exactly when the model followed the documented flow: composing with
+    // a primary that needs the non-standard-size method had its paid submission
+    // refused as `image_nonstandard_size_skill_required` although the guide had in
+    // fact been read, and a composed promo package never enabled the workspace-library
+    // path. Two code paths for one rule is how they drifted apart.
+    const applyLoadedGuide = (name: unknown, instructions: unknown) => {
+      if (typeof name !== "string" || typeof instructions !== "string" || !instructions.length) return;
+      const metadata = options.skillMetadata?.[name];
+      if (!metadata) return;
+      if (metadata.capabilities.includes("nonstandard-ratio"))
+        options.configurable.nonstandard_size_skill_loaded_run_id = options.run.runId;
+      // A loaded guide that declares workspace-library attachment enables the
+      // deterministic library reference path even when the model skips the
+      // read-only lookup.
+      if (metadata.attachWorkspaceLibrary) options.configurable.promo_library_auto_run_id = options.run.runId;
+    };
+    if (toolName === "use_skill" && loadedReceipt && typeof loadedSkillName === "string" && "instructions" in receipt)
+      applyLoadedGuide(loadedSkillName, (receipt as { instructions?: unknown }).instructions);
     // Remember the last Skill actually read this run for session stickiness.
     if (toolName === "use_skill" && typeof loadedSkillName === "string" && loadedReceipt)
       options.configurable.session_loaded_skill_slug = loadedSkillName;
@@ -387,16 +400,23 @@ export async function* streamMastraDesignAgent(options: {
     };
     if (toolName === "use_skill" && loadedReceipt && typeof loadedSkillName === "string")
       recordReadSkills([loadedSkillName]);
-    // compose_skills loads one primary plus its helpers, so a successful
-    // composition means every guide it named was read. A preloaded entry comes
-    // back marked instead of repeated, and it still counts: its text is in this
-    // turn's instructions, so it was read.
+    // compose_skills loads one primary plus its helpers and its result carries every
+    // guide's full body, so a successful composition means every guide it named was
+    // read — and each of them may declare a capability. Only the PRIMARY becomes the
+    // sticky deliverable: a helper that overwrote it would make the next "继续" carry
+    // the helper's guide instead of the deliverable's.
     if (toolName === "compose_skills") {
       const composed = compactMastraToolResult(result);
       const shape = composed && typeof composed === "object"
-        ? composed as { status?: unknown; primary?: { name?: unknown }; helpers?: Array<{ name?: unknown }> } : undefined;
-      if (shape?.status === "composed")
-        recordReadSkills([shape.primary?.name, ...(shape.helpers ?? []).map(helper => helper.name)]);
+        ? composed as { status?: unknown; primary?: { name?: unknown; instructions?: unknown };
+            helpers?: Array<{ name?: unknown; instructions?: unknown }> } : undefined;
+      if (shape?.status === "composed") {
+        const helpers = shape.helpers ?? [];
+        for (const guide of [shape.primary, ...helpers]) applyLoadedGuide(guide?.name, guide?.instructions);
+        if (typeof shape.primary?.name === "string")
+          options.configurable.session_loaded_skill_slug = shape.primary.name;
+        recordReadSkills([shape.primary?.name, ...helpers.map(helper => helper.name)]);
+      }
     }
     // A clarification request means the next short answer is a generation.
     if (toolName === "ask_clarification") options.configurable.session_clarification_asked = true;

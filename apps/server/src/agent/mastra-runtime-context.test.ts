@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { createContextBudget } from "./context-budget.js";
-import { resolveMastraHistoryLimits, resolveMastraMemoryMode, shouldCommitMastraHistory, MASTRA_RECENT_IMAGE_JOB_PROJECTION, projectMastraImageReceipt } from "./mastra-runtime.js";
+import { declaresWorkspaceLibrary, resolveMastraHistoryLimits, resolveMastraMemoryMode, shouldCommitMastraHistory, MASTRA_RECENT_IMAGE_JOB_PROJECTION, projectMastraImageReceipt } from "./mastra-runtime.js";
 
 const first = "00000000-0000-4000-8000-000000000001";
 const second = "00000000-0000-4000-8000-000000000002";
@@ -79,5 +79,31 @@ describe("Mastra runtime context policy", () => {
       coverageMessageIds: [first, second],
       omissions: ["changed"],
     }, snapshot)).toBe(false);
+  });
+});
+
+describe("workspace-library attachment follows declaration or adoption, never keywords", () => {
+  const metadata = {
+    "game-promo-visuals": { attachWorkspaceLibrary: true },
+    "campaign-design": { attachWorkspaceLibrary: false },
+  };
+  const rule = (declaredSkills: string[], mentionedSkills: string[] = []) =>
+    declaresWorkspaceLibrary({ declaredSkills, mentionedSkills, metadata });
+
+  it("enables the library path for the Skill the turn declares", () => {
+    // A user @mention is their own decision.
+    expect(rule([], ["game-promo-visuals"])).toBe(true);
+    // A continuation reuses the Skill the session already adopted.
+    expect(rule(["game-promo-visuals"])).toBe(true);
+  });
+
+  it("stays off for a Skill that declares no library, for an unknown one, and for a keyword-only match", () => {
+    expect(rule(["campaign-design"], ["campaign-design"])).toBe(false);
+    expect(rule(["not-an-enabled-skill"])).toBe(false);
+    // The branch the call site deliberately does not take: "做一个游戏充值活动图"
+    // matches the promo package's keywords, but a run that neither named it nor read
+    // it must not attach its library — a candidate is a hint for the model, not an
+    // adoption, and acting on one would restore runtime routing.
+    expect(rule([])).toBe(false);
   });
 });
