@@ -390,13 +390,13 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
         if (!picked.length) return { sourceAssetIds: [], inputImages: [] };
         return explicitSourceResolver({ context, sourceAssetIds: picked });
       } });
-    // Skills the user's own words point at this turn. These are HINTS for the
-    // closure report, NOT preloaded bodies: the runtime injects no guide text at
-    // all now, so they must never be handed to the Skill tools as "already in
-    // context" — that would answer a use_skill call with the "本轮已预载" marker
-    // instead of the body the model just asked for, and the model would never
-    // receive the method. The toolkit's `preloadedSkillNames` option stays
-    // supported for the day any body is injected again; nothing passes it today.
+    // Skills the user's own words point at this turn. HINTS for the closure report
+    // only: the runtime injects no guide text, so these are never handed to the
+    // Skill tools as "already in context" — that would answer a use_skill call with
+    // a "已预载" marker instead of the body the model just asked for, and the model
+    // would never receive the method. The mechanism that could do that has been
+    // deleted outright rather than left unused, so it cannot be switched on by
+    // accident.
     const hintedSkillNames = [settledSkill?.name, nonstandardSizeSkill?.name,
       ...helperSkills.map(skill => skill.name)].filter((name): name is string => Boolean(name));
     const toolkit = createMastraToolkit({

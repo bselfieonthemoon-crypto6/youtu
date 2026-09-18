@@ -26,12 +26,6 @@ export type MastraToolkitInput = {
   /** Main-agent tool dependencies. Omit to expose only native/read-only tools. */
   mainToolDependencies?: Parameters<typeof createMainAgentTools>[0];
   workspaceSkills?: readonly WorkspaceSkillEntry[];
-  /**
-   * Skill slugs whose guide bodies this turn already preloaded into the session
-   * instructions. `use_skill` / `compose_skills` return their identity and role
-   * but not a second copy of the text.
-   */
-  preloadedSkillNames?: readonly string[];
   promptLibraryService?: PromptLibraryService;
   /** Native Mastra tools, including the replacement direct image-submit tool. */
   nativeImageTools?: readonly MastraAgentTool[];
@@ -128,8 +122,7 @@ export function createMastraToolkit(input: MastraToolkitInput): MastraToolkit {
   const tools: MastraAgentTool[] = [
     createClarificationTool(),
     createWriteTodosTool(),
-    ...createWorkspaceSkillTools(workspaceSkills,
-      input.preloadedSkillNames?.length ? { preloadedSkillNames: input.preloadedSkillNames } : {}),
+    ...createWorkspaceSkillTools(workspaceSkills),
     createMastraWorkspaceSkillReadTool(workspaceSkills),
     ...mainTools,
     ...nativeTools,
