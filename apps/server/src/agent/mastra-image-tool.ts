@@ -479,6 +479,10 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
       ...(normalized.background === "transparent" ? { outputFormat: "png" } : {}),
       ...(inputImages?.length ? { inputImages } : {}),
     };
+    // Record the frame this run actually resolved. The session series persists a
+    // size to authorize later renders in the same series, so it must record the
+    // real output rather than a regex reading of the prompt.
+    configurable.session_submitted_aspect_ratio = submission.aspectRatio;
     const invalidNativeRatio = validateNativeImageAspectRatio(submission, input.availableImageModels);
     if (invalidNativeRatio) {
       if (ratioState.approximation.authorized) return {

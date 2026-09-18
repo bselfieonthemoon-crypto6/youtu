@@ -162,8 +162,13 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
       ? selectPrimarySkill({ prompt: run.prompt, mentions: run.mentions, skills }) : undefined;
     const priorSkill = designContext?.activeSkill && enabledSkillSlugs.has(designContext.activeSkill)
       ? designContext.activeSkill : undefined;
+    // No confidence, no guess. When a NEW brief matches no deliverable Skill we
+    // used to fall back to the previous turn's sticky Skill, so switching topic
+    // preloaded an unrelated deliverable's guide. Reuse is what
+    // `series_continuation` is for; an unmatched new brief simply runs without a
+    // preloaded primary and lets the model choose from the compact catalog.
     const activeSkill = designIntent === "new_generation"
-      ? (routedSkill && enabledSkillSlugs.has(routedSkill) ? routedSkill : priorSkill)
+      ? (routedSkill && enabledSkillSlugs.has(routedSkill) ? routedSkill : undefined)
       : designIntent === "series_continuation" ? priorSkill : undefined;
     const seriesApplied = designIntent === "series_continuation" && designContext?.series ? designContext.series : undefined;
     const preloadedSkill = (designIntent === "new_generation" || designIntent === "series_continuation")
@@ -582,7 +587,15 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
           const finalSkill = finalActiveSkill ? skills.find(skill => skill.name === finalActiveSkill) : undefined;
           const materialAssetIds = Array.isArray(configurable.session_material_asset_ids)
             ? configurable.session_material_asset_ids.filter((item: unknown): item is string => typeof item === "string") : [];
-          const sizes = extractTargetSizes(run.prompt);
+          // Prefer the frame the run ACTUALLY submitted over a regex reading of
+          // the prompt. The remembered series is what authorizes a later render
+          // in the same series, so it must record the real output; a scraped
+          // guess could freeze a size the user never asked for (for example a
+          // meeting time, before that was filtered). Falls back to the stated
+          // sizes only when nothing was submitted this run.
+          const submittedRatio = typeof configurable.session_submitted_aspect_ratio === "string"
+            ? configurable.session_submitted_aspect_ratio : undefined;
+          const sizes = submittedRatio ? [submittedRatio] : extractTargetSizes(run.prompt);
           const style = extractStyleHints(run.prompt);
           const activeSkillPatch = {
             ...(finalActiveSkill ? { activeSkill: finalActiveSkill } : {}),
