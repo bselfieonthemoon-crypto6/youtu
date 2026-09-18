@@ -27,7 +27,7 @@ import { compileMastraMemoryContext } from "./mastra-memory-adapter.js";
 import { APIYI_VIDEO_MODELS } from "../generation/providers/apiyi-video.js";
 import { createMastraImageJobScopeQuery, createMastraImageStatusTools } from "./mastra-image-status-tools.js";
 import { createMastraLibraryTools, loadLibraryAssetRows, sampleRandom } from "./mastra-library-tools.js";
-import { createDesignTurnIntentClassifier, describeDesignRouting, explainPrimarySkillSelection, extractStyleHints, extractTargetSizes, mergeStyleHints, resolveDesignTurnIntent, selectHelperSkills, shouldReplaceSessionSeries, skillRoutesFromMetadata } from "./design-turn-intent.js";
+import { createDesignTurnIntentClassifier, describeDesignRouting, extractStyleHints, extractTargetSizes, matchedSkillHints, mergeStyleHints, resolveDesignTurnIntent, shouldReplaceSessionSeries, skillRoutesFromMetadata } from "./design-turn-intent.js";
 import { explicitNonstandardRatio } from "./image-ratio-intent.js";
 import { mastraImageExecutionPolicy } from "./mastra-image-execution-policy.js";
 import { formatEnabledSkillCatalog } from "./design-skill-catalog.js";
@@ -213,45 +213,31 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
         intent: designIntent, reasonCode: turnIntent.reasonCode, rule: turnIntent.assessment.rule,
         rules: turnIntent.assessment.rules, confidence: turnIntent.confidence, clamped: turnIntent.clamped });
     const enabledSkillSlugs = new Set(skills.map(skill => skill.name));
-    // Candidate evidence for the notice and the dispatch log ONLY. Nothing is
-    // preloaded from it: this is what the user's own words happened to match, and
-    // the model decides from the catalog whether to read any of it. The user's own
-    // word is the honest reason shown back to them, which is why the notice reports
-    // 候选 rather than a selection.
-    const primarySelection = designIntent === "new_generation"
-      ? explainPrimarySkillSelection({ prompt: run.prompt, mentions: run.mentions, skills }) : undefined;
-    const routedSkill = primarySelection?.skill;
-    const priorSkill = designContext?.activeSkill && enabledSkillSlugs.has(designContext.activeSkill)
-      ? designContext.activeSkill : undefined;
-    // No confidence, no guess. When a NEW brief matches no candidate Skill the turn
-    // simply runs without one; reuse is what `series_continuation` is for.
-    const activeSkill = designIntent === "new_generation"
-      ? (routedSkill && enabledSkillSlugs.has(routedSkill) ? routedSkill : undefined)
-      : designIntent === "series_continuation" ? priorSkill : undefined;
+    // Candidate hints for the notice and the dispatch log ONLY, as a SET: every Skill
+    // the request's own words point at, with no score, no priority and no winner.
+    // Nothing is preloaded from them and nothing is chosen from them — the model reads
+    // the catalog — so the notice reports 候选 rather than a selection, except when the
+    // user named a Skill outright, which is their decision and not the runtime's.
+    const candidateHints = matchedSkillHints({ prompt: run.prompt, mentions: run.mentions, skills })
+      .filter(hint => enabledSkillSlugs.has(hint.skill));
+    const mentionedHint = candidateHints.find(hint => hint.mentioned);
+    // What the notice names: the Skill the user named, or — on a continuation — the one
+    // the session actually adopted in an earlier turn. Never a scorer's guess.
+    const settledSkill = mentionedHint
+      ? skills.find(skill => skill.name === mentionedHint.skill)
+      : designIntent === "series_continuation" && designContext?.activeSkill
+        ? skills.find(skill => skill.name === designContext.activeSkill)
+        : undefined;
     const seriesApplied = designIntent === "series_continuation" && designContext?.series ? designContext.series : undefined;
-    // The Skill this turn settled on, used for the notice and for the persisted
-    // session memory — never for injecting its body, which no longer happens.
-    const settledSkill = (designIntent === "new_generation" || designIntent === "series_continuation")
-      ? skills.find(skill => skill.name === activeSkill) : undefined;
-    // Helper-tier candidates for the notice. They are modifiers of a deliverable
-    // (workflow / reference / prompt / domain), so the notice lists them separately
-    // from the deliverable candidate — but nothing is injected from this list.
-    const helperSkills = selectHelperSkills({ prompt: run.prompt, skills })
-      .map(name => skills.find(skill => skill.name === name))
-      .filter((skill): skill is (typeof skills)[number] => Boolean(skill) && skill!.name !== activeSkill);
-    if (helperSkills.length)
-      console.info("[skill-dispatch]", { runId: run.runId, intent: designIntent,
-        primary: activeSkill ?? null, helpers: helperSkills.map(skill => skill.name) });
-    if (designIntent === "new_generation" && routedSkill && priorSkill && routedSkill !== priorSkill)
-      console.info("[session-design-context]", { runId: run.runId, intent: designIntent, switchedTo: routedSkill, from: priorSkill });
+    // Helper-tier candidates, listed separately in the notice because they modify a
+    // deliverable rather than being one. Nothing is injected from this list either.
+    const helperSkills = candidateHints
+      .filter(hint => hint.tier === "helper" && hint.skill !== settledSkill?.name)
+      .map(hint => skills.find(skill => skill.name === hint.skill))
+      .filter((skill): skill is (typeof skills)[number] => Boolean(skill));
     // Series preferences apply only to continuation; a new generation replaces
     // them. Local edits and unrelated turns leave the remembered state alone.
-    const sessionDesignContextJson = activeSkill || seriesApplied ? {
-      intent: designIntent,
-      ...(activeSkill ? { activeSkill,
-        ...(settledSkill ? { activeSkillVersion: settledSkill.version } : {}) } : {}),
-      ...(seriesApplied ? { series: seriesApplied } : {}),
-    } : undefined;
+    const sessionDesignContextJson = seriesApplied ? { intent: designIntent, series: seriesApplied } : undefined;
     // Resolve the vision model once (reusing the run snapshot) and fetch/optimize
     // every attachment concurrently, preserving request order for the map.
     const [visionModel, attachmentResults] = await Promise.all([
@@ -281,7 +267,11 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
       capabilities: skillLoomicCapabilities(skill.metadata),
       attachWorkspaceLibrary: skillLoomicFlag(skill.metadata, "attachWorkspaceLibrary"),
     };
-    const attachWorkspaceLibrary = Boolean((activeSkill && skillMetadata[activeSkill]?.attachWorkspaceLibrary)
+    // Enabled when ANY Skill the request points at declares it, or the user named one
+    // that does. A candidate set rather than the scored winner: this is a declared
+    // capability of a package the user's own words reached, so it must not depend on
+    // which Skill a ranking happened to put first.
+    const attachWorkspaceLibrary = Boolean(candidateHints.some(hint => skillMetadata[hint.skill]?.attachWorkspaceLibrary)
       || run.mentions.some(mention => mention.mentionType === "skill" && skillMetadata[mention.slug]?.attachWorkspaceLibrary === true));
     // Deterministic capability enable for non-standard output sizes.
     //
@@ -610,13 +600,15 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     // no guide at all is reported in `[skill-dispatch-outcome]` rather than being
     // silently absorbed.
     const skillCatalog = formatEnabledSkillCatalog(skills);
-    // What the user's own words happened to match, as a HINT. Not a decision: the
-    // model may read something else the catalog describes better, and only a
-    // use_skill / compose_skills call that returned a real body counts as adopted.
-    const candidateHint = primarySelection || helperSkills.length
-      ? `【候选技能｜仅供参考，不是决定】用户原话可能对应：${[
-          primarySelection ? `${primarySelection.displayName ?? primarySelection.skill}（命中 ${primarySelection.keywords.join("/")}）` : "",
-          ...helperSkills.map(skill => skill.displayName ?? skill.name)].filter(Boolean).join("、")}。`
+    // The candidate set the request's own words point at, as a HINT. Not a decision and
+    // not a ranking: the model may read something else the catalog describes better,
+    // and only a use_skill / compose_skills call that returned a real body counts as
+    // adopted. Every candidate is named, in the order the set produced them.
+    const candidateHint = candidateHints.length
+      ? `【候选技能｜仅供参考，不是决定】用户原话可能对应：${candidateHints.map(hint => {
+          const label = hint.displayName ?? hint.skill;
+          return hint.keywords.length ? `${label}（命中 ${hint.keywords.join("/")}）` : label;
+        }).join("、")}。`
         + "请对照目录里每个技能声明的适用场景自行判断；只有 use_skill/compose_skills 读到正文才算采用，没读到的技能等于没选。"
       : "";
     const seriesInstruction = seriesApplied
@@ -663,7 +655,13 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
       intent: designIntent, reasonCode: turnIntent.reasonCode, source: turnIntent.source,
       confidence: turnIntent.confidence,
       ...(noticeSkillRef ? { primarySkill: noticeSkillRef,
-        ...(primarySelection ? { matchedKeywords: primarySelection.keywords } : {}) } : {}),
+        ...(mentionedHint ? { primarySkillMentioned: true } : {}),
+        ...(mentionedHint?.keywords.length ? { matchedKeywords: mentionedHint.keywords } : {}) } : {}),
+      // The candidate set, so a turn whose words clearly match a Skill never reports
+      // that nothing was found.
+      ...(candidateHints.length ? { candidateSkills: candidateHints.map(hint => ({
+        skill: { name: hint.skill, ...(hint.displayName ? { displayName: hint.displayName } : {}) },
+        keywords: hint.keywords })) } : {}),
       ...(helperSkills.length ? { helperSkills: helperSkills.map(skill => ({ name: skill.name,
         ...(skill.displayName ? { displayName: skill.displayName } : {}) })) } : {}),
       ...(nonstandardSizeSkill ? { nonstandardSizeSkill: { name: nonstandardSizeSkill.name,
@@ -709,10 +707,14 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
             ? configurable.session_loaded_skill_slug : undefined;
           // Only a deliverable Skill may become the sticky primary. A one-off
           // `use_skill` on a workflow/reference/prompt helper (for example
-          // design-review) used to overwrite it, so the next "继续" preloaded the
+          // design-review) used to overwrite it, so the next "继续" carried the
           // helper's guide instead of the deliverable's.
+          //
+          // There is deliberately NO fallback to a routed guess any more: session
+          // memory records the Skill the model actually read, so a turn that read
+          // nothing remembers nothing rather than remembering a scorer's prediction.
           const finalActiveSkill = loadedSkillSlug && enabledSkillSlugs.has(loadedSkillSlug)
-            && !helperSkillNames.has(loadedSkillSlug) ? loadedSkillSlug : activeSkill;
+            && !helperSkillNames.has(loadedSkillSlug) ? loadedSkillSlug : undefined;
           const finalSkill = finalActiveSkill ? skills.find(skill => skill.name === finalActiveSkill) : undefined;
           const materialAssetIds = Array.isArray(configurable.session_material_asset_ids)
             ? configurable.session_material_asset_ids.filter((item: unknown): item is string => typeof item === "string") : [];

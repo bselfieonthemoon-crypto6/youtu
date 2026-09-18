@@ -223,6 +223,68 @@ export function skillRoutesFromMetadata(skills: readonly SkillRouteSource[]): Sk
   return routes.sort((left, right) => right.priority - left.priority || left.skill.localeCompare(right.skill));
 }
 
+/**
+ * A Skill the user's own words point at. Membership only — there is no score, no
+ * priority and no single winner, because the runtime no longer selects.
+ */
+export type SkillCandidateHint = {
+  skill: string;
+  displayName?: string;
+  /** Declared keywords that occur in the request; empty for an explicit mention. */
+  keywords: string[];
+  tier: SkillTier;
+  /** The user named this Skill outright, which is their choice rather than a guess. */
+  mentioned: boolean;
+};
+
+/** Enough to show the user what was noticed without turning the notice into a list. */
+export const MAX_SKILL_CANDIDATE_HINTS = 6;
+
+/**
+ * Every Skill the request points at, as a SET.
+ *
+ * This replaces scored selection. The runtime used to rank Skills against each other
+ * — a length-weighted keyword score, the declared `priority` as a tie-break, and
+ * `tier` deciding who was even allowed to take the single primary slot — and then act
+ * on the winner by preloading its body. With preloading gone there is nothing left
+ * for a ranking to decide: selection belongs to the model, which reads the catalog.
+ * What remains is a hint for the user-facing notice and the dispatch log, and a hint
+ * must not invent a winner. So membership is a plain union in slug order, and a Skill
+ * the user explicitly mentioned comes first and is flagged, because naming a Skill is
+ * the user's decision rather than the runtime's.
+ */
+export function matchedSkillHints(input: {
+  prompt: string;
+  mentions: readonly MessageMention[];
+  skills: readonly SkillRouteSource[];
+  max?: number;
+}): SkillCandidateHint[] {
+  const routes = skillRoutesFromMetadata(input.skills);
+  const tierBySlug = new Map(routes.map(route => [route.skill, route.tier]));
+  const bySlug = new Map(input.skills.map(skill => [skill.name, skill]));
+  const label = (slug: string) => {
+    const displayName = bySlug.get(slug)?.displayName;
+    return displayName ? { displayName } : {};
+  };
+  const hints: SkillCandidateHint[] = [];
+  const seen = new Set<string>();
+  for (const slug of mentionSkillSlugs(input.mentions)) {
+    if (seen.has(slug)) continue;
+    seen.add(slug);
+    hints.push({ skill: slug, ...label(slug), keywords: [], tier: tierBySlug.get(slug) ?? "primary", mentioned: true });
+  }
+  // Slug order: deterministic and visibly unranked, unlike the priority ordering the
+  // competitive selector used.
+  for (const route of [...routes].sort((left, right) => left.skill.localeCompare(right.skill))) {
+    if (seen.has(route.skill)) continue;
+    const keywords = matchRouteKeywords(input.prompt, route.keywords);
+    if (!keywords.length) continue;
+    seen.add(route.skill);
+    hints.push({ skill: route.skill, ...label(route.skill), keywords, tier: route.tier, mentioned: false });
+  }
+  return hints.slice(0, Math.max(1, input.max ?? MAX_SKILL_CANDIDATE_HINTS));
+}
+
 /** A keyword made only of printable ASCII needs word boundaries; CJK does not. */
 const ASCII_KEYWORD_PATTERN = /^[ -~]+$/;
 const REGEXP_METACHARACTERS = /[.*+?^${}()|[\]\\]/g;
@@ -903,7 +965,19 @@ export type DesignRoutingNoticeInput = {
   source: DesignTurnIntentResolution["source"];
   confidence: number;
   primarySkill?: DesignRoutingSkillRef | undefined;
-  /** Which declared keywords selected the primary Skill. */
+  /**
+   * The user NAMED this Skill outright, so the notice reports their own choice
+   * rather than a candidate the runtime noticed.
+   */
+  primarySkillMentioned?: boolean | undefined;
+  /**
+   * Every Skill the request's own words point at, in hint order. Reported as
+   * candidates: the runtime no longer ranks them, so the notice must not present one
+   * as the chosen one — but it must still show them, or a turn whose words clearly
+   * match a Skill would claim nothing was found.
+   */
+  candidateSkills?: readonly { skill: DesignRoutingSkillRef; keywords: readonly string[] }[] | undefined;
+  /** Which declared keywords the request matched. */
   matchedKeywords?: readonly string[] | undefined;
   helperSkills?: readonly DesignRoutingSkillRef[] | undefined;
   nonstandardSizeSkill?: DesignRoutingSkillRef | undefined;
@@ -929,10 +1003,18 @@ export function describeDesignRouting(input: DesignRoutingNoticeInput): DesignRo
   const reason = REASON_LABELS[input.reasonCode];
 
   let summary: string;
-  // The runtime no longer selects a Skill: it states what the user's own words
-  // point at, and the model decides from the catalog. The copy says 候选 rather
-  // than 识别为 so the notice cannot claim a decision nobody made.
-  if (skillLabel && keywords.length) summary = `候选技能：${skillLabel}（命中 ${keywords.join("/")}）`;
+  // The runtime no longer selects a Skill: it states what the user's own words point
+  // at, and the model decides from the catalog. A Skill the user named is reported as
+  // their choice; anything else is one of possibly several candidates, which the notice
+  // must list rather than dress up as a decision — hence 候选 rather than 识别为.
+  const candidates = (input.candidateSkills ?? []).slice(0, 3).map(candidate => {
+    const label = candidate.skill.displayName ?? candidate.skill.name;
+    const hits = [...new Set(candidate.keywords)].slice(0, 3);
+    return hits.length ? `${label}（命中 ${hits.join("/")}）` : label;
+  });
+  if (skillLabel && input.primarySkillMentioned) summary = `已指定技能：${skillLabel}`;
+  else if (candidates.length) summary = `候选技能：${candidates.join("、")}`;
+  else if (skillLabel && keywords.length) summary = `候选技能：${skillLabel}（命中 ${keywords.join("/")}）`;
   else if (skillLabel) summary = `候选技能：${skillLabel}（${reason}）`;
   else if (input.intent === "new_generation") summary = "未匹配到候选技能，由模型从技能目录自行选择";
   else if (input.intent === "series_continuation") summary = "沿用当前系列的方法与尺寸，未重新匹配候选技能";

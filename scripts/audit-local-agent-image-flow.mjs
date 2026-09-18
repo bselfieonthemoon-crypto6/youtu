@@ -1,3 +1,26 @@
+// SUPERSEDED — do not run this to validate the current runtime.
+//
+// It still asserts the legacy PROPOSAL → CONFIRM flow (a structured proposal with a
+// durable confirmationId, then a "确认生成" turn). That flow was deliberately removed
+// when the Mastra runtime took over direct image submission: `mastra-toolkit.ts`
+// filters `get_image_proposal` / `confirm_image_generation` out entirely. So this
+// script spends a REAL provider call on its first turn and then fails on
+// "canvas: structured proposal" — it cannot pass, and running it costs money to
+// learn that.
+//
+// Use the sanctioned four-step acceptance instead, documented in
+// docs/type-guards-real-image-acceptance-20260916.md:
+//   1. apps/server: node --env-file=../../artifacts/local-replica-20260907/app.env \
+//        --import tsx scripts/preflight-real-image-acceptance.mjs        (read-only)
+//   2. apps/server: … scripts/prepare-real-image-acceptance.mjs --prepare (creates a
+//        dedicated QA project/session + fixture; submits no run)
+//   3. apps/web:    … scripts/run-paid-dialogue-browser.mjs --submit \
+//        --fixture=<fixture.json> --prompt="<fixture.prompt>"            (PAID, one image)
+//   4. apps/server: … scripts/audit-real-image-acceptance.mjs --fixture=<fixture.json>
+//        (read-only postflight: one job, canvas element, chat card, receipts, no
+//         duplicate credit deduction)
+// Kept only as a record of the legacy proposal-flow acceptance.
+//
 // Real local Agent + worker acceptance. Only creates dedicated QA projects.
 // Run with --env-file=artifacts/local-replica-20260907/app.env.
 import { createRequire } from "node:module";

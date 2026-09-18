@@ -118,7 +118,7 @@ function client() {
   };
 }
 
-async function runTurn(prompt: string) {
+async function runTurn(prompt: string, mentions: any[] = []) {
   captured.upserts = [];
   captured.generates = [];
   captured.options = undefined;
@@ -132,7 +132,7 @@ async function runTurn(prompt: string) {
   const events: any[] = [];
   for await (const event of await factory({ runId: ids.run, conversationId: ids.conversation, sessionId: ids.session,
     userMessageId: ids.current, userId: ids.user, workspaceId: ids.workspace, canvasId: ids.canvas,
-    accessToken: "test-token", prompt, executionMode: "fast", attachments: [], mentions: [],
+    accessToken: "test-token", prompt, executionMode: "fast", attachments: [], mentions,
     signal: new AbortController().signal })) events.push(event);
   return events;
 }
@@ -153,8 +153,10 @@ describe("runtime routing notice", () => {
     const found = notices(events);
     expect(found).toHaveLength(1);
     expect(found[0]).toMatchObject({ type: "design.routing", runId: ids.run, intent: "new_generation",
-      reasonCode: "explicit_creation", source: "deterministic", clamped: false,
-      primarySkill: "campaign-design" });
+      reasonCode: "explicit_creation", source: "deterministic", clamped: false });
+    // No Skill is "chosen": the runtime reports the candidate the user's own words
+    // point at, and the model decides from the catalog whether to read it.
+    expect(found[0]).not.toHaveProperty("primarySkill");
     expect(found[0].summary).toBe("候选技能：活动海报与宣传图（命中 活动/海报）");
     // A confidently resolved turn costs no model call at all.
     expect(classifierCalls()).toHaveLength(0);
@@ -166,8 +168,10 @@ describe("runtime routing notice", () => {
   it("covers the helper candidates and the non-standard-size enable", async () => {
     const events = await runTurn("做一张活动海报，再写一句文案，尺寸 658×176");
     const notice = notices(events)[0]!;
-    expect(notice).toMatchObject({ primarySkill: "campaign-design",
+    expect(notice).toMatchObject({
       helperSkills: ["design-copywriting"], nonstandardSizeSkill: "nonstandard-image-size" });
+    expect(notice).not.toHaveProperty("primarySkill");
+    expect(notice.summary).toContain("候选技能：活动海报与宣传图");
     // The runtime injects no guide text any more, so the notice must not claim a
     // preload: these are the guides the user's own words point at.
     expect(notice.detail).toContain("候选助手指南（需模型读取后生效）：海报文案");
@@ -195,16 +199,19 @@ describe("runtime routing notice", () => {
     const events = await runTurn("做一版活动海报，把标题文字改成蓝色");
     const notice = notices(events)[0]!;
     expect(classifierCalls()).toHaveLength(1);
-    expect(notice).toMatchObject({ source: "model", clamped: false, intent: "new_generation",
-      primarySkill: "campaign-design" });
+    expect(notice).toMatchObject({ source: "model", clamped: false, intent: "new_generation" });
+    expect(notice.summary).toContain("候选技能：活动海报与宣传图");
     expect(notice.detail).toContain("模型判定 · 置信度 88%");
 
-    // The same conflict resolved as an edit names no candidate Skill.
+    // The same conflict resolved as an edit: no Skill is chosen, but the user's own
+    // words still point at one, so the notice surfaces the candidate while the detail
+    // discloses that the turn is handled as a local edit.
     captured.classifierReply = { intent: "local_edit", reasonCode: "property_edit", confidence: 0.66 };
     const edited = notices(await runTurn("做一版活动海报，把标题文字改成蓝色"))[0]!;
     expect(edited).toMatchObject({ source: "model", intent: "local_edit" });
     expect(edited).not.toHaveProperty("primarySkill");
-    expect(edited.summary).toBe("按局部修改处理，未匹配候选技能");
+    expect(edited.summary).toContain("候选技能：活动海报与宣传图");
+    expect(edited.detail).toContain("只修改局部属性");
   });
 
   it("clamps a model verdict that would revive a declined turn", async () => {
@@ -220,8 +227,18 @@ describe("runtime routing notice", () => {
     captured.classifierFailure = new Error("provider outage");
     const events = await runTurn("做一版活动海报，把标题文字改成蓝色");
     const notice = notices(events)[0]!;
-    expect(notice).toMatchObject({ intent: "new_generation", source: "fallback", primarySkill: "campaign-design" });
+    expect(notice).toMatchObject({ intent: "new_generation", source: "fallback" });
+    expect(notice.summary).toContain("候选技能：活动海报与宣传图");
     expect(notice.detail).toContain("模型不可用，沿用规则判定");
+  });
+
+  it("reports a Skill the user NAMED as their own choice, not as a candidate", async () => {
+    // Naming a Skill is the user's decision, so echoing it is not the runtime routing.
+    const events = await runTurn("做一张活动海报", [{ mentionType: "skill", id: "campaign-design",
+      label: "活动海报与宣传图", slug: "campaign-design" }]);
+    const notice = notices(events)[0]!;
+    expect(notice).toMatchObject({ primarySkill: "campaign-design" });
+    expect(notice.summary).toBe("已指定技能：活动海报与宣传图");
   });
 
   it("briefs a continuation from the remembered series without re-matching", async () => {

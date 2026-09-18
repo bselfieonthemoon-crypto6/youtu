@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { MessageMention } from "@loomic/shared";
 
-import { classifyDesignTurnIntent, explainPrimarySkillSelection, extractStyleHints, extractTargetSizes, mergeStyleHints, selectHelperSkills, selectPrimarySkill, shouldReplaceSessionSeries } from "./design-turn-intent.js";
+import { classifyDesignTurnIntent, explainPrimarySkillSelection, extractStyleHints, extractTargetSizes, matchedSkillHints, mergeStyleHints, selectHelperSkills, selectPrimarySkill, shouldReplaceSessionSeries } from "./design-turn-intent.js";
 
 const skillMention = (slug: string): MessageMention => ({ mentionType: "skill", id: slug, label: slug, slug });
 
@@ -248,6 +248,46 @@ describe("keyword matching", () => {
   it("leaves CJK substring matching alone, where there is no word boundary", () => {
     expect(match("写一句标题文案", ["文案", "标题文案"])).toEqual({ score: 4, keywords: ["标题文案"] });
     expect(selectHelpers("把这张图的背景去掉")).toEqual(["background-removal"]);
+  });
+});
+
+describe("matchedSkillHints — candidates, not a selection", () => {
+  const hints = (prompt: string, mentions: MessageMention[] = [], max?: number) =>
+    matchedSkillHints({ prompt, mentions, skills: allSkills, ...(max !== undefined ? { max } : {}) });
+  const slugs = (prompt: string, mentions: MessageMention[] = []) => hints(prompt, mentions).map(hint => hint.skill);
+
+  it("lists EVERY matching Skill instead of picking one winner", () => {
+    // Preloading is gone, so a ranking has nothing left to decide. Both Skills the
+    // words point at are reported; the model decides what to read.
+    expect(slugs("做一张活动海报，配成轮播")).toEqual(["campaign-design", "social-carousel"]);
+  });
+
+  it("does not let declared priority reorder or add candidates", () => {
+    // logo-design declares priority 60 and campaign-design 10. Membership and order
+    // must come from the words and the slug, never from a competitive ranking.
+    expect(slugs("做一个 logo 加活动海报")).toEqual(["campaign-design", "logo-design"]);
+    const reversed = matchedSkillHints({ prompt: "做一个 logo 加活动海报", mentions: [],
+      skills: [...allSkills].reverse() }).map(hint => hint.skill);
+    expect(reversed).toEqual(["campaign-design", "logo-design"]);
+  });
+
+  it("puts a Skill the user NAMED first and flags it as their choice", () => {
+    const result = hints("做一张活动海报", [skillMention("logo-design")]);
+    expect(result[0]).toMatchObject({ skill: "logo-design", mentioned: true, keywords: [] });
+    expect(result[1]).toMatchObject({ skill: "campaign-design", mentioned: false });
+    expect(result[1]!.keywords).toContain("海报");
+  });
+
+  it("keeps helper-tier candidates in the same set, distinguished by tier", () => {
+    const result = hints("做一张活动海报，写一句文案");
+    expect(result.map(hint => [hint.skill, hint.tier])).toEqual([
+      ["campaign-design", "primary"], ["design-copywriting", "helper"],
+    ]);
+  });
+
+  it("bounds the candidate list and reports nothing when nothing matches", () => {
+    expect(hints("做一张活动海报，写文案，再来个轮播", [], 2)).toHaveLength(2);
+    expect(slugs("你好呀")).toEqual([]);
   });
 });
 
