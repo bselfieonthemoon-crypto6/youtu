@@ -240,4 +240,24 @@ describe("runtime routing notice", () => {
     // Nothing was written at all, so the remembered style/size survive verbatim.
     expect(captured.upserts.some(row => "series" in row)).toBe(false);
   });
+
+  it("carries the catalog and NO Skill body: selection belongs to the model", async () => {
+    // The architecture in one assertion pair. The runtime used to inject the
+    // routed Skill bodies into the instructions, which made a keyword score the
+    // router: a Skill the scorer did not know could never be used, and adding a
+    // package changed nothing. Now the model gets the catalog and reads what it
+    // decides it needs, so NOTHING may leak a body into the instructions again.
+    await runTurn("做一张活动海报，再写一句文案，尺寸 658×176");
+    const instructions = String(captured.options?.instructions ?? "");
+    expect(instructions).toContain("【本轮已启用技能目录");
+    expect(instructions).toContain("campaign-design（活动海报与宣传图）");
+    expect(instructions).toContain("design-copywriting（海报文案）");
+    expect(instructions).not.toContain("CAMPAIGN SKILL BODY");
+    expect(instructions).not.toContain("COPYWRITING SKILL BODY");
+    expect(instructions).not.toContain("NONSTANDARD SIZE SKILL BODY");
+    // What the user's own words matched is stated as a candidate, not a decision.
+    expect(instructions).toContain("候选技能｜仅供参考，不是决定");
+    // Guardrails still reach the model; they are what the runtime keeps.
+    expect(instructions).toContain("【本轮图片额度】");
+  });
 });
