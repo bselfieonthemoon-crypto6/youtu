@@ -1,19 +1,20 @@
 import { describe, expect, it } from "vitest";
 import type { MessageMention } from "@loomic/shared";
 
-import { classifyDesignTurnIntent, extractStyleHints, extractTargetSizes, mergeStyleHints, selectPrimarySkill } from "./design-turn-intent.js";
+import { classifyDesignTurnIntent, extractStyleHints, extractTargetSizes, mergeStyleHints, selectPrimarySkill, shouldReplaceSessionSeries } from "./design-turn-intent.js";
 
 const skillMention = (slug: string): MessageMention => ({ mentionType: "skill", id: slug, label: slug, slug });
 
 const route = (name: string, priority: number, keywords: string[]) =>
   ({ name, metadata: { loomic: { routing: { keywords, priority } } } });
+/** Mirrors the real `metadata.loomic.routing` blocks in the skill manifests. */
 const routingSkills = [
-  route("logo-design", 60, ["logo", "字标", "图形标记", "商标", "wordmark", "brand mark"]),
-  route("social-carousel", 50, ["轮播", "多页", "多图", "九宫格", "carousel"]),
-  route("series-visual-design", 40, ["系列", "多张", "一套"]),
-  route("product-visual", 30, ["商品", "产品", "主图"]),
-  route("game-promo-visuals", 20, ["游戏", "棋牌", "抽奖", "礼包", "充值", "bonus", "casino"]),
-  route("campaign-design", 10, ["活动", "促销", "海报", "宣传", "banner", "poster"]),
+  route("logo-design", 60, ["logo", "字标", "图形标记", "图形标志", "商标", "wordmark", "brand mark", "brandmark", "品牌标志", "标志设计"]),
+  route("social-carousel", 50, ["轮播", "多页", "多图", "九宫格", "carousel", "slides", "slide"]),
+  route("series-visual-design", 40, ["系列", "多张", "一套", "整套", "series"]),
+  route("product-visual", 30, ["商品", "产品", "主图", "ecommerce", "product image", "product shot", "product visual"]),
+  route("game-promo-visuals", 20, ["游戏", "棋牌", "抽奖", "礼包", "充值", "bonus", "jackpot", "casino", "game promo", "game event"]),
+  route("campaign-design", 10, ["活动", "促销", "海报", "宣传", "推广", "banner", "poster", "promo", "cover", "key visual", "主视觉"]),
 ];
 const select = (prompt: string, mentions: MessageMention[] = []) =>
   selectPrimarySkill({ prompt, mentions, skills: routingSkills });
@@ -38,6 +39,37 @@ describe("classifyDesignTurnIntent", () => {
     for (const prompt of ["把标题的字改一下", "换个背景颜色", "把 logo 放大一点", "去掉边框"]) {
       expect(classify(prompt), prompt).toBe("local_edit");
     }
+  });
+
+  it("keeps an explanatory question out of remembered state even when it names an action verb", () => {
+    // Regression: these used to classify as `new_generation`, which preloaded a
+    // Skill and replaced the session series from a question.
+    for (const prompt of [
+      "怎么生成一张高质量的海报？",
+      "如何设计一个专业的 logo",
+      "为什么这个配色看起来不高级",
+      "生成一张海报需要多久",
+    ]) {
+      expect(classify(prompt, { hasSeries: true }), prompt).toBe("non_design");
+    }
+    // A permission request is still a request, not an informational question.
+    expect(classify("能不能帮我生成一张海报")).toBe("new_generation");
+  });
+
+  it("recognizes a bare deliverable brief that has no action verb", () => {
+    // Regression: "游戏活动的产品主图" used to stay non_design, so the server
+    // neither routed a Skill nor captured the series.
+    expect(classify("游戏活动的产品主图")).toBe("new_generation");
+    expect(classify("夏日促销主视觉")).toBe("new_generation");
+    // An edit verb still outranks the deliverable noun.
+    expect(classify("把海报上的文字改成蓝色")).toBe("local_edit");
+    // An interrogative mention of the deliverable stays informational.
+    expect(classify("这个海报怎么样")).toBe("non_design");
+  });
+
+  it("treats a hedged negation as discussion rather than a generation request", () => {
+    expect(classify("别急着生成，我们先讨论一下方向")).toBe("non_design");
+    expect(classify("先讨论一下方向再决定")).toBe("non_design");
   });
 
   it("continues a series only when one is remembered", () => {
@@ -104,6 +136,28 @@ describe("selectPrimarySkill", () => {
 
   it("returns nothing when no Skill declares a matching keyword", () => {
     expect(select("你好")).toBeUndefined();
+  });
+
+  it("scores corroborating and specific keywords above one incidental generic hit", () => {
+    // Regression: priority-first-hit routed this to logo-design (priority 60)
+    // even though three keywords point at campaign-design.
+    expect(select("海报上放我们的 logo，做一个活动主视觉")).toBe("campaign-design");
+    // A specific keyword outweighs a short generic one on score.
+    expect(select("做一个游戏活动的宣传海报")).toBe("campaign-design");
+    // Priority still breaks an exact score tie.
+    expect(select("做个logo")).toBe("logo-design");
+  });
+});
+
+describe("shouldReplaceSessionSeries", () => {
+  it("only lets a real design write replace the remembered series", () => {
+    expect(shouldReplaceSessionSeries({ designIntent: "new_generation", performedDesignWrite: true })).toBe(true);
+    // A misclassified turn that generated nothing must not wipe user context.
+    expect(shouldReplaceSessionSeries({ designIntent: "new_generation", performedDesignWrite: false })).toBe(false);
+    expect(shouldReplaceSessionSeries({ designIntent: "local_edit", performedDesignWrite: true })).toBe(false);
+    expect(shouldReplaceSessionSeries({ designIntent: "non_design", performedDesignWrite: true })).toBe(false);
+    // Continuations merge in place and never take the replace branch.
+    expect(shouldReplaceSessionSeries({ designIntent: "series_continuation", performedDesignWrite: true })).toBe(false);
   });
 });
 

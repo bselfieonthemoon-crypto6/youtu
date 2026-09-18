@@ -27,7 +27,7 @@ import { compileMastraMemoryContext } from "./mastra-memory-adapter.js";
 import { APIYI_VIDEO_MODELS } from "../generation/providers/apiyi-video.js";
 import { createMastraImageJobScopeQuery, createMastraImageStatusTools } from "./mastra-image-status-tools.js";
 import { createMastraLibraryTools, loadLibraryAssetRows, sampleRandom } from "./mastra-library-tools.js";
-import { classifyDesignTurnIntent, extractStyleHints, extractTargetSizes, mergeStyleHints, selectPrimarySkill } from "./design-turn-intent.js";
+import { classifyDesignTurnIntent, extractStyleHints, extractTargetSizes, mergeStyleHints, selectPrimarySkill, shouldReplaceSessionSeries } from "./design-turn-intent.js";
 import { explicitNonstandardRatio } from "./image-ratio-intent.js";
 import { formatEnabledSkillCatalog } from "./design-skill-catalog.js";
 import { loadSessionDesignContext, saveSessionDesignContext, sessionSkillMemoryEnabled } from "./session-design-context.js";
@@ -558,10 +558,23 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
             awaitingClarification: clarificationAsked,
           };
           if (designIntent === "new_generation") {
-            // A fresh brief replaces the whole series.
-            await saveSessionDesignContext(client, run.sessionId, { ...activeSkillPatch,
-              series: { ...(style ? { style } : {}), ...(sizes.length ? { sizes } : {}),
-                ...(materialAssetIds.length ? { materialAssetIds } : {}), updatedAt: new Date().toISOString() } });
+            // A fresh brief replaces the whole series — but ONLY when this run
+            // actually performed a design write. The turn classifier is a
+            // regex hint, and an `EXPLANATORY_QUESTION` or a phrasing it misses
+            // used to reach this branch and silently discard the remembered
+            // style/size/material. Gating on the write receipt makes a
+            // misclassification harmless: nothing was generated, so nothing is
+            // overwritten. The clarification flag is still persisted below.
+            const performedDesignWrite = configurable.session_design_write_run_id === run.runId;
+            if (shouldReplaceSessionSeries({ designIntent, performedDesignWrite })) {
+              await saveSessionDesignContext(client, run.sessionId, { ...activeSkillPatch,
+                series: { ...(style ? { style } : {}), ...(sizes.length ? { sizes } : {}),
+                  ...(materialAssetIds.length ? { materialAssetIds } : {}), updatedAt: new Date().toISOString() } });
+            } else if (clarificationAsked || (finalActiveSkill && finalActiveSkill !== designContext?.activeSkill)) {
+              // No write happened, so the series is untouched; only the method
+              // hint and the clarification flag may move.
+              await saveSessionDesignContext(client, run.sessionId, activeSkillPatch);
+            }
           } else {
             // Continuation keeps materials and unspecified style; a newly stated
             // size and/or direction updates the series in place.

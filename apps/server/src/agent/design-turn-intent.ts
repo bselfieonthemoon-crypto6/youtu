@@ -17,9 +17,27 @@ const EDIT_PATTERN =
   /(?:改(?:成|为|一下|下|掉|小)?|换(?:成|为|个|一下|掉)?(?:颜色|底色|背景|字体|文字|文案|标题|logo|图标|元素)|去掉|去除|删除|移除|擦除|抹掉|挪(?:动|一下)?|移动|位移|调整|微调|放大|缩小|变大|变小|加(?:上|个)?(?:字|文字|标题|logo|图标)|补上|旋转|裁切|裁剪|调(?:整|一下|下)|把.{0,16}(?:改|换|调)|remove|delete|recolou?r|resize|move|tweak|adjust)/i;
 
 const NEGATION_PATTERN =
-  /(?:不要(?:生成|做|出图|图片)|先不(?:要|做|生成|出图)|别(?:生成|做|出图)|不用生成|不需要生成|只(?:讨论|聊|说)|先别(?:做|生成)|先看看就好)/i;
+  /(?:不要(?:生成|做|出图|图片)|先不(?:要|做|生成|出图)|别(?:急着|着急|忙)?(?:生成|做|出图)|不用生成|不需要生成|先(?:讨论|聊|说|看看)|只(?:讨论|聊|说)|先别(?:做|生成))/i;
 
 const QUESTION_PATTERN = /(?:怎么|如何|为什么|能不能|可不可以|可以吗|是否|哪些|什么|多少|吗|呢|要不要|how|why|what|can (?:you|i)|is it|should)/i;
+
+/**
+ * Explanatory questions ask HOW/WHY something works. They are informational even
+ * when they contain an action verb: "怎么生成一张高质量的海报？" must not be
+ * classified as a generation request, because a `new_generation` verdict
+ * preloads a Skill and sediments a new series — so a question would silently
+ * overwrite what the session had remembered.
+ */
+const EXPLANATORY_QUESTION_PATTERN =
+  /(?:怎么|如何|为什么|为何|是什么|哪些|哪种|多少|需要多久|why\b|how\s+(?:do|does|to|can|should)|what\s+(?:is|are))/i;
+
+/**
+ * A bare brief that names the deliverable without any action verb
+ * ("游戏活动的产品主图") is still a creation request. Only consulted when the
+ * prompt is not interrogative, so "这个海报怎么样" stays informational.
+ */
+const DELIVERABLE_NOUN_PATTERN =
+  /(?:海报|主图|封面|头图|配图|宣传图|主视觉|横幅|图标|字标|标志|轮播|九宫格|详情页|落地页|插画|banner|poster|cover|logo|kv\b)/i;
 
 // Re-rolling the elements/subject of the same deliverable is another render of
 // the series, not a property edit of one existing object.
@@ -61,8 +79,7 @@ export function extractStyleHints(prompt: string): string | undefined {
   return hints.length ? hints.slice(0, 6).join("、") : undefined;
 }
 
-export type SkillRouteSource = { name: string; metadata?: Record<string, unknown> | undefined };
-export type SkillRoute = { skill: string; keywords: string[]; priority: number };
+export type SkillRouteSource = { name: string; metadata?: Record<string, unknown> | undefined };export type SkillRoute = { skill: string; keywords: string[]; priority: number };
 
 function mentionSkillSlugs(mentions: readonly MessageMention[]): string[] {
   return mentions
@@ -83,17 +100,57 @@ export function skillRoutesFromMetadata(skills: readonly SkillRouteSource[]): Sk
   return routes.sort((left, right) => right.priority - left.priority || left.skill.localeCompare(right.skill));
 }
 
-/** Explicit @Skill mention, then each Skill's declared routing keywords. */
+/**
+ * Session series state may only be REPLACED when this run actually performed a
+ * design write.
+ *
+ * The turn classifier is a regex hint, and a wrong `new_generation` used to
+ * discard the remembered style / size / material outright — asking "怎么生成一张
+ * 海报？" was enough to wipe them. Gating the overwrite on a real write receipt
+ * makes a misclassification harmless: nothing was generated, so nothing is
+ * overwritten. Continuations merge in place and are decided separately.
+ */
+export function shouldReplaceSessionSeries(input: {
+  designIntent: DesignTurnIntent;
+  performedDesignWrite: boolean;
+}): boolean {
+  return input.designIntent === "new_generation" && input.performedDesignWrite;
+}
+
+/**
+ * Explicit @Skill mention wins. Otherwise each Skill's declared routing keywords
+ * are SCORED rather than first-match-wins:
+ *
+ *   score = sum of the length of every distinct declared keyword present
+ *
+ * Length stands in for specificity, so a concrete keyword ("主视觉") outweighs a
+ * generic one ("logo"), and several corroborating keywords outweigh a single
+ * incidental hit. `priority` only breaks an exact score tie.
+ *
+ * The previous rule — walk routes by descending priority and return the first
+ * route with any keyword hit — let one incidental generic keyword hijack a turn:
+ * "海报上放我们的 logo，做一个活动主视觉" routed to logo-design (priority 60)
+ * even though three keywords pointed at campaign-design.
+ */
 export function selectPrimarySkill(input: {
   prompt: string; mentions: readonly MessageMention[]; skills: readonly SkillRouteSource[];
 }): string | undefined {
   const mentioned = mentionSkillSlugs(input.mentions);
   if (mentioned.length) return mentioned[0];
   const text = input.prompt.toLowerCase();
+  let best: { skill: string; score: number; priority: number } | undefined;
   for (const route of skillRoutesFromMetadata(input.skills)) {
-    if (route.keywords.some(keyword => text.includes(keyword.toLowerCase()))) return route.skill;
+    let score = 0;
+    for (const keyword of new Set(route.keywords)) {
+      if (text.includes(keyword.toLowerCase())) score += keyword.length;
+    }
+    if (!score) continue;
+    // Higher score wins; declaration priority is only a tie-breaker, so it can
+    // no longer override a clearly better-matching Skill.
+    if (!best || score > best.score || (score === best.score && route.priority > best.priority))
+      best = { skill: route.skill, score, priority: route.priority };
   }
-  return undefined;
+  return best?.skill;
 }
 
 /** Deterministic "WxH" / "W:H" targets present in the current request. */
@@ -106,9 +163,11 @@ export function extractTargetSizes(prompt: string): string[] {
 }
 
 /**
- * Order matters: explicit mention and hard negation win first, then series
- * continuation, then creation, then local edit. Anything ambiguous stays
- * non_design so no remembered state is silently applied or overwritten.
+ * Order matters: explicit mention and hard negation win first, then an
+ * explanatory question (informational even when it contains an action verb),
+ * then series continuation, then creation, then a bare deliverable brief, then
+ * local edit. Anything ambiguous stays non_design so no remembered state is
+ * silently applied or overwritten.
  */
 export function classifyDesignTurnIntent(input: {
   prompt: string;
@@ -122,6 +181,9 @@ export function classifyDesignTurnIntent(input: {
   if (!prompt) return "non_design";
   if (mentionSkillSlugs(input.mentions).length) return "new_generation";
   if (NEGATION_PATTERN.test(prompt)) return "non_design";
+  // An explanatory question is informational even when it names an action verb,
+  // so it is resolved before the reset/continuation/generation branches.
+  if (EXPLANATORY_QUESTION_PATTERN.test(prompt)) return "non_design";
   // An explicit reset always starts a fresh series, even with continuation words.
   if (RESET_PATTERN.test(prompt)) return "new_generation";
   // "再来一张" / "换成海洋风格" / "换个元素和主体" with no remembered series
@@ -129,7 +191,13 @@ export function classifyDesignTurnIntent(input: {
   if (CONTINUATION_PATTERN.test(prompt) || STYLE_CHANGE_PATTERN.test(prompt) || ELEMENT_CHANGE_PATTERN.test(prompt))
     return input.hasSeries ? "series_continuation" : "new_generation";
   if (GENERATION_PATTERN.test(prompt)) return "new_generation";
+  // An edit verb outranks a bare deliverable noun: "把海报上的文字改成蓝色" names
+  // the deliverable but is a property edit of an existing object.
   if (EDIT_PATTERN.test(prompt)) return "local_edit";
+  // A brief that only names the deliverable ("游戏活动的产品主图") has no action
+  // verb but is unambiguously a creation request. Interrogative prompts were
+  // already handled above, so this cannot swallow a question.
+  if (DELIVERABLE_NOUN_PATTERN.test(prompt) && !QUESTION_PATTERN.test(prompt)) return "new_generation";
   if (QUESTION_PATTERN.test(prompt)) return "non_design";
   // A short factual answer to a pending clarification is a generation request,
   // so the server preloads the skill and captures the series instead of relying

@@ -221,6 +221,16 @@ function toolResultEnvelope(toolName: string, toolCallId: string, result: unknow
   return createToolResultEnvelope({ content, name: toolName, toolCallId });
 }
 
+/**
+ * Tool results report a rejected call by returning an `error` field rather than
+ * throwing. Such a call submitted nothing, so it must not count as a design
+ * write when deciding whether this turn may replace the session series.
+ */
+function toolResultIsError(result: unknown): boolean {
+  return Boolean(result && typeof result === "object" && "error" in result
+    && (result as { error?: unknown }).error);
+}
+
 export async function* streamMastraDesignAgent(options: {
   run: MastraRunInput;
   model: ReturnType<typeof createMastraWorkspaceModel>;
@@ -257,6 +267,13 @@ export async function* streamMastraDesignAgent(options: {
    * produced. A catalog listing or a model claim never enables a capability.
    */
   const applyToolReceipt = (toolName: string, result: unknown) => {
+    // Record that this run actually performed a design write. Session series
+    // state is only replaced on a real write, so a misclassified turn (for
+    // example a question that happens to contain a generation verb) can no
+    // longer overwrite the style/size/material the session had remembered.
+    // A failed write submits nothing, so it must not count either.
+    if (MASTRA_WRITE_TOOL_NAMES.has(toolName) && !toolResultIsError(result))
+      options.configurable.session_design_write_run_id = options.run.runId;
     const receipt = toolName === "use_skill" ? compactMastraToolResult(result) : undefined;
     const loadedSkillName = receipt && typeof receipt === "object" && "skill" in receipt
       && receipt.skill && typeof receipt.skill === "object" && "name" in receipt.skill
