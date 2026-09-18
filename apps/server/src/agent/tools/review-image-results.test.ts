@@ -4,6 +4,40 @@ import { describe, expect, it, vi } from "vitest";
 import { createReviewImageResultsTool } from "./review-image-results.js";
 import { reconcileWorkflowPlan, applyTrustedWorkflowEvent } from "../../features/agent-tasks/agent-workflow.js";
 import { toolExecutionContext } from "./tool-run-context.js";
+import type { AgentToolExecutionContext } from "./tool-run-context.js";
+
+/**
+ * Raw arguments as the model sends them, before the tool's Zod schema applies
+ * defaults (`result_asset_ids`, `prompt_library_case_ids`, `comparison` all
+ * default). Mastra types `execute`'s parameter from the schema's *parsed* output
+ * and declares `execute` itself optional, so these direct calls use the view
+ * below instead of repeating every defaulted field at each call site.
+ */
+type ReviewToolInput = {
+  mode?: "result_verification" | "reference_analysis";
+  job_id?: string;
+  result_asset_ids?: string[];
+  prompt_library_case_ids?: string[];
+  comparison?: "individual" | "series" | "before_after";
+};
+
+/** Receipt fields these assertions read; the tool also returns other fields. */
+type ReviewToolResult = {
+  status?: "passed" | "unavailable";
+  error?: string;
+  summary?: string;
+  viewed?: boolean;
+  acceptanceRecorded?: boolean;
+  reviewMode?: string;
+  reviewed?: Array<{ id: string; source: string; role: string }>;
+};
+
+/** Keep the tool's own properties, but make `execute` required and callable with raw input. */
+function directTool<T extends { execute?: unknown }>(tool: T) {
+  return tool as unknown as Omit<T, "execute"> & {
+    execute: (input: ReviewToolInput, context: AgentToolExecutionContext) => Promise<ReviewToolResult>;
+  };
+}
 
 async function fixture(resultReviewScope?: { jobId: string; assetIds: string[] }) {
   const bytes = await sharp({ create: { width: 32, height: 32, channels: 4, background: "#22c55e" } }).png().toBuffer();
@@ -39,11 +73,11 @@ async function fixture(resultReviewScope?: { jobId: string; assetIds: string[] }
       updateBrief: vi.fn(async (_runId, brief) => { snapshot.brief = brief; return snapshot; }),
     },
   };
-  const tool = createReviewImageResultsTool({
+  const tool = directTool(createReviewImageResultsTool({
     createUserClient: () => client, model: { generate } as never,
     currentUserPrompt: "请换背景但不要裁切商品", task,
     ...(resultReviewScope ? { resultReviewScope } : {}),
-  });
+  }));
   return { ...result, tool, task, generate, filters, client };
 }
 

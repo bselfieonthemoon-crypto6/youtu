@@ -79,7 +79,8 @@ describe("withNormalizedAssistantRole", () => {
     const response = await wrapped("https://gateway.example.test/v1/chat/completions", { method: "POST" });
     expect(response.headers.get("content-type")).toBe("application/json");
     expect(response.headers.get("content-length")).toBeNull();
-    expect((await response.json()).choices[0].message.role).toBe("assistant");
+    const body = await response.json() as { choices: Array<{ message: { role: string } }> };
+    expect(body.choices[0]!.message.role).toBe("assistant");
   });
 
   it("keeps server-sent events incremental while normalizing deltas", async () => {
@@ -128,7 +129,7 @@ describe("withNormalizedAssistantRole", () => {
   });
 
   it("forwards the request unchanged so the inner fetch keeps enforcing confinement", async () => {
-    const seen: { url?: string; init?: RequestInit } = {};
+    const seen: { url?: string; init?: RequestInit | undefined } = {};
     const inner = (async (input: string | URL | Request, init?: RequestInit) => {
       seen.url = String(input);
       seen.init = init;

@@ -3,6 +3,26 @@ import { describe, expect, it, vi } from "vitest";
 import { createMastraVideoTool } from "./mastra-video-tool.js";
 import type { MastraVideoJobContext } from "./mastra-video-jobs.js";
 import { toolExecutionContext } from "./tools/tool-run-context.js";
+import type { AgentToolExecutionContext } from "./tools/tool-run-context.js";
+
+/**
+ * Raw arguments as the model sends them, before the tool's Zod schema applies its
+ * defaults. Mastra types `execute`'s parameter from the schema's *parsed* output
+ * and declares `execute` itself optional.
+ */
+type VideoToolInput = {
+  title: string;
+  prompt: string;
+  model?: string;
+  duration?: number;
+  sourceAssetIds?: string[];
+};
+
+function directTool(tool: { execute?: unknown }) {
+  return tool as unknown as {
+    execute: (input: VideoToolInput, context: AgentToolExecutionContext) => Promise<unknown>;
+  };
+}
 
 const assetId = "10000000-0000-4000-8000-000000000001";
 const config = {
@@ -18,7 +38,7 @@ const models = [{
 
 function fixture() {
   const submit = vi.fn(async (_context: MastraVideoJobContext, _input: unknown) => ({ jobId: "job-1", status: "processing" as const }));
-  return { submit, tool: createMastraVideoTool({ createUserClient: vi.fn(), submitter: { submit }, availableVideoModels: models }) };
+  return { submit, tool: directTool(createMastraVideoTool({ createUserClient: vi.fn(), submitter: { submit }, availableVideoModels: models })) };
 }
 
 describe("Mastra native video tool", () => {

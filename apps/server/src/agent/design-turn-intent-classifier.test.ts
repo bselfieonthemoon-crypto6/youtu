@@ -104,10 +104,12 @@ describe("resolveDesignTurnIntent — model stage", () => {
   });
 
   it("sends only the current request and never the deterministic verdict", async () => {
-    const classifier = vi.fn(async () => ({ intent: "new_generation", reasonCode: "explicit_creation", confidence: 0.5 }));
+    // Typed as the real classifier so `mock.calls[0]` carries the argument this
+    // test inspects; an untyped `vi.fn` records a zero-argument call.
+    const classifier = vi.fn<DesignTurnIntentClassifier>(async () => ({ intent: "new_generation", reasonCode: "explicit_creation", confidence: 0.5 }));
     await resolveDesignTurnIntent({ prompt: CREATE_AND_EDIT, mentions: [], activeSkill: "campaign-design",
       hasSeries: true, hasAttachments: true, classifier, signal: new AbortController().signal });
-    const payload = classifier.mock.calls[0]![0] as Record<string, unknown>;
+    const payload = classifier.mock.calls[0]![0];
     expect(payload).toMatchObject({
       policyVersion: "mastra-design-turn-intent-v1",
       currentRequest: CREATE_AND_EDIT,

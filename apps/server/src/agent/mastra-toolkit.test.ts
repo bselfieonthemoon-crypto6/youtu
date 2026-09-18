@@ -3,11 +3,36 @@ import { z } from "zod";
 
 import { createMastraToolkit } from "./mastra-toolkit.js";
 import { createAgentTool, toolExecutionContext } from "./tools/tool-run-context.js";
+import type { MastraAgentTool } from "./tools/tool-run-context.js";
+
+/**
+ * Raw arguments as the models send them. Mastra declares `execute` optional
+ * because a tool may be schema-only; the tools under test are all built with a
+ * handler, so lookups go through this view instead of `!` at each call site.
+ */
+type ToolkitToolInput = {
+  questions?: Array<{ title: string; prompt: string; options: string[]; allowCustom?: boolean }>;
+  file_path?: string;
+  offset?: number;
+  limit?: number;
+};
+
+function directTool(tool: MastraAgentTool) {
+  return tool as unknown as {
+    execute: (input: ToolkitToolInput, context: ReturnType<typeof toolExecutionContext>) => Promise<unknown>;
+  };
+}
+
+/** Look up one toolkit tool and expose its callable contract. */
+function toolById(toolkit: { tools: MastraAgentTool[] }, id: string) {
+  const tool = toolkit.tools.find(candidate => candidate.id === id);
+  if (!tool) throw new Error(`Missing toolkit tool ${id}.`);
+  return directTool(tool);
+}
 
 describe("Mastra tool catalog", () => {
   it("returns existing tools with demand-loaded workspace skills and read-only prompt references", () => {
     const toolkit = createMastraToolkit({
-      backend: {} as never,
       mainToolDependencies: {
         createUserClient: vi.fn(),
         availableImageModels: [],
@@ -33,7 +58,7 @@ describe("Mastra tool catalog", () => {
 
   it("returns a structured clarification payload with exact question choices", async () => {
     const toolkit = createMastraToolkit({});
-    const ask = toolkit.tools.find(item => item.id === "ask_clarification")!;
+    const ask = toolById(toolkit, "ask_clarification");
     await expect(ask.execute({ questions: [{
       title: "用途",
       prompt: "主要用在哪里？",
@@ -53,7 +78,6 @@ describe("Mastra tool catalog", () => {
 
   it("marks a skill unavailable when this runtime did not register one of its required tools", async () => {
     const toolkit = createMastraToolkit({
-      backend: {} as never,
       mainToolDependencies: { createUserClient: vi.fn(), availableImageModels: [], availableVideoModels: [] },
       workspaceSkills: [{
         name: "needs-file-write", path: "/workspace-skills/needs-file-write/SKILL.md", description: "Writes files",
@@ -61,7 +85,7 @@ describe("Mastra tool catalog", () => {
           intents: [], outputKinds: [], requiredTools: ["write_file"], optionalTools: [], models: [], limitations: [], examples: [], sources: [] } },
       }],
     });
-    const list = toolkit.tools.find(tool => tool.id === "list_skills")!;
+    const list = toolById(toolkit, "list_skills");
     await expect(list.execute({}, toolExecutionContext({}))).resolves.toMatchObject({ skills: [{ name: "needs-file-write", readiness: { status: "unavailable" } }] });
   });
 
@@ -85,7 +109,7 @@ describe("Mastra tool catalog", () => {
       }],
     });
 
-    const list = toolkit.tools.find(item => item.id === "list_skills")!;
+    const list = toolById(toolkit, "list_skills");
     const result = await list.execute({}, toolExecutionContext({})) as any;
     expect(toolkit.tools.map(item => item.id)).not.toEqual(expect.arrayContaining([
       "create_design_boards", "manipulate_design",
@@ -98,7 +122,6 @@ describe("Mastra tool catalog", () => {
 
   it("removes native design mutations supplied by main tools while keeping design reads", () => {
     const toolkit = createMastraToolkit({
-      backend: {} as never,
       mainToolDependencies: {
         createUserClient: vi.fn(), availableImageModels: [], availableVideoModels: [],
         designTools: {} as never,
@@ -121,7 +144,7 @@ describe("Mastra tool catalog", () => {
     };
     const toolkit = createMastraToolkit({ workspaceSkills: [skill] });
     skill.files[0]!.content = "mutated after run start";
-    const read = toolkit.tools.find(tool => tool.id === "read_file")!;
+    const read = toolById(toolkit, "read_file");
     await expect(read.execute({ file_path: "/workspace-skills/logo-guide/references/checks.md", offset: 1, limit: 3 }, toolExecutionContext({})))
       .resolves.toMatchObject({ status: "ok", content: "bcd", truncated: true, next_offset: 4 });
     await expect(read.execute({ file_path: "/workspace-skills/logo-guide/references/../../secret.txt" }, toolExecutionContext({})))

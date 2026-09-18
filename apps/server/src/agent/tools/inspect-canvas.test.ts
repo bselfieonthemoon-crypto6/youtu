@@ -1,6 +1,34 @@
 import { describe, expect, it, vi } from "vitest";
 import { createInspectCanvasTool } from "./inspect-canvas.js";
 import { toolExecutionContext } from "./tool-run-context.js";
+import type { AgentToolExecutionContext } from "./tool-run-context.js";
+
+/**
+ * Raw arguments as the model sends them, before the tool's Zod schema applies the
+ * `detail_level`/`limit` defaults. Mastra types `execute`'s parameter from the
+ * schema's *parsed* output and declares `execute` optional, and its result would
+ * be `unknown`, which `JSON.parse` cannot accept.
+ */
+type InspectCanvasInput = {
+  detail_level?: "summary" | "full";
+  limit?: number;
+  element_id?: string;
+  filter_text?: string;
+  filter_group_id?: string;
+  filter_type?: string[];
+  filter_region?: { min_x: number; min_y: number; max_x: number; max_y: number };
+  selected_element_ids?: string[];
+  cursor?: string;
+};
+
+/** This tool answers with a JSON string, so the direct call is typed as one. */
+type DirectInspectCanvasTool = {
+  execute: (input: InspectCanvasInput, context: AgentToolExecutionContext) => Promise<string>;
+};
+
+function directTool(tool: { execute?: unknown }) {
+  return tool as unknown as DirectInspectCanvasTool;
+}
 
 const node = (id: string, i: number, extra: Record<string, unknown> = {}) => ({
   id, type: "rectangle", x: -1_000 + i * 30, y: (i % 9) * 50 - 200,
@@ -13,7 +41,7 @@ function fixture(initial: Record<string, unknown>[]) {
     elements, appState: { viewBackgroundColor: "#fafafa" },
   } }, error: null }));
   const query: any = { select: () => query, eq: () => query, single };
-  const tool = createInspectCanvasTool({ createUserClient: () => ({ from: () => query }) });
+  const tool = directTool(createInspectCanvasTool({ createUserClient: () => ({ from: () => query }) }));
   const config = { configurable: { canvas_id: "canvas-a", access_token: "token" } };
   return { tool, config, setElements: (next: Record<string, unknown>[]) => { elements = next; } };
 }

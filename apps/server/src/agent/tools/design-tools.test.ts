@@ -11,6 +11,7 @@ import { createDestructiveConfirmationService } from "../../features/agent-actio
 import { createDesignTools, createDurableDesignMutationExecutor } from "./design-tools.js";
 import { applyDesignCommands } from "../../features/designs/design-command-applier.js";
 import { toolExecutionContext } from "./tool-run-context.js";
+import type { MastraAgentTool } from "./tool-run-context.js";
 
 const ids = {
   design: "10000000-0000-4000-8000-000000000001",
@@ -94,10 +95,17 @@ function makeTools(overrides: Record<string, unknown> = {}) {
   return { tools: createDesignTools(dependencies as never), mutate };
 }
 
-function toolAt(tools: ReturnType<typeof createDesignTools>, index: number) {
+/**
+ * Mastra declares `execute` optional because a tool may be schema-only. Every
+ * tool here is built with a handler, so the direct calls go through a view that
+ * makes it required instead of asserting non-nullness at 15 call sites.
+ */
+type DirectDesignTool = Omit<MastraAgentTool, "execute"> & { execute: NonNullable<MastraAgentTool["execute"]> };
+
+function toolAt(tools: ReturnType<typeof createDesignTools>, index: number): DirectDesignTool {
   const candidate = tools[index];
   if (!candidate) throw new Error(`Missing design tool at index ${index}.`);
-  return candidate;
+  return candidate as DirectDesignTool;
 }
 
 describe("agent design tools", () => {

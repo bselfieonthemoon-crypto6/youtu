@@ -122,7 +122,6 @@ describe("Mastra SDK tool schema compatibility", () => {
         canvasId: "00000000-0000-4000-8000-000000000004", liveDesignIds: new Set<string>() },
     });
     const toolkit = createMastraToolkit({
-      backend: {} as never,
       mainToolDependencies: {
         createUserClient,
         designTools,

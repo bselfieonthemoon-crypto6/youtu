@@ -3,6 +3,28 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createScreenshotCanvasTool } from "./screenshot-canvas.js";
 import { toolExecutionContext } from "./tool-run-context.js";
+import type { AgentToolExecutionContext } from "./tool-run-context.js";
+
+/**
+ * Raw arguments as the model sends them, before the tool's Zod schema applies the
+ * `max_dimension` default. Mastra types `execute`'s parameter from the schema's
+ * *parsed* output and declares `execute` optional, and its result would be
+ * `unknown`, which `JSON.parse` cannot accept.
+ */
+type ScreenshotCanvasInput = {
+  mode: "full" | "region" | "viewport";
+  region?: { x: number; y: number; width: number; height: number };
+  max_dimension?: number;
+};
+
+/** This tool answers with a JSON string, so the direct call is typed as one. */
+type DirectScreenshotCanvasTool = {
+  execute: (input: ScreenshotCanvasInput, context: AgentToolExecutionContext) => Promise<string>;
+};
+
+function directTool(tool: { execute?: unknown }) {
+  return tool as unknown as DirectScreenshotCanvasTool;
+}
 
 async function dataUri() {
   const bytes = await sharp({ create: { width: 40, height: 20, channels: 4, background: "#3b82f6" } }).png().toBuffer();
@@ -15,7 +37,7 @@ describe("screenshot_canvas pixel truthfulness", () => {
     const generate = vi.fn(async (_input: unknown) => ({
       text: '{"blockingIssues":[],"suggestions":[],"uncertainties":[]}', usage: {},
     }));
-    const tool = createScreenshotCanvasTool({ connectionManager: { rpcToCanvas } as never, model: { generate } as never, currentUserPrompt: "检查标题裁切" });
+    const tool = directTool(createScreenshotCanvasTool({ connectionManager: { rpcToCanvas } as never, model: { generate } as never, currentUserPrompt: "检查标题裁切" }));
     const output = JSON.parse(await tool.execute({ mode: "full", max_dimension: 1024 }, toolExecutionContext({
       configurable: { user_id: "user", canvas_id: "canvas" },
     })));
@@ -26,7 +48,7 @@ describe("screenshot_canvas pixel truthfulness", () => {
   });
 
   it("marks a captured screenshot unavailable when no vision model is wired", async () => {
-    const tool = createScreenshotCanvasTool({ connectionManager: { rpcToCanvas: async () => ({ url: await dataUri(), width: 40, height: 20 }) } as never });
+    const tool = directTool(createScreenshotCanvasTool({ connectionManager: { rpcToCanvas: async () => ({ url: await dataUri(), width: 40, height: 20 }) } as never }));
     const output = JSON.parse(await tool.execute({ mode: "viewport", max_dimension: 512 }, toolExecutionContext({
       configurable: { user_id: "user", canvas_id: "canvas" },
     })));
@@ -39,10 +61,10 @@ describe("screenshot_canvas pixel truthfulness", () => {
     try {
       let release!: (value: unknown) => void;
       const generate = vi.fn();
-      const tool = createScreenshotCanvasTool({
+      const tool = directTool(createScreenshotCanvasTool({
         connectionManager: { rpcToCanvas: () => new Promise(resolve => { release = resolve; }) } as never,
         model: { generate } as never, rpcTimeout: 60_000,
-      });
+      }));
       const pending = tool.execute({ mode: "full", max_dimension: 1024 }, toolExecutionContext({
         configurable: { user_id: "user", canvas_id: "canvas" },
       }));

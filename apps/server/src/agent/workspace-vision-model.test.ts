@@ -30,6 +30,7 @@ vi.mock("./provider-message-role.js", async importOriginal => ({
 }));
 
 import { createWorkspaceVisionModel } from "./workspace-vision-model.js";
+import type { WorkspaceVisionUsageBuffer } from "./workspace-vision-model.js";
 
 const SNAPSHOT = {
   apiKey: "run-secret",
@@ -152,7 +153,7 @@ describe("workspace vision model on the AI SDK", () => {
 
   it("bounds the observation buffer at 64 records", async () => {
     captureProviderCalls();
-    const usageBuffer = { sequence: 0, records: [] as unknown[] };
+    const usageBuffer: WorkspaceVisionUsageBuffer = { sequence: 0, records: [] };
     const model = createWorkspaceVisionModel(SNAPSHOT, { usageBuffer });
     for (let index = 0; index < 40; index += 1) await model.generate({ user: "hi" });
     // 40 calls x (preflight + completed) = 80 observations, trimmed to 64.

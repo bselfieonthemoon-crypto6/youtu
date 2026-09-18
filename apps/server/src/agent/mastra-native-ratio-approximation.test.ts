@@ -3,6 +3,7 @@ import sharp from "sharp";
 
 import { createMastraImageEditTool, createMastraImageTool } from "./mastra-image-tool.js";
 import { toolExecutionContext } from "./tools/tool-run-context.js";
+import type { AgentToolExecutionContext } from "./tools/tool-run-context.js";
 
 const assetId = "10000000-0000-4000-8000-000000000003";
 const native = { id: "workspace:native", provider: "test", upstreamModelId: "gpt-image-2",
@@ -14,12 +15,51 @@ const configurable = {
   user_prompt: "做一张 656:176 的图，尺寸差不多就好",
 };
 
+/**
+ * Raw tool arguments as the model sends them, before the tool's Zod schema applies
+ * defaults. Mastra types `execute`'s parameter from the schema's *parsed* output
+ * (every `.default()`ed field required) and declares `execute` optional, so these
+ * direct calls are viewed through {@link directTool} instead of per-call casts.
+ */
+type RatioToolInput = {
+  title: string;
+  prompt: string;
+  model?: string;
+  aspectRatio?: string;
+  aspectRatioIntent?: "preserve_source" | "resize" | "approximate";
+  sourceAssetIds?: string[];
+  sourceUsage?: "edit" | "reference";
+};
+
+/** Receipt fields these assertions read; the tools also return other fields. */
+type RatioToolResult = {
+  status?: "processing" | "failed" | "unknown";
+  error?: string;
+  summary?: string;
+  actualQuality?: "High" | "Medium" | "Low";
+  actualResolution?: "1K" | "2K" | "4K";
+  approximateSizePlan?: {
+    target: { width: number; height: number };
+    scaledTarget?: { width: number; height: number };
+    scaleFactor?: number;
+    aspectRatio: string;
+    substituted?: boolean;
+    ratioError?: number;
+  };
+};
+
+type RatioTool = {
+  execute: (input: RatioToolInput, context: AgentToolExecutionContext) => Promise<RatioToolResult>;
+};
+
+const directTool = <T extends { execute?: unknown }>(tool: T) => tool as unknown as RatioTool;
+
 function fixture(selected = native, groundSources?: Parameters<typeof createMastraImageTool>[0]["groundSources"]) {
   const submit = vi.fn(async () => ({ jobId: "job", status: "processing" as const,
     creditsCost: 0, pricingVersion: "credits-v1", actualQuality: "Low" as const, actualResolution: "1K" as const }));
   const deps = { createUserClient: vi.fn(), submitter: { submit }, availableImageModels: [selected],
     ...(groundSources ? { groundSources } : {}) };
-  return { generate: createMastraImageTool(deps), edit: createMastraImageEditTool(deps), submit };
+  return { generate: directTool(createMastraImageTool(deps)), edit: directTool(createMastraImageEditTool(deps)), submit };
 }
 
 describe("Mastra native ratio approximation", () => {

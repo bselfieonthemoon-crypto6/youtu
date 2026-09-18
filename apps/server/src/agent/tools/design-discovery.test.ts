@@ -1,6 +1,18 @@
 import { describe, it, expect, vi } from "vitest";
 import { createDesignDiscoveryTool } from "./design-discovery.js";
 import { toolExecutionContext } from "./tool-run-context.js";
+import type { AgentToolExecutionContext } from "./tool-run-context.js";
+
+/**
+ * Mastra declares `execute` optional because a tool may be schema-only. This tool
+ * is always built with a handler, so these direct calls use a view that makes it
+ * required. The schema takes no arguments.
+ */
+function directTool(tool: { execute?: unknown }) {
+  return tool as unknown as {
+    execute: (input: Record<string, never>, context: AgentToolExecutionContext) => Promise<unknown>;
+  };
+}
 
 describe("native design discovery", () => {
   it("lists real board metadata and constrains the query to the active canvas/workspace", async () => {
@@ -21,12 +33,12 @@ describe("native design discovery", () => {
       height: 600,
       revision: 3,
     }));
-    const t = createDesignDiscoveryTool({
+    const t = directTool(createDesignDiscoveryTool({
       createUserClient: () => ({ from: () => query }),
       designService: { get },
       designResourceService: {},
       designTemplateService: {},
-    } as any);
+    } as any));
     const result = await t.execute({}, toolExecutionContext({
         configurable: {
           access_token: "token",
@@ -45,7 +57,7 @@ describe("native design discovery", () => {
   });
   it("fails closed without authenticated canvas context", async () => {
     const client = vi.fn();
-    const t = createDesignDiscoveryTool({ createUserClient: client } as any);
+    const t = directTool(createDesignDiscoveryTool({ createUserClient: client } as any));
     expect(await t.execute({}, toolExecutionContext({}))).toMatchObject({
       error: "design_context_missing",
     });

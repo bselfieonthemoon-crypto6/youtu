@@ -2,6 +2,24 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createMastraLibraryTools, libraryAssetIdsFromToolResult } from "./mastra-library-tools.js";
 import { toolExecutionContext } from "./tools/tool-run-context.js";
+import type { AgentToolExecutionContext } from "./tools/tool-run-context.js";
+
+/**
+ * Raw arguments as the model sends them, before the tool's Zod schema applies the
+ * `count` default. Mastra types `execute`'s parameter from the schema's *parsed*
+ * output and declares `execute` itself optional.
+ */
+type FindLibraryAssetsInput = {
+  count?: number;
+  kind?: "image" | "illustration" | "icon" | "background" | "mockup" | "svg";
+  query?: string;
+};
+
+function directTool(tool: { execute?: unknown }) {
+  return tool as unknown as {
+    execute: (input: FindLibraryAssetsInput, context: AgentToolExecutionContext) => Promise<any>;
+  };
+}
 
 type QueryCalls = { eq: Array<[string, unknown]>; is: Array<[string, unknown]>; ilike: Array<[string, unknown]>; limit?: number };
 
@@ -30,8 +48,8 @@ function database(rows: unknown[], filteredRows: unknown[] = rows) {
 
 const row = (id: string, name = "青龙") => ({ id, name, asset_object_id: id, kind: "image", width: 1024, height: 1024 });
 
-function invoke(tools: ReturnType<typeof createMastraLibraryTools>, input: Record<string, unknown>, configurable: Record<string, unknown> = { access_token: "token", workspace_id: "ws" }) {
-  return tools.findLibraryAssets.execute(input, toolExecutionContext({ configurable } as never)) as Promise<any>;
+function invoke(tools: ReturnType<typeof createMastraLibraryTools>, input: FindLibraryAssetsInput, configurable: Record<string, unknown> = { access_token: "token", workspace_id: "ws" }) {
+  return directTool(tools.findLibraryAssets).execute(input, toolExecutionContext({ configurable } as never));
 }
 
 describe("find_library_assets", () => {

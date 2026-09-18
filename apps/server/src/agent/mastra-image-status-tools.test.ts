@@ -2,6 +2,26 @@ import { describe, expect, it, vi } from "vitest";
 import { createMastraImageJobScopeQuery, createMastraImageStatusTools } from "./mastra-image-status-tools.js";
 import { ImageJobAccessError } from "../features/jobs/conversation-image-job-access.js";
 import { toolExecutionContext } from "./tools/tool-run-context.js";
+import type { AgentToolExecutionContext } from "./tools/tool-run-context.js";
+
+/**
+ * Mastra declares `execute` optional because a tool may be schema-only. Both tools
+ * here are always built with a handler, so direct calls use a view that makes it
+ * required; `jobId` may be omitted so the tool can fail closed on its own.
+ */
+type ImageStatusInput = { jobId?: string };
+type ImageStatusResult = { status?: string; summary?: string };
+
+function directTool(tool: { execute?: unknown }) {
+  return tool as unknown as {
+    execute: (input: ImageStatusInput, context: AgentToolExecutionContext) => Promise<ImageStatusResult>;
+  };
+}
+
+function directTools(tools: ReturnType<typeof createMastraImageStatusTools>) {
+  return { getImageStatus: directTool(tools.getImageStatus), cancelImageJob: directTool(tools.cancelImageJob) };
+}
+
 const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12,"0")}`;
 function fixture(status = "running") {
   const scope = { userId:id(1),workspaceId:id(2),sessionId:id(3),canvasId:id(4),liveDesignIds:new Set([id(5)]) };
@@ -9,7 +29,7 @@ function fixture(status = "running") {
   const getConversationImageJob=vi.fn(async()=>({id:id(6),status,model:"workspace:nano",requestedAspectRatio:"3:4",
     creditsCost:"7",creditsCostColumn:7,pricingVersion:"credits-v1",quality:"hd",resolution:"2k"}));
   const cancelJobAdmin=vi.fn(async()=>({id:id(6),status:"canceled"}));
-  return {scope,user,getConversationImageJob,cancelJobAdmin,tools:createMastraImageStatusTools({user,scope,jobService:{getConversationImageJob,cancelJobAdmin} as never})};
+  return {scope,user,getConversationImageJob,cancelJobAdmin,tools:directTools(createMastraImageStatusTools({user,scope,jobService:{getConversationImageJob,cancelJobAdmin} as never}))};
 }
 describe("Mastra image status tools",()=>{
   it("returns persisted model/ratio via the authorized service",async()=>{

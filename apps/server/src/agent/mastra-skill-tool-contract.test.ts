@@ -25,6 +25,17 @@ type ManifestSkill = {
  */
 const REMOVED_NATIVE_BOARD_SKILLS = new Set<string>([]);
 
+/**
+ * Mastra declares `execute` optional because a tool may be schema-only; the
+ * toolkit's tools are all built with a handler, so the direct call goes through
+ * this view. `list_skills` takes no arguments.
+ */
+function directTool(tool: { execute?: unknown }) {
+  return tool as unknown as {
+    execute: (input: Record<string, never>, context: ReturnType<typeof toolExecutionContext>) => Promise<unknown>;
+  };
+}
+
 async function installedManifestSkills(): Promise<ManifestSkill[]> {
   const entries = await readdir(skillRoot, { withFileTypes: true });
   const skills = await Promise.all(entries.filter(entry => entry.isDirectory()).map(async entry => {
@@ -87,7 +98,7 @@ describe("installed Skill manifests against the real Mastra tool surface", () =>
 
     const toolkit = realMastraToolkit(skills);
     const registered = new Set(toolkit.tools.map(tool => tool.id));
-    const listed = await toolkit.tools.find(tool => tool.id === "list_skills")!.execute({}, toolExecutionContext({})) as {
+    const listed = await directTool(toolkit.tools.find(tool => tool.id === "list_skills")!).execute({}, toolExecutionContext({})) as {
       skills: Array<{ name: string; readiness?: { status: string; reasons: string[] } }>;
     };
     const readiness = new Map(listed.skills.map(skill => [skill.name, skill.readiness]));

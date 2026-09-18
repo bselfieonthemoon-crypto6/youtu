@@ -5,6 +5,7 @@ import type { MastraImageSubmitContext } from "./mastra-image-tool.js";
 import { createMastraImageEditTool, createMastraImageTool, createMastraImageTools } from "./mastra-image-tool.js";
 import { MastraImagePreflightError } from "./mastra-image-jobs.js";
 import { toolExecutionContext } from "./tools/tool-run-context.js";
+import type { AgentToolExecutionContext } from "./tools/tool-run-context.js";
 
 const assetId = "10000000-0000-4000-8000-000000000001";
 const objectId = "10000000-0000-4000-8000-000000000002";
@@ -20,6 +21,59 @@ const models = [
   { id: "workspace:auto", provider: "test", upstreamModelId: "upstream-a", displayName: "Auto", description: "" },
   { id: "workspace:selected", provider: "test", upstreamModelId: "upstream-b", displayName: "Selected", description: "" },
 ];
+
+/**
+ * Raw arguments as the model would send them, before the tool's Zod schema
+ * applies defaults and validators. Mastra types a tool's `execute` parameter from
+ * the schema's *parsed* output, so a direct call would otherwise have to spell out
+ * every `.default()`ed field (`quality`, `resolution`, `operation`, ...), and it
+ * declares `execute` itself optional. These tests drive the built tool directly
+ * with raw arguments and let the tool validate them, so they view it through the
+ * contract below via {@link directTool}.
+ */
+type DirectImageToolInput = {
+  operation?: "generate" | "remove_background";
+  title: string;
+  prompt: string;
+  model?: string;
+  aspectRatio?: string;
+  aspectRatioIntent?: "preserve_source" | "resize" | "approximate";
+  quality?: "standard" | "hd" | "ultra";
+  resolution?: "1k" | "2k" | "4k";
+  outputFormat?: "png" | "jpg" | "webp";
+  background?: "transparent" | "opaque" | "auto";
+  sourceAssetIds?: string[];
+  sourceUsage?: "edit" | "reference";
+};
+
+/** Receipt fields these assertions read; the tools also return other fields. */
+type DirectImageToolResult = {
+  status?: "processing" | "failed" | "unknown";
+  error?: string;
+  jobId?: string;
+  errorCode?: string;
+  retryEligible?: boolean;
+  sourceAssetIds?: string[];
+  actualQuality?: "High" | "Medium" | "Low";
+  actualResolution?: "1K" | "2K" | "4K";
+  approximateSizePlan?: { target: { width: number; height: number }; aspectRatio: string };
+  limit?: number;
+  summary?: string;
+};
+
+type DirectImageTool = {
+  inputSchema?: { safeParse: (value: unknown) => { success: boolean } };
+  execute: (input: DirectImageToolInput, context: AgentToolExecutionContext) => Promise<DirectImageToolResult>;
+};
+
+type BuiltImageTool = { execute?: unknown; inputSchema?: unknown };
+
+/** Re-view a real built tool (or the `createMastraImageTools` record) for a direct call. */
+function directTool(tool: BuiltImageTool): DirectImageTool;
+function directTool<T extends Record<string, BuiltImageTool>>(toolkit: T): { [K in keyof T]: DirectImageTool };
+function directTool(value: BuiltImageTool | Record<string, BuiltImageTool>) {
+  return value as unknown as DirectImageTool & Record<string, DirectImageTool>;
+}
 
 function fixture(options: {
   groundSources?: Parameters<typeof createMastraImageTool>[0]["groundSources"];
@@ -39,7 +93,7 @@ function fixture(options: {
     ...(options.groundSources ? { groundSources: options.groundSources } : {}),
     ...(options.resolveExplicitSources ? { resolveExplicitSources: options.resolveExplicitSources } : {}),
     ...(options.autoLibrarySources ? { autoLibrarySources: options.autoLibrarySources } : {}) };
-  return { generate: createMastraImageTool(deps), edit: createMastraImageEditTool(deps), submit };
+  return { generate: directTool(createMastraImageTool(deps)), edit: directTool(createMastraImageEditTool(deps)), submit };
 }
 
 describe("Mastra direct image tool", () => {
@@ -138,8 +192,8 @@ describe("Mastra direct image tool", () => {
   });
   it("keeps the two outputs of a multi-ratio original request in one shared run", async () => {
     const submit = vi.fn(async () => ({ jobId: "job", status: "processing" as const }));
-    const tools = createMastraImageTools({ createUserClient: vi.fn(), submitter: { submit }, availableImageModels: models,
-      currentUserMessage: { runId: "run", text: "生成一张1:1和一张16:9的宣传图" } });
+    const tools = directTool(createMastraImageTools({ createUserClient: vi.fn(), submitter: { submit }, availableImageModels: models,
+      currentUserMessage: { runId: "run", text: "生成一张1:1和一张16:9的宣传图" } }));
     const config = { ...baseConfig, configurable: { ...baseConfig.configurable, image_generation_aspect_ratio: "auto" } };
     for (const aspectRatio of ["1:1", "16:9"])
       await expect(tools.generateImage.execute({ title: "宣传图", prompt: "brand", aspectRatio, aspectRatioIntent: "resize" }, toolExecutionContext(config))).resolves.toMatchObject({ status: "processing" });
@@ -150,8 +204,8 @@ describe("Mastra direct image tool", () => {
     const bytes = await sharp({ create: { width: 30, height: 40, channels: 3, background: "white" } }).png().toBuffer();
     const config = { ...baseConfig, configurable: { ...baseConfig.configurable, user_attachment_map: { [assetId]: `data:image/png;base64,${bytes.toString("base64")}` } } };
     const submit = vi.fn(async () => ({ jobId: "job", status: "processing" as const }));
-    const tools = createMastraImageTools({ createUserClient: vi.fn(), submitter: { submit }, availableImageModels: models,
-      currentUserMessage: { runId: "run", text: "制作海报" } });
+    const tools = directTool(createMastraImageTools({ createUserClient: vi.fn(), submitter: { submit }, availableImageModels: models,
+      currentUserMessage: { runId: "run", text: "制作海报" } }));
     const first = { title: "First", prompt: "poster" };
     await tools.generateImage.execute(first, toolExecutionContext(config));
     const outcomes = await Promise.all(Array.from({ length: 4 }, (_, index) => tools.editImage.execute({ title: `Edit${index}`, prompt: "edit", sourceAssetIds: [assetId] }, toolExecutionContext(config))));
@@ -171,7 +225,7 @@ describe("Mastra direct image tool", () => {
   it("serializes concurrent requests so an unknown transport receipt freezes later submissions", async () => {
     let reject!: (error: Error) => void;
     const submit = vi.fn(() => new Promise<never>((_resolve, rejectPromise) => { reject = rejectPromise; }));
-    const tools = createMastraImageTools({ createUserClient: vi.fn(), submitter: { submit }, availableImageModels: models });
+    const tools = directTool(createMastraImageTools({ createUserClient: vi.fn(), submitter: { submit }, availableImageModels: models }));
     const first = tools.generateImage.execute({ title: "First", prompt: "poster" }, toolExecutionContext(baseConfig));
     await vi.waitFor(() => expect(submit).toHaveBeenCalledOnce());
     const second = tools.generateImage.execute({ title: "Second", prompt: "poster" }, toolExecutionContext(baseConfig));
@@ -225,7 +279,7 @@ describe("Mastra direct image tool", () => {
     for (const errorCode of ["provider_rejected", "image_generation_result_unknown"]) {
       const submit = vi.fn(async () => ({ jobId: "job-terminal", error: "provider did not deliver",
         errorCode, retryEligible: errorCode === "provider_rejected" }));
-      const generate = createMastraImageTool({ createUserClient: vi.fn(), submitter: { submit }, availableImageModels: models });
+      const generate = directTool(createMastraImageTool({ createUserClient: vi.fn(), submitter: { submit }, availableImageModels: models }));
       await expect(generate.execute({ title: "海报", prompt: "poster" }, toolExecutionContext(baseConfig))).resolves.toMatchObject({
         status: "failed", jobId: "job-terminal", errorCode, retryEligible: errorCode === "provider_rejected",
       });
@@ -583,7 +637,7 @@ describe("Mastra direct image tool", () => {
 
   it("shares an unknown-submission receipt across generate and edit", async () => {
     const submit = vi.fn(async (_context: MastraImageSubmitContext, _input: unknown) => { throw new Error("transport lost"); });
-    const tools = createMastraImageTools({ createUserClient: vi.fn(), submitter: { submit }, availableImageModels: models });
+    const tools = directTool(createMastraImageTools({ createUserClient: vi.fn(), submitter: { submit }, availableImageModels: models }));
     const first = await tools.generateImage.execute({ title: "横幅", prompt: "蓝色横幅" }, toolExecutionContext(baseConfig));
     const second = await tools.editImage.execute({ title: "改图", prompt: "蓝色", sourceAssetIds: [assetId] }, toolExecutionContext(baseConfig));
     expect(first).toMatchObject({ status: "unknown" });
