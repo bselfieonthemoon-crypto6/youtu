@@ -191,10 +191,16 @@ export const FabricDesignSurface = forwardRef<
       canvasRef.current = mounted;
       initialBackgroundRef.current = backgroundRef.current;
       if (inlineOverflow) {
-        const upperCanvas = mounted.upperCanvasEl;
         const updateHitRegion = () => {
           const currentInlineSize = inlineSizeRef.current;
-          if (!currentInlineSize) return;
+          // Re-read the upper element on every call instead of capturing it
+          // once: React StrictMode mounts this effect twice in development and
+          // Fabric can briefly report no upper canvas, which surfaced as
+          // "Cannot read properties of undefined (reading 'style')" on the
+          // immediate call below. A missing element is not an error here — it
+          // only means there is no overflow hit region to clip yet.
+          const upperCanvas = mounted.upperCanvasEl;
+          if (!currentInlineSize || !upperCanvas?.style) return;
           upperCanvas.style.clipPath = makeOverflowHitPath(
             mounted,
             currentInlineSize,
@@ -215,7 +221,8 @@ export const FabricDesignSurface = forwardRef<
           mounted.off("selection:created", updateHitRegion);
           mounted.off("selection:updated", updateHitRegion);
           mounted.off("selection:cleared", updateHitRegion);
-          upperCanvas.style.clipPath = "";
+          const upperCanvas = mounted.upperCanvasEl;
+          if (upperCanvas?.style) upperCanvas.style.clipPath = "";
         };
       }
 
@@ -408,6 +415,9 @@ function makeOverflowHitPath(
   logicalHeight: number,
 ) {
   const upperCanvas = canvas.upperCanvasEl;
+  // Defense in depth: the caller already skips a missing element, and an absent
+  // upper canvas means there is simply no overflow hit path to compute.
+  if (!upperCanvas?.style) return "";
   // Fabric's control coordinates use backing-store pixels. clip-path path()
   // uses local CSS pixels, which stay correct even when an ancestor is zoomed.
   const cssWidth = parseFloat(upperCanvas.style.width) || upperCanvas.clientWidth;
