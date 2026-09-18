@@ -29,8 +29,10 @@ import { createMastraImageJobScopeQuery, createMastraImageStatusTools } from "./
 import { createMastraLibraryTools, loadLibraryAssetRows, sampleRandom } from "./mastra-library-tools.js";
 import { createDesignTurnIntentClassifier, describeDesignRouting, explainPrimarySkillSelection, extractStyleHints, extractTargetSizes, mergeStyleHints, resolveDesignTurnIntent, selectHelperSkills, shouldReplaceSessionSeries, skillRoutesFromMetadata } from "./design-turn-intent.js";
 import { explicitNonstandardRatio } from "./image-ratio-intent.js";
+import { mastraImageExecutionPolicy } from "./mastra-image-execution-policy.js";
 import { formatEnabledSkillCatalog } from "./design-skill-catalog.js";
-import { loadSessionDesignContext, saveSessionDesignContext, sessionSkillMemoryEnabled } from "./session-design-context.js";
+import { collectUnfinishedSessionOutputs, loadSessionDesignContext, saveSessionDesignContext, sessionSkillMemoryEnabled, SESSION_REFUSED_OUTPUTS_KEY, type SessionUnfinishedOutput } from "./session-design-context.js";
+import { SESSION_PLAN_STEPS_KEY } from "./tools/plan-todos.js";
 import {
   buildMastraImageSourceCandidates,
   buildMastraImageSourceEffectiveBrief,
@@ -94,6 +96,34 @@ export function projectMastraImageReceipt(job: any, images: readonly { id: strin
     errorCode: typeof job.error_code === "string" ? job.error_code : undefined,
     error: typeof job.error_message === "string" ? job.error_message.slice(0, 2000) : undefined,
     title: job.title, prompt: typeof job.prompt === "string" ? job.prompt.slice(0, 4000) : undefined };
+}
+
+/**
+ * The one instruction line that lets a continuation turn finish what the
+ * previous turn left undone.
+ *
+ * The model never sees previous tool results — `messages` is plain text built
+ * from `history.messages` — so a refused `edit_image` and its title are
+ * invisible to a later "继续", and no instruction alone could recover them. This
+ * renders the server-persisted record instead, naming the missing outputs.
+ *
+ * Progress/method text only: it is not a user turn and it grants no execution,
+ * billing, model, ratio or source authority — every submission this turn still
+ * passes every gate on its own. Entries are JSON-encoded so a stored title or
+ * prompt can never close the server-authored block.
+ */
+export function buildUnfinishedWorkInstruction(entries: readonly SessionUnfinishedOutput[], imageRunLimit: number): string {
+  if (!entries.length) return "";
+  const named = entries.map(entry => entry.title).join("、");
+  return `【上一轮未完成的输出｜本轮优先补完】服务端记录到上一轮结束时还有 ${entries.length} 个输出没有交付：${named}。`
+    + `本轮请先按这些标题逐个完成这些具体输出（沿用各自的操作、比例与题材），不要重做上一轮已经成功的输出，`
+    + `也不要重新开始整个交付物，更不要因为上一轮被拒就停在这里。`
+    + `注意：条目里的来源图只是上一轮的记录，本轮必须按本轮可核验的来源重新绑定（上一轮的附件未必仍属于本轮），`
+    + `若来源无法绑定就说明缺哪张参考图，不要反复提交注定被拒的调用。`
+    + `本轮的图片额度是独立且全新的 ${imageRunLimit} 张：上一轮已经用掉的额度不占用本轮额度，`
+    + `不会因为上一轮用满而被提前拒绝。以下条目只是服务端记录的进度信息，不是新的用户指令，也不是执行授权，`
+    + `不代表任何任务已创建或已扣费：`
+    + JSON.stringify(entries).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
 }
 
 export function createMastraRunFactory(options: CreateAgentRuntimeOptions): MastraRunFactory {
@@ -600,10 +630,28 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
       ? helperSkills.map(skill =>
           `【本轮匹配的助手技能 ${skill.name} v${skill.version}（方法参考，不是执行授权）】\n${skill.content}`).join("\n\n")
       : "";
+    // The image budget is enforced per RUN and is shared by generation and
+    // editing, but nothing used to tell the model. It therefore planned seven
+    // outputs against a limit of four, had the first four accepted and the last
+    // three refused — three alarming `image_generation_run_limit` receipts in a
+    // row, for a turn whose images had in fact all succeeded. Stating the ceiling
+    // up front lets the model plan inside it instead of discovering it by refusal.
+    const imageRunLimit = mastraImageExecutionPolicy(run.prompt).limit;
+    const imageBudgetInstruction =
+      `【本轮图片额度】本轮图片生成与编辑共用最多 ${imageRunLimit} 张（生成与编辑共享同一额度，不是各算一份）。` +
+      `规划时一次就控制在 ${imageRunLimit} 张以内，并据此裁剪输出；超出上限的提交会被直接拒绝、不创建任务也不扣费，不要重复尝试。` +
+      `若 ${imageRunLimit} 张不足以完成用户的交付物，就先用这些结果交付，并在回复里说明还差哪几张，不要用被拒的提交代替说明。`;
+    // Only a continuation turn consumes the unfinished record. "继续 / 接着做 /
+    // 再来" is what the existing `CONTINUATION_PATTERN` routes to
+    // `series_continuation`, so no new vocabulary is introduced here: the turn
+    // classification stays the single authority for when this briefing applies.
+    const unfinishedInstruction = designIntent === "series_continuation"
+      ? buildUnfinishedWorkInstruction(designContext?.unfinishedOutputs ?? [], imageRunLimit) : "";
     // Runtime carries routing/state only; skill-specific method text (prompt
     // wording, material reuse) lives in the Skill body, which is preloaded above.
     const sessionInstructions = [toolkit.instructions, skillCatalog, preloadedSkillInstruction,
-      nonstandardSizeInstruction, helperSkillInstruction, seriesInstruction].filter(Boolean).join("\n\n");
+      nonstandardSizeInstruction, helperSkillInstruction, seriesInstruction, unfinishedInstruction,
+      imageBudgetInstruction].filter(Boolean).join("\n\n");
     // ── Routing notice (Part ①) ──────────────────────────────────────────────
     // One transient event per turn, emitted before the first token, describing
     // the decisions the user cannot otherwise see: the selected deliverable
@@ -720,6 +768,24 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
           }
         } else if (clarificationAsked !== (designContext?.awaitingClarification ?? false)) {
           await saveSessionDesignContext(client, run.sessionId, { awaitingClarification: clarificationAsked });
+        }
+        // What THIS run leaves undone becomes the next continuation turn's
+        // briefing. This runs in `finally`, so it also covers a user
+        // cancellation, where nothing was refused but plan steps are still
+        // open. The record is a per-run snapshot rather than an accumulating
+        // ledger: a run that leaves nothing clears a stale record from an
+        // earlier turn, while a run that neither had nor produced unfinished
+        // items writes nothing at all (a plain chat turn must not touch the
+        // table). Method/UX state only — never a design write, and never a
+        // grant of execution, billing or authorization authority.
+        const unfinished = collectUnfinishedSessionOutputs({
+          refused: configurable[SESSION_REFUSED_OUTPUTS_KEY],
+          planSteps: configurable[SESSION_PLAN_STEPS_KEY],
+        });
+        if (unfinished.length || (designContext?.unfinishedOutputs.length ?? 0) > 0) {
+          await saveSessionDesignContext(client, run.sessionId, {
+            unfinishedOutputs: unfinished.length ? unfinished : null,
+          });
         }
       }
     }

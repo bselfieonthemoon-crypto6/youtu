@@ -4,6 +4,7 @@ import sharp from "sharp";
 import type { MastraImageSubmitContext } from "./mastra-image-tool.js";
 import { createMastraImageEditTool, createMastraImageTool, createMastraImageTools } from "./mastra-image-tool.js";
 import { MastraImagePreflightError } from "./mastra-image-jobs.js";
+import { SESSION_REFUSED_OUTPUTS_KEY, SESSION_UNFINISHED_MAX_ITEMS } from "./session-design-context.js";
 import { toolExecutionContext } from "./tools/tool-run-context.js";
 import type { AgentToolExecutionContext } from "./tools/tool-run-context.js";
 
@@ -59,6 +60,8 @@ type DirectImageToolResult = {
   approximateSizePlan?: { target: { width: number; height: number }; aspectRatio: string };
   limit?: number;
   summary?: string;
+  /** Present exactly when the request was refused before any submission attempt. */
+  refused?: boolean;
 };
 
 type DirectImageTool = {
@@ -657,5 +660,191 @@ describe("Mastra direct image tool", () => {
       ...baseConfig, configurable: { ...baseConfig.configurable, active_design_id: designId },
     }))).resolves.toMatchObject({ status: "processing" });
     expect(f.submit.mock.calls[0]![1]).not.toHaveProperty("target");
+  });
+});
+
+/**
+ * The incident this guards: every image the run actually submitted succeeded,
+ * but the submissions it refused before contact were indistinguishable from
+ * failed generations in the product UI, and the next "继续" turn could not know
+ * which outputs were missing — the model never sees previous tool results.
+ */
+describe("pre-submission refusal marking", () => {
+  it("marks every refusal decided before a submission attempt", async () => {
+    // Missing authenticated run context.
+    const bare = fixture();
+    expect(await bare.generate.execute({ title: "海报", prompt: "poster" },
+      toolExecutionContext({ configurable: baseConfig.configurable })))
+      .toMatchObject({ status: "failed", error: "image_context_unavailable", refused: true });
+
+    // A canceled turn.
+    const controller = new AbortController();
+    controller.abort();
+    const canceled = fixture();
+    expect(await canceled.generate.execute({ title: "海报", prompt: "poster" },
+      toolExecutionContext({ configurable: baseConfig.configurable, signal: controller.signal })))
+      .toMatchObject({ status: "failed", error: "image_submission_canceled", refused: true });
+
+    // Execution-policy violation (no paid tier in the user's own words).
+    const f = fixture({ currentUserText: "制作海报" });
+    expect(await f.generate.execute({ title: "海报", prompt: "poster", quality: "ultra" }, toolExecutionContext(baseConfig)))
+      .toMatchObject({ status: "failed", error: "image_quality_not_authorized", refused: true });
+
+    // An invalid execution tier is rejected by the tool's own schema, so it
+    // throws before any submission. `await` must stay OUTSIDE `expect(...)`:
+    // awaiting first would settle (and rethrow) the rejection here.
+    await expect(f.generate.execute({ title: "海报", prompt: "poster", resolution: "8k" } as any, toolExecutionContext(baseConfig)))
+      .rejects.toThrow();
+    expect(f.submit).not.toHaveBeenCalled();
+  });
+
+  it("marks the ratio, model, grounding, source and resolution refusals", async () => {
+    // Ambiguous output ratio in the user's own text.
+    const ambiguous = fixture({ currentUserText: "生成一张1:1和一张16:9的宣传图" });
+    expect(await ambiguous.generate.execute({ title: "宣传图", prompt: "brand" }, toolExecutionContext({
+      ...baseConfig, configurable: { ...baseConfig.configurable, user_prompt: "生成一张1:1和一张16:9的宣传图",
+        image_generation_aspect_ratio: "auto" } })))
+      .toMatchObject({ status: "failed", error: "image_aspect_ratio_ambiguous", refused: true });
+
+    // A model outside the published workspace catalog.
+    const model = fixture();
+    expect(await model.generate.execute({ title: "海报", prompt: "poster", model: "not-in-catalog" }, toolExecutionContext(baseConfig)))
+      .toMatchObject({ status: "failed", error: "image_model_identifier_unavailable", refused: true });
+
+    // Trusted source grounding could not decide.
+    const grounding = fixture({ groundSources: async () => ({ decision: "recoverable" as const,
+      code: "source_grounding_ambiguous" as const, summary: "请明确参考图", authorizationGranted: false as const }) });
+    expect(await grounding.generate.execute({ title: "横幅", prompt: "参考刚才图片" }, toolExecutionContext(baseConfig)))
+      .toMatchObject({ status: "failed", error: "source_grounding_ambiguous", refused: true });
+
+    // The selected canvas source contradicts the explicit source set.
+    const selection = fixture({ resolveExplicitSources: async () => {
+      throw new Error("explicit_source_conflicts_with_canvas_selection"); } });
+    expect(await selection.edit.execute({ title: "改色", prompt: "把 aaaa 改成红色", sourceAssetIds: [assetId] },
+      toolExecutionContext(baseConfig)))
+      .toMatchObject({ status: "failed", error: "source_selection_conflict", refused: true });
+
+    // A reference that binds to no authenticated asset.
+    const reference = fixture();
+    expect(await reference.edit.execute({ title: "改图", prompt: "改成蓝色", sourceAssetIds: [assetId] },
+      toolExecutionContext(baseConfig)))
+      .toMatchObject({ status: "failed", error: "invalid_reference_image", refused: true });
+
+    // A resolution tier the frozen legacy executor cannot forward.
+    const legacy = fixture({ currentUserText: "生成2K海报",
+      availableImageModels: [{ ...models[0]!, upstreamModelId: "gpt-image-2-all" }] });
+    expect(await legacy.generate.execute({ title: "海报", prompt: "poster", model: models[0]!.id, resolution: "2k" },
+      toolExecutionContext(baseConfig)))
+      .toMatchObject({ status: "failed", error: "image_resolution_not_supported", refused: true });
+
+    // The legacy background-removal execution contract.
+    expect(await reference.edit.execute({ operation: "remove_background", title: "去背景", prompt: "remove background",
+      sourceAssetIds: [assetId] }, toolExecutionContext(baseConfig)))
+      .toMatchObject({ status: "failed", error: "image_legacy_background_removal_contract_required", refused: true });
+
+    for (const imageFixture of [ambiguous, model, grounding, selection, reference, legacy])
+      expect(imageFixture.submit).not.toHaveBeenCalled();
+  });
+
+  it("marks the run-limit refusal while preserving its own limit field", async () => {
+    const submit = vi.fn(async () => ({ jobId: "job", status: "processing" as const }));
+    const tools = directTool(createMastraImageTools({ createUserClient: vi.fn(), submitter: { submit }, availableImageModels: models,
+      currentUserMessage: { runId: "run", text: "生成两张海报" } }));
+    const config = { ...baseConfig, configurable: { ...baseConfig.configurable, user_prompt: "生成两张海报" } };
+    for (const title of ["海报A", "海报B"])
+      await expect(tools.generateImage.execute({ title, prompt: "poster" }, toolExecutionContext(config)))
+        .resolves.toMatchObject({ status: "processing" });
+    expect(await tools.generateImage.execute({ title: "海报C", prompt: "poster" }, toolExecutionContext(config)))
+      .toMatchObject({ status: "failed", error: "image_generation_run_limit", limit: 2, refused: true });
+    expect(submit).toHaveBeenCalledTimes(2);
+  });
+
+  it("never marks a receipt that follows a submission attempt", async () => {
+    // An unknown transport outcome may already own a durable task.
+    const unknown = fixture();
+    unknown.submit.mockRejectedValueOnce(new Error("transport lost"));
+    const unknownReceipt = await unknown.generate.execute({ title: "海报", prompt: "poster" }, toolExecutionContext(baseConfig));
+    expect(unknownReceipt).toMatchObject({ status: "unknown", error: "image_submission_unknown" });
+    expect(unknownReceipt).not.toHaveProperty("refused");
+
+    // A proven no-write preflight rejection is decided INSIDE the submitter, so
+    // it is not a refusal reached before a submission attempt.
+    const preflight = fixture();
+    preflight.submit.mockRejectedValueOnce(new MastraImagePreflightError("no_write", "not submitted"));
+    const preflightReceipt = await preflight.generate.execute({ title: "海报", prompt: "poster" }, toolExecutionContext(baseConfig));
+    expect(preflightReceipt).toMatchObject({ status: "failed", error: "no_write" });
+    expect(preflightReceipt).not.toHaveProperty("refused");
+
+    // A submitted request is not a refusal either.
+    const accepted = fixture();
+    const acceptedReceipt = await accepted.generate.execute({ title: "海报", prompt: "poster" }, toolExecutionContext(baseConfig));
+    expect(acceptedReceipt).toMatchObject({ status: "processing" });
+    expect(acceptedReceipt).not.toHaveProperty("refused");
+  });
+});
+
+describe("unfinished work recorded for the next continuation turn", () => {
+  it("records each refused output once, in order, and never as a design write", async () => {
+    // The edits must reach the RUN-LIMIT gate, so the source has to resolve as an
+    // authenticated attachment; otherwise the call is refused earlier for an
+    // invalid reference, which is a user-input problem and deliberately NOT
+    // recorded as unfinished work (see the last test in this block).
+    const bytes = await sharp({ create: { width: 30, height: 40, channels: 3, background: "white" } }).png().toBuffer();
+    const submit = vi.fn(async () => ({ jobId: "job", status: "processing" as const }));
+    const configurable: Record<string, unknown> = { ...baseConfig.configurable, user_prompt: "生成两张海报",
+      user_attachment_map: { [assetId]: `data:image/png;base64,${bytes.toString("base64")}` } };
+    const tools = directTool(createMastraImageTools({ createUserClient: vi.fn(), submitter: { submit }, availableImageModels: models,
+      currentUserMessage: { runId: "run", text: "生成两张海报" } }));
+    const config = { ...baseConfig, configurable };
+    // Two accepted outputs spend the whole budget of two.
+    for (const title of ["主图A", "主图B"])
+      await tools.generateImage.execute({ title, prompt: "poster" }, toolExecutionContext(config));
+
+    for (const title of ["轮播第2页", "轮播第3页"]) {
+      const receipt = await tools.editImage.execute({ title, prompt: `${title} 的画面`, sourceAssetIds: [assetId] }, toolExecutionContext(config));
+      expect(receipt).toMatchObject({ error: "image_generation_run_limit", limit: 2, refused: true });
+    }
+    // A repeated refusal of the same page is one entry, not a copy.
+    await tools.editImage.execute({ title: "轮播第2页", prompt: "换个说法再来", sourceAssetIds: [assetId] }, toolExecutionContext(config));
+
+    const recorded = configurable[SESSION_REFUSED_OUTPUTS_KEY] as Array<{ title: string; prompt: string }>;
+    // Ordered, deduplicated, and only the pages that are actually missing.
+    expect(recorded.map(entry => entry.title)).toEqual(["轮播第2页", "轮播第3页"]);
+    expect(recorded[0]!.prompt).toBe("轮播第2页 的画面");
+    // Refusals are progress state: they must never look like a design write.
+    expect(configurable.session_design_write_run_id).toBeUndefined();
+    expect(submit).toHaveBeenCalledTimes(2);
+  });
+
+  it("bounds the recorded list, so one run cannot build an unusable record", async () => {
+    const bytes = await sharp({ create: { width: 30, height: 40, channels: 3, background: "white" } }).png().toBuffer();
+    const submit = vi.fn(async () => ({ jobId: "job", status: "processing" as const }));
+    // One output requested, so the single accepted submission already spends the
+    // whole budget and every later page is refused on the run-limit gate.
+    const configurable: Record<string, unknown> = { ...baseConfig.configurable, user_prompt: "生成一张海报",
+      user_attachment_map: { [assetId]: `data:image/png;base64,${bytes.toString("base64")}` } };
+    const tools = directTool(createMastraImageTools({ createUserClient: vi.fn(), submitter: { submit }, availableImageModels: models,
+      currentUserMessage: { runId: "run", text: "生成一张海报" } }));
+    const config = { ...baseConfig, configurable };
+    await tools.generateImage.execute({ title: "海报A", prompt: "poster" }, toolExecutionContext(config));
+    for (let index = 0; index < SESSION_UNFINISHED_MAX_ITEMS + 4; index += 1)
+      await tools.editImage.execute({ title: `第${index + 1}页`, prompt: "page", sourceAssetIds: [assetId] }, toolExecutionContext(config));
+    const recorded = configurable[SESSION_REFUSED_OUTPUTS_KEY] as Array<{ title: string }>;
+    expect(recorded).toHaveLength(SESSION_UNFINISHED_MAX_ITEMS);
+    // The EARLIEST refusals are kept: a continuation must produce the first
+    // missing pages, not the last few.
+    expect(recorded[0]!.title).toBe("第1页");
+    expect(recorded[recorded.length - 1]!.title).toBe(`第${SESSION_UNFINISHED_MAX_ITEMS}页`);
+  });
+
+  it("records nothing for a run that only refused for an unrelated reason", async () => {
+    // A refusal that is not a missing output (an unauthorized quality tier) is
+    // marked in the receipt but is not unfinished work the next turn must build.
+    const configurable: Record<string, unknown> = { ...baseConfig.configurable, user_prompt: "制作海报" };
+    const f = fixture({ currentUserText: "制作海报" });
+    expect(await f.generate.execute({ title: "海报", prompt: "poster", quality: "ultra" },
+      toolExecutionContext({ ...baseConfig, configurable })))
+      .toMatchObject({ refused: true });
+    expect(configurable[SESSION_REFUSED_OUTPUTS_KEY]).toBeUndefined();
   });
 });

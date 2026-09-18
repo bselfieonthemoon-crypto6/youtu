@@ -7,7 +7,7 @@ import { streamMastraDesignAgent } from "./mastra-agent.js";
 import { createMastraToolkit } from "./mastra-toolkit.js";
 import type { MastraRunInput } from "./mastra-run-types.js";
 import { createAgentTool, type MastraAgentTool } from "./tools/tool-run-context.js";
-import { SESSION_PLAN_ID_KEY, SESSION_PLAN_REVISION_KEY } from "./tools/plan-todos.js";
+import { SESSION_PLAN_ID_KEY, SESSION_PLAN_REVISION_KEY, SESSION_PLAN_STEPS_KEY } from "./tools/plan-todos.js";
 
 /**
  * End-to-end producer test for the `plan.updated` stream event through the real
@@ -118,6 +118,10 @@ describe("write_todos -> plan.updated emission", () => {
     expect(configurable.session_design_write_run_id).toBeUndefined();
     expect(configurable[SESSION_PLAN_ID_KEY]).toBe("plan_plan-emission-run");
     expect(configurable[SESSION_PLAN_REVISION_KEY]).toBe(1);
+    // The run's last recorded snapshot is kept on the run context, because the
+    // runtime reads its still-open steps after the stream to learn what a
+    // cancellation (or an exhausted budget) left undone for the next turn.
+    expect(configurable[SESSION_PLAN_STEPS_KEY]).toEqual(steps);
   });
 
   it("publishes one event per call: same planId, strictly increasing revision", async () => {
@@ -157,6 +161,9 @@ describe("write_todos -> plan.updated emission", () => {
     }));
     expect(configurable[SESSION_PLAN_REVISION_KEY]).toBeUndefined();
     expect(configurable[SESSION_PLAN_ID_KEY]).toBeUndefined();
+    // A rejected call records no snapshot either, so the runtime cannot report
+    // a plan (or its open steps) that the product never displayed.
+    expect(configurable[SESSION_PLAN_STEPS_KEY]).toBeUndefined();
   });
 
   it("emits nothing when the write_todos handler reports a rejected call that still carries a draft", async () => {

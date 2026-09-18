@@ -32,6 +32,13 @@ export const MAX_PLAN_STEP_TITLE_LENGTH = 200;
  */
 export const SESSION_PLAN_ID_KEY = "session_plan_id";
 export const SESSION_PLAN_REVISION_KEY = "session_plan_revision";
+/**
+ * The last full snapshot this run recorded. `mastra-runtime.ts` reads it after
+ * the stream: steps still `pending`/`in_progress` are the unfinished work a
+ * cancellation left behind, which is invisible to the next turn because the
+ * model never sees previous tool results. Display/progress state only.
+ */
+export const SESSION_PLAN_STEPS_KEY = "session_plan_steps";
 
 /** One `plan.updated` as it travels on the wire. */
 export type PlanUpdatedEvent = Extract<StreamEvent, { type: "plan.updated" }>;
@@ -156,6 +163,10 @@ export function recordPlanSnapshot(input: {
   }
   input.configurable[SESSION_PLAN_ID_KEY] = planId;
   input.configurable[SESSION_PLAN_REVISION_KEY] = revision;
+  // A snapshot replaces the previous one wholesale, so the last recorded
+  // snapshot IS the run's current plan — the runtime reads its open steps at
+  // run end. Recording them grants nothing: this tool only displays a plan.
+  input.configurable[SESSION_PLAN_STEPS_KEY] = steps;
   return parsed.data;
 }
 

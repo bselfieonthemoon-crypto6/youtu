@@ -30,6 +30,7 @@ import { MASTRA_IMAGE_SOURCE_MAX_INPUTS } from "./mastra-image-source-grounding.
 import { bindNativeImageRatioUsage, nativeImageRatioArgs, resolveNativeImageRatio } from "./mastra-image-ratio-state.js";
 import { mastraImageExecutionPolicy, mastraImageRunLimitReceipt, validateMastraImageExecution, validateMastraImageResolutionSupport } from "./mastra-image-execution-policy.js";
 import { mastraImageSubmissionKey } from "./mastra-image-jobs.js";
+import { SESSION_REFUSED_OUTPUTS_KEY, SESSION_UNFINISHED_MAX_ITEMS, type SessionRefusedOutput } from "./session-design-context.js";
 
 export type {
   MastraExplicitImageSourceResolver,
@@ -188,6 +189,66 @@ function contextFromToolContext(context: unknown): MastraImageSubmitContext | nu
 }
 
 /**
+ * A receipt for a request this tool refused BEFORE any submission attempt: the
+ * submitter was never called for it, so nothing was created and nothing was
+ * charged.
+ *
+ * This marker exists so the product can tell a refusal from a failed generation
+ * without reading Chinese prose, and it is display/progress state only. It never
+ * grants execution, billing or authorization authority, and it is never recorded
+ * as a design write. Post-submission outcomes — including the proven no-write
+ * `MastraImagePreflightError` raised INSIDE the submitter, and every unknown
+ * transport outcome — deliberately carry no marker, because an attempt was made.
+ */
+type MastraImageRefusal = { status: "failed"; error: string; summary: string; refused: true };
+
+/** The single place a pre-submission refusal receipt is built. */
+function refusal(error: string, summary: string): MastraImageRefusal {
+  return { status: "failed", error, summary, refused: true };
+}
+
+/**
+ * Mark an existing refusal-shaped receipt built by a policy/validation module as
+ * pre-submission, preserving its own fields (for example the run-limit `limit`).
+ * Only `refused` is added; no existing field or `status` value changes.
+ */
+function asRefusal<T extends { status: "failed"; error: string; summary: string }>(receipt: T): T & { refused: true } {
+  return { ...receipt, refused: true };
+}
+
+/**
+ * Remember one output this run refused, so a later "继续" turn can be told what
+ * is still missing. The model never sees previous tool results, so this run
+ * context record — persisted at run end by `mastra-runtime.ts` — is the only way
+ * the refusal can survive into the next turn.
+ *
+ * Bounded and deduplicated by title, earliest first, so three refusals of a
+ * four-page carousel record three distinct pages rather than copies. This is
+ * progress/method state: it does not set the design-write marker, does not
+ * create or replay a job, and does not authorize anything — the next turn's
+ * submission still passes every gate on its own.
+ */
+function recordRefusedOutput(configurable: Record<string, unknown>, entry: SessionRefusedOutput): void {
+  const title = entry.title.trim().slice(0, 200);
+  if (!title) return;
+  const existing = Array.isArray(configurable[SESSION_REFUSED_OUTPUTS_KEY])
+    ? configurable[SESSION_REFUSED_OUTPUTS_KEY] as unknown[] : [];
+  const key = title.toLocaleLowerCase();
+  const alreadyRecorded = existing.some(item => item && typeof item === "object"
+    && typeof (item as { title?: unknown }).title === "string"
+    && ((item as { title: string }).title.trim().toLocaleLowerCase() === key));
+  if (alreadyRecorded) return;
+  const sourceAssetIds = (entry.sourceAssetIds ?? []).filter(value => typeof value === "string").slice(0, 16);
+  const next = [...existing, { title, prompt: entry.prompt?.slice(0, 400) ?? "",
+    operation: entry.operation ?? "generate",
+    ...(entry.aspectRatio ? { aspectRatio: entry.aspectRatio } : {}), sourceAssetIds }];
+  // Keep the earliest MAX entries: a refused carousel is ordered 2,3,4…, so the
+  // first missing pages are the ones a continuation must produce first.
+  configurable[SESSION_REFUSED_OUTPUTS_KEY] = next.length > SESSION_UNFINISHED_MAX_ITEMS
+    ? next.slice(0, SESSION_UNFINISHED_MAX_ITEMS) : next;
+}
+
+/**
  * Direct Mastra image submission. It intentionally has no proposal, approval
  * phrase, reviewer or retry path: runtime supplies the authenticated current
  * user authorization, while this tool binds only live owned sources and lets
@@ -207,18 +268,17 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
     execute: async (raw, context) => {
     if (state.unknownReceipt) return state.unknownReceipt;
     const submitContext = contextFromToolContext(context);
-    if (!submitContext) return { status: "failed" as const, error: "image_context_unavailable",
-      summary: "当前图片任务缺少经过认证的运行上下文，未提交生成。" };
-    if (submitContext.signal.aborted) return { status: "failed" as const, error: "image_submission_canceled",
-      summary: "本轮已取消，未提交图片生成。" };
+    if (!submitContext) return refusal("image_context_unavailable",
+      "当前图片任务缺少经过认证的运行上下文，未提交生成。");
+    if (submitContext.signal.aborted) return refusal("image_submission_canceled",
+      "本轮已取消，未提交图片生成。");
     const configurable = runContextOf(context);
     const currentUserText = input.currentUserMessage?.runId === submitContext.runId ? input.currentUserMessage.text : undefined;
     const executionViolation = validateMastraImageExecution(raw, currentUserText);
-    if (executionViolation) return { status: "failed" as const, error: executionViolation.code, summary: executionViolation.summary };
+    if (executionViolation) return refusal(executionViolation.code, executionViolation.summary);
     const constraint = imageGenerationModelConstraintSchema.safeParse(configurable.image_generation_model_constraint);
     if (configurable.image_generation_model_constraint !== undefined && !constraint.success)
-      return { status: "failed" as const, error: "image_model_constraint_invalid",
-        summary: "无法校验本轮图片模型选择，未提交生成。" };
+      return refusal("image_model_constraint_invalid", "无法校验本轮图片模型选择，未提交生成。");
     let sourceAssetIds = mode === "edit" ? (raw as z.infer<typeof editImageSchema>).sourceAssetIds : [];
     const sourceUsage = mode === "edit" ? (raw as z.infer<typeof editImageSchema>).sourceUsage : undefined;
     const proposal = sourceAssetIds.length ? { ...raw, inputImages: sourceAssetIds, sourceUsage } : raw;
@@ -234,11 +294,11 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
       skillLoaded: configurable.nonstandard_size_skill_loaded_run_id === submitContext.runId
         || configurable.nonstandard_size_skill_enabled_run_id === submitContext.runId,
       ...(seriesSizes?.length ? { seriesSizes } : {}) });
-    if (!initialRatio.ok) return { status: "failed" as const, error: initialRatio.code, summary: initialRatio.error };
+    if (!initialRatio.ok) return refusal(initialRatio.code, initialRatio.error);
     let ratioState = initialRatio.state;
     let model = resolveNativeImageModelProposal(nativeImageRatioArgs(proposal as Record<string, unknown>, ratioState), input.availableImageModels,
       constraint.success ? constraint.data : undefined);
-    if (!model.ok) return { status: "failed" as const, error: model.code, summary: model.error };
+    if (!model.ok) return refusal(model.code, model.error);
     // Model resolution only changes the catalog ID and empty reference hints;
     // the initial ratio and its verified intent already remain authoritative.
     let proposalArgs = model.args;
@@ -268,7 +328,7 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
           model = resolveNativeImageModelProposal({ ...nativeImageRatioArgs(proposalArgs, ratioState), model: raw.model,
             inputImages: sourceAssetIds, sourceUsage: "reference" } as Record<string, unknown>,
           input.availableImageModels, constraint.success ? constraint.data : undefined);
-          if (!model.ok) return { status: "failed" as const, error: model.code, summary: model.error };
+          if (!model.ok) return refusal(model.code, model.error);
           proposalArgs = model.args;
           normalized = parseNativeImageProposal(schema, proposalArgs);
         }
@@ -277,7 +337,7 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
       }
     }
     // Restore ok-narrowing after the optional try/catch assignment.
-    if (!model.ok) return { status: "failed" as const, error: model.code, summary: model.error };
+    if (!model.ok) return refusal(model.code, model.error);
     if (mode === "new" && input.groundSources && !groundedInputImages && sourceAssetIds.length === 0) {
       let grounding: MastraImageSourceGroundingResult;
       try {
@@ -287,11 +347,11 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
           quality: normalized.quality, ...(normalized.outputFormat ? { outputFormat: normalized.outputFormat } : {}),
         } });
       } catch {
-        return { status: "failed" as const, error: "source_grounding_unavailable",
-          summary: "当前候选参考来源暂时无法核验，未提交图片生成；请稍后重试或明确指定参考图。" };
+        return refusal("source_grounding_unavailable",
+          "当前候选参考来源暂时无法核验，未提交图片生成；请稍后重试或明确指定参考图。");
       }
       if (grounding.decision === "recoverable")
-        return { status: "failed" as const, error: grounding.code, summary: grounding.summary };
+        return refusal(grounding.code, grounding.summary);
       if (grounding.decision === "bind") {
         // The runtime materializes every source after RLS/lineage checks. Keep
         // a structural fence here so a faulty integration cannot inject a URL.
@@ -299,8 +359,7 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
           || grounding.sourceAssetIds.length !== grounding.inputImages.length
           || !grounding.sourceAssetIds.every(value => z.string().uuid().safeParse(value).success)
           || !grounding.inputImages.every(value => typeof value === "string" && value.startsWith("data:")))
-          return { status: "failed" as const, error: "source_grounding_unavailable",
-            summary: "参考图来源核验结果不完整，未提交图片生成。" };
+          return refusal("source_grounding_unavailable", "参考图来源核验结果不完整，未提交图片生成。");
         sourceAssetIds = grounding.sourceAssetIds;
         groundedInputImages = grounding.inputImages;
         // Grounding changes an independent proposal into one with real input
@@ -312,7 +371,7 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
         model = resolveNativeImageModelProposal({ ...nativeImageRatioArgs(proposalArgs, ratioState), model: raw.model, inputImages: sourceAssetIds,
           sourceUsage: grounding.usage } as Record<string, unknown>, input.availableImageModels,
         constraint.success ? constraint.data : undefined);
-        if (!model.ok) return { status: "failed" as const, error: model.code, summary: model.error };
+        if (!model.ok) return refusal(model.code, model.error);
         proposalArgs = model.args;
         normalized = parseNativeImageProposal(schema, proposalArgs);
       }
@@ -338,7 +397,7 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
           model = resolveNativeImageModelProposal({ ...nativeImageRatioArgs(proposalArgs, ratioState), model: raw.model,
             inputImages: sourceAssetIds, sourceUsage: "reference" } as Record<string, unknown>,
           input.availableImageModels, constraint.success ? constraint.data : undefined);
-          if (!model.ok) return { status: "failed" as const, error: model.code, summary: model.error };
+          if (!model.ok) return refusal(model.code, model.error);
           proposalArgs = model.args;
           normalized = parseNativeImageProposal(schema, proposalArgs);
         }
@@ -371,7 +430,7 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
       }
     }
     // Restore the ok-narrowing after the optional try/catch assignment.
-    if (!model.ok) return { status: "failed" as const, error: model.code, summary: model.error };
+    if (!model.ok) return refusal(model.code, model.error);
     let attachmentMap = configurable.user_attachment_map as Record<string, string> | undefined;
     if (Object.keys(appendedLibraryCarriers).length)
       attachmentMap = { ...(attachmentMap ?? {}), ...appendedLibraryCarriers };
@@ -401,17 +460,17 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
       } catch (error) {
         const reason = error instanceof Error ? error.message : "";
         if (reason === "explicit_source_conflicts_with_canvas_selection")
-          return { status: "failed" as const, error: "source_selection_conflict",
-            summary: "本次改图来源与发送时选中的画布图片不一致；未提交生成。请重新选择图片后再试。" };
+          return refusal("source_selection_conflict",
+            "本次改图来源与发送时选中的画布图片不一致；未提交生成。请重新选择图片后再试。");
         if (reason === "historical_upload_removed_or_out_of_scope")
-          return { status: "failed" as const, error: "source_historical_upload_unavailable",
-            summary: "先前的上传记录已删除或不属于当前会话；未提交生成。请重新上传或选择仍在当前会话中的参考图。" };
+          return refusal("source_historical_upload_unavailable",
+            "先前的上传记录已删除或不属于当前会话；未提交生成。请重新上传或选择仍在当前会话中的参考图。");
         if (reason === "historical_upload_asset_out_of_scope" || reason === "historical_upload_asset_missing")
-          return { status: "failed" as const, error: "source_historical_upload_unavailable",
-            summary: "先前上传的图片资产已删除或不属于当前工作区；未提交生成。请重新上传该图片。" };
+          return refusal("source_historical_upload_unavailable",
+            "先前上传的图片资产已删除或不属于当前工作区；未提交生成。请重新上传该图片。");
         if (reason === "historical_upload_download_failed" || reason === "historical_upload_history_unavailable")
-          return { status: "failed" as const, error: "source_historical_upload_unavailable",
-            summary: "先前上传的图片暂时无法核验或读取；未提交生成。请稍后重试。" };
+          return refusal("source_historical_upload_unavailable",
+            "先前上传的图片暂时无法核验或读取；未提交生成。请稍后重试。");
         // Keep the legacy resolver available for authenticated live canvas
         // assets. It cannot grant access to a non-canvas source by itself.
       }
@@ -424,18 +483,16 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
         if (Object.keys(resolved).length !== new Set(unresolved).size) throw new Error("canvas_reference_not_found");
         attachmentMap = { ...(attachmentMap ?? {}), ...resolved };
       } catch {
-        return { status: "failed" as const, error: "invalid_reference_image",
-          summary: "参考图必须是本轮认证附件或当前画布的存活 assetId；不能传任意 URL、历史链接或未绑定来源。未提交生成。" };
+        return refusal("invalid_reference_image",
+          "参考图必须是本轮认证附件或当前画布的存活 assetId；不能传任意 URL、历史链接或未绑定来源。未提交生成。");
       }
     }
     const sources = groundedInputImages ? undefined : captureImageProposalSources(sourceAssetIds, attachmentMap);
     if (!groundedInputImages && sourceAssetIds.length && (!sources || sources.length !== sourceAssetIds.length))
-      return { status: "failed" as const, error: "invalid_reference_image",
-        summary: "参考图来源无法绑定到当前认证资产，未提交生成。" };
+      return refusal("invalid_reference_image", "参考图来源无法绑定到当前认证资产，未提交生成。");
     const resolvedInputImages = sources?.map(source => attachmentMap?.[source.assetId]);
     if (resolvedInputImages && !resolvedInputImages.every((reference): reference is string => typeof reference === "string"))
-      return { status: "failed" as const, error: "invalid_reference_image",
-        summary: "参考图来源无法绑定到当前认证资产，未提交生成。" };
+      return refusal("invalid_reference_image", "参考图来源无法绑定到当前认证资产，未提交生成。");
     const inputImages = groundedInputImages ?? resolvedInputImages as string[] | undefined;
     // Read the authenticated source carrier, never a model-supplied dimension
     // or remote URL. Omitted edit framing must preserve the actual image.
@@ -452,8 +509,8 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
         outputAspectRatio = `${width}:${height}`;
         ratioState = { ...ratioState, frame: { ...ratioState.frame, aspectRatio: outputAspectRatio } };
       } catch {
-        return { status: "failed" as const, error: "source_dimensions_unavailable",
-          summary: "源图尺寸暂时无法读取，未提交生成；可以重试或指定输出比例。" };
+        return refusal("source_dimensions_unavailable",
+          "源图尺寸暂时无法读取，未提交生成；可以重试或指定输出比例。");
       }
     }
     // The legacy job path validates against the selected frozen upstream ID
@@ -461,11 +518,19 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
     // an otherwise-independent request source-bound.
     const selectedModel = input.availableImageModels.find(candidate => candidate.id === model.model);
     const resolutionSupportViolation = validateMastraImageResolutionSupport(selectedModel?.upstreamModelId ?? model.model, normalized.resolution);
-    if (resolutionSupportViolation) return { status: "failed" as const, error: resolutionSupportViolation.code, summary: resolutionSupportViolation.summary };
+    if (resolutionSupportViolation) return refusal(resolutionSupportViolation.code, resolutionSupportViolation.summary);
     const limitViolation = validateImageGenerationRequestLimits({ model: model.model, prompt: normalized.prompt,
       ...(selectedModel?.upstreamModelId ? { upstreamModelId: selectedModel.upstreamModelId } : {}),
       ...(inputImages?.length ? { inputImages } : {}) });
-    if (limitViolation) return { status: "failed" as const, error: limitViolation.code, summary: limitViolation.message };
+    if (limitViolation) {
+      // A request rejected by the server-side request limits is one specific
+      // output this run could not deliver, so it is recorded for the next
+      // continuation turn. Progress state only: no design write, no submission.
+      recordRefusedOutput(configurable, { title: normalized.title, prompt: normalized.prompt,
+        operation: normalized.operation, ...(outputAspectRatio ? { aspectRatio: outputAspectRatio } : {}),
+        sourceAssetIds: [...sourceAssetIds] });
+      return refusal(limitViolation.code, limitViolation.message);
+    }
     const submission: NativeImageSubmission = {
       operation: normalized.operation,
       title: normalized.title,
@@ -485,15 +550,15 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
     configurable.session_submitted_aspect_ratio = submission.aspectRatio;
     const invalidNativeRatio = validateNativeImageAspectRatio(submission, input.availableImageModels);
     if (invalidNativeRatio) {
-      if (ratioState.approximation.authorized) return {
+      if (ratioState.approximation.authorized) return asRefusal({
         status: "failed" as const,
         error: ratioState.approximation.skillLoaded
           ? "image_native_approximate_ratio_plan_required" : "image_nonstandard_size_skill_required",
         summary: ratioState.approximation.skillLoaded
           ? `原生比例 ${submission.aspectRatio} 超出可提交范围，未提交或扣费。当前近似授权可使用最近支持的 3:1/1:3；请按已加载的 nonstandard-image-size Skill 重新提交合法比例并设 aspectRatioIntent=approximate，说明比例偏差，无需重复询问同一生成授权。`
           : `原生比例 ${submission.aspectRatio} 超出可提交范围，未提交或扣费。当前请求允许近似，但本轮尚无 nonstandard-image-size 的 use_skill loaded 回执；请先调用 list_skills 和 use_skill，读取正文后按合法近似比例重新提交，无需重复询问同一生成授权。`,
-      };
-      return { status: "failed" as const, ...invalidNativeRatio };
+      });
+      return asRefusal({ status: "failed" as const, ...invalidNativeRatio });
     }
     let approximateSizePlan: ReturnType<typeof planApproximateNativeImageSize> | undefined;
     if (ratioState.approximation.applied
@@ -516,7 +581,16 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
       const key = mastraImageSubmissionKey(submitContext.runId, submission);
       const replay = state.accepted.has(key);
       const limit = mastraImageExecutionPolicy(currentUserText).limit;
-      if (!replay && state.accepted.size + state.inFlight >= limit) return mastraImageRunLimitReceipt(limit);
+      if (!replay && state.accepted.size + state.inFlight >= limit) {
+        // The reported incident: the model planned more outputs than the run
+        // budget allowed, the extra submissions were refused here, and the next
+        // turn could not know which outputs were missing because it never sees
+        // previous tool results. Record them for the continuation instruction.
+        recordRefusedOutput(configurable, { title: submission.title, prompt: submission.prompt,
+          ...(submission.operation ? { operation: submission.operation } : {}), aspectRatio: submission.aspectRatio,
+          sourceAssetIds: [...sourceAssetIds] });
+        return asRefusal(mastraImageRunLimitReceipt(limit));
+      }
       if (!replay) state.inFlight++;
       let result: NativeImageSubmitResult;
       try {

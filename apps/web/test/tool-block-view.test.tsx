@@ -53,6 +53,67 @@ describe("ToolBlockView", () => {
     expect(screen.getByText("参数需要调整")).toBeInTheDocument();
     expect(screen.queryByText("图片生成失败")).not.toBeInTheDocument();
   });
+  it("renders a pre-submission refusal neutrally with the server summary, never the raw code", () => {
+    const { container } = render(<ToolBlockView block={{ type: "tool", toolCallId: "refused-image", toolName: "edit_image", status: "completed",
+      output: { status: "failed", error: "image_generation_run_limit", limit: 4, refused: true,
+        summary: "本轮图片生成与编辑共用 4 张额度，已达到上限；未创建新任务、未扣费。请在新的用户请求中明确下一批输出。" } }} />);
+    const card = screen.getByText("未提交生成").closest(".rounded-xl");
+    expect(card).not.toBeNull();
+    expect(card?.textContent).toContain("本轮图片生成与编辑共用 4 张额度");
+    expect(card?.textContent).toContain("未创建新任务、未扣费");
+    expect(card?.className).toContain("amber");
+    expect(card?.className).not.toContain("destructive");
+    // The machine receipt — the raw code, the raw limit and `status: failed` — is
+    // not repeated anywhere else in the block either.
+    expect(container.textContent).not.toContain("image_generation_run_limit");
+    expect(container.textContent).not.toContain("status: failed");
+    expect(screen.queryByText("图片生成失败")).not.toBeInTheDocument();
+  });
+  it("still renders a post-submission failure as a destructive 图片生成失败 card", () => {
+    render(<ToolBlockView block={{ type: "tool", toolCallId: "failed-image", toolName: "edit_image", status: "completed",
+      output: { status: "failed", error: "provider_unavailable" } }} />);
+    expect(screen.getByText("图片生成失败")).toBeInTheDocument();
+    expect(screen.queryByText("未提交生成")).not.toBeInTheDocument();
+    const card = screen.getByText("图片生成失败").closest(".rounded-xl");
+    expect(card?.textContent).toContain("provider_unavailable");
+    expect(card?.className).toContain("destructive");
+    // A genuine failure keeps its raw output preview exactly as before.
+    expect(screen.getByText("error: provider_unavailable")).toBeInTheDocument();
+  });
+  it("falls back to the raw code when a receipt carries no summary", () => {
+    render(<ToolBlockView block={{ type: "tool", toolCallId: "refused-no-summary", toolName: "edit_image", status: "completed",
+      output: { status: "failed", error: "image_generation_run_limit", refused: true } }} />);
+    const card = screen.getByText("未提交生成").closest(".rounded-xl");
+    expect(card?.textContent).toContain("image_generation_run_limit");
+    expect(screen.getAllByText("image_generation_run_limit")).toHaveLength(1);
+  });
+  it.each([undefined, false, "true"])("does not treat refused=%s as a pre-submission refusal", (refused) => {
+    render(<ToolBlockView block={{ type: "tool", toolCallId: `not-refused-${String(refused)}`, toolName: "edit_image", status: "completed",
+      output: { status: "failed", error: "image_generation_run_limit",
+        summary: "本轮图片生成与编辑共用 4 张额度，已达到上限；未创建新任务、未扣费。",
+        ...(refused === undefined ? {} : { refused }) } }} />);
+    expect(screen.getByText("图片生成失败")).toBeInTheDocument();
+    expect(screen.queryByText("未提交生成")).not.toBeInTheDocument();
+    const card = screen.getByText("图片生成失败").closest(".rounded-xl");
+    expect(card?.textContent).toContain("未创建新任务、未扣费");
+    expect(card?.textContent).not.toContain("image_generation_run_limit");
+  });
+  it("keeps a video failure destructive with its own title", () => {
+    render(<ToolBlockView block={{ type: "tool", toolCallId: "video-failed", toolName: "generate_video", status: "completed",
+      output: { status: "failed", error: "视频渠道不可用，任务已停止" } }} />);
+    expect(screen.getByText("视频生成失败")).toBeInTheDocument();
+    expect(screen.queryByText("未提交生成")).not.toBeInTheDocument();
+    const card = screen.getByText("视频生成失败").closest(".rounded-xl");
+    expect(card?.textContent).toContain("视频渠道不可用，任务已停止");
+    expect(card?.className).toContain("destructive");
+  });
+  it("keeps the cancellation copy even when a canceled receipt carries a summary", () => {
+    render(<ToolBlockView block={{ type: "tool", toolCallId: "canceled-with-summary", toolName: "edit_image", status: "failed",
+      output: { status: "canceled", error: "生成任务未完成", summary: "本轮已取消，未创建新任务、未扣费。" } }} />);
+    expect(screen.getByText("图片生成已取消")).toBeInTheDocument();
+    expect(screen.getByText("任务已取消，不会将后续结果放入画布")).toBeInTheDocument();
+    expect(screen.queryByText("本轮已取消，未创建新任务、未扣费。")).not.toBeInTheDocument();
+  });
   it("does not show retired visual acceptance copy on an unverified generated image", () => {
     render(<ToolBlockView block={{ type: "tool", toolCallId: "image-result", toolName: "generate_image", status: "completed",
       output: { status: "succeeded", visualStatus: "unverified" },

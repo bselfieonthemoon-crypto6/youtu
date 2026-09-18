@@ -203,11 +203,10 @@ export const ToolBlockView = React.memo(function ToolBlockView({
     isImageProposalTool || block.toolName === "edit_image" || block.toolName === "confirm_image_generation";
   const isVideoTool = block.toolName === "generate_video";
   const isMediaTool = isImageTool || isVideoTool;
+  const mediaErrorOutput = block.output as Record<string, unknown> | undefined;
   const mediaError =
     isMediaTool && isCompleted && !imageArtifact
-      ? ((block.output as Record<string, unknown> | undefined)?.error as
-          | string
-          | undefined)
+      ? (mediaErrorOutput?.error as string | undefined)
       : undefined;
   const inputValidationFailure = isMediaTool && !block.output?.jobId &&
     !!block.output?.validationErrors &&
@@ -300,6 +299,21 @@ export const ToolBlockView = React.memo(function ToolBlockView({
   const terminalError = terminalFailure
     ? generationCanceled ? "任务已取消，不会将后续结果放入画布" : observedJob?.error_message || String(block.output?.error || "生成失败，任务已停止")
     : null;
+  // The card body is server-authored copy: the server writes `summary` next to
+  // the decision it describes, while `error` is a machine code. The code only
+  // survives as a fallback for receipts persisted before summaries existed.
+  // A cancellation keeps its own fixed copy and is never rewritten from a summary.
+  const mediaErrorBody =
+    (generationCanceled ? undefined : readNonEmptyString(mediaErrorOutput?.summary)) ??
+    terminalError ??
+    mediaError ??
+    "生成失败，任务已停止";
+  // `refused` is an explicit server field for a receipt returned before any
+  // submission attempt. Nothing was created and nothing was charged, so this is
+  // not a generation failure. The field is only ever honored when it is exactly
+  // `true`; a missing field means "not a refusal".
+  const mediaErrorRefused =
+    !generationCanceled && mediaErrorOutput?.refused === true;
   const succeeded = observedJob?.status === "succeeded" || generation.succeeded;
   const observedResult = observedJob?.result as Record<string, unknown> | null | undefined;
   const attachmentRejected =
@@ -479,8 +493,8 @@ export const ToolBlockView = React.memo(function ToolBlockView({
           <p className="mt-1 text-xs text-muted-foreground">本次调用尚未提交生图，未调用图片接口。Agent 可修正参数后继续。</p>
         </div>
       )}
-      {!inputValidationFailure && isMediaTool && (terminalError || (isCompleted && !imageArtifact && mediaError)) && (
-        <MediaErrorCard isVideoTool={isVideoTool} canceled={generationCanceled} error={terminalError ?? mediaError!} />
+      {!inputValidationFailure && isMediaTool && (terminalError || (isCompleted && !imageArtifact && (mediaError || mediaErrorRefused))) && (
+        <MediaErrorCard isVideoTool={isVideoTool} canceled={generationCanceled} refused={mediaErrorRefused} error={mediaErrorBody} />
       )}
 
       {/* Layer 2b: Image generation card with inline preview */}
@@ -498,7 +512,7 @@ export const ToolBlockView = React.memo(function ToolBlockView({
           onOpenPanel={handleOpenPanel}
           onRefreshImage={handleRefreshImage}
         />
-      ) : showCard ? (
+      ) : showCard && !mediaErrorRefused ? (
         /* Layer 2: Generic output card (non-image tools) */
         <div className="rounded-xl border-[0.5px] border-border p-3">
           <div className="flex items-start gap-3">
@@ -1604,15 +1618,37 @@ const MediaErrorCard = React.memo(function MediaErrorCard({
   isVideoTool,
   error,
   canceled = false,
+  refused = false,
 }: {
   isVideoTool: boolean;
   error: string;
   canceled?: boolean;
+  refused?: boolean;
 }) {
+  // A refusal is not a failure. The receipt comes back before any submission
+  // attempt — nothing created, nothing charged — so it is a warning about the
+  // remaining budget, and it must not be dressed as a red generation failure.
+  const cardClass = canceled
+    ? "rounded-xl border-[0.5px] border-border bg-muted/30 p-3"
+    : refused
+      ? "rounded-xl border-[0.5px] border-amber-200 bg-amber-50 p-3"
+      : "rounded-xl border-[0.5px] border-destructive/30 bg-destructive/5 p-3";
+  const iconClass = canceled
+    ? "mt-0.5 shrink-0 rounded-lg bg-muted p-1.5 text-muted-foreground"
+    : refused
+      ? "mt-0.5 shrink-0 rounded-lg bg-amber-100 p-1.5 text-amber-700"
+      : "mt-0.5 shrink-0 rounded-lg bg-destructive/10 p-1.5 text-destructive";
+  const title = canceled
+    ? isVideoTool ? "视频生成已取消" : "图片生成已取消"
+    : refused
+      ? "\u672a\u63d0\u4ea4\u751f\u6210"
+      : isVideoTool
+        ? "\u89c6\u9891\u751f\u6210\u5931\u8d25"
+        : "\u56fe\u7247\u751f\u6210\u5931\u8d25";
   return (
-    <div className={canceled ? "rounded-xl border-[0.5px] border-border bg-muted/30 p-3" : "rounded-xl border-[0.5px] border-destructive/30 bg-destructive/5 p-3"}>
+    <div className={cardClass}>
       <div className="flex items-start gap-2.5">
-        <div className={canceled ? "mt-0.5 shrink-0 rounded-lg bg-muted p-1.5 text-muted-foreground" : "mt-0.5 shrink-0 rounded-lg bg-destructive/10 p-1.5 text-destructive"}>
+        <div className={iconClass}>
           <svg
             className="h-4 w-4"
             viewBox="0 0 24 24"
@@ -1625,9 +1661,7 @@ const MediaErrorCard = React.memo(function MediaErrorCard({
         </div>
         <div className="min-w-0 flex-1">
           <div className="text-sm font-semibold text-foreground">
-            {canceled ? (isVideoTool ? "视频生成已取消" : "图片生成已取消") : isVideoTool
-              ? "\u89c6\u9891\u751f\u6210\u5931\u8d25"
-              : "\u56fe\u7247\u751f\u6210\u5931\u8d25"}
+            {title}
           </div>
           <div className="mt-0.5 whitespace-pre-wrap break-words text-[12px] text-muted-foreground">
             {error}

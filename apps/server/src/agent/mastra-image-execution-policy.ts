@@ -56,16 +56,36 @@ export function mastraImageExecutionPolicy(currentUserText: unknown, configuredL
   };
 }
 
+/**
+ * Units that name an OUTPUT of this turn, shared by both count patterns so they
+ * cannot drift apart.
+ *
+ * 版/款/组 are counted because they unambiguously count deliverables ("出三版",
+ * "两款方案", "两组图") and used to be missed entirely, which silently capped an
+ * explicit request at the default limit and then refused the rest as
+ * `image_generation_run_limit`.
+ *
+ * 套 is deliberately NOT a unit: "一套" is a bundle that is normally followed by
+ * its own 张 count, so counting it would double-count "一套五张" as six. 页 is
+ * excluded for the mirror reason: it names a deliverable ("详情页", "落地页") as
+ * often as it counts images.
+ */
+const OUTPUT_COUNT_UNITS = "张|幅|版|款|组|个(?:图片|版本|方案)|images?\\b|outputs?\\b|pictures?\\b";
+
 export function currentUserImageOutputCount(text: string): number | undefined {
   const cn: Record<string, number> = { 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
-  const countPattern = /([0-9]{1,3}|[一二两三四五六七八九十])\s*(?:张|幅|个(?:图片|版本|方案)|images?\b|outputs?\b|pictures?\b)/gi;
+  const countPattern = new RegExp(`([0-9]{1,3}|[一二两三四五六七八九十])\\s*(?:${OUTPUT_COUNT_UNITS})`, "gi");
   let total = 0;
   let found = false;
   for (const clause of text.split(/[。！？!?;；\n]/)) {
     if (/(?:不要|不需要|别|禁止|勿|无需|为什么|检查|讨论|解释|是否|吗|why\b|check\b|explain\b|do\s+not|don['’]t)/i.test(clause)) continue;
-    const directive = /(?:生成|制作|输出|给我|做|generate|create|make|produce)/i.exec(clause);
+    // `出` and `来` belong here. Both state a count with no other verb present —
+    // "再出三版不同风格的主图", "来两款方案" — and without them the scan started at
+    // the NEXT verb (or found none), so an explicit count was never read and the
+    // request was silently capped at the default limit.
+    const directive = /(?:生成|制作|输出|出|给我|来|做|generate|create|make|produce)/i.exec(clause);
     if (!directive) continue;
-    const totalMatch = /(?:一共|总共|合计|共|总计|in\s+total|total(?:\s+of)?)\s*(?:生成|制作|输出|generate|create|make|produce)?\s*(?:exactly\s*)?([0-9]{1,3}|[一二两三四五六七八九十])\s*(?:张|幅|images?\b|outputs?\b|pictures?\b)/i.exec(clause);
+    const totalMatch = new RegExp(`(?:一共|总共|合计|共|总计|in\\s+total|total(?:\\s+of)?)\\s*(?:生成|制作|输出|generate|create|make|produce)?\\s*(?:exactly\\s*)?([0-9]{1,3}|[一二两三四五六七八九十])\\s*(?:${OUTPUT_COUNT_UNITS})`, "i").exec(clause);
     if (totalMatch) return cn[totalMatch[1]!] ?? Number(totalMatch[1]);
     const outputs = clause.slice(directive.index + directive[0].length);
     for (const match of outputs.matchAll(countPattern)) {
