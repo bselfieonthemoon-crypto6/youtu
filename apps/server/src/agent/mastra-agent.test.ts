@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { compactMastraStepToolContext, compactMastraToolResult, streamMastraDesignAgent } from "./mastra-agent.js";
+import { compactMastraStepToolContext, compactMastraToolResult, mergeReadSkillSlugs, streamMastraDesignAgent } from "./mastra-agent.js";
 import { createContextBudget } from "./context-budget.js";
 import { createMastraImageTools, type MastraImageSubmitContext } from "./mastra-image-tool.js";
 import { createMastraToolkit } from "./mastra-toolkit.js";
@@ -24,6 +24,31 @@ function structuredResponse(object: unknown) {
     usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
   }), { headers: { "content-type": "application/json" } });
 }
+
+describe("dispatch closure: which preloaded guides the run actually read", () => {
+  it("accumulates reads in order, deduplicated and bounded", () => {
+    expect(mergeReadSkillSlugs(undefined, ["logo-design"])).toEqual(["logo-design"]);
+    // A guide read again, or named twice in one composition, is one entry.
+    expect(mergeReadSkillSlugs(["logo-design"], ["logo-design", "design-review"]))
+      .toEqual(["logo-design", "design-review"]);
+    // Earliest first, so the primary a turn settled on stays at the front.
+    expect(mergeReadSkillSlugs(["a", "b"], ["c"])).toEqual(["a", "b", "c"]);
+    // Bounded: a run cannot build an unbounded diagnostic record.
+    expect(mergeReadSkillSlugs(Array.from({ length: 8 }, (_, i) => `s${i}`), ["extra"]))
+      .toHaveLength(8);
+    expect(mergeReadSkillSlugs(Array.from({ length: 8 }, (_, i) => `s${i}`), ["extra"])![0]).toBe("s0");
+  });
+
+  it("ignores an empty or malformed read list rather than clearing what was recorded", () => {
+    // Nothing new read must leave the caller's state untouched, which is what lets
+    // the runtime treat a missing record as "nothing was read".
+    expect(mergeReadSkillSlugs(["a"], [])).toBeUndefined();
+    expect(mergeReadSkillSlugs(["a"], [undefined, "", null as never, 42 as never])).toBeUndefined();
+    // A malformed earlier value is ignored, not thrown on.
+    expect(mergeReadSkillSlugs("not-an-array", ["a"])).toEqual(["a"]);
+    expect(mergeReadSkillSlugs([1, null, "ok"], ["a"])).toEqual(["ok", "a"]);
+  });
+});
 
 describe("Mastra real SDK stream bridge (synthetic transport, not provider E2E)", () => {
   it("rejects an oversized final wire packet before calling the provider", async () => {

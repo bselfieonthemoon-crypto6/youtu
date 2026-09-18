@@ -294,6 +294,31 @@ describe("extractStyleHints", () => {
     expect(mergeStyleHints(undefined, "海洋")).toBe("海洋");
     expect(mergeStyleHints("高端、海洋", "海洋")).toBe("高端、海洋");
   });
+
+  it("records a style the user names, without it being in any table", () => {
+    // Regression: the curated list was the GATE, so a real style the list had
+    // never heard of was dropped from the series and the next "继续" lost it.
+    expect(extractStyleHints("做成莫兰迪色系的主图")).toBe("莫兰迪");
+    expect(extractStyleHints("走包豪斯风格")).toBe("包豪斯");
+    expect(extractStyleHints("高级灰调性")).toBe("高级灰");
+    expect(extractStyleHints("孟菲斯风")).toBe("孟菲斯");
+    // A curated hit and a user-named style combine.
+    expect(extractStyleHints("做成莫兰迪色系、极简风格的主图")).toBe("极简、莫兰迪");
+  });
+
+  it("never lets the label pass swallow the request or read a plain noun as a style", () => {
+    // A directive in front of the label is scaffolding, not part of the style, and
+    // a capture that still contains one is rejected rather than recorded.
+    expect(extractStyleHints("给我来三版莫兰迪色系的主图")).toBe("莫兰迪");
+    expect(extractStyleHints("换个风格")).toBeUndefined();
+    expect(extractStyleHints("做一个详细的落地页")).toBeUndefined();
+    // Plain nouns that merely end in a style label are not styles.
+    expect(extractStyleHints("台风天要发的海报")).toBeUndefined();
+    expect(extractStyleHints("龙卷风天气的宣传图")).toBeUndefined();
+    expect(extractStyleHints("屏风产品的主图")).toBeUndefined();
+    // No overlap collapse: three curated tokens stay three.
+    expect(extractStyleHints("高端奢华黑金风格")).toBe("高端、奢华、黑金");
+  });
 });
 
 describe("edit label vocabulary is unchanged by the deferral", () => {

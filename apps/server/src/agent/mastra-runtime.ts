@@ -787,6 +787,20 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
             unfinishedOutputs: unfinished.length ? unfinished : null,
           });
         }
+        // Dispatch closure. A preload is a hypothesis about what this turn needs,
+        // and until now nothing reported whether it held: the guides went into the
+        // instructions and the only evidence of a misfire was a vague sense that
+        // routing was unreliable. Naming the preloaded-but-never-read guides is
+        // what lets a Skill's declared routing keywords be corrected, which is the
+        // whole maintenance story once Skills are the unit being added.
+        if (preloadedSkillNames.length) {
+          const read = new Set((Array.isArray(configurable.session_read_skill_slugs)
+            ? configurable.session_read_skill_slugs as unknown[] : [])
+            .filter((value): value is string => typeof value === "string"));
+          console.info("[skill-dispatch-outcome]", { runId: run.runId, intent: designIntent,
+            preloaded: preloadedSkillNames, read: [...read],
+            preloadedNeverRead: preloadedSkillNames.filter(name => !read.has(name)) });
+        }
       }
     }
   };

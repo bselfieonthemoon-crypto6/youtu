@@ -146,12 +146,54 @@ export function mergeStyleHints(existing: string | undefined, next: string | und
   return tokens.length ? tokens.join("、") : undefined;
 }
 
-/** Compact, deterministic style descriptors present in the user's own words. */
+/**
+ * A phrase the user THEMSELVES attaches to a style label.
+ *
+ * This is the general signal, and it needs no style vocabulary: whatever the user
+ * calls a 风格/色系/色调 is a style, so "莫兰迪色系" or "包豪斯风格" is recorded the
+ * first time it appears instead of being silently dropped until someone adds it to
+ * `STYLE_HINTS`. That table is kept as a hint source, but it is no longer the gate.
+ */
+const STYLE_LABEL_SUFFIX = "(?:风格|风|色系|色调|配色|主题色|调性)";
+const STYLE_LABEL_PATTERN = new RegExp(`([\\u4e00-\\u9fa5A-Za-z0-9]{1,12}?)${STYLE_LABEL_SUFFIX}`, "g");
+/** Scaffolding the label is used with: "换成海洋风格", "做成莫兰迪色系". */
+const STYLE_LABEL_LEADING = /^(?:给(?:我)?|来|做|出|生成|制作|用|要|换|改|成|为|个|的|了|是|按|走|这种|那种|一下|一个|点|些|更|再)+/;
+/**
+ * Structural leftovers that mean the capture swallowed the request instead of a
+ * style. Not a style blacklist — it never decides what counts as a style, it only
+ * rejects a label that still contains a directive, quantity or digit.
+ */
+const STYLE_LABEL_REJECT = /(?:生成|制作|输出|做|出图|给我|来|要|用|换|改|版|张|幅|款|组|套|第|\d)/;
+/** Plain nouns that end in 风/调 without describing a style. Parse artefacts only. */
+const STYLE_LABEL_STOPWORDS = new Set(["龙卷", "台风", "屏风", "狂风", "风口", "风控", "作风", "口感", "手感", "敏感", "感谢"]);
+
+/**
+ * Compact style descriptors taken from the user's own words.
+ *
+ * Three passes, most reliable first: the curated vocabulary, explicit colour
+ * tokens, then phrases the user labelled as a style even when no table knows the
+ * word. A label overlapping a curated hit is dropped so "高端奢华黑金风格" stays
+ * three tokens instead of collapsing into one long phrase.
+ */
 export function extractStyleHints(prompt: string): string | undefined {
   const hints: string[] = [];
-  for (const hint of STYLE_HINTS) if (prompt.includes(hint) && !hints.includes(hint)) hints.push(hint);
-  for (const match of prompt.matchAll(/(?:深|浅|暗|亮|暖|冷)?(?:黑|白|金|银|红|蓝|绿|紫|橙|粉|青|灰|棕|黄)色/g)) {
-    if (!hints.includes(match[0])) hints.push(match[0]);
+  const add = (hint: string) => { if (hint && !hints.includes(hint)) hints.push(hint); };
+  for (const hint of STYLE_HINTS) if (prompt.includes(hint)) add(hint);
+  for (const match of prompt.matchAll(/(?:深|浅|暗|亮|暖|冷)?(?:黑|白|金|银|红|蓝|绿|紫|橙|粉|青|灰|棕|黄)色/g)) add(match[0]);
+  for (const match of prompt.matchAll(STYLE_LABEL_PATTERN)) {
+    const raw = (match[1] ?? "").replace(STYLE_LABEL_LEADING, "").trim();
+    // A capture that swallowed the request ("给我来三版莫兰迪") must not lose the
+    // style at its end, so the longest VALID tail wins instead of rejecting the
+    // whole capture. Longest-first also keeps "高级灰" ahead of "灰".
+    let label: string | undefined;
+    for (let start = 0; start < raw.length && !label; start += 1) {
+      const candidate = raw.slice(start);
+      if (candidate.length < 2 || candidate.length > 6) continue;
+      if (STYLE_LABEL_REJECT.test(candidate) || STYLE_LABEL_STOPWORDS.has(candidate)) continue;
+      if (STYLE_HINTS.some(hint => candidate.includes(hint))) continue;
+      label = candidate;
+    }
+    if (label) add(label);
   }
   return hints.length ? hints.slice(0, 6).join("、") : undefined;
 }

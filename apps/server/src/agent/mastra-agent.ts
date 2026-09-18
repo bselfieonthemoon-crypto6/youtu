@@ -232,6 +232,20 @@ function toolResultIsError(result: unknown): boolean {
     && (result as { error?: unknown }).error);
 }
 
+/**
+ * Per-run record of which Skill guides were actually read: deduplicated, earliest
+ * first, bounded to 8 (the hard run limit for image outputs, so one run can never
+ * legitimately read more guides than that). Returns `undefined` when nothing new
+ * was read, so the caller leaves untouched state alone.
+ */
+export function mergeReadSkillSlugs(previous: unknown, names: readonly unknown[]): string[] | undefined {
+  const known = names.filter((name): name is string => typeof name === "string" && name.length > 0);
+  if (!known.length) return undefined;
+  const earlier = Array.isArray(previous)
+    ? previous.filter((value): value is string => typeof value === "string" && value.length > 0) : [];
+  return [...new Set([...earlier, ...known])].slice(0, 8);
+}
+
 export async function* streamMastraDesignAgent(options: {
   run: MastraRunInput;
   model: ReturnType<typeof createMastraWorkspaceModel>;
@@ -322,6 +336,29 @@ export async function* streamMastraDesignAgent(options: {
     // Remember the last Skill actually read this run for session stickiness.
     if (toolName === "use_skill" && typeof loadedSkillName === "string" && loadedReceipt)
       options.configurable.session_loaded_skill_slug = loadedSkillName;
+    // Which guides this run actually READ. A preload is only a hypothesis about
+    // what the turn needs, so recording what the model went on to load is what
+    // makes dispatch observable: a Skill whose declared routing keywords never lead
+    // to a read can then be found and corrected instead of silently costing
+    // context every turn. Bounded and deduplicated; per-run diagnostics, never
+    // authority and never persisted as session state.
+    const recordReadSkills = (names: readonly unknown[]) => {
+      const merged = mergeReadSkillSlugs(options.configurable.session_read_skill_slugs, names);
+      if (merged) options.configurable.session_read_skill_slugs = merged;
+    };
+    if (toolName === "use_skill" && loadedReceipt && typeof loadedSkillName === "string")
+      recordReadSkills([loadedSkillName]);
+    // compose_skills loads one primary plus its helpers, so a successful
+    // composition means every guide it named was read. A preloaded entry comes
+    // back marked instead of repeated, and it still counts: its text is in this
+    // turn's instructions, so it was read.
+    if (toolName === "compose_skills") {
+      const composed = compactMastraToolResult(result);
+      const shape = composed && typeof composed === "object"
+        ? composed as { status?: unknown; primary?: { name?: unknown }; helpers?: Array<{ name?: unknown }> } : undefined;
+      if (shape?.status === "composed")
+        recordReadSkills([shape.primary?.name, ...(shape.helpers ?? []).map(helper => helper.name)]);
+    }
     // A clarification request means the next short answer is a generation.
     if (toolName === "ask_clarification") options.configurable.session_clarification_asked = true;
     // Keep the exact library assets the model just received so the submit
