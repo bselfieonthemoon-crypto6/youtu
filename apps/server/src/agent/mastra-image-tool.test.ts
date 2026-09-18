@@ -759,7 +759,33 @@ describe("pre-submission refusal marking", () => {
     expect(submit).toHaveBeenCalledTimes(2);
   });
 
-  it("never marks a receipt that follows a submission attempt", async () => {
+  it("marks a database-level preflight rejection as a refusal, since nothing was written", async () => {
+    // The INSERT trigger is the AUTHORITATIVE gate; the in-process counter is only
+    // an optimisation, so this path must be marked too. It was the one refusal
+    // path that was still rendering as a red generation failure.
+    const configurable: Record<string, unknown> = { ...baseConfig.configurable, user_prompt: "生成四张海报" };
+    const exhausted = fixture();
+    exhausted.submit.mockRejectedValueOnce(
+      new MastraImagePreflightError("image_generation_run_limit", "本轮额度已满，未创建任务。"));
+    expect(await exhausted.generate.execute({ title: "第4页", prompt: "page" },
+      toolExecutionContext({ ...baseConfig, configurable })))
+      .toMatchObject({ status: "failed", error: "image_generation_run_limit", refused: true });
+    // An exhausted budget IS unfinished work, so it is recorded for "继续".
+    expect((configurable[SESSION_REFUSED_OUTPUTS_KEY] as Array<{ title: string }>).map(entry => entry.title))
+      .toEqual(["第4页"]);
+
+    // Any other preflight code is a request-shape or authorization problem: still a
+    // refusal, but NOT unfinished work the next turn must be told to finish.
+    const other: Record<string, unknown> = { ...baseConfig.configurable };
+    const rejected = fixture();
+    rejected.submit.mockRejectedValueOnce(new MastraImagePreflightError("image_preflight_rejected", "未创建任务。"));
+    expect(await rejected.generate.execute({ title: "海报", prompt: "poster" },
+      toolExecutionContext({ ...baseConfig, configurable: other })))
+      .toMatchObject({ status: "failed", error: "image_preflight_rejected", refused: true });
+    expect(other[SESSION_REFUSED_OUTPUTS_KEY]).toBeUndefined();
+  });
+
+  it("marks only receipts that created nothing, never one with an unknown or accepted outcome", async () => {
     // An unknown transport outcome may already own a durable task.
     const unknown = fixture();
     unknown.submit.mockRejectedValueOnce(new Error("transport lost"));
@@ -767,15 +793,17 @@ describe("pre-submission refusal marking", () => {
     expect(unknownReceipt).toMatchObject({ status: "unknown", error: "image_submission_unknown" });
     expect(unknownReceipt).not.toHaveProperty("refused");
 
-    // A proven no-write preflight rejection is decided INSIDE the submitter, so
-    // it is not a refusal reached before a submission attempt.
+    // A preflight rejection IS a refusal: it is thrown from the INSERT catch in
+    // mastra-image-jobs.ts before any durable write, and job-service.ts answers
+    // every one of those codes with its own "未创建新任务、未扣费" copy. The
+    // submitter being the component that decides it does not make anything have
+    // been created, so it must not be dressed as a generation failure.
     const preflight = fixture();
     preflight.submit.mockRejectedValueOnce(new MastraImagePreflightError("no_write", "not submitted"));
     const preflightReceipt = await preflight.generate.execute({ title: "海报", prompt: "poster" }, toolExecutionContext(baseConfig));
-    expect(preflightReceipt).toMatchObject({ status: "failed", error: "no_write" });
-    expect(preflightReceipt).not.toHaveProperty("refused");
+    expect(preflightReceipt).toMatchObject({ status: "failed", error: "no_write", refused: true });
 
-    // A submitted request is not a refusal either.
+    // A submitted request is not a refusal.
     const accepted = fixture();
     const acceptedReceipt = await accepted.generate.execute({ title: "海报", prompt: "poster" }, toolExecutionContext(baseConfig));
     expect(acceptedReceipt).toMatchObject({ status: "processing" });

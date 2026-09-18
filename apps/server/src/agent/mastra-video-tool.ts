@@ -55,6 +55,19 @@ export type MastraVideoToolDependencies = {
 
 type UnknownSubmissionReceipt = { status: "unknown"; error: "video_submission_unknown"; summary: string };
 
+/**
+ * The single place a pre-submission video refusal receipt is built.
+ *
+ * `refused: true` marks a receipt produced before any durable write: no job was
+ * created and nothing was charged, which is what every one of these summaries
+ * already says ("未提交视频生成"). The product must therefore not dress it as a
+ * "视频生成失败". Same contract as the image tool; `status` and every other field
+ * keep their existing meaning, and the marker is never inferred from prose.
+ */
+function refusal(error: string, summary: string) {
+  return { status: "failed" as const, error, summary, refused: true };
+}
+
 function resolutionRank(value: "720p" | "1080p" | "4k" | "480p" | "2160p") {
   return ({ "480p": 0, "720p": 1, "1080p": 2, "4k": 3, "2160p": 3 })[value];
 }
@@ -99,12 +112,12 @@ export function createMastraVideoTool(deps: MastraVideoToolDependencies) {
     execute: async (input, context) => {
     if (unknownReceipt) return unknownReceipt;
     const jobContext = contextFromToolContext(context);
-    if (!jobContext) return { status: "failed" as const, error: "video_context_unavailable",
-      summary: "当前视频任务缺少经过认证的运行上下文，未提交生成。" };
-    if (jobContext.signal.aborted) return { status: "failed" as const, error: "video_submission_canceled",
-      summary: "本轮已取消，未提交视频生成。" };
+    if (!jobContext) return refusal("video_context_unavailable",
+      "当前视频任务缺少经过认证的运行上下文，未提交生成。");
+    if (jobContext.signal.aborted) return refusal("video_submission_canceled",
+      "本轮已取消，未提交视频生成。");
     const selected = validateModel(input, deps.availableVideoModels);
-    if (!selected.ok) return { status: "failed" as const, error: selected.code, summary: selected.summary };
+    if (!selected.ok) return refusal(selected.code, selected.summary);
     const sourceAssetIds = input.sourceAssetIds ?? [];
     let attachmentMap = (runContextOf(context) as VideoToolRunContext).user_attachment_map as Record<string, string> | undefined;
     const unresolved = sourceAssetIds.filter(reference => !captureImageProposalSources([reference], attachmentMap));
@@ -116,16 +129,16 @@ export function createMastraVideoTool(deps: MastraVideoToolDependencies) {
         if (Object.keys(resolved).length !== new Set(unresolved).size) throw new Error("canvas_reference_not_found");
         attachmentMap = { ...(attachmentMap ?? {}), ...resolved };
       } catch {
-        return { status: "failed" as const, error: "invalid_video_reference",
-          summary: "参考图必须是本轮认证附件或当前画布的存活 assetId；不能传 URL 或历史链接。未提交视频生成。" };
+        return refusal("invalid_video_reference",
+          "参考图必须是本轮认证附件或当前画布的存活 assetId；不能传 URL 或历史链接。未提交视频生成。");
       }
     }
     const sources = captureImageProposalSources(sourceAssetIds, attachmentMap);
     if (sourceAssetIds.length && (!sources || sources.length !== sourceAssetIds.length))
-      return { status: "failed" as const, error: "invalid_video_reference", summary: "参考图来源无法绑定到当前认证资产，未提交视频生成。" };
+      return refusal("invalid_video_reference", "参考图来源无法绑定到当前认证资产，未提交视频生成。");
     const inputImages = sources?.map(source => attachmentMap?.[source.assetId]);
     if (inputImages && !inputImages.every((value): value is string => typeof value === "string"))
-      return { status: "failed" as const, error: "invalid_video_reference", summary: "参考图来源无法绑定到当前认证资产，未提交视频生成。" };
+      return refusal("invalid_video_reference", "参考图来源无法绑定到当前认证资产，未提交视频生成。");
     const submission: MastraVideoJobInput = {
       title: input.title, prompt: input.prompt, model: selected.model.id,
       ...(input.duration !== undefined ? { duration: input.duration } : {}),
@@ -143,7 +156,9 @@ export function createMastraVideoTool(deps: MastraVideoToolDependencies) {
           : "视频任务已提交或正在处理；请使用返回的 jobId 查询结果，不要重复提交。" };
     } catch (error) {
       if (error instanceof MastraVideoPreflightError) {
-        return { status: "failed" as const, error: error.code, summary: error.summary };
+        // Every throw site is a pre-creation check (scope, model, tier guard,
+        // price, credits), so nothing durable exists and nothing was charged.
+        return refusal(error.code, error.summary);
       }
       const diagnostic = error as { name?: string; code?: string; stack?: string };
       console.warn("[mastra-video-submit]", {

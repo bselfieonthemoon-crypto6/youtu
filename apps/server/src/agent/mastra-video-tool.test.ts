@@ -83,4 +83,29 @@ describe("Mastra native video tool", () => {
     expect(second).toEqual(first);
     expect(f.submit).toHaveBeenCalledOnce();
   });
+
+  it("marks every pre-submission refusal, so the UI cannot call it a failed generation", async () => {
+    // Video had the same misleading card as images: a refusal that created
+    // nothing and charged nothing rendered as a red "视频生成失败".
+    const f = fixture();
+    // A model outside the published catalog, an unsupported duration, and a
+    // missing authenticated run context are all decided before any submission.
+    await expect(f.tool.execute({ title: "视频", prompt: "动态", model: "veo-default" }, toolExecutionContext(config)))
+      .resolves.toMatchObject({ status: "failed", error: "video_model_required", refused: true });
+    await expect(f.tool.execute({ title: "视频", prompt: "动态", model: "workspace:video", duration: 3 }, toolExecutionContext(config)))
+      .resolves.toMatchObject({ status: "failed", error: "video_duration_unsupported", refused: true });
+    await expect(f.tool.execute({ title: "视频", prompt: "动态" }, toolExecutionContext({ configurable: config.configurable })))
+      .resolves.toMatchObject({ status: "failed", error: "video_context_unavailable", refused: true });
+    // A reference that binds to no authenticated asset is the same class.
+    await expect(f.tool.execute({ title: "视频", prompt: "动态", sourceAssetIds: [assetId] }, toolExecutionContext(config)))
+      .resolves.toMatchObject({ status: "failed", error: "invalid_video_reference", refused: true });
+    expect(f.submit).not.toHaveBeenCalled();
+
+    // An unknown transport outcome may own a durable task, so it is NOT a refusal.
+    const unknown = fixture();
+    unknown.submit.mockRejectedValueOnce(new Error("poll transport lost"));
+    const receipt = await unknown.tool.execute({ title: "视频", prompt: "动态", model: "workspace:video" }, toolExecutionContext(config));
+    expect(receipt).toMatchObject({ status: "unknown" });
+    expect(receipt).not.toHaveProperty("refused");
+  });
 });

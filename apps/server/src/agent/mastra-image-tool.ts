@@ -616,7 +616,21 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
       };
     } catch (error) {
       if (error instanceof MastraImagePreflightError) {
-        return { status: "failed" as const, error: error.code, summary: error.summary };
+        // The INSERT trigger rejected before any durable write, which makes this
+        // a pre-submission refusal exactly like the local gates above — so it must
+        // be marked as one. This is the AUTHORITATIVE run-limit gate (the local
+        // counter is only an optimisation), so leaving it unmarked meant a
+        // database-level budget rejection still rendered as a red generation
+        // failure carrying the raw code.
+        //
+        // Only an exhausted run budget means an output is still MISSING; the other
+        // preflight codes are request-shape or authorization problems, which the
+        // next turn must not be briefed to "finish".
+        if (error.code === "image_generation_run_limit")
+          recordRefusedOutput(configurable, { title: submission.title, prompt: submission.prompt,
+            ...(submission.operation ? { operation: submission.operation } : {}), aspectRatio: submission.aspectRatio,
+            sourceAssetIds: [...sourceAssetIds] });
+        return asRefusal({ status: "failed" as const, error: error.code, summary: error.summary });
       }
       // A transport failure can happen after the durable submitter inserted its
       // idempotency record. Do not claim that nothing was created or retry.
