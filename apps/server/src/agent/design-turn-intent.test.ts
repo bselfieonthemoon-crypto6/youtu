@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { MessageMention } from "@loomic/shared";
 
-import { classifyDesignTurnIntent, extractStyleHints, extractTargetSizes, mergeStyleHints, selectPrimarySkill, shouldReplaceSessionSeries } from "./design-turn-intent.js";
+import { classifyDesignTurnIntent, extractStyleHints, extractTargetSizes, mergeStyleHints, selectHelperSkills, selectPrimarySkill, shouldReplaceSessionSeries } from "./design-turn-intent.js";
 
 const skillMention = (slug: string): MessageMention => ({ mentionType: "skill", id: slug, label: slug, slug });
 
@@ -18,6 +18,20 @@ const routingSkills = [
 ];
 const select = (prompt: string, mentions: MessageMention[] = []) =>
   selectPrimarySkill({ prompt, mentions, skills: routingSkills });
+
+/** Helper tier: modifiers of a deliverable, declared with tier: "helper". */
+const helperRoute = (name: string, keywords: string[]) =>
+  ({ name, metadata: { loomic: { routing: { keywords, priority: 0, tier: "helper" } } } });
+const helperSkills = [
+  helperRoute("background-removal", ["去背景", "去掉背景", "背景去掉", "透明底", "抠图"]),
+  helperRoute("design-copywriting", ["文案", "写文案", "标题文案"]),
+  helperRoute("design-review", ["评审", "点评"]),
+  helperRoute("json-image-prompt", ["提示词", "生图提示"]),
+];
+const allSkills = [...routingSkills, ...helperSkills];
+const selectHelpers = (prompt: string, max?: number) =>
+  selectHelperSkills({ prompt, skills: allSkills, ...(max !== undefined ? { max } : {}) });
+const selectAny = (prompt: string) => selectPrimarySkill({ prompt, mentions: [], skills: allSkills });
 
 function classify(prompt: string, options: { mentions?: MessageMention[]; activeSkill?: string | null; hasSeries?: boolean } = {}) {
   return classifyDesignTurnIntent({ prompt, mentions: options.mentions ?? [], activeSkill: options.activeSkill ?? null,
@@ -146,6 +160,45 @@ describe("selectPrimarySkill", () => {
     expect(select("做一个游戏活动的宣传海报")).toBe("campaign-design");
     // Priority still breaks an exact score tie.
     expect(select("做个logo")).toBe("logo-design");
+  });
+});
+
+describe("selectHelperSkills", () => {
+  it("preloads a matching helper for the turn's own words", () => {
+    // Regression: this used to route nothing at all, so the background-removal
+    // guide only reached the model if it discovered it by itself.
+    expect(selectHelpers("把这张图的背景去掉")).toEqual(["background-removal"]);
+    expect(selectHelpers("写一句海报文案")).toEqual(["design-copywriting"]);
+  });
+
+  it("never lets a helper take the primary deliverable slot", () => {
+    // A prompt carrying only helper keywords has no deliverable, so it must not
+    // be promoted to a primary Skill just because a helper matched.
+    expect(selectAny("把这张图的背景去掉")).toBeUndefined();
+    expect(selectAny("写一句文案")).toBeUndefined();
+    // A real deliverable still wins the primary slot while helpers ride along.
+    expect(selectAny("做一张活动海报，写一句文案")).toBe("campaign-design");
+    expect(selectHelpers("做一张活动海报，写一句文案")).toEqual(["design-copywriting"]);
+  });
+
+  it("caps how many helpers one prompt can pull in", () => {
+    const crowded = "做一张海报，写文案，再点评一下，顺便优化提示词";
+    expect(selectHelpers(crowded)).toHaveLength(2);
+    expect(selectHelpers(crowded, 1)).toHaveLength(1);
+    expect(selectHelpers(crowded, 4).length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("returns nothing when no helper matches", () => {
+    expect(selectHelpers("生成一张促销海报")).toEqual([]);
+    expect(selectHelpers("你好呀")).toEqual([]);
+  });
+
+  it("resolves helpers independently of the turn label", () => {
+    // A review or prompt-optimisation request classifies as non_design yet still
+    // needs its guide, so helper resolution cannot be gated on the turn label.
+    expect(classify("帮我评审一下这版设计")).toBe("non_design");
+    expect(selectHelpers("帮我评审一下这版设计")).toEqual(["design-review"]);
+    expect(selectHelpers("优化一下提示词")).toEqual(["json-image-prompt"]);
   });
 });
 

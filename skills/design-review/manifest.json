@@ -10,6 +10,19 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "routing": {
+        "keywords": [
+          "评审",
+          "审阅",
+          "检查设计",
+          "设计检查",
+          "点评",
+          "审一下",
+          "design review"
+        ],
+        "priority": 0,
+        "tier": "helper"
+      },
       "execution": "guidance",
       "intents": [
         "design-review",

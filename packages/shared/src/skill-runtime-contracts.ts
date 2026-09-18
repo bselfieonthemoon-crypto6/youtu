@@ -32,6 +32,14 @@ export const skillRuntimeMetadataSchema = z.object({
   routing: z.object({
     keywords: z.array(z.string().min(1).max(60)).min(1).max(30),
     priority: z.number().int().min(0).max(1000),
+    /**
+     * `primary` (the default) Skills compete for the single routed deliverable
+     * slot. `helper` Skills never compete for it: workflow / reference / prompt /
+     * domain guides are modifiers of a deliverable, not deliverables, so the
+     * runtime preloads every matching helper ALONGSIDE the primary Skill. Making
+     * them primaries instead would let a modifier hijack a turn's main Skill.
+     */
+    tier: z.enum(["primary", "helper"]).optional(),
   }).strict().optional(),
   models: z.array(z.object({
     role: skillModelRoleSchema,

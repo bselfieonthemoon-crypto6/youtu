@@ -10,6 +10,18 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "routing": {
+        "keywords": [
+          "分析这张图",
+          "分析图片",
+          "参考图分析",
+          "拆解这张图",
+          "图片分析",
+          "reference analysis"
+        ],
+        "priority": 0,
+        "tier": "helper"
+      },
       "execution": "guidance",
       "intents": [
         "reference-analysis",

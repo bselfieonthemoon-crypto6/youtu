@@ -27,7 +27,7 @@ import { compileMastraMemoryContext } from "./mastra-memory-adapter.js";
 import { APIYI_VIDEO_MODELS } from "../generation/providers/apiyi-video.js";
 import { createMastraImageJobScopeQuery, createMastraImageStatusTools } from "./mastra-image-status-tools.js";
 import { createMastraLibraryTools, loadLibraryAssetRows, sampleRandom } from "./mastra-library-tools.js";
-import { classifyDesignTurnIntent, extractStyleHints, extractTargetSizes, mergeStyleHints, selectPrimarySkill, shouldReplaceSessionSeries } from "./design-turn-intent.js";
+import { classifyDesignTurnIntent, extractStyleHints, extractTargetSizes, mergeStyleHints, selectHelperSkills, selectPrimarySkill, shouldReplaceSessionSeries } from "./design-turn-intent.js";
 import { explicitNonstandardRatio } from "./image-ratio-intent.js";
 import { formatEnabledSkillCatalog } from "./design-skill-catalog.js";
 import { loadSessionDesignContext, saveSessionDesignContext, sessionSkillMemoryEnabled } from "./session-design-context.js";
@@ -168,6 +168,18 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     const seriesApplied = designIntent === "series_continuation" && designContext?.series ? designContext.series : undefined;
     const preloadedSkill = (designIntent === "new_generation" || designIntent === "series_continuation")
       ? skills.find(skill => skill.name === activeSkill) : undefined;
+    // Helper guides are preloaded ALONGSIDE the primary Skill, never instead of
+    // it. They are modifiers of a deliverable (workflow / reference / prompt /
+    // domain), so they must not compete for the primary slot — but they must
+    // reach the model in this same turn. The keyword match IS the gate: a review
+    // or prompt-optimisation request classifies as non_design yet still needs its
+    // guide, so helpers are resolved independently of the turn label.
+    const helperSkills = selectHelperSkills({ prompt: run.prompt, skills })
+      .map(name => skills.find(skill => skill.name === name))
+      .filter((skill): skill is (typeof skills)[number] => Boolean(skill) && skill!.name !== activeSkill);
+    if (helperSkills.length)
+      console.info("[skill-dispatch]", { runId: run.runId, intent: designIntent,
+        primary: activeSkill ?? null, helpers: helperSkills.map(skill => skill.name) });
     if (designIntent === "new_generation" && routedSkill && priorSkill && routedSkill !== priorSkill)
       console.info("[session-design-context]", { runId: run.runId, intent: designIntent, switchedTo: routedSkill, from: priorSkill });
     // Series preferences apply only to continuation; a new generation replaces
@@ -525,10 +537,17 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
       ? `【本轮为系列延续｜方法参考】保持会话中的风格${seriesApplied.style ? `（${seriesApplied.style}）` : ""}` +
         `与尺寸${seriesApplied.sizes?.length ? `（${seriesApplied.sizes.join("、")}）` : ""}，除非用户明确要求改变。`
       : "";
+    // Matching helper guides for this turn, preloaded deterministically so the
+    // model does not have to discover them. Method reference only: no guide
+    // grants execution, model, ratio or billing authority.
+    const helperSkillInstruction = helperSkills.length
+      ? helperSkills.map(skill =>
+          `【本轮匹配的助手技能 ${skill.name} v${skill.version}（方法参考，不是执行授权）】\n${skill.content}`).join("\n\n")
+      : "";
     // Runtime carries routing/state only; skill-specific method text (prompt
     // wording, material reuse) lives in the Skill body, which is preloaded above.
     const sessionInstructions = [toolkit.instructions, skillCatalog, preloadedSkillInstruction,
-      nonstandardSizeInstruction, seriesInstruction].filter(Boolean).join("\n\n");
+      nonstandardSizeInstruction, helperSkillInstruction, seriesInstruction].filter(Boolean).join("\n\n");
     try {
       for await (const event of streamMastraDesignAgent({ run, model, messages, tools: toolkit.tools, configurable,
         skillMetadata, contextBudget: budget,

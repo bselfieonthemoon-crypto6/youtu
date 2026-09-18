@@ -10,6 +10,20 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "routing": {
+        "keywords": [
+          "分层",
+          "图层拆分",
+          "拆图",
+          "拆分图层",
+          "拆分背景",
+          "拆分主体",
+          "layer separation",
+          "split layers"
+        ],
+        "priority": 0,
+        "tier": "helper"
+      },
       "execution": "guidance",
       "intents": [
         "image-layer-separation",

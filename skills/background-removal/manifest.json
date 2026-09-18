@@ -10,6 +10,26 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "routing": {
+        "keywords": [
+          "去背景",
+          "去掉背景",
+          "背景去掉",
+          "背景透明",
+          "抠图",
+          "抠出",
+          "抠掉",
+          "透明底",
+          "透明背景",
+          "去底",
+          "去背",
+          "remove background",
+          "cutout",
+          "transparent background"
+        ],
+        "priority": 0,
+        "tier": "helper"
+      },
       "execution": "image",
       "intents": [
         "background-removal",

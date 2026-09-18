@@ -10,6 +10,18 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "routing": {
+        "keywords": [
+          "创意方向",
+          "概念方案",
+          "几个方向",
+          "方向探索",
+          "创意概念",
+          "creative direction"
+        ],
+        "priority": 0,
+        "tier": "helper"
+      },
       "execution": "guidance",
       "intents": [
         "concept",

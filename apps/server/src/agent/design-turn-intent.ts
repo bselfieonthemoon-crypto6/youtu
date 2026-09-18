@@ -79,7 +79,10 @@ export function extractStyleHints(prompt: string): string | undefined {
   return hints.length ? hints.slice(0, 6).join("、") : undefined;
 }
 
-export type SkillRouteSource = { name: string; metadata?: Record<string, unknown> | undefined };export type SkillRoute = { skill: string; keywords: string[]; priority: number };
+export type SkillRouteSource = { name: string; metadata?: Record<string, unknown> | undefined };
+export type SkillTier = "primary" | "helper";
+/** `tier` decides which slot a Skill competes for; see `selectHelperSkills`. */
+export type SkillRoute = { skill: string; keywords: string[]; priority: number; tier: SkillTier };
 
 function mentionSkillSlugs(mentions: readonly MessageMention[]): string[] {
   return mentions
@@ -92,12 +95,48 @@ export function skillRoutesFromMetadata(skills: readonly SkillRouteSource[]): Sk
   const routes: SkillRoute[] = [];
   for (const skill of skills) {
     const loomic = skill.metadata?.loomic as Record<string, unknown> | undefined;
-    const routing = loomic?.routing as { keywords?: unknown; priority?: unknown } | undefined;
+    const routing = loomic?.routing as { keywords?: unknown; priority?: unknown; tier?: unknown } | undefined;
     if (!routing || !Array.isArray(routing.keywords) || typeof routing.priority !== "number") continue;
     const keywords = routing.keywords.filter((keyword): keyword is string => typeof keyword === "string" && keyword.trim().length > 0);
-    if (keywords.length) routes.push({ skill: skill.name, keywords, priority: routing.priority });
+    if (keywords.length) routes.push({ skill: skill.name, keywords, priority: routing.priority,
+      tier: routing.tier === "helper" ? "helper" : "primary" });
   }
   return routes.sort((left, right) => right.priority - left.priority || left.skill.localeCompare(right.skill));
+}
+
+/** Length-weighted keyword score shared by the primary and helper tiers. */
+function routeScore(text: string, keywords: readonly string[]): number {
+  let score = 0;
+  for (const keyword of new Set(keywords)) {
+    if (text.includes(keyword.toLowerCase())) score += keyword.length;
+  }
+  return score;
+}
+
+/**
+ * Matching HELPER Skills, highest scoring first.
+ *
+ * Workflow / reference / prompt / domain guides modify a deliverable rather than
+ * being one, so they must never take the single primary slot — but they must
+ * still reach the model in the SAME turn. Relying on the model to notice them in
+ * the compact catalog is what made Skill dispatch feel unreliable: a weak model
+ * simply skipped the extra `list_skills` + `use_skill` round trip.
+ *
+ * Only the top `max` matches are returned so one broad prompt ("海报文案") cannot
+ * flood the context with every guide.
+ */
+export function selectHelperSkills(input: {
+  prompt: string; skills: readonly SkillRouteSource[]; max?: number;
+}): string[] {
+  const text = input.prompt.toLowerCase();
+  const scored: Array<{ skill: string; score: number }> = [];
+  for (const route of skillRoutesFromMetadata(input.skills)) {
+    if (route.tier !== "helper") continue;
+    const score = routeScore(text, route.keywords);
+    if (score) scored.push({ skill: route.skill, score });
+  }
+  scored.sort((left, right) => right.score - left.score || left.skill.localeCompare(right.skill));
+  return scored.slice(0, input.max ?? 2).map(entry => entry.skill);
 }
 
 /**
@@ -140,10 +179,9 @@ export function selectPrimarySkill(input: {
   const text = input.prompt.toLowerCase();
   let best: { skill: string; score: number; priority: number } | undefined;
   for (const route of skillRoutesFromMetadata(input.skills)) {
-    let score = 0;
-    for (const keyword of new Set(route.keywords)) {
-      if (text.includes(keyword.toLowerCase())) score += keyword.length;
-    }
+    // A helper guide must never take the deliverable slot.
+    if (route.tier === "helper") continue;
+    const score = routeScore(text, route.keywords);
     if (!score) continue;
     // Higher score wins; declaration priority is only a tie-breaker, so it can
     // no longer override a clearly better-matching Skill.

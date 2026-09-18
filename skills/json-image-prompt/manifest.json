@@ -10,6 +10,16 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "routing": {
+        "keywords": [
+          "提示词",
+          "生图提示",
+          "提示词优化",
+          "image prompt"
+        ],
+        "priority": 0,
+        "tier": "helper"
+      },
       "execution": "guidance",
       "intents": [
         "image-prompt",

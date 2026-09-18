@@ -10,6 +10,18 @@
     "bundle": "loomic-design-skills-v2",
     "loomic": {
       "schemaVersion": 1,
+      "routing": {
+        "keywords": [
+          "文案",
+          "写文案",
+          "标题文案",
+          "卖点文案",
+          "广告语",
+          "copywriting"
+        ],
+        "priority": 0,
+        "tier": "helper"
+      },
       "execution": "guidance",
       "intents": [
         "copywriting",
