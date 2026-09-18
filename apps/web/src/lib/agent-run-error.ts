@@ -12,6 +12,12 @@ const contextMessages: Record<string, string> = {
   agent_context_scope_forbidden: "当前账号已无权访问这段任务上下文。请确认登录账号和项目权限后继续。",
   agent_context_task_forbidden: "当前账号已无权访问这项任务。请确认登录账号和项目权限后继续。",
   agent_context_forbidden: "当前账号已无权访问这段任务上下文。请确认登录账号和项目权限后继续。",
+  // Transient upstream failures. The server already renders these, but keeping
+  // them here guarantees actionable wording even if only the reason code arrives
+  // (an upstream 5xx can carry an empty message body, which previously produced
+  // a generic "请求处理失败" with nothing the user could act on).
+  provider_unavailable: "模型服务暂时不可用，系统已自动重试仍未成功。这通常是上游临时抖动，稍后重试即可；本轮没有提交任何生成任务，不会产生扣费。",
+  provider_rate_limited: "模型服务当前请求过多，系统已自动重试仍未成功。请稍等片刻再发一次；本轮没有提交任何生成任务，不会产生扣费。",
 };
 
 /** Presentation only: does not restart a run, replay a tool, or switch models. */
