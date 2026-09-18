@@ -191,12 +191,29 @@ export function selectPrimarySkill(input: {
   return best?.skill;
 }
 
+/** Frame ratios whose colon pair is a size even though it reads like a time. */
+const STANDARD_RATIO_PRESETS = new Set([
+  "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9", "2:1", "1:2",
+]);
+/** `H:MM` with a real hour and a two-digit minute, i.e. a clock time. */
+const CLOCK_TIME_PATTERN = /^(?:[01]?\d|2[0-3]):[0-5]\d$/;
+
 /** Deterministic "WxH" / "W:H" targets present in the current request. */
 export function extractTargetSizes(prompt: string): string[] {
   const sizes = new Set<string>();
   // Store every target as W:H so series sizes always compare as ratios.
+  // The `x`/`×`/`*` form is already unambiguous: a clock time never uses it.
   for (const match of prompt.matchAll(/(\d{2,5})\s*[x×*]\s*(\d{2,5})/g)) sizes.add(`${match[1]}:${match[2]}`);
-  for (const match of prompt.matchAll(/(\d{1,5})\s*[:：]\s*(\d{1,5})/g)) sizes.add(`${match[1]}:${match[2]}`);
+  for (const match of prompt.matchAll(/(\d{1,5})\s*[:：]\s*(\d{1,5})/g)) {
+    const pair = `${match[1]}:${match[2]}`;
+    // "9:16" is a frame and "9:00" is a clock time; both are numerically valid as
+    // either, so judge each pair on its own instead of the whole sentence. A
+    // meeting time read as a size used to sediment into the session series, and
+    // treating the sentence as "has size wording" would still capture the time
+    // whenever a real size appeared in the same turn.
+    if (CLOCK_TIME_PATTERN.test(pair) && !STANDARD_RATIO_PRESETS.has(pair)) continue;
+    sizes.add(pair);
+  }
   return [...sizes];
 }
 

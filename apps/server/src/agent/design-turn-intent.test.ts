@@ -218,6 +218,20 @@ describe("extractTargetSizes", () => {
   it("captures pixel and ratio targets", () => {
     expect(extractTargetSizes("目标宽高 656×288")).toEqual(["656:288"]);
     expect(extractTargetSizes("做成 1200:628 的横幅")).toEqual(["1200:628"]);
+    // Size wording makes a small colon pair unambiguous.
+    expect(extractTargetSizes("比例 16:9")).toEqual(["16:9"]);
+    expect(extractTargetSizes("做成 9:16 竖版")).toEqual(["9:16"]);
+    // Numbers this large cannot be a clock time.
+    expect(extractTargetSizes("尺寸 1080:1920")).toEqual(["1080:1920"]);
+  });
+
+  it("never reads a clock time as an output size", () => {
+    // Regression: these sedimented into the session series as fake dimensions.
+    expect(extractTargetSizes("会议 10:30 开始")).toEqual([]);
+    expect(extractTargetSizes("下午 14:00 之前给我")).toEqual([]);
+    expect(extractTargetSizes("每天 9:00 发一条")).toEqual([]);
+    // A time and a real size in one turn: only the size survives.
+    expect(extractTargetSizes("10:30 前给我，尺寸 1200:628")).toEqual(["1200:628"]);
   });
 });
 
