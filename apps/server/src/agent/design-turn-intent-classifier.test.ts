@@ -50,14 +50,20 @@ describe("assessDesignTurnIntent — deterministic pre-filter", () => {
       hasSeries: false, hasAttachments: false }))
       .toMatchObject({ intent: "non_design", rule: "hedged_negation", needsModel: true,
         rules: expect.arrayContaining(["hedged_negation", "generation_verb"]) });
-    // No rule matched at all. This deliberately includes small talk: the spec
-    // accepts one cheap call rather than guessing on an unmatched turn, and the
-    // verdict is clamped to a routing hint either way.
+    // No rule matched at all, and NOTHING is remembered: measured against the new
+    // proof this is provably inert — nothing preloads any more, and with no series
+    // there is nothing for a verdict to apply — so the call is skipped instead of
+    // being spent "in case". With a series remembered the same turn does need the
+    // model, because only a verdict can recognise a continuation; both columns are
+    // asserted in the guard block below.
     expect(assessDesignTurnIntent({ prompt: NO_RULE, mentions: [], activeSkill: null,
       hasSeries: false, hasAttachments: false }))
-      .toMatchObject({ intent: "non_design", rule: "no_rule", needsModel: true });
+      .toMatchObject({ intent: "non_design", rule: "no_rule", needsModel: false });
     expect(assessDesignTurnIntent({ prompt: "你好呀", mentions: [], activeSkill: null,
       hasSeries: false, hasAttachments: false }))
+      .toMatchObject({ intent: "non_design", rule: "no_rule", needsModel: false });
+    expect(assessDesignTurnIntent({ prompt: NO_RULE, mentions: [], activeSkill: null,
+      hasSeries: true, hasAttachments: false }))
       .toMatchObject({ intent: "non_design", rule: "no_rule", needsModel: true });
     // A pending clarification with a factual answer is a weak default, not a rule.
     expect(assessDesignTurnIntent({ prompt: "简约现代，黑白配色", mentions: [], activeSkill: null,
@@ -253,24 +259,20 @@ describe("describeDesignRouting — notice copy", () => {
   });
 });
 
-/** The same input shape the runtime uses, with the optional evidence made explicit. */
-function assessWith(prompt: string, extra: {
-  activeSkill?: string | null; hasSeries?: boolean; skillKeywordMatched?: boolean;
-} = {}) {
+/** The same input shape the runtime uses. */
+function assessWith(prompt: string, extra: { activeSkill?: string | null; hasSeries?: boolean } = {}) {
   return assessDesignTurnIntent({
     prompt, mentions: [], activeSkill: extra.activeSkill ?? null, hasSeries: extra.hasSeries ?? false,
     hasAttachments: false,
-    ...(extra.skillKeywordMatched !== undefined ? { skillKeywordMatched: extra.skillKeywordMatched } : {}),
   });
 }
 
 const resolveWith = (prompt: string, extra: {
-  activeSkill?: string | null; hasSeries?: boolean; skillKeywordMatched?: boolean;
+  activeSkill?: string | null; hasSeries?: boolean;
   classifier?: DesignTurnIntentClassifier;
 }) => resolveDesignTurnIntent({
   prompt, mentions: [], activeSkill: extra.activeSkill ?? null, hasSeries: extra.hasSeries ?? false,
   hasAttachments: false,
-  ...(extra.skillKeywordMatched !== undefined ? { skillKeywordMatched: extra.skillKeywordMatched } : {}),
   ...(extra.classifier ? { classifier: extra.classifier } : {}),
   signal: new AbortController().signal,
 });
@@ -330,89 +332,83 @@ describe("a lone generic edit verb is deferred instead of published as decisive"
 });
 
 describe("provably inert no_rule turns skip the model call", () => {
-  it("(a) skips when nothing can be preloaded and nothing can be reused", () => {
-    // PROOF, not a heuristic: with no keyword match, `activeSkill === null` and no
-    // remembered series, all four possible model verdicts are no-ops —
-    // `non_design` matches the deterministic verdict; `new_generation` cannot fill
-    // the primary slot (which comes from a keyword match or an @Skill mention)
-    // and has no series to replace; `series_continuation` has nothing to reuse;
-    // `local_edit` preloads nothing and leaves remembered state alone.
+  it("(a) skips when nothing is remembered for a verdict to act on", () => {
+    // PROOF, not a heuristic: the runtime injects no Skill body, so NO verdict can
+    // preload anything; and with no remembered series the only verdict that changes
+    // behaviour (`series_continuation`, which applies `designContext.series`) has
+    // nothing to apply. So all four labels are no-ops and the call is pure latency.
     for (const prompt of ["你好呀", "谢谢", "好的", ...CONTINUATION_PHRASINGS]) {
-      expect(assessWith(prompt, { skillKeywordMatched: false }), prompt).toMatchObject({
+      expect(assessWith(prompt, {}), prompt).toMatchObject({
         intent: "non_design", reasonCode: "unclear", rule: "no_rule", confidence: 0.3, needsModel: false,
       });
     }
   });
 
-  it("(a) is switched off as soon as a keyword matched or something is remembered", () => {
-    // A matched keyword is real routing evidence: the model may legitimately turn
-    // this turn into a `new_generation` that preloads that Skill. "多张" matches
-    // series-visual-design's declared keyword and reaches `no_rule`, so it must
-    // still cost its model call in BOTH contexts.
-    for (const context of [{}, { hasSeries: true }, { activeSkill: "series-visual-design", hasSeries: true }]) {
-      expect(assessWith("多张", { ...context, skillKeywordMatched: true }), JSON.stringify(context))
-        .toMatchObject({ rule: "no_rule", needsModel: true });
-    }
-    // The SAME continuation phrasing legitimately flips on the remember-state: with
-    // nothing remembered the call is provably inert (a), with a series or a sticky
-    // Skill it is the only way to reuse them. These two columns are both correct —
-    // do not "fix" one into the other.
-    for (const prompt of CONTINUATION_PHRASINGS) {
-      expect(assessWith(prompt, { skillKeywordMatched: false, hasSeries: true }), prompt)
-        .toMatchObject({ rule: "no_rule", needsModel: true });
-      expect(assessWith(prompt, { skillKeywordMatched: false, activeSkill: "campaign-design" }), prompt)
-        .toMatchObject({ rule: "no_rule", needsModel: true });
+  it("(a) is switched off by remembered state — and by nothing else", () => {
+    // The SAME phrasing flips on the remember-state, and both columns are correct:
+    // with nothing remembered the call is provably inert, with a series it is the
+    // only way to reuse it. Do not "fix" one column into the other.
+    for (const prompt of ["多张", ...CONTINUATION_PHRASINGS]) {
+      expect(assessWith(prompt, {}), prompt).toMatchObject({ rule: "no_rule", needsModel: false });
+      expect(assessWith(prompt, { hasSeries: true }), prompt).toMatchObject({ rule: "no_rule", needsModel: true });
     }
   });
 
-  it("keeps the conservative behaviour when the caller supplies no keyword evidence", () => {
-    // Every caller and test that predates `skillKeywordMatched` must be unchanged:
-    // `undefined` means nothing is provable, so the old `needsModel: true` stands.
-    for (const prompt of ["你好呀", "谢谢", "好的", NO_RULE, ...CONTINUATION_PHRASINGS]) {
-      expect(assessWith(prompt), prompt).toMatchObject({ rule: "no_rule", needsModel: true });
+  it("does not keep the call for remember-state that no verdict reads", () => {
+    // `activeSkill` is session memory for the notice and the persisted context. No
+    // verdict acts on it now that nothing is preloaded, so on its own it must not
+    // buy a model call — this is the difference the removal of the keyword evidence
+    // made. A matched keyword is likewise no longer routing evidence, for the same
+    // reason: there is no preload left for it to gate.
+    for (const prompt of ["你好呀", ...CONTINUATION_PHRASINGS]) {
+      expect(assessWith(prompt, { activeSkill: "campaign-design" }), prompt)
+        .toMatchObject({ rule: "no_rule", needsModel: false });
     }
+    expect(assessWith("还是老样子", { activeSkill: "campaign-design", hasSeries: true }))
+      .toMatchObject({ rule: "no_rule", needsModel: true });
   });
 
   it("(b) skips an acknowledgement only when the WHOLE turn is one", () => {
     for (const prompt of ["你好", "您好", "hi", "hello", "好的", "好", "嗯", "嗯嗯", "谢谢", "多谢", "收到", "明白", "ok",
       "好的好的", "OK!", " 你好。 "]) {
-      expect(assessWith(prompt, { skillKeywordMatched: false, hasSeries: true }), prompt)
+      expect(assessWith(prompt, { hasSeries: true }), prompt)
         .toMatchObject({ rule: "no_rule", needsModel: false });
     }
     // `在吗` is in the closed class but never even reaches the skip: the question
     // pattern already resolves it deterministically. Same outcome, other rule.
-    expect(assessWith("在吗", { skillKeywordMatched: false, hasSeries: true }))
+    expect(assessWith("在吗", { hasSeries: true }))
       .toMatchObject({ intent: "non_design", rule: "informational_question", needsModel: false });
     // Hard requirement: a continuation that merely STARTS with an acknowledgement
     // is not one. With a remembered series (a) cannot fire, so (b) is the only
     // candidate skip here — and it must not fire.
     for (const prompt of ["好的，还是老样子", "嗯嗯，照旧", "谢谢，按之前的来", "你好，帮我看下那个风格"]) {
-      expect(assessWith(prompt, { skillKeywordMatched: false, hasSeries: true }), prompt)
+      expect(assessWith(prompt, { hasSeries: true }), prompt)
         .toMatchObject({ rule: "no_rule", needsModel: true });
     }
     // The closed class is closed: greetings and thanks outside it are not skipped
     // just for looking social.
     for (const prompt of ["你好呀", "多谢啦", "太感谢了"]) {
-      expect(assessWith(prompt, { skillKeywordMatched: false, hasSeries: true }), prompt)
+      expect(assessWith(prompt, { hasSeries: true }), prompt)
         .toMatchObject({ rule: "no_rule", needsModel: true });
     }
-    // A matched keyword also switches (b) off, so an acknowledgement that happens
-    // to be some manifest's keyword can still reach the model.
-    expect(assessWith("好的", { skillKeywordMatched: true, hasSeries: true }))
-      .toMatchObject({ rule: "no_rule", needsModel: true });
+    // Declared keywords no longer participate: with nothing preloaded there is no
+    // routing decision for them to gate, so (b) is decided by the turn's own words
+    // alone. A package that declares an acknowledgement token as a routing keyword
+    // has a manifest problem, which the strict schema and the dispatch-outcome log
+    // surface — the guard no longer silently compensates for it.
   });
 
   it("never calls the classifier for a skipped turn and keeps the deterministic verdict", async () => {
     const classifier = vi.fn<DesignTurnIntentClassifier>(async () => ({ intent: "series_continuation", reasonCode: "series_continuation", confidence: 0.9 }));
     for (const prompt of ["你好呀", "谢谢", "好的", ...CONTINUATION_PHRASINGS]) {
-      const resolution = await resolveWith(prompt, { skillKeywordMatched: false, classifier });
+      const resolution = await resolveWith(prompt, { classifier });
       expect(resolution, prompt).toMatchObject({ intent: "non_design", reasonCode: "unclear",
         confidence: 0.3, source: "deterministic", clamped: false });
     }
     expect(classifier).not.toHaveBeenCalled();
     // The same phrasing WITH something remembered reaches the model and is
     // refined as usual.
-    const remembered = await resolveWith("还是老样子", { skillKeywordMatched: false, activeSkill: "campaign-design",
+    const remembered = await resolveWith("还是老样子", { activeSkill: "campaign-design",
       hasSeries: true, classifier: classifierReturning({ intent: "series_continuation", reasonCode: "series_continuation", confidence: 0.9 }) });
     expect(remembered).toMatchObject({ intent: "series_continuation", source: "model", clamped: false });
   });

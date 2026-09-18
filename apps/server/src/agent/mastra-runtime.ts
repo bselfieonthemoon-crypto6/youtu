@@ -187,28 +187,22 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     // Session-level sticky Skill + series state. Method routing only: the
     // output is a hint and never authorizes execution or billing.
     const designContext = sessionMemoryOn ? loadedDesignContext : null;
-    // ── Turn routing (R1) ────────────────────────────────────────────────────
-    // The regex pre-filter runs for free; ONE structured-output model call is
-    // spent only when that pre-filter reports a genuine conflict or no match at
-    // all, and any classifier failure/timeout falls back to the regex verdict.
-    // The resulting label is a routing hint for method selection only: it never
-    // authorizes execution, billing, ratio or image source.
+    // ── Turn verdict ─────────────────────────────────────────────────────────
+    // The regex pre-filter runs for free; ONE structured-output model call is spent
+    // only when that pre-filter cannot resolve the turn (a genuine conflict, or no
+    // rule at all while something remembered is worth protecting), and any
+    // classifier failure/timeout falls back to the regex verdict.
     //
-    // Skill keyword evidence is computed ONCE, here, BEFORE the turn verdict: it
-    // is the same pure selection the preload below uses (no second match that
-    // could drift), it tells the verdict whether a `no_rule` turn has anything to
-    // route at all, and `explainPrimarySkillSelection` is cheap enough to run on
-    // every turn — it only scores declared keywords.
-    const routingSelection = explainPrimarySkillSelection({ prompt: run.prompt, mentions: run.mentions, skills });
-    const routedHelperSkillSlugs = selectHelperSkills({ prompt: run.prompt, skills });
-    const skillKeywordMatched = Boolean(routingSelection?.mentioned || routingSelection?.keywords.length)
-      || routedHelperSkillSlugs.length > 0;
+    // The label is a hint for METHOD SELECTION ONLY. It never authorizes execution,
+    // billing, ratio or image source, and it no longer selects a Skill: the runtime
+    // injects no Skill body at all, so the model selects from the catalog and reads
+    // with use_skill/compose_skills. See `isProvablyInertNoRuleTurn` for exactly
+    // which verdicts still can and cannot change behaviour.
     const turnIntent = await resolveDesignTurnIntent({
       prompt: run.prompt, mentions: run.mentions,
       activeSkill: designContext?.activeSkill ?? null, hasSeries: Boolean(designContext?.series),
       hasAttachments: run.attachments.length > 0,
       clarificationPending: designContext?.awaitingClarification === true,
-      skillKeywordMatched,
       classifier: turnIntentClassifier, signal: run.signal,
     });
     const designIntent = turnIntent.intent;
@@ -219,32 +213,30 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
         intent: designIntent, reasonCode: turnIntent.reasonCode, rule: turnIntent.assessment.rule,
         rules: turnIntent.assessment.rules, confidence: turnIntent.confidence, clamped: turnIntent.clamped });
     const enabledSkillSlugs = new Set(skills.map(skill => skill.name));
-    // The selection carries its own evidence (matched keywords) so the routing
-    // notice can explain the choice instead of inventing a reason. Only a
-    // `new_generation` verdict may preload a primary, so only that verdict reads
-    // the selection — the computation above is pure and reused, never re-run.
-    const primarySelection = designIntent === "new_generation" ? routingSelection : undefined;
+    // Candidate evidence for the notice and the dispatch log ONLY. Nothing is
+    // preloaded from it: this is what the user's own words happened to match, and
+    // the model decides from the catalog whether to read any of it. The user's own
+    // word is the honest reason shown back to them, which is why the notice reports
+    // 候选 rather than a selection.
+    const primarySelection = designIntent === "new_generation"
+      ? explainPrimarySkillSelection({ prompt: run.prompt, mentions: run.mentions, skills }) : undefined;
     const routedSkill = primarySelection?.skill;
     const priorSkill = designContext?.activeSkill && enabledSkillSlugs.has(designContext.activeSkill)
       ? designContext.activeSkill : undefined;
-    // No confidence, no guess. When a NEW brief matches no deliverable Skill we
-    // used to fall back to the previous turn's sticky Skill, so switching topic
-    // preloaded an unrelated deliverable's guide. Reuse is what
-    // `series_continuation` is for; an unmatched new brief simply runs without a
-    // preloaded primary and lets the model choose from the compact catalog.
+    // No confidence, no guess. When a NEW brief matches no candidate Skill the turn
+    // simply runs without one; reuse is what `series_continuation` is for.
     const activeSkill = designIntent === "new_generation"
       ? (routedSkill && enabledSkillSlugs.has(routedSkill) ? routedSkill : undefined)
       : designIntent === "series_continuation" ? priorSkill : undefined;
     const seriesApplied = designIntent === "series_continuation" && designContext?.series ? designContext.series : undefined;
-    const preloadedSkill = (designIntent === "new_generation" || designIntent === "series_continuation")
+    // The Skill this turn settled on, used for the notice and for the persisted
+    // session memory — never for injecting its body, which no longer happens.
+    const settledSkill = (designIntent === "new_generation" || designIntent === "series_continuation")
       ? skills.find(skill => skill.name === activeSkill) : undefined;
-    // Helper guides are preloaded ALONGSIDE the primary Skill, never instead of
-    // it. They are modifiers of a deliverable (workflow / reference / prompt /
-    // domain), so they must not compete for the primary slot — but they must
-    // reach the model in this same turn. The keyword match IS the gate: a review
-    // or prompt-optimisation request classifies as non_design yet still needs its
-    // guide, so helpers are resolved independently of the turn label.
-    const helperSkills = routedHelperSkillSlugs
+    // Helper-tier candidates for the notice. They are modifiers of a deliverable
+    // (workflow / reference / prompt / domain), so the notice lists them separately
+    // from the deliverable candidate — but nothing is injected from this list.
+    const helperSkills = selectHelperSkills({ prompt: run.prompt, skills })
       .map(name => skills.find(skill => skill.name === name))
       .filter((skill): skill is (typeof skills)[number] => Boolean(skill) && skill!.name !== activeSkill);
     if (helperSkills.length)
@@ -257,7 +249,7 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     const sessionDesignContextJson = activeSkill || seriesApplied ? {
       intent: designIntent,
       ...(activeSkill ? { activeSkill,
-        ...(preloadedSkill ? { activeSkillVersion: preloadedSkill.version } : {}) } : {}),
+        ...(settledSkill ? { activeSkillVersion: settledSkill.version } : {}) } : {}),
       ...(seriesApplied ? { series: seriesApplied } : {}),
     } : undefined;
     // Resolve the vision model once (reusing the run snapshot) and fetch/optimize
@@ -405,7 +397,7 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     // instead of the body the model just asked for, and the model would never
     // receive the method. The toolkit's `preloadedSkillNames` option stays
     // supported for the day any body is injected again; nothing passes it today.
-    const hintedSkillNames = [preloadedSkill?.name, nonstandardSizeSkill?.name,
+    const hintedSkillNames = [settledSkill?.name, nonstandardSizeSkill?.name,
       ...helperSkills.map(skill => skill.name)].filter((name): name is string => Boolean(name));
     const toolkit = createMastraToolkit({
       mainToolDependencies: { createUserClient: options.createUserClient, ...(options.designTools ? { designTools: options.designTools } : {}),
@@ -658,12 +650,14 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     // Skill, the preloaded helper guides and the non-standard-size enable. It is
     // a notice, never authority, and it is omitted entirely for a turn with no
     // design decision at all (a plain "你好呀" must stay silent).
-    // The notice names the Skill that was actually preloaded this turn, which
-    // covers both the fresh-routing branch (with its matched keywords) and the
-    // continuation branch, where the sticky Skill is reused without re-matching.
-    const noticeSkillRef = preloadedSkill
-      ? { name: preloadedSkill.name,
-          ...(preloadedSkill.displayName ? { displayName: preloadedSkill.displayName } : {}) }
+    // The notice names the CANDIDATE this turn's words point at — nothing is
+    // preloaded any more, so it must not read as a selection the runtime made. It
+    // covers both the fresh-match branch (with its matched keywords) and the
+    // continuation branch, where the session's own Skill is reported without
+    // re-matching.
+    const noticeSkillRef = settledSkill
+      ? { name: settledSkill.name,
+          ...(settledSkill.displayName ? { displayName: settledSkill.displayName } : {}) }
       : undefined;
     const routingNotice = describeDesignRouting({
       intent: designIntent, reasonCode: turnIntent.reasonCode, source: turnIntent.source,

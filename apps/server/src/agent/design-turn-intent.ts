@@ -475,13 +475,6 @@ export type DesignTurnIntentInput = {
   hasSeries: boolean;
   hasAttachments: boolean;
   clarificationPending?: boolean;
-  /**
-   * Whether a Skill routing keyword (or an explicit @Skill mention) matched this
-   * turn. Optional on purpose: `undefined` means the caller supplied NO evidence,
-   * and every proof-based skip below must then stay off so a caller that
-   * predates this field keeps its exact previous behaviour.
-   */
-  skillKeywordMatched?: boolean | undefined;
 };
 
 /**
@@ -511,44 +504,37 @@ function isAcknowledgementOnly(prompt: string): boolean {
 }
 
 /**
- * The two `no_rule` shapes where one model call provably cannot change anything.
+ * The `no_rule` shapes where one model call provably cannot change anything.
  *
- * This is a PROOF, not a heuristic, and it must not be weakened into "no rule +
- * no keyword ⇒ skip": the ENTIRE natural continuation vocabulary ("还是老样子",
- * "照旧", "就按之前的", "跟刚才一样" …) is `no_rule` with no keyword match, and
- * the model verdict is the only thing that recognises those turns. A shortcut of
- * that shape would silently delete the capability.
+ * This is a PROOF, not a heuristic, and it must not be weakened into "no rule ⇒
+ * skip": the ENTIRE natural continuation vocabulary ("还是老样子", "照旧",
+ * "就按之前的", "跟刚才一样" …) is `no_rule` and contains no Skill keyword, and the
+ * model verdict is the only thing that recognises those turns as a continuation.
+ * Skipping them with a series remembered would silently delete series reuse.
  *
- * `skillKeywordMatched === undefined` means no evidence was supplied, so nothing
- * is provable and the conservative `needsModel: true` is kept. `true` means the
- * keyword match is itself routing evidence, so a `new_generation` verdict could
- * legitimately preload that Skill.
+ * What makes the proof TRUE now: the runtime injects no Skill body at all — the
+ * model selects from the catalog and reads with use_skill/compose_skills — so no
+ * verdict can preload anything, and the only verdict that changes behaviour is
+ * `series_continuation`, which applies `designContext.series` and reads nothing
+ * else. Walk all four labels for a `no_rule` turn with NO remembered series:
+ *   - `non_design` — identical to the deterministic verdict, no change;
+ *   - `new_generation` — preloads nothing (there is no preload path left) and could
+ *     only replace a remembered series, which does not exist;
+ *   - `series_continuation` — reuse requires `series`, so nothing is applied;
+ *   - `local_edit` — leaves remembered state alone, exactly like `non_design`.
+ * Every verdict is a no-op, so skipping cannot lose a decision. This is why the old
+ * `skillKeywordMatched` evidence is gone: with no preload to gate on, a keyword
+ * match no longer distinguishes a consequential verdict from an inert one, and
+ * requiring `activeSkill === null` was stricter than the proof needed — it skipped
+ * fewer turns than are provably safe.
  *
- * (a) Nothing to preload AND nothing to reuse: no keyword matched,
- *     `activeSkill === null` and no remembered series. Walk all four labels a
- *     model verdict could return:
- *       - `non_design` — identical to the deterministic verdict, no change;
- *       - `new_generation` — the primary slot is filled from a keyword match or
- *         a current-turn @Skill mention only, and both are absent, so no Skill
- *         can be preloaded; replacing the remembered series additionally needs a
- *         real write receipt and there is no series to replace;
- *       - `series_continuation` — reuse reads `activeSkill` and `series`, and
- *         both are empty, so nothing is applied;
- *       - `local_edit` — preloads no Skill and leaves remembered state alone,
- *         exactly like `non_design` (see the call site: only `new_generation` and
- *         `series_continuation` preload, and only continuation applies a series).
- *     Every possible verdict is a no-op, so skipping cannot lose a decision.
- *
- * (b) An acknowledgement-only turn that also matched no keyword. An
- *     acknowledgement carries no design intent of its own: it names no
- *     deliverable, states no change, and contains nothing to reuse, so there is
- *     no routing decision for a verdict to make. The class is closed and is
- *     matched against the WHOLE trimmed turn.
+ * The acknowledgement class is the second shape: it carries no design intent of its
+ * own even when a series IS remembered, because it names no deliverable, states no
+ * change and asks for nothing. It is matched against the WHOLE trimmed turn, so
+ * "好的，还是老样子" is a continuation, not an acknowledgement.
  */
 function isProvablyInertNoRuleTurn(prompt: string, input: DesignTurnIntentInput): boolean {
-  if (input.skillKeywordMatched === undefined) return false;
-  if (input.skillKeywordMatched) return false;
-  if (input.activeSkill === null && !input.hasSeries) return true;
+  if (!input.hasSeries) return true;
   return isAcknowledgementOnly(prompt);
 }
 
