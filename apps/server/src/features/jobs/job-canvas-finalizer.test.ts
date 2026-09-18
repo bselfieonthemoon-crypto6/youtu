@@ -24,14 +24,22 @@ function createAdmin() {
   const eqStatus = vi.fn(async () => ({ error: null }));
   const eqId = vi.fn(() => ({ eq: eqStatus }));
   const update = vi.fn(() => ({ eq: eqId }));
+  // The chat card is now written with update-only, scoped to the placeholder row
+  // the submitter created (id === job id). It must NOT resurrect a row that the
+  // user deleted through "edit and resend".
+  const chatUpdate = vi.fn(() => ({
+    eq: () => ({ eq: () => ({ select: vi.fn(async () => ({ data: [{ id: "chat-card" }], error: null })) }) }),
+  }));
+  // Other chat-card paths (design delivery, terminal placeholders) still upsert.
   const upsert = vi.fn(async () => ({ error: null }));
   return {
     admin: {
       from: vi.fn((table: string) =>
-        table === "chat_messages" ? { upsert } : { update },
+        table === "chat_messages" ? { update: chatUpdate, upsert } : { update },
       ),
     },
     update,
+    chatUpdate,
     upsert,
     eqId,
     eqStatus,
@@ -59,14 +67,31 @@ const successfulJob = {
 
 describe("image job canvas finalization", () => {
   it("preserves durable zero-cost Low 2K metadata when replacing a queued card with success", async () => {
-    const { admin, upsert } = createAdmin();
+    const { admin, chatUpdate } = createAdmin();
     insertImageElement.mockResolvedValue({ elementId: "element", inserted: true });
     await finalizeImageJobToCanvas(admin as never, { ...successfulJob, session_id: "session-1",
       payload: { ...successfulJob.payload, quality: "standard", resolution: "2k", mastra_credits_cost: 0, mastra_pricing_version: "credits-v1" },
       result: { ...successfulJob.result, signed_url: "https://example.com/generated.png" } });
-    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ content_blocks: [expect.objectContaining({ output: expect.objectContaining({
+    // Update-only, scoped to the placeholder the submitter wrote (id === job id).
+    expect(chatUpdate).toHaveBeenCalledWith(expect.objectContaining({ content_blocks: [expect.objectContaining({ output: expect.objectContaining({
       creditsCost: 0, pricingVersion: "credits-v1", actualQuality: "Low", actualResolution: "2K", status: "succeeded",
-    }) })] }), { onConflict: "id" });
+    }) })] }));
+  });
+
+  it("does not resurrect a chat card whose placeholder the user deleted via edit", async () => {
+    const { admin, chatUpdate, update } = createAdmin();
+    // The "edit and resend" path deleted the placeholder, so the scoped update
+    // matches nothing. The canvas result must still be recorded.
+    chatUpdate.mockImplementationOnce(() => ({
+      eq: () => ({ eq: () => ({ select: vi.fn(async () => ({ data: [], error: null })) }) }),
+    }));
+    insertImageElement.mockResolvedValue({ elementId: "element", inserted: true });
+    await finalizeImageJobToCanvas(admin as never, { ...successfulJob, session_id: "session-1",
+      result: { ...successfulJob.result, signed_url: "https://example.com/generated.png" } });
+    // chat_finalized_at is still stamped so a recovery scan stops retrying.
+    expect(update).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({ chat_finalized_at: expect.any(String) }),
+    }));
   });
   beforeEach(() => {
     insertImageElement.mockReset();
@@ -366,7 +391,7 @@ describe("image job canvas finalization", () => {
       elementId: "element-3",
       inserted: true,
     });
-    const { admin, upsert, update } = createAdmin();
+    const { admin, chatUpdate, update } = createAdmin();
 
     await finalizeImageJobToCanvas(
       admin as never,
@@ -380,10 +405,8 @@ describe("image job canvas finalization", () => {
       } as never,
     );
 
-    expect(upsert).toHaveBeenCalledWith(
+    expect(chatUpdate).toHaveBeenCalledWith(
       expect.objectContaining({
-        id: "job-1",
-        session_id: "session-1",
         content_blocks: [
           expect.objectContaining({
             toolName: "generate_image",
@@ -391,7 +414,6 @@ describe("image job canvas finalization", () => {
           }),
         ],
       }),
-      { onConflict: "id" },
     );
     expect(update).toHaveBeenCalledWith(
       expect.objectContaining({

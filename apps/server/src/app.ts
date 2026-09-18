@@ -669,6 +669,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   void registerChatRoutes(app, {
     auth,
     chatService,
+    // Present only when the queue is configured; scope is enforced inside.
+    ...(jobService ? { jobService } : {}),
   });
   void registerUploadRoutes(app, {
     auth,

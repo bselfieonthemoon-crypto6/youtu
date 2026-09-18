@@ -107,7 +107,11 @@ describe("ChatService.truncateFrom (edit and resend)", () => {
       { error: null, count: 3 },
     );
 
-    await expect(fixture.service.truncateFrom(user, "session-1", "m2")).resolves.toEqual({ deleted: 3 });
+    const result = await fixture.service.truncateFrom(user, "session-1", "m2");
+    expect(result).toMatchObject({ deleted: 3 });
+    // The ids are returned so the route can also stop those jobs: an assistant
+    // placeholder's id IS its job id.
+    expect(result.deletedIds).toEqual(["m2", "m3", "m4"]);
     // m1 must survive: the cut starts AT the edited message, it is not a session wipe.
     expect(fixture.from).toHaveBeenLastCalledWith("chat_messages");
     expect(fixture.from).toHaveBeenCalledTimes(3);
@@ -120,7 +124,8 @@ describe("ChatService.truncateFrom (edit and resend)", () => {
       { error: null, count: 1 },
     );
 
-    await expect(fixture.service.truncateFrom(user, "session-1", "m2")).resolves.toEqual({ deleted: 1 });
+    await expect(fixture.service.truncateFrom(user, "session-1", "m2"))
+      .resolves.toMatchObject({ deleted: 1, deletedIds: ["m2"] });
   });
 
   it("chunks a long tail so one id list cannot overflow the request URL", async () => {
@@ -133,7 +138,8 @@ describe("ChatService.truncateFrom (edit and resend)", () => {
       { error: null, count: 50 },
     );
 
-    await expect(fixture.service.truncateFrom(user, "session-1", "m0")).resolves.toEqual({ deleted: 250 });
+    await expect(fixture.service.truncateFrom(user, "session-1", "m0"))
+      .resolves.toMatchObject({ deleted: 250 });
     // 1 session check + 1 id read + 3 delete chunks
     expect(fixture.from).toHaveBeenCalledTimes(5);
   });

@@ -14,6 +14,7 @@ import {
   ChatServiceError,
   type ChatService,
 } from "../features/chat/chat-service.js";
+import type { JobService } from "../features/jobs/job-service.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
 
 export async function registerChatRoutes(
@@ -21,6 +22,8 @@ export async function registerChatRoutes(
   options: {
     auth: RequestAuthenticator;
     chatService: ChatService;
+    /** Absent when the deployment has no job queue configured. */
+    jobService?: Pick<JobService, "cancelDiscardedTurnJobs"> | undefined;
   },
 ) {
   // List sessions for a canvas
@@ -194,12 +197,34 @@ export async function registerChatRoutes(
           request.params.messageId,
         );
 
+        // An assistant placeholder's id IS its job id, so the removed ids also
+        // identify the discarded turn's generations. Stop the ones still queued
+        // or running: the user replaced the turn, so the provider must not keep
+        // working on it and its finalizer must not write the card back.
+        // Best-effort: the truncation already succeeded and is what the user
+        // sees, so a cancel failure must not fail the request.
+        let canceledJobs = 0;
+        if (options.jobService) {
+          try {
+            const canceled = await options.jobService.cancelDiscardedTurnJobs(user, {
+              sessionId: request.params.sessionId,
+              jobIds: result.deletedIds,
+            });
+            canceledJobs = canceled.canceled;
+          } catch (cancelError) {
+            request.log.warn(
+              { sessionId: request.params.sessionId, err: cancelError },
+              "chat.truncateFrom job cancel FAILED",
+            );
+          }
+        }
+
         request.log.info(
           { sessionId: request.params.sessionId, messageId: request.params.messageId,
-            deleted: result.deleted },
+            deleted: result.deleted, canceledJobs },
           "chat.truncateFrom OK",
         );
-        return reply.code(200).send({ deleted: result.deleted });
+        return reply.code(200).send({ deleted: result.deleted, canceledJobs });
       } catch (error) {
         request.log.error(
           { sessionId: request.params.sessionId, messageId: request.params.messageId, err: error },

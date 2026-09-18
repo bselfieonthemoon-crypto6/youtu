@@ -191,6 +191,22 @@ export type JobService = {
   cancelJob(user: AuthenticatedUser, jobId: string): Promise<BackgroundJob>;
   getConversationImageJob(user: AuthenticatedUser, scope: ConversationImageJobScope, jobId?: string): Promise<Record<string, unknown> | null>;
   cancelJobAdmin(user: AuthenticatedUser, jobId: string, scope: ConversationImageJobScope): Promise<BackgroundJob>;
+  /**
+   * Stop the still-in-flight jobs of a turn the user just replaced.
+   *
+   * "重新编辑" is an edit, not an append: the superseded turn's queued/running
+   * generations must actually stop, otherwise the provider keeps working on a
+   * result the user no longer wants and its finalizer writes the discarded card
+   * back into the chat. Only the caller's OWN jobs in the given session are
+   * touched, so a collaborator's paid work is never canceled by someone else's
+   * edit. Marking `canceled` is sufficient for refunds: the worker's periodic
+   * `reconcileTerminalJobRefunds` scan already refunds canceled jobs that were
+   * charged.
+   */
+  cancelDiscardedTurnJobs(
+    user: AuthenticatedUser,
+    input: { sessionId: string; jobIds: readonly string[] },
+  ): Promise<{ canceled: number }>;
   getJobAdmin(jobId: string): Promise<BackgroundJob>;
 
   // Admin-only methods (use admin client, no user auth)
@@ -1258,8 +1274,29 @@ export function createJobService(options: {
       return cancelWithClient(admin, jobId, scope);
     },
 
-    async getJobAdmin(jobId) {
+    async cancelDiscardedTurnJobs(user, { sessionId, jobIds }) {
+      const ids = [...new Set(jobIds)];
+      if (!ids.length) return { canceled: 0 };
       const admin = options.getAdminClient();
+      // Scope by session AND creator. The caller already proved session access
+      // when it truncated the messages, but a shared session may also contain a
+      // collaborator's jobs, and only the user's own paid work may be stopped.
+      const { data, error } = await admin
+        .from("background_jobs")
+        .update({ status: "canceled", canceled_at: new Date().toISOString(),
+          error_code: "superseded_by_edit" })
+        .in("id", ids)
+        .eq("session_id", sessionId)
+        .eq("created_by", user.id)
+        .eq("job_type", "image_generation")
+        .in("status", ["queued", "running"])
+        .select("id");
+      if (error)
+        throw new JobServiceError("job_cancel_failed", "Failed to stop superseded jobs.", 500);
+      return { canceled: Array.isArray(data) ? data.length : 0 };
+    },
+
+    async getJobAdmin(jobId) {      const admin = options.getAdminClient();
       const { data: job, error } = await admin
         .from("background_jobs")
         .select(SELECT_COLS)

@@ -119,17 +119,25 @@ describe("Mastra image job submitter", () => {
       expect(queuedCard.content_blocks[0].output).not.toHaveProperty("billing");
       if (status !== "processing") {
         const upsert = vi.fn(async (_message: unknown, _options?: unknown) => ({ error: null }));
+        // The canvas success path now writes the card with a scoped UPDATE, so a
+        // chat placeholder the user deleted through "edit and resend" is never
+        // resurrected. The terminal-placeholder path still upserts.
+        const chatUpdateChain: any = { eq: () => chatUpdateChain,
+          select: async () => ({ data: [{ id: durableJob.id }], error: null }) };
+        const chatUpdate = vi.fn(() => chatUpdateChain);
         const updateChain: any = { eq: () => updateChain, then: (resolve: any) => Promise.resolve({ error: null }).then(resolve) };
-        const admin = { from: (table: string) => table === "chat_messages" ? { upsert } : { update: () => updateChain } };
+        const admin = { from: (table: string) => table === "chat_messages" ? { upsert, update: chatUpdate } : { update: () => updateChain } };
         const finalized = { ...durableJob, status, result: status === "succeeded" ? {
           asset_id: "asset-1", object_path: "workspace/generated.png", signed_url: "https://example.com/generated.png",
           width: 1024, height: 576, mime_type: "image/png",
         } : null };
         if (status === "succeeded") await finalizeImageJobToCanvas(admin as never, finalized);
         else await finalizeTerminalImageJobPlaceholder(admin as never, finalized);
-        expect(upsert).toHaveBeenCalledOnce();
-        const card: any = upsert.mock.calls[0]?.[0];
-        expect(card.id).toBe(durableJob.id);
+        const writeSpy = status === "succeeded" ? chatUpdate : upsert;
+        expect(writeSpy).toHaveBeenCalledOnce();
+        const card: any = writeSpy.mock.calls[0]?.[0];
+        // The scoped UPDATE carries the target id in its WHERE clause instead.
+        if (status !== "succeeded") expect(card.id).toBe(durableJob.id);
         expect(card.content_blocks[0].output).toMatchObject({ ...receipt, status });
         expect(card.content_blocks[0].output.creditsCost).toBe(durableJob.credits_cost);
         expect(card.content_blocks[0].output).not.toHaveProperty("billing");

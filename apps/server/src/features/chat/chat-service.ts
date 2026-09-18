@@ -57,13 +57,15 @@ export type ChatService = {
    *
    * This is the server half of "edit and resend": the replacement turn must not
    * leave the superseded attempt (its assistant reply, and any generation card
-   * inside it) visible above the new one. Returns how many rows were removed.
+   * inside it) visible above the new one. Returns the removed ids so the caller
+   * can also stop the jobs those messages projected — an assistant placeholder's
+   * id IS its job id.
    */
   truncateFrom(
     user: AuthenticatedUser,
     sessionId: string,
     fromMessageId: string,
-  ): Promise<{ deleted: number }>;
+  ): Promise<{ deleted: number; deletedIds: string[] }>;
 };
 
 /**
@@ -336,7 +338,7 @@ export function createChatService(options: {
         }
         deleted += count ?? 0;
       }
-      return { deleted };
+      return { deleted, deletedIds: doomed };
     },
   };
 }

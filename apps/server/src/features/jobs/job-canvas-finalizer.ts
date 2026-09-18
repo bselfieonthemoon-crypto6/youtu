@@ -632,21 +632,32 @@ async function finalizeCurrentImageJobToCanvas(
         ],
       },
     ];
-    const { error: chatError } = await admin.from("chat_messages").upsert(
-      {
-        id: job.id,
-        session_id: job.session_id,
-        role: "assistant",
-        content: "图片生成完成",
-        content_blocks: contentBlocks as Json,
-      },
-      { onConflict: "id" },
-    );
+    // The chat card is a PROJECTION of the placeholder row written at submission
+    // time (its id is the job id). An "edit and resend" deletes that row, so an
+    // upsert here would resurrect the discarded attempt and put its card back on
+    // screen. Update-only: when the row is gone, the turn was deliberately
+    // discarded and only the canvas result remains — the user paid for that
+    // image, so it is kept rather than deleted.
+    //
+    // Tradeoff: this gives up re-creating a placeholder lost to a crash between
+    // job creation and the placeholder insert. That window is milliseconds and
+    // the canvas result is still finalized either way, whereas resurrecting a
+    // discarded turn is a visible, reproducible bug.
+    const { data: chatRows, error: chatError } = await admin.from("chat_messages")
+      .update({ content: "图片生成完成", content_blocks: contentBlocks as Json })
+      .eq("id", job.id)
+      .eq("session_id", job.session_id)
+      .select("id");
     if (chatError) {
       throw new Error(
         `Failed to persist image job ${job.id} in chat: ${chatError.message}`,
       );
     }
+    if (!chatRows?.length) {
+      console.info("[job-finalizer] chat card skipped; turn was discarded", { jobId: job.id });
+    }
+    // Recorded either way: the placeholder is gone for good, so a recovery scan
+    // must not keep trying to write this card.
     finalizedResult.chat_finalized_at = new Date().toISOString();
   }
 
