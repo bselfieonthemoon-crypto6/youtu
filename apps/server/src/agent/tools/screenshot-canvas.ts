@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import type { ConnectionManager } from "../../ws/connection-manager.js";
-import type { PersistImageFn } from "./image-generate.js";
+import type { PersistImageFn } from "../image-generation-contracts.js";
 import type { ScreenshotResult } from "@loomic/shared";
 import type { WorkspaceVisionModel } from "../workspace-vision-model.js";
 import { createAgentTool, runContextOf, toolAbortSignalOf } from "./tool-run-context.js";

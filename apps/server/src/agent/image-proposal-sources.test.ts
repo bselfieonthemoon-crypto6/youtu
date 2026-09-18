@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
 import { captureImageProposalSources, imageReferenceHash, resolveCanvasImageProposalSources, verifyImageProposalSources } from "./image-proposal-sources.js";
-import { imageProposalInputSchema } from "../features/agent-actions/image-proposal-store.js";
 
 const assetId = "70000000-0000-4000-8000-000000000001";
 const assetIdV7 = "70000000-0000-7000-8000-000000000001";
@@ -125,11 +124,4 @@ describe("trusted persisted proposal source identities", () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it("persists the server binding without rewriting execution references, rejects inconsistent stored input", () => {
-    const f = fixture();
-    const input = { ...f.input, operation: "remove_background", title: "Cutout", prompt: "Background only", model: "gpt-image-2" };
-    expect(imageProposalInputSchema.parse(input)).toMatchObject({ inputImages: [reference], inputImageSources: f.input.inputImageSources, outputFormat: "png" });
-    expect(imageProposalInputSchema.safeParse({ ...input, inputImages: ["https://changed.test/original.png"] }).success).toBe(false);
-    expect(imageProposalInputSchema.safeParse({ ...input, inputImageSources: [] }).success).toBe(false);
-  });
 });

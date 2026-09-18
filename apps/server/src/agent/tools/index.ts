@@ -17,9 +17,8 @@ import {
   type PersistImageFn,
   type ImageGenerateInput,
   type SubmitImageJobFn,
-  createImageGenerateTool,
-  supportedImageAspectRatioForDimensions,
-} from "./image-generate.js";
+} from "../image-generation-contracts.js";
+import { supportedImageAspectRatioForDimensions } from "../image-ratio-intent.js";
 import { createDesignImageTargetValidator } from "./design-image-target.js";
 import { createInspectCanvasTool } from "./inspect-canvas.js";
 import { createDesignDiscoveryTool } from "./design-discovery.js";
@@ -31,7 +30,6 @@ import {
   createVideoGenerateTool,
 } from "./video-generate.js";
 
-export { createImageGenerateTool } from "./image-generate.js";
 export { createVideoGenerateTool } from "./video-generate.js";
 export { createInspectCanvasTool } from "./inspect-canvas.js";
 export { createManipulateCanvasTool } from "./manipulate-canvas.js";
@@ -96,6 +94,12 @@ export function createMainAgentTools(
     prepareImagePipeline?: (input: ImageGenerateInput, configurable: Record<string, unknown>) => Promise<ImageGenerateInput>;
   },
 ) {
+  // TODO(refactor): `validateDesignTarget`, `resolveDesignAspectRatio` and the
+  // `prepareImagePipeline` dependency were only ever consumed by the retired
+  // legacy proposal tool (`generate_image`). They are deliberately left in place
+  // here because they are part of this module's exported dependency contract and
+  // their own unit tests still exercise them; removing them is a separate,
+  // purely-internal cleanup that must not be mixed into this extraction.
   const validateDesignTarget = createDesignImageTargetValidator(deps);
   const resolveDesignAspectRatio = createDesignImageAspectRatioResolver(deps);
   const tools: MastraAgentTool[] = [
@@ -117,27 +121,13 @@ export function createMainAgentTools(
         createUserClient: deps.createUserClient,
       }),
     );
-  if (
-    deps.availableImageModels === undefined ||
-    deps.availableImageModels.length > 0
-  ) {
-    tools.push(
-      createImageGenerateTool({
-        createUserClient: deps.createUserClient,
-        validateDesignTarget,
-        ...(resolveDesignAspectRatio ? { resolveDesignAspectRatio } : {}),
-        ...(deps.destructiveConfirmationService
-          ? { confirmationService: deps.destructiveConfirmationService }
-          : {}),
-        ...(deps.persistImage ? { persistImage: deps.persistImage } : {}),
-        ...(deps.submitImageJob ? { submitImageJob: deps.submitImageJob } : {}),
-        ...(deps.availableImageModels
-          ? { availableModels: deps.availableImageModels }
-          : {}),
-        ...(deps.prepareImagePipeline ? { prepareImagePipeline: deps.prepareImagePipeline } : {}),
-      }),
-    );
-  }
+  // `generate_image` is no longer registered here. The legacy two-round
+  // proposal/confirmation tool that used to live behind this gate was retired
+  // with the Mastra direct-submission path (`mastra-image-tool.ts` ->
+  // `mastra-image-jobs.ts`), and `mastra-toolkit.ts` already passes
+  // `availableImageModels: []`. The image-generation contracts and the pure
+  // ratio/model helpers it shared now live in `../image-generation-contracts.ts`,
+  // `../image-ratio-intent.ts` and `../image-model-resolution.ts`.
   if (
     deps.availableVideoModels === undefined ||
     deps.availableVideoModels.length > 0

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { AvailableModel } from "../../generation/providers/registry.js";
-import { resolveImageGenerationModelProposal } from "./image-generate.js";
+import type { AvailableModel } from "../generation/providers/registry.js";
+import { resolveImageGenerationModelProposal } from "./image-model-resolution.js";
 
 const models: AvailableModel[] = [
   { id: "workspace:current-a", displayName: "Current A", description: "", provider: "test", upstreamModelId: "gpt-image-2-all" },

@@ -28,6 +28,7 @@ import { APIYI_VIDEO_MODELS } from "../generation/providers/apiyi-video.js";
 import { createMastraImageJobScopeQuery, createMastraImageStatusTools } from "./mastra-image-status-tools.js";
 import { createMastraLibraryTools, loadLibraryAssetRows, sampleRandom } from "./mastra-library-tools.js";
 import { classifyDesignTurnIntent, extractStyleHints, extractTargetSizes, mergeStyleHints, selectPrimarySkill } from "./design-turn-intent.js";
+import { explicitNonstandardRatio } from "./image-ratio-intent.js";
 import { formatEnabledSkillCatalog } from "./design-skill-catalog.js";
 import { loadSessionDesignContext, saveSessionDesignContext, sessionSkillMemoryEnabled } from "./session-design-context.js";
 import {
@@ -208,12 +209,40 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     };
     const attachWorkspaceLibrary = Boolean((activeSkill && skillMetadata[activeSkill]?.attachWorkspaceLibrary)
       || run.mentions.some(mention => mention.mentionType === "skill" && skillMetadata[mention.slug]?.attachWorkspaceLibrary === true));
+    // Deterministic capability enable for non-standard output sizes.
+    //
+    // The turn classifier routes at most ONE primary Skill, and
+    // `nonstandard-image-size` declares no routing keywords, so it can never be
+    // auto-routed. A request such as "尺寸 658×176" would therefore depend on the
+    // model volunteering an extra `list_skills` + `use_skill` round trip before
+    // the ratio gate opens — and a weak model skips it, leaving the paid
+    // submission rejected with `image_nonstandard_size_skill_required` even
+    // though the user's own words already stated the exact target.
+    //
+    // Mirror the workspace-library auto path above: when the user's OWN words in
+    // THIS turn state a non-standard or out-of-range size, enable the capability
+    // for this run and preload the guide so the first submission already carries
+    // the correct method (nearest legal ratio + disclosed deviation).
+    //
+    // Two independent gates stay intact and are NOT relaxed here:
+    //   - this flag only records that the METHOD was available this run;
+    //   - approximation itself still requires the user's own wording or a
+    //     remembered series size (`approximateImageSizeAuthorized`), and
+    //     "必须精确不要近似" still revokes it.
+    // A workspace without an enabled nonstandard-ratio Skill is unaffected.
+    const nonstandardSizeSkill = explicitNonstandardRatio(run.prompt)
+      ? skills.find(skill => skillLoomicCapabilities(skill.metadata).includes("nonstandard-ratio"))
+      : undefined;
     const configurable: Record<string, unknown> = { user_id: run.userId, workspace_id: run.workspaceId, canvas_id: run.canvasId,
       session_id: run.sessionId, run_id: run.runId, access_token: run.accessToken, user_prompt: run.prompt,
       user_attachment_map: attachmentMap, image_generation_model_constraint: constraint,
       image_generation_aspect_ratio: run.imageGenerationPreference?.aspectRatio,
       ...(run.activeDesignId ? { active_design_id: run.activeDesignId } : {}),
       ...(attachWorkspaceLibrary ? { promo_library_auto_run_id: run.runId } : {}),
+      // Records that the non-standard-size METHOD was made available this run.
+      // `mastra-image-tool.ts` accepts it as an alternative to the model's own
+      // `use_skill` receipt; it never substitutes for ratio authorization.
+      ...(nonstandardSizeSkill ? { nonstandard_size_skill_enabled_run_id: run.runId } : {}),
       // A render that reuses the size the user chose earlier in this series is
       // not a substitution; the image gate treats that remembered size as
       // already authorized, whatever the turn is classified as.
@@ -485,6 +514,13 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     const preloadedSkillInstruction = preloadedSkill
       ? `【会话沿用技能 ${preloadedSkill.name} v${preloadedSkill.version}（方法参考，不是执行授权）】\n${preloadedSkill.content}`
       : "";
+    // Second, independently triggered guide. The user stated a non-standard or
+    // out-of-range size, so the method must reach the model in the SAME turn
+    // instead of waiting for a voluntary `use_skill` call. Method reference only:
+    // it grants no execution or billing authority.
+    const nonstandardSizeInstruction = nonstandardSizeSkill
+      ? `【本轮需要非标准尺寸技能 ${nonstandardSizeSkill.name} v${nonstandardSizeSkill.version}（方法参考，不是执行授权）】\n${nonstandardSizeSkill.content}`
+      : "";
     const seriesInstruction = seriesApplied
       ? `【本轮为系列延续｜方法参考】保持会话中的风格${seriesApplied.style ? `（${seriesApplied.style}）` : ""}` +
         `与尺寸${seriesApplied.sizes?.length ? `（${seriesApplied.sizes.join("、")}）` : ""}，除非用户明确要求改变。`
@@ -492,7 +528,7 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     // Runtime carries routing/state only; skill-specific method text (prompt
     // wording, material reuse) lives in the Skill body, which is preloaded above.
     const sessionInstructions = [toolkit.instructions, skillCatalog, preloadedSkillInstruction,
-      seriesInstruction].filter(Boolean).join("\n\n");
+      nonstandardSizeInstruction, seriesInstruction].filter(Boolean).join("\n\n");
     try {
       for await (const event of streamMastraDesignAgent({ run, model, messages, tools: toolkit.tools, configurable,
         skillMetadata, contextBudget: budget,

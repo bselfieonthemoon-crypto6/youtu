@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createMainAgentTools } from "./index.js";
 
 describe("main Agent image review wiring", () => {
-  it("registers bounded pixel review and wires foreground preparation into image proposals", () => {
+  it("registers bounded pixel review and no longer registers the retired legacy image proposal tool", () => {
     const prepareImagePipeline = vi.fn();
     const tools = createMainAgentTools({
       createUserClient: vi.fn(),
@@ -14,7 +14,10 @@ describe("main Agent image review wiring", () => {
     });
     expect(tools.map(tool => tool.id)).toContain("review_image_results");
     expect(tools.find(tool => tool.id === "review_image_results")?.description).toContain("never generates, retries");
-    expect(tools.find(tool => tool.id === "generate_image")).toBeDefined();
+    // The two-round proposal tool is retired: Mastra owns direct submission
+    // (`mastra-image-tool.ts` -> `mastra-image-jobs.ts`), and `mastra-toolkit.ts`
+    // passes `availableImageModels: []`. No image-generation tool may reappear here.
+    expect(tools.map(tool => tool.id)).not.toContain("generate_image");
   });
 
   it("keeps screenshot capture explicit but omits asset review without a vision model", () => {

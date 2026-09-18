@@ -1,5 +1,5 @@
 import type { ImageGenerationPreference, MessageMention } from "@loomic/shared";
-import type { ImageGenerationModelConstraint } from "./tools/image-generate.js";
+import type { ImageGenerationModelConstraint } from "./image-generation-contracts.js";
 
 /**
  * Server-only model choice constraint derived from authenticated request

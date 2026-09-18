@@ -41,6 +41,25 @@ describe("Mastra native ratio approximation", () => {
     expect(f.submit).not.toHaveBeenCalled();
   });
 
+  it("accepts the server-enabled non-standard-size capability for the current run only", async () => {
+    const f = fixture();
+    const args = { title: "Header", prompt: "blue header", model: native.id,
+      aspectRatio: "3:1", aspectRatioIntent: "approximate" as const };
+    // The capability is per-run: a stale run id must not open the gate.
+    await expect(f.generate.execute(args, toolExecutionContext({ signal,
+      configurable: { ...configurable, nonstandard_size_skill_enabled_run_id: "previous-run" } })))
+      .resolves.toMatchObject({ status: "failed", error: "image_nonstandard_size_skill_required" });
+    expect(f.submit).not.toHaveBeenCalled();
+    // The runtime enables it deterministically when the user's own turn states a
+    // non-standard / out-of-range size, so a weak model needs no extra
+    // use_skill round trip before a legitimate request can be submitted.
+    await expect(f.generate.execute(args, toolExecutionContext({ signal,
+      configurable: { ...configurable, nonstandard_size_skill_enabled_run_id: "run" } })))
+      .resolves.toMatchObject({ status: "processing",
+        approximateSizePlan: { aspectRatio: "3:1", substituted: true } });
+    expect(f.submit).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["edit", "reference"] as const)("retains verified approximate intent after implicit %s grounding", async (usage) => {
     const bytes = await sharp({ create: { width: 64, height: 64, channels: 3, background: "blue" } }).png().toBuffer();
     const source = `data:image/png;base64,${bytes.toString("base64")}`;

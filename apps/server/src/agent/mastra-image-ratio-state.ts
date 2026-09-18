@@ -6,7 +6,7 @@ import {
   isStandardAspectRatio,
   normalizeImageGenerationAspectRatioProposal,
   ratioMatchesAnyOf,
-} from "./tools/image-generate.js";
+} from "./image-ratio-intent.js";
 
 export type NativeImageUsage = "independent" | "edit" | "reference";
 type Frame = { aspectRatio?: string; intent: "preserve_source" | "resize";

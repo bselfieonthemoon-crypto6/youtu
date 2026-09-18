@@ -7,7 +7,7 @@ import {
   resolveVideoProviderName,
 } from "../../generation/providers/registry.js";
 import { generateVideo } from "../../generation/video-generation.js";
-import type { GenerationBillingSummary } from "./image-generate.js";
+import type { GenerationBillingSummary } from "../image-generation-contracts.js";
 
 const DEFAULT_MODEL = "veo-3.1-fast-generate-preview";
 

@@ -7,12 +7,9 @@ import {
   captureImageProposalSources,
   resolveCanvasImageProposalSources,
 } from "./image-proposal-sources.js";
-import {
-  imageGenerationModelConstraintSchema,
-  imageAspectRatiosEqual,
-  resolveImageGenerationModelProposal,
-  validateNativeImageAspectRatio,
-} from "./tools/image-generate.js";
+import { imageGenerationModelConstraintSchema } from "./image-generation-contracts.js";
+import { resolveImageGenerationModelProposal } from "./image-model-resolution.js";
+import { imageAspectRatiosEqual, validateNativeImageAspectRatio } from "./image-ratio-intent.js";
 import { validateImageGenerationRequestLimits } from "../generation/image-request-limits.js";
 import type { AvailableModel } from "../generation/providers/registry.js";
 import type {
@@ -230,7 +227,12 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
     const initialRatio = resolveNativeImageRatio({ args: proposal as Record<string, unknown>,
       preference: configurable.image_generation_aspect_ratio, userPrompt: configurable.user_prompt,
       usage: sourceUsage ?? "independent",
-      skillLoaded: configurable.nonstandard_size_skill_loaded_run_id === submitContext.runId,
+      // The non-standard-size method counts as available when EITHER the model
+      // loaded it via use_skill, OR the runtime deterministically enabled it
+      // because the user's own turn stated a non-standard / out-of-range size.
+      // Ratio AUTHORIZATION remains a separate gate inside resolveNativeImageRatio.
+      skillLoaded: configurable.nonstandard_size_skill_loaded_run_id === submitContext.runId
+        || configurable.nonstandard_size_skill_enabled_run_id === submitContext.runId,
       ...(seriesSizes?.length ? { seriesSizes } : {}) });
     if (!initialRatio.ok) return { status: "failed" as const, error: initialRatio.code, summary: initialRatio.error };
     let ratioState = initialRatio.state;

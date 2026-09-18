@@ -14,7 +14,7 @@ import { JobServiceError } from "../features/jobs/job-service.js";
 import type { WorkspaceModelCatalogService } from "../features/providers/workspace-model-catalog-service.js";
 import type { AuthenticatedUser, UserSupabaseClient } from "../supabase/user.js";
 import type { ConnectionManager } from "../ws/connection-manager.js";
-import type { SubmitImageJobFn } from "./tools/image-generate.js";
+import type { SubmitImageJobFn } from "./image-generation-contracts.js";
 import { imageSubmissionReceipt } from "../features/jobs/image-submission-receipt.js";
 import { mastraImageDefaultRunLimit, validateMastraImageExecution, validateMastraImageResolutionSupport } from "./mastra-image-execution-policy.js";
 

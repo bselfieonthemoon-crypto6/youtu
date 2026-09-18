@@ -11,7 +11,7 @@ import type { WorkspaceModelCatalogService } from "../features/providers/workspa
 import type { AuthenticatedUser, UserSupabaseClient } from "../supabase/user.js";
 import { sanitizeErrorForClient } from "../utils/error-sanitizer.js";
 import type { ConnectionManager } from "../ws/connection-manager.js";
-import type { GenerationBillingSummary } from "./tools/image-generate.js";
+import type { GenerationBillingSummary } from "./image-generation-contracts.js";
 
 export type MastraVideoJobContext = {
   userId: string;
