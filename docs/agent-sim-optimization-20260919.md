@@ -67,6 +67,25 @@
 - 头部注释补充战役教训（长文本用 `--text-file`、并发会诱发 429/504、`check --allow unfinished_jobs` 的用法）。
 - 实测（旧会话）：`check` 在 p2/p6 命中 `optimistic_tail`——正是批次 1 修掉的 A 类缺陷，
   其余 10 个会话干净，说明不变量既不空转也不误报。
+- `canvasSummary.placeholders` 现已同时统计 `image-generator` 与 `image-replacement` 两种占位节点，
+  否则 `stale_generating_placeholder` 实际上什么都没检查。
+
+## 五、新代码上线后的一次真实端到端复验（2026-09-19 21:55）
+
+重启 API/worker 加载本批代码后，新建会话实测"生成 → 运行中取消"：
+
+| 观测 | 结果 |
+| --- | --- |
+| 取消是否同步结算 | 是。job `ea4a89d8…` 取消后 `result.chat_terminal_finalized_at=21:55:11.918Z`、`canvas_terminal_finalized_at=21:55:11.936Z`，与取消请求同一秒（旧代码滞后 132–145 秒） |
+| 最后一条消息 | 追加的通知"图片生成已取消，未交付新图片。"（新消息），排在同轮的"已提交，正在生成：…出图后我告诉你结果。"**之后** |
+| 卡片 | 提交卡片被原地改写为 `status:"canceled"`，带同一句中文文案，无英文上游原文 |
+| 画布 | 保留 1 个 `image-generator` 占位框（status=error，文案"生成已取消"）；这是有意保留的重试入口 |
+| 计费 | `creditsCost: 0`、`credit_transactions` 0 行、余额 940，未编造金额 |
+| `check` | `ok: true`，0 违规（无 `optimistic_tail`、无 `card_not_settled`、无 `missing_terminal_card`） |
+
+**新发现（本轮未修，已加固提示词）**：这次实测的助手正文里出现了英文开场白
+`I'll load the logo design guide and get this started.`——违反"不得预告内部准备（任何语言）"。
+已在提示词里把这句话原样列为反例。属模型偶发不遵守，非代码缺陷。
 
 ## 未被本轮采纳（记录，避免重做）
 

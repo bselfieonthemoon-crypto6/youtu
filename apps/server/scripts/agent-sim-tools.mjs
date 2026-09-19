@@ -224,9 +224,13 @@ async function canvasSummary(settings) {
       status: element.customData?.status ?? null,
       sourceJobId: element.customData?.sourceJobId ?? element.customData?.jobId ?? null,
     })),
-    placeholders: elements.filter(element => element.customData?.type === "image-replacement").map(element => ({
-      id: element.id, operation: element.customData?.operation ?? null, status: element.customData?.status ?? null,
-      x: Math.round(element.x), y: Math.round(element.y), jobId: element.customData?.jobId ?? null,
+    // Both placeholder kinds belong here: the image pipeline creates
+    // `image-generator` boxes (and `image-replacement` ones for edit flows), and
+    // an invariant that only saw one kind silently checked nothing.
+    placeholders: elements.filter(element => ["image-replacement", "image-generator"].includes(element.customData?.type)).map(element => ({
+      id: element.id, type: element.customData?.type ?? null,
+      operation: element.customData?.operation ?? null, status: element.customData?.status ?? null,
+      x: Math.round(element.x), y: Math.round(element.y), jobId: element.customData?.jobId ?? element.customData?.sourceJobId ?? null,
     })),
     fileCount: Object.keys(files).length,
   };
