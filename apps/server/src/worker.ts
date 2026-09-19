@@ -636,8 +636,20 @@ export async function processMessage(
         : `${tag} Job ${jobId} finished after a terminal state won +${Date.now() - startTime}ms`,
     );
   } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    const errorCode = (err as { code?: string })?.code ?? "executor_error";
+    // A schema violation is deterministic and unreadable in its raw form: a
+    // ZodError's message is a JSON issue dump, and retrying the same payload can
+    // never succeed. Classify it as `invalid_input` (already non-retryable) with
+    // a message a person can act on, instead of retrying `executor_error` three
+    // times and handing the user a wall of JSON.
+    const issues = (err as { issues?: Array<{ path?: unknown[]; message?: string }> })?.issues;
+    const schemaViolation = Array.isArray(issues) && issues.length > 0;
+    const errorMessage = schemaViolation
+      ? `任务参数校验失败：${issues.slice(0, 3).map(issue =>
+          `${(issue.path ?? []).join(".") || "参数"} ${issue.message ?? ""}`.trim()).join("；")}`
+      : err instanceof Error ? err.message : String(err);
+    const errorCode = schemaViolation
+      ? "invalid_input"
+      : ((err as { code?: string })?.code ?? "executor_error");
 
     // Non-retryable errors: retrying with the same input will always fail.
     // Dead-letter immediately so the caller (agent polling) gets fast feedback.

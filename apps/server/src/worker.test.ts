@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 import { registerDesignAsyncExecutors } from "./features/designs/design-async-worker.js";
 import { getExecutor, registerExecutor } from "./features/jobs/job-executor.js";
@@ -239,16 +240,27 @@ describe("worker claim gate", () => {
     expect(deleteMsg).toHaveBeenCalledWith("image_generation_jobs", 12);
   });
 
+  // A payload that violates its schema fails the same way every time, and the raw
+  // ZodError message is a JSON issue dump. It must dead-letter immediately with a
+  // message a person can act on — the acceptance run for the box-selection split
+  // hit exactly this and was retried once instead of failing fast.
+  const schemaViolation = z.object({ layer_names: z.array(z.string()).min(2) })
+    .safeParse({ layer_names: ["框选元素"] });
+  if (schemaViolation.success) throw new Error("fixture must violate the schema");
+  const schemaIssue = schemaViolation.error.issues[0]!;
+  const schemaMessage = `任务参数校验失败：${(schemaIssue.path ?? []).join(".") || "参数"} ${schemaIssue.message ?? ""}`.trim();
   it.each([
-    ["an unknown image provider outcome", "image_generation_result_unknown", "provider result is unknown", "job-unknown"],
-    ["an image aspect-ratio mismatch", "image_aspect_ratio_mismatch", "generated 2:3 instead of 4:5", "job-ratio"],
-    ["overlapping semantic layers", "layer_output_overlap", "generated layers overlap", "job-layer-overlap"],
-  ])("dead-letters %s without another attempt", async (_label, errorCode, errorMessage, jobId) => {
+    ["an unknown image provider outcome", "image_generation_result_unknown", "provider result is unknown", "job-unknown",
+      () => Object.assign(new Error("provider result is unknown"), { code: "image_generation_result_unknown" })],
+    ["an image aspect-ratio mismatch", "image_aspect_ratio_mismatch", "generated 2:3 instead of 4:5", "job-ratio",
+      () => Object.assign(new Error("generated 2:3 instead of 4:5"), { code: "image_aspect_ratio_mismatch" })],
+    ["overlapping semantic layers", "layer_output_overlap", "generated layers overlap", "job-layer-overlap",
+      () => Object.assign(new Error("generated layers overlap"), { code: "layer_output_overlap" })],
+    ["a payload schema violation", "invalid_input", schemaMessage, "job-schema",
+      () => schemaViolation.error],
+  ])("dead-letters %s without another attempt", async (_label, errorCode, errorMessage, jobId, makeError) => {
     const originalExecutor = getExecutor("image_generation");
-    const terminal = Object.assign(new Error(errorMessage), {
-      code: errorCode,
-    });
-    registerExecutor("image_generation", vi.fn(async () => { throw terminal; }));
+    registerExecutor("image_generation", vi.fn(async () => { throw makeError(); }));
     const archive = vi.fn(async () => undefined);
     const markDeadLetter = vi.fn(async () => true);
     const settleTerminal = vi.fn(async () => true);
