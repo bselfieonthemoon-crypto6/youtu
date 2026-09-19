@@ -1,6 +1,5 @@
 "use client";
 import { imageToolOperationModel } from "../../lib/layer-backend";
-import type { SemanticLayerSplitRequest } from "../canvas/image-action-dialog";
 
 import {
   type BackgroundJob,
@@ -1090,7 +1089,7 @@ export function DesignEditorSession({
     options: {
       selectionRegion?: NormalizedImageRegion;
       eraseStrokes?: NormalizedEraseStroke[];
-      layerBackend?: "qwen-image-layered" | "semantic";
+      layerBackend?: "semantic";
       layerNames?: string[];
       repairBackground?: true;
       model?: string;
@@ -1112,7 +1111,7 @@ export function DesignEditorSession({
       const response = await client.createDesignImageJob(accessToken, {
         ...(document.project_id ? { project_id: document.project_id } : {}),
         prompt: promptForImageOperation(operation),
-        ...(options.layerBackend === "semantic" ? { model: options.model } : { model: imageToolOperationModel(operation, options.layerBackend) }),
+        ...(options.layerBackend === "semantic" ? { model: options.model } : { model: imageToolOperationModel(operation) }),
         operation,
         quality: options.layerBackend === "semantic" ? "standard" : "hd",
         ...(options.layerBackend === "semantic" ? {
@@ -1875,9 +1874,6 @@ export function DesignEditorSession({
             if (selectedImage)
               void submitImageOperation(selectedImage.objectId, operation);
           }}
-          accessToken={accessToken}
-          onRunDedicatedLayers={() => { if (selectedImage) void submitImageOperation(selectedImage.objectId, "split_layers", { layerBackend: "qwen-image-layered" }); }}
-          onRunSemanticLayers={(request: SemanticLayerSplitRequest) => { if (selectedImage) void submitImageOperation(selectedImage.objectId, "split_layers", { layerBackend: "semantic", layerNames: request.layerNames, repairBackground: request.repairBackground, model: request.model }); }}
           onStartRegion={() => beginImageInteraction("region")}
           onStartErase={() => beginImageInteraction("erase")}
           onRefresh={() => void refreshImageJobs()}

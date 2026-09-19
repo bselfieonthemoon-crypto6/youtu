@@ -1234,7 +1234,7 @@ export function CanvasToolMenu({
         placement?: { x: number; y: number; width: number; height: number };
         selectionRegion?: NormalizedImageRegion;
         maskImage?: string;
-        layerBackend?: "qwen-image-layered" | "semantic";
+        layerBackend?: "semantic";
         layerNames?: string[];
         repairBackground?: true;
         model?: string;
@@ -1269,7 +1269,7 @@ export function CanvasToolMenu({
         : (await fetchImageModels(accessToken)).models;
       const preferredModel = imageModelPreference.models[0];
       const model = usesFixedOperationModel
-        ? (options?.layerBackend === "semantic" ? options.model : imageToolOperationModel(operation, options?.layerBackend))
+        ? (options?.layerBackend === "semantic" ? options.model : imageToolOperationModel(operation))
         : (availableModels.find((item) => item.id === preferredModel)?.id ??
           availableModels[0]?.id);
       if (!model) {
@@ -1473,10 +1473,6 @@ export function CanvasToolMenu({
     [handleDirectImageAction],
   );
 
-  const handleSplitImageLayers = useCallback(
-    () => handleDirectImageAction("split-layers", "拆分前景元素并修复背景"),
-    [handleDirectImageAction],
-  );
   const handleDedicatedSplitImageLayers = useCallback(
     (request: SemanticLayerSplitRequest) => handleDirectImageAction("split-layers", "将原图拆分成独立的透明图层并补全底图", {
       layerBackend: "semantic",
@@ -1484,10 +1480,6 @@ export function CanvasToolMenu({
       repairBackground: request.repairBackground,
       model: request.model,
     }),
-    [handleDirectImageAction],
-  );
-  const handleQwenSplitImageLayers = useCallback(
-    () => handleDirectImageAction("split-layers", "将原图拆分成独立的透明图层，保留构图和原始内容", { layerBackend: "qwen-image-layered" }),
     [handleDirectImageAction],
   );
 
@@ -2056,9 +2048,7 @@ export function CanvasToolMenu({
             onRegenerate={handleRegenerateImage}
             onUpscale={handleUpscaleImage}
             onRemoveBackground={handleRemoveImageBackground}
-            onSplitLayers={handleSplitImageLayers}
             onSplitLayersDedicated={handleDedicatedSplitImageLayers}
-            onSplitLayersQwen={handleQwenSplitImageLayers}
             onSplitLayersBox={() => void handleStartLayerBox()}
             onSplitLayersAuto={handleSuggestLayerElements}
             accessToken={accessToken}

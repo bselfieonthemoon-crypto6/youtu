@@ -16,13 +16,13 @@ it("shows only board import inside a board and restores tools outside", () => {
   expect(screen.getByRole("button", { name: "更多图片工具" })).toBeTruthy();
 });
 
-it("keeps every split mode behind one 图层拆分 entry, each with its own cost", () => {
+it("keeps both split modes behind one 图层拆分 entry, each with its own cost", () => {
   const onSplitLayersBox = vi.fn();
-  const onSplitLayers = vi.fn();
   const onSplitLayersDedicated = vi.fn();
+  const onSplitLayersAuto = vi.fn();
   const props = { image: { id: "image" } as any, screenBounds: { x: 100, y: 100, width: 100, height: 100 },
     onDownload: vi.fn(), onCrop: vi.fn(), onRegenerate: vi.fn(), onUpscale: vi.fn(), onRemoveBackground: vi.fn(),
-    onSplitLayers, onSplitLayersDedicated, onSplitLayersBox, onErase: vi.fn(), onChatCommand: vi.fn(),
+    onSplitLayersDedicated, onSplitLayersAuto, onSplitLayersBox, onErase: vi.fn(), onChatCommand: vi.fn(),
     onRecognizeText: async () => [], onApplyTextReplacement: async () => {} };
   render(<ImageSelectionToolbar {...props} />);
 
@@ -31,25 +31,25 @@ it("keeps every split mode behind one 图层拆分 entry, each with its own cost
   const panel = screen.getByTestId("layer-split-menu");
   expect(panel).toBeTruthy();
   expect(onSplitLayersBox).not.toHaveBeenCalled();
-  expect(onSplitLayers).not.toHaveBeenCalled();
-  for (const mode of ["框选剥离", "按名称拆分", "本地快速拆分"]) expect(screen.getByText(mode)).toBeTruthy();
+  expect(panel.textContent).toContain("框选剥离");
+  expect(panel.textContent).toContain("全部剥离");
   expect(panel.textContent).toContain("2 次图片调用");
-  expect(panel.textContent).toContain("免费 · 不出网");
+  expect(panel.textContent).toContain("1 次识别 + N+1 次图片调用");
 
-  // The overflow menu no longer repeats them: one entry point, described modes.
-  fireEvent.click(screen.getByRole("button", { name: "更多图片工具" }));
-  expect(screen.queryByText("本地快速拆分")).toBeTruthy();
-  expect(screen.getAllByText("框选剥离")).toHaveLength(1);
+  // The deleted features stay deleted: no manual naming, no local split, no
+  // dedicated backend anywhere in the toolbar.
+  for (const gone of ["按名称拆分", "本地快速拆分", "专用分层服务", "专用后端"])
+    expect(screen.queryByText(gone, { exact: false })).toBeNull();
 
   fireEvent.click(screen.getByText("框选剥离"));
   expect(onSplitLayersBox).toHaveBeenCalledOnce();
 });
 
-it("fills the named split from the automatic element listing", async () => {
+it("fills the split dialog from the automatic element listing", async () => {
   const onSplitLayersAuto = vi.fn(async () => ["左侧人物", "标题文字"]);
   const props = { image: { id: "image" } as any, screenBounds: { x: 100, y: 100, width: 100, height: 100 },
     onDownload: vi.fn(), onCrop: vi.fn(), onRegenerate: vi.fn(), onUpscale: vi.fn(), onRemoveBackground: vi.fn(),
-    onSplitLayers: vi.fn(), onSplitLayersDedicated: vi.fn(), onSplitLayersAuto, onErase: vi.fn(),
+    onSplitLayersDedicated: vi.fn(), onSplitLayersAuto, onErase: vi.fn(),
     onChatCommand: vi.fn(), onRecognizeText: async () => [], onApplyTextReplacement: async () => {} };
   render(<ImageSelectionToolbar {...props} />);
 
@@ -65,7 +65,7 @@ it("explains an empty element listing without leaving the split panel", async ()
   const onSplitLayersAuto = vi.fn(async () => []);
   const props = { image: { id: "image" } as any, screenBounds: { x: 100, y: 100, width: 100, height: 100 },
     onDownload: vi.fn(), onCrop: vi.fn(), onRegenerate: vi.fn(), onUpscale: vi.fn(), onRemoveBackground: vi.fn(),
-    onSplitLayers: vi.fn(), onSplitLayersAuto, onErase: vi.fn(),
+    onSplitLayersDedicated: vi.fn(), onSplitLayersAuto, onErase: vi.fn(),
     onChatCommand: vi.fn(), onRecognizeText: async () => [], onApplyTextReplacement: async () => {} };
   render(<ImageSelectionToolbar {...props} />);
 

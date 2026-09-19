@@ -12,7 +12,6 @@ import { ImageActionDialog, type SemanticLayerSplitRequest } from "./image-actio
 import { ImageDetailsDialog } from "./image-details-dialog";
 import { ImageToolbarCustomizeDialog } from "./image-toolbar-customize-dialog";
 import { ImageTextReplacementPanel } from "./image-text-replacement-panel";
-import { LayerBackendOption } from "./layer-backend-option";
 import type { ImageToolbarActionId, SelectedCanvasImage } from "./image-toolbar-types";
 
 const icons: Record<ImageToolbarActionId, typeof Sparkles> = {
@@ -24,7 +23,7 @@ const icons: Record<ImageToolbarActionId, typeof Sparkles> = {
   "add-to-chat": MessageCirclePlus, details: Info, download: Download,
 };
 
-export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop, onRegenerate, onUpscale, onRemoveBackground, onSplitLayers, onSplitLayersDedicated, onSplitLayersQwen, onSplitLayersBox, onSplitLayersAuto, accessToken, onErase, onOutpaint, onChatCommand, onRecognizeText, onApplyTextReplacement, onAddToBoard, addToBoardLabel = "添加到画板", boardOnly = false }: {  image: SelectedCanvasImage;
+export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop, onRegenerate, onUpscale, onRemoveBackground, onSplitLayersDedicated, onSplitLayersBox, onSplitLayersAuto, accessToken, onErase, onOutpaint, onChatCommand, onRecognizeText, onApplyTextReplacement, onAddToBoard, addToBoardLabel = "添加到画板", boardOnly = false }: {  image: SelectedCanvasImage;
   screenBounds: { x: number; y: number; width: number; height: number; viewportWidth?: number };
   onDownload: () => void;
   onAddToBoard?: () => void;
@@ -34,9 +33,11 @@ export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop,
   onRegenerate: (prompt: string) => void;
   onUpscale: (prompt: string, quality?: "hd" | "ultra") => void;
   onRemoveBackground: () => void;
-  onSplitLayers: () => void;
+  /**
+   * Submits a split whose layer names are already decided. The automatic listing
+   * fills them; there is no manual typing entry any more.
+   */
   onSplitLayersDedicated?: (request: SemanticLayerSplitRequest) => void;
-  onSplitLayersQwen?: () => void;
   /**
    * Box-selection split: the user frames one element and the model extracts it
    * together with a repaired background. When provided, the split button opens a
@@ -105,10 +106,9 @@ export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop,
     if (id === "replace-text") return setReplaceTextOpen(true);
     if (id === "remove-background") return onRemoveBackground();
     if (id === "split-layers") {
-      // One entry, several modes. The panel states what each mode costs and what it
-      // produces, instead of scattering four look-alike entries through the menu.
-      // `onSplitLayers` is required, so the panel always has at least one mode.
-      setSplitMenuOpen(true);
+      // One entry, two modes. The panel states what each mode costs and what it
+      // produces instead of scattering look-alike entries through the menu.
+      if (onSplitLayersBox || onSplitLayersDedicated) setSplitMenuOpen(true);
       return;
     }
     if (id === "erase") return onErase();
@@ -157,21 +157,11 @@ export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop,
         {onSplitLayersBox && <SplitMode icon={<Focus className="size-4" />} title="框选剥离"
           detail="拖框圈住一个元素，只提取它并修补底图" cost="2 次图片调用"
           onClick={() => { setSplitMenuOpen(false); onSplitLayersBox(); }} />}
-        {onSplitLayersAuto && <SplitMode icon={<Sparkles className="size-4" />}
+        {onSplitLayersAuto && onSplitLayersDedicated && <SplitMode icon={<Sparkles className="size-4" />}
           title={autoSplitBusy ? "正在识别元素…" : "全部剥离"}
-          detail="先识别画面里的元素，再逐个提取并修补底图"
+          detail="先识别画面里的元素，再逐个提取并修补底图（名字可在确认前修改）"
           cost={autoSplitBusy ? undefined : "1 次识别 + N+1 次图片调用"} disabled={autoSplitBusy}
           onClick={() => void startAutomaticSplit()} />}
-        <div className="my-0.5 h-px bg-border" />
-        {onSplitLayersDedicated && <SplitMode icon={<Layers3 className="size-4" />} title="按名称拆分"
-          detail="自己填写 2–4 个元素名，省掉识别那一次"
-          cost="N+1 次图片调用"
-          onClick={() => { setSplitMenuOpen(false); setSuggestedLayerNames([]); setActiveAction("split-layers"); }} />}
-        {onSplitLayers && <SplitMode icon={<Layers3 className="size-4" />} title="本地快速拆分"
-          detail="本地模型按前景连通块粗分，不修补底图" cost="免费 · 不出网"
-          onClick={() => { setSplitMenuOpen(false); onSplitLayers(); }} />}
-        {accessToken && onSplitLayersQwen && <LayerBackendOption accessToken={accessToken}
-          onRun={() => { setSplitMenuOpen(false); onSplitLayersQwen(); }} />}
       </div>
       {autoSplitError && <p role="alert" className="mt-2 text-[11px] text-destructive">{autoSplitError}</p>}
       <div className="mt-2 flex justify-end">

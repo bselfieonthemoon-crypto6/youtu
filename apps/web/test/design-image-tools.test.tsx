@@ -25,10 +25,9 @@ describe("DesignImageTools", () => {
     expect(screen.getByRole("button", { name: "去除背景" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "框选主体" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "橡皮擦除" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "图层拆分" })).toBeDisabled();
   });
 
-  it("exposes every required entry for a selected design image", () => {
+  it("exposes only the surviving entries for a selected design image", () => {
     const onRun = vi.fn();
     const onStartRegion = vi.fn();
     const onStartErase = vi.fn();
@@ -47,17 +46,15 @@ describe("DesignImageTools", () => {
     fireEvent.click(screen.getByRole("button", { name: "去除背景" }));
     fireEvent.click(screen.getByRole("button", { name: "框选主体" }));
     fireEvent.click(screen.getByRole("button", { name: "橡皮擦除" }));
-    fireEvent.click(screen.getByRole("button", { name: "图层拆分" }));
 
     expect(onRun).toHaveBeenNthCalledWith(1, "remove_background");
     expect(onRun).toHaveBeenCalledTimes(1);
-    expect(screen.getByText("AI 图层拆分")).toBeInTheDocument();
-    // AI splitting opens the current configuration panel; the separate
-    // local entry retains the legacy split_layers callback contract.
-    fireEvent.click(screen.getByRole("button", { name: "本地拆分" }));
-    expect(onRun).toHaveBeenNthCalledWith(2, "split_layers");
     expect(onStartRegion).toHaveBeenCalledOnce();
     expect(onStartErase).toHaveBeenCalledOnce();
+    // Layer splitting left the design board: both the manual naming dialog and the
+    // local fast split are gone, and the dedicated backend went with them.
+    for (const gone of ["图层拆分", "本地拆分", "专用"])
+      expect(screen.queryByText(gone, { exact: false })).toBeNull();
   });
 
   it("shows restored progress, finalization conflicts, and cancellation", () => {

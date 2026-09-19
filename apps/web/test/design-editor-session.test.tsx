@@ -35,7 +35,6 @@ const cancelDesignImageJob = vi.fn();
 const uploadFile = vi.hoisted(() => vi.fn());
 const fetchAssetBlob = vi.hoisted(() => vi.fn());
 const getFontFaceContent = vi.hoisted(() => vi.fn());
-const fetchLayerBackend = vi.hoisted(() => vi.fn(async () => ({ configured: false, available: false, model: "qwen-image-layered", reason: "尚未配置专用分层服务", remote: true })));
 const getTemplate = vi.hoisted(() => vi.fn());
 const listTemplates = vi.hoisted(() =>
   vi.fn<
@@ -122,10 +121,6 @@ vi.mock("../src/lib/design-api", async (importOriginal) => ({
 
 vi.mock("../src/lib/server-api", () => ({ uploadFile }));
 vi.mock("../src/lib/canvas-elements", () => ({ fetchAssetBlob }));
-vi.mock("../src/lib/layer-backend", async (importOriginal) => ({
-  ...await importOriginal<typeof import("../src/lib/layer-backend")>(),
-  fetchLayerBackend,
-}));
 vi.mock("../src/lib/design-resource-api", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("../src/lib/design-resource-api")>();
@@ -472,29 +467,6 @@ describe("DesignEditorSession", () => {
     expect(createDesignImageJob.mock.calls[0]?.[1]).not.toHaveProperty(
       "input_images",
     );
-  });
-
-  it("submits an explicitly selected Qwen splitter with the same authoritative source and revision", async () => {
-    const initial = documentFixture({ revision: 7 });
-    (initial.scene.objects as unknown as ReturnType<typeof imageFixture>[]).push(imageFixture());
-    getDesign.mockResolvedValue(initial);
-    serializeScene.mockReturnValue(initial.scene);
-    createDesignImageJob.mockResolvedValue(imageJobFixture());
-    fetchLayerBackend.mockResolvedValueOnce({ configured: true, available: true, model: "qwen-image-layered", reason: "专用分层服务就绪", remote: true });
-    render(<DesignEditorSession accessToken="token" designId={initial.id} backgroundRoot={document.createElement("div")} onClose={vi.fn()} />);
-    await screen.findByTestId("editor-overlay");
-    fireEvent.click(screen.getByRole("button", { name: "模拟选择图片" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Qwen 专用分层" })).toBeEnabled());
-    expect(createDesignImageJob).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Qwen 专用分层" }));
-    await waitFor(() => expect(createDesignImageJob).toHaveBeenCalledOnce());
-    expect(createDesignImageJob).toHaveBeenCalledWith("token", expect.objectContaining({
-      operation: "split_layers", model: "qwen-image-layered",
-      target: expect.objectContaining({ kind: "design", design_id: initial.id, expected_revision: 7,
-        source_object_id: imageFixture().objectId, source_asset_object_id: imageFixture().assetObjectId,
-        expected_object_version: imageFixture().objectVersion, idempotency_key: expect.any(String) }),
-    }));
-    expect(createDesignImageJob.mock.calls[0]?.[1]).not.toHaveProperty("input_images");
   });
 
   it("restores a running image task and reloads the authoritative scene after finalization", async () => {

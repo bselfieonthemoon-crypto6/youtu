@@ -1,21 +1,22 @@
 "use client";
 
-import { useState } from "react";
 import type { BackgroundJob, DesignObject } from "@loomic/shared";
 import {
   BoxSelect,
   Eraser,
-  Layers3,
   RefreshCw,
   Scissors,
-  Sparkles,
   X,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { LayerBackendOption } from "../canvas/layer-backend-option";
-import { ImageActionDialog, type SemanticLayerSplitRequest } from "../canvas/image-action-dialog";
 
+/**
+ * Operations that can still be requested from the design board's image panel.
+ * `split_layers` stays in the label map because historical job rows carry it, but
+ * it is no longer offered here: layer splitting now lives on the canvas toolbar
+ * (框选剥离 / 全部剥离).
+ */
 export type DesignImageOperation =
   | "remove_background"
   | "region_matting"
@@ -26,7 +27,7 @@ export type DesignImageOperation =
 const OPERATION_LABELS: Record<DesignImageOperation, string> = {
   remove_background: "去除背景",
   region_matting: "框选主体",
-  split_layers: "图层拆分",
+  split_layers: "图层拆分（已移到画布工具栏）",
   erase_transparent: "透明擦除",
   smart_erase: "智能擦除",
 };
@@ -38,9 +39,6 @@ export function DesignImageTools({
   error,
   busyJobId,
   onRun,
-  onRunDedicatedLayers,
-  onRunSemanticLayers,
-  accessToken,
   onStartRegion,
   onStartErase,
   onRefresh,
@@ -51,16 +49,12 @@ export function DesignImageTools({
   loading?: boolean;
   error?: string | null;
   busyJobId?: string | null;
-  onRun: (operation: "remove_background" | "split_layers") => void;
-  onRunDedicatedLayers?: () => void;
-  onRunSemanticLayers?: (request: SemanticLayerSplitRequest) => void;
-  accessToken?: string;
+  onRun: (operation: "remove_background") => void;
   onStartRegion: () => void;
   onStartErase: () => void;
   onRefresh: () => void;
   onCancel: (job: BackgroundJob) => void;
 }) {
-  const [semanticSplitOpen, setSemanticSplitOpen] = useState(false);
   const disabled = !selectedImage;
   return (
     <section className="border-l border-b p-3" aria-label="图片智能工具">
@@ -101,25 +95,7 @@ export function DesignImageTools({
           disabled={disabled}
           onClick={onStartErase}
         />
-        <ToolButton
-          icon={<Layers3 />}
-          label="图层拆分"
-          disabled={disabled}
-          onClick={() => setSemanticSplitOpen(true)}
-        />
-        <ToolButton icon={<Layers3 />} label="本地拆分" disabled={disabled} onClick={() => onRun("split_layers")} />
       </div>
-      {accessToken && onRunDedicatedLayers && <div className="mt-2"><LayerBackendOption accessToken={accessToken} disabled={disabled} onRun={onRunDedicatedLayers} /></div>}
-      {semanticSplitOpen && selectedImage && (
-        <ImageActionDialog
-          action="split-layers"
-          image={{ id: selectedImage.objectId, fileId: selectedImage.assetObjectId, x: 0, y: 0, width: selectedImage.width, height: selectedImage.height, mimeType: "image/*", title: "当前图片" }}
-          screenBounds={{ x: 16, y: 80, width: 0, height: 0 }}
-          {...(accessToken !== undefined ? { accessToken } : {})}
-          onOpenChange={(open) => setSemanticSplitOpen(open)}
-          onConfirm={(_prompt, _quality, request) => { setSemanticSplitOpen(false); if (request) onRunSemanticLayers?.(request); }}
-        />
-      )}
       {error && (
         <p role="alert" className="mt-2 text-xs text-destructive">
           {error}
