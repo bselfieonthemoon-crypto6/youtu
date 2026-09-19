@@ -25,9 +25,13 @@ import {
 import { ImagePill } from "./chat/image-lightbox";
 import { MarkdownRenderer } from "./chat/markdown-renderer";
 import { MentionPill } from "./chat/mention-pill";
+import { ProcessGroup } from "./chat/process-group";
 import { ThinkingBlockView } from "./chat/thinking-block-view";
 import {
   ToolBlockView,
+  isProcessOnlyToolBlock,
+  isToolBlockInProgress,
+  isUnrenderedToolBlock,
   type ToolConfirmationKind,
 } from "./chat/tool-block-view";
 
@@ -393,6 +397,19 @@ const AssistantMessage = React.memo(function AssistantMessage({
 }) {
   const toolRefs = useRef(new Map<string, HTMLDivElement>());
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * Process rows collapse by default, so the transcript reads as the user's words
+   * plus the media that was delivered. Expansion is controlled here because a
+   * plan step must be able to open the row that holds the tool it points at
+   * before scrolling to it.
+   */
+  const [openProcessGroups, setOpenProcessGroups] = useState<ReadonlySet<string>>(
+    () => new Set<string>(),
+  );
+  const openProcessGroupsRef = useRef(openProcessGroups);
+  openProcessGroupsRef.current = openProcessGroups;
+  const processGroupByToolRef = useRef(new Map<string, string>());
+  const pendingLocateRef = useRef<string | null>(null);
   const [highlightedToolCallId, setHighlightedToolCallId] = useState<
     string | null
   >(null);
@@ -439,7 +456,7 @@ const AssistantMessage = React.memo(function AssistantMessage({
     return result;
   }, [contentBlocks]);
 
-  const locateTool = useCallback((toolCallId: string) => {
+  const scrollToTool = useCallback((toolCallId: string) => {
     const target = toolRefs.current.get(toolCallId);
     if (!target) return;
     target.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -451,6 +468,71 @@ const AssistantMessage = React.memo(function AssistantMessage({
       );
     }, 1800);
   }, []);
+
+  const toggleProcessGroup = useCallback((key: string) => {
+    setOpenProcessGroups((previous) => {
+      const next = new Set(previous);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  /** A plan step can point at a tool inside a collapsed row: open it first, then
+   * scroll once the row has actually rendered the target. */
+  const locateTool = useCallback(
+    (toolCallId: string) => {
+      const groupKey = processGroupByToolRef.current.get(toolCallId);
+      if (groupKey && !openProcessGroupsRef.current.has(groupKey)) {
+        pendingLocateRef.current = toolCallId;
+        setOpenProcessGroups((previous) => new Set(previous).add(groupKey));
+        return;
+      }
+      scrollToTool(toolCallId);
+    },
+    [scrollToTool],
+  );
+
+  useEffect(() => {
+    const pending = pendingLocateRef.current;
+    if (!pending || !toolRefs.current.has(pending)) return;
+    pendingLocateRef.current = null;
+    scrollToTool(pending);
+  }, [openProcessGroups, scrollToTool]);
+
+  const renderToolBlock = useCallback(
+    (block: ToolBlock) => (
+      <div
+        key={block.toolCallId}
+        id={getToolExecutionAnchorId(block.toolCallId)}
+        ref={(node) => {
+          if (node) toolRefs.current.set(block.toolCallId, node);
+          else toolRefs.current.delete(block.toolCallId);
+        }}
+        data-plan-step-id={
+          (block as ToolBlock & { planStepId?: string }).planStepId
+        }
+      >
+        <ToolBlockView
+          block={block}
+          highlighted={highlightedToolCallId === block.toolCallId}
+          {...(onConfirmAction ? { onConfirmAction } : {})}
+          {...(onWaitGeneration ? { onWaitGeneration } : {})}
+          {...(onRestoreGeneration ? { onRestoreGeneration } : {})}
+          {...(onRetryRead ? { onRetryRead } : {})}
+          {...(onOpenDesign ? { onOpenDesign } : {})}
+        />
+      </div>
+    ),
+    [
+      highlightedToolCallId,
+      onConfirmAction,
+      onOpenDesign,
+      onRestoreGeneration,
+      onRetryRead,
+      onWaitGeneration,
+    ],
+  );
 
   // Find the last text block index for streaming cursor placement
   const lastTextIdx = useMemo(() => {
@@ -490,6 +572,99 @@ const AssistantMessage = React.memo(function AssistantMessage({
     hasContent &&
     contentBlocks.at(-1)?.type !== "thinking";
 
+  /**
+   * Conversation order is preserved: a run of process-only steps collapses into
+   * one row, while text, plans, delivered media, confirmations and failures render
+   * in place. `processGroupByToolRef` remembers which row holds which tool so a
+   * plan step can open it before scrolling (see `locateTool`).
+   */
+  const renderItems: React.ReactNode[] = [];
+  const groupByTool = new Map<string, string>();
+  let pendingNodes: React.ReactNode[] = [];
+  let pendingTools: ToolBlock[] = [];
+  let pendingKey: string | null = null;
+  const flushProcess = () => {
+    if (!pendingNodes.length) return;
+    const key = pendingKey ?? `process-${renderItems.length}`;
+    for (const tool of pendingTools) groupByTool.set(tool.toolCallId, key);
+    const nodes = pendingNodes;
+    renderItems.push(
+      <ProcessGroup
+        key={key}
+        count={nodes.length}
+        open={openProcessGroups.has(key)}
+        running={pendingTools.some(isToolBlockInProgress)}
+        onToggle={() => toggleProcessGroup(key)}
+      >
+        {nodes}
+      </ProcessGroup>,
+    );
+    pendingNodes = [];
+    pendingTools = [];
+    pendingKey = null;
+  };
+
+  contentBlocks.forEach((block, idx) => {
+    if ((block as { type: string }).type === "plan") {
+      flushProcess();
+      renderItems.push(
+        <AgentPlanView
+          key={`plan-${(block as unknown as AgentPlanBlock).planId}`}
+          block={block as unknown as AgentPlanBlock}
+          toolsByStepId={
+            toolsByPlanStep.get((block as unknown as AgentPlanBlock).planId) ??
+            new Map()
+          }
+          onLocateTool={locateTool}
+        />,
+      );
+      return;
+    }
+
+    if (block.type === "thinking") {
+      renderItems.push(
+        <ThinkingBlockView
+          key={`thinking-${idx}`}
+          thinking={block.thinking}
+          isStreaming={isStreaming && idx === contentBlocks.length - 1}
+        />,
+      );
+      return;
+    }
+
+    if (block.type === "text") {
+      const visibleText = hasInternalPreparation
+        ? hideInternalPreparationNarration(block.text)
+        : block.text;
+      if (!visibleText.trim()) return;
+      flushProcess();
+      renderItems.push(
+        <MarkdownRenderer
+          key={idx}
+          text={visibleText}
+          showCursor={isStreaming && idx === lastTextIdx}
+        />,
+      );
+      return;
+    }
+
+    if (block.type === "tool") {
+      if (!isUserVisibleToolBlock(block)) return;
+      if (isUnrenderedToolBlock(block)) return;
+      if (isProcessOnlyToolBlock(block)) {
+        pendingKey = pendingKey ?? `process-${block.toolCallId}`;
+        pendingTools.push(block);
+        pendingNodes.push(renderToolBlock(block));
+        return;
+      }
+      flushProcess();
+      renderItems.push(renderToolBlock(block));
+    }
+    // ImageBlock -- skip in assistant messages (user-side only)
+  });
+  flushProcess();
+  processGroupByToolRef.current = groupByTool;
+
   return (
     <motion.div
       initial={{ opacity: 0, x: -12 }}
@@ -524,77 +699,7 @@ const AssistantMessage = React.memo(function AssistantMessage({
           <span>{internalPreparationRunning ? "正在分析中" : "分析完成"}</span>
         </div>
       )}
-      {contentBlocks.map((block, idx) => {
-        if ((block as { type: string }).type === "plan") {
-          return (
-            <AgentPlanView
-              key={`plan-${(block as unknown as AgentPlanBlock).planId}`}
-              block={block as unknown as AgentPlanBlock}
-              toolsByStepId={
-                toolsByPlanStep.get(
-                  (block as unknown as AgentPlanBlock).planId,
-                ) ?? new Map()
-              }
-              onLocateTool={locateTool}
-            />
-          );
-        }
-
-        if (block.type === "thinking") {
-          return (
-            <ThinkingBlockView
-              key={`thinking-${idx}`}
-              thinking={block.thinking}
-              isStreaming={isStreaming && idx === contentBlocks.length - 1}
-            />
-          );
-        }
-
-        if (block.type === "text") {
-          const visibleText = hasInternalPreparation
-            ? hideInternalPreparationNarration(block.text)
-            : block.text;
-          if (!visibleText.trim()) return null;
-          const showCursor = isStreaming && idx === lastTextIdx;
-          return (
-            <MarkdownRenderer
-              key={idx}
-              text={visibleText}
-              showCursor={showCursor}
-            />
-          );
-        }
-
-        if (block.type === "tool") {
-          if (!isUserVisibleToolBlock(block)) return null;
-          return (
-            <div
-              key={block.toolCallId}
-              id={getToolExecutionAnchorId(block.toolCallId)}
-              ref={(node) => {
-                if (node) toolRefs.current.set(block.toolCallId, node);
-                else toolRefs.current.delete(block.toolCallId);
-              }}
-              data-plan-step-id={
-                (block as ToolBlock & { planStepId?: string }).planStepId
-              }
-            >
-              <ToolBlockView
-                block={block}
-                highlighted={highlightedToolCallId === block.toolCallId}
-                {...(onConfirmAction ? { onConfirmAction } : {})}
-                {...(onWaitGeneration ? { onWaitGeneration } : {})}
-                {...(onRestoreGeneration ? { onRestoreGeneration } : {})}
-                {...(onRetryRead ? { onRetryRead } : {})}
-                {...(onOpenDesign ? { onOpenDesign } : {})}
-              />
-            </div>
-          );
-        }
-
-        // ImageBlock -- skip in assistant messages (user-side only)
-        return null;
-      })}
+      {renderItems}
       {showProcessing && (
         <div
           role="status"

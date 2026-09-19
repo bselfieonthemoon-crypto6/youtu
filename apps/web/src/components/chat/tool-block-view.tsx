@@ -621,6 +621,84 @@ export const ToolBlockView = React.memo(function ToolBlockView({
   );
 });
 
+/**
+ * A tool step that produced nothing the user must see or act on: a canvas read, a
+ * submitted-but-pending image task, its cost receipt, a plan step's bookkeeping.
+ *
+ * The transcript groups exactly these into a collapsed process row so the chat
+ * reads as text plus the media that was delivered. Everything that would be
+ * dishonest or unusable to hide stays in the open:
+ * a confirmation the user must answer, delivered media, a delivered design, and
+ * every failure, cancellation, refusal or invalid-input receipt.
+ */
+export function isProcessOnlyToolBlock(block: ToolBlock): boolean {
+  if (readConfirmation(block)) return false;
+  if ((block.artifacts ?? []).some(artifact => artifact.type === "image" || artifact.type === "video")) return false;
+  if (readGeneratedDesignTarget(block) || readDesignFinalizationNotice(block)) return false;
+  // A failure is a fact about the user's request, not process detail.
+  if (block.status === "failed" || block.status === "canceled") return false;
+  const designResult = readDesignToolResult(block);
+  if (designResult && designResult.status !== "completed") return false;
+  const output = block.output as Record<string, unknown> | undefined;
+  if (readNonEmptyString(output?.error)) return false;
+  if (output?.refused === true) return false;
+  if (output?.validationErrors) return false;
+  return true;
+}
+
+/**
+ * Tool blocks this transcript never renders: their work is already represented by
+ * the assistant's own words (or by a pending confirmation elsewhere). Grouping has
+ * to skip them too, otherwise a collapsed process row would open onto nothing.
+ */
+export function isUnrenderedToolBlock(block: ToolBlock): boolean {
+  if (
+    block.toolName === "delegate_design_tasks" ||
+    block.toolName === "record_task_workflow" ||
+    block.toolName === "select_next_workflow_step"
+  ) {
+    return true;
+  }
+  const output = block.output as Record<string, unknown> | undefined;
+  const confirmation = readConfirmation(block);
+  const hasForegroundDisclosure =
+    confirmation?.kind === "image_generation" &&
+    confirmation.details.foregroundPolicy !== undefined;
+  const isConversationalImageProposal = Boolean(
+    block.toolName === "generate_image" &&
+      block.status === "completed" &&
+      (output?.status === "awaiting_confirmation" ||
+        output?.error === "confirmation_required"),
+  );
+  if (isConversationalImageProposal && !hasForegroundDisclosure) return true;
+  return (
+    block.toolName === "confirm_image_generation" &&
+    ((block.status === "failed" && !block.output) ||
+      output?.status === "awaiting_ui_confirmation")
+  );
+}
+
+/**
+ * A grouped step whose job is still running. The collapsed row keeps a live label
+ * from this, because that row is the only place the pending work is described.
+ */
+export function isToolBlockInProgress(block: ToolBlock): boolean {
+  if (block.status === "running") return true;
+  const output = block.output as Record<string, unknown> | undefined;
+  const reported =
+    typeof output?.jobStatus === "string"
+      ? output.jobStatus
+      : typeof output?.status === "string"
+        ? output.status
+        : null;
+  return (
+    reported === "queued" ||
+    reported === "processing" ||
+    reported === "running" ||
+    reported === "submitting"
+  );
+}
+
 const DESIGN_TOOL_NAMES = new Set([
   "inspect_design",
   "get_design_objects",

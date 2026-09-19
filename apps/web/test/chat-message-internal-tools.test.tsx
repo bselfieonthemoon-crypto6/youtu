@@ -2,6 +2,7 @@
 
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ContentBlock } from "@loomic/shared";
 
@@ -47,7 +48,7 @@ describe("ChatMessage internal preparation tools", () => {
     expect(screen.queryByText(/技能目录被截断/)).not.toBeInTheDocument();
   });
 
-  it("continues to show tools that represent a user-visible operation", () => {
+  it("keeps a running image task reachable behind the collapsed process row", async () => {
     const blocks = [
       {
         type: "tool",
@@ -59,6 +60,16 @@ describe("ChatMessage internal preparation tools", () => {
 
     render(<ChatMessage role="assistant" contentBlocks={blocks} />);
 
+    // The chat shows one quiet process row instead of a tool card; expanding it
+    // still reaches the full operation with its own anchor.
+    expect(screen.queryByText("正在准备图片方案（尚未生成）")).not.toBeInTheDocument();
+    const row = screen.getByRole("button", { name: "过程 · 1 项" });
+    expect(row).toHaveAttribute("aria-expanded", "false");
+    expect(row).toHaveTextContent("正在处理…");
+
+    await userEvent.click(row);
+
+    expect(row).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("正在准备图片方案（尚未生成）")).toBeInTheDocument();
     expect(document.getElementById("tool-execution-generate")).toBeInTheDocument();
   });
