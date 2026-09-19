@@ -41,9 +41,10 @@ import { VideoPlayerPanel } from "./canvas/video-player-panel";
 import { ImageSelectionToolbar } from "./canvas/image-selection-toolbar";
 import type { SemanticLayerSplitRequest } from "./canvas/image-action-dialog";
 import { ImageOutpaintPanel, type OutpaintSource } from "./canvas/image-outpaint-panel";
+import { ImageRegionMattingOverlay } from "./canvas/image-region-matting-overlay";
 import { CanvasImageBoardActions } from "./canvas/canvas-image-board-actions";
 import { classifyImageBoardPlacement } from "../lib/image-board-placement";
-import { imageToolOperationModel } from "../lib/layer-backend";
+import { imageToolOperationModel, fetchSemanticLayerQuote, type SemanticLayerQuote } from "../lib/layer-backend";
 import { buildTextReplacementContent } from "../lib/image-text-replacement-request";
 import { ImageCropResolutionPanel } from "./canvas/image-crop-resolution-panel";
 import {
@@ -333,6 +334,11 @@ export function CanvasToolMenu({
   const eraserSessionRef = useRef<EraserSession | null>(null);
   const [repaintBusy, setRepaintBusy] = useState(false);
   const [repaintError, setRepaintError] = useState<string>();
+  // Box-selection layer split. The quote is fetched when the box session opens,
+  // because the paid calls are what the user must see before framing anything.
+  const [layerBoxSession, setLayerBoxSession] = useState<RegionMattingSession | null>(null);
+  const [layerSplitQuote, setLayerSplitQuote] = useState<SemanticLayerQuote | null>(null);
+  const [layerSplitQuoteError, setLayerSplitQuoteError] = useState<string>();
   const repaintBusyRef = useRef(false);
   const repaintJobRef = useRef<{ id: string; placeholderId: string } | null>(null);
   const repaintSubmissionRef = useRef<{ payload: Parameters<typeof createImageGenerationJob>[1]; placeholderId: string } | null>(null);
@@ -1484,6 +1490,47 @@ export function CanvasToolMenu({
     [handleDirectImageAction],
   );
 
+  /**
+   * Box-selection split.
+   *
+   * The element is identified by the rectangle the user draws, not by a name, so
+   * the flow is: quote the two paid calls (element + repaired background), let the
+   * user frame one element, then submit the same semantic split with a single
+   * layer and that region. The quote comes first because it carries the model the
+   * job must freeze and the number of calls the user is about to pay for.
+   */
+  const handleStartLayerBox = useCallback(async () => {
+    if (!selectedImage || !selectedImageBounds) return;
+    setLayerBoxSession({
+      imageId: selectedImage.id,
+      bounds: { x: selectedImageBounds.x, y: selectedImageBounds.y,
+        width: selectedImageBounds.width, height: selectedImageBounds.height },
+      angle: selectedImage.angle ?? 0,
+    });
+    setLayerSplitQuote(null);
+    setLayerSplitQuoteError(undefined);
+    try {
+      setLayerSplitQuote(await fetchSemanticLayerQuote(accessToken, 1));
+    } catch (cause) {
+      setLayerSplitQuoteError(cause instanceof Error ? cause.message : "无法读取本次拆分报价。");
+    }
+  }, [accessToken, selectedImage, selectedImageBounds]);
+
+  const handleConfirmLayerBox = useCallback(
+    (region: NormalizedImageRegion) => {
+      setLayerBoxSession(null);
+      if (!layerSplitQuote) return;
+      void handleDirectImageAction("split-layers", "提取框选的这个元素，并把原图背景修补完整", {
+        layerBackend: "semantic",
+        layerNames: ["框选元素"],
+        repairBackground: true,
+        selectionRegion: region,
+        model: layerSplitQuote.model,
+      });
+    },
+    [handleDirectImageAction, layerSplitQuote],
+  );
+
   const handleStartErase = useCallback(async () => {
     if (!selectedImage || !selectedImageBounds) return;
     if (repaintBusyRef.current) return;
@@ -1976,7 +2023,7 @@ export function CanvasToolMenu({
       {/* Image Generator Panel -- floats below the selected placeholder */}
       {selectedImage &&
         selectedImageBounds &&
-        !eraserSession && !outpaintSession && (
+        !eraserSession && !outpaintSession && !layerBoxSession && (
           <ImageSelectionToolbar
             key={`${selectedImage.id}:${Boolean(editingDesignId)}`}
             boardOnly={Boolean(editingDesignId)}
@@ -1992,6 +2039,7 @@ export function CanvasToolMenu({
             onSplitLayers={handleSplitImageLayers}
             onSplitLayersDedicated={handleDedicatedSplitImageLayers}
             onSplitLayersQwen={handleQwenSplitImageLayers}
+            onSplitLayersBox={() => void handleStartLayerBox()}
             accessToken={accessToken}
             onErase={handleStartErase}
             onOutpaint={() => {
@@ -2012,6 +2060,25 @@ export function CanvasToolMenu({
         onCanvasRevisionChange={onCanvasRevisionChange} {...(onOpenDesign ? { onOpenDesign } : {})} />
 
       {outpaintSession && createPortal(<ImageOutpaintPanel source={outpaintSession.source} placement={outpaintSession.placement} api={excalidrawApi} accessToken={accessToken} canvasId={canvasId} preferredModel={imageModelPreference.models[0]} onClose={()=>setOutpaintSession(null)} />,document.body)}
+      {layerBoxSession &&
+        createPortal(
+          <ImageRegionMattingOverlay
+            bounds={layerBoxSession.bounds}
+            angle={layerBoxSession.angle}
+            hint="拖动框选要剥离的元素"
+            selectedHint="已框选，确认后提取该元素并修补底图"
+            confirmLabel="剥离该元素"
+            {...(layerSplitQuote
+              ? { note: `${layerSplitQuote.displayName} · ${layerSplitQuote.calls} 次图片调用 · ${layerSplitQuote.credits} credits` }
+              : {})}
+            {...(layerSplitQuoteError ? { error: layerSplitQuoteError } : {})}
+            disabled={!layerSplitQuote}
+            onCancel={() => setLayerBoxSession(null)}
+            onConfirm={handleConfirmLayerBox}
+          />,
+          document.body,
+        )}
+
       {eraserSession &&
         createPortal(
           <ImageEraserOverlay

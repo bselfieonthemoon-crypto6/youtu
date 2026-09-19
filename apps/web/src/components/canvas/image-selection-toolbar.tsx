@@ -24,7 +24,7 @@ const icons: Record<ImageToolbarActionId, typeof Sparkles> = {
   "add-to-chat": MessageCirclePlus, details: Info, download: Download,
 };
 
-export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop, onRegenerate, onUpscale, onRemoveBackground, onSplitLayers, onSplitLayersDedicated, onSplitLayersQwen, accessToken, onErase, onOutpaint, onChatCommand, onRecognizeText, onApplyTextReplacement, onAddToBoard, addToBoardLabel = "添加到画板", boardOnly = false }: {
+export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop, onRegenerate, onUpscale, onRemoveBackground, onSplitLayers, onSplitLayersDedicated, onSplitLayersQwen, onSplitLayersBox, accessToken, onErase, onOutpaint, onChatCommand, onRecognizeText, onApplyTextReplacement, onAddToBoard, addToBoardLabel = "添加到画板", boardOnly = false }: {
   image: SelectedCanvasImage;
   screenBounds: { x: number; y: number; width: number; height: number; viewportWidth?: number };
   onDownload: () => void;
@@ -38,6 +38,12 @@ export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop,
   onSplitLayers: () => void;
   onSplitLayersDedicated?: (request: SemanticLayerSplitRequest) => void;
   onSplitLayersQwen?: () => void;
+  /**
+   * Box-selection split: the user frames one element and the model extracts it
+   * together with a repaired background. When provided, the split button opens a
+   * short menu instead of going straight to the named-layer dialog.
+   */
+  onSplitLayersBox?: () => void;
   accessToken?: string;
   onErase: () => void;
   onOutpaint?: () => void;
@@ -70,7 +76,13 @@ export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop,
     if (id === "add-to-chat") return onChatCommand();
     if (id === "replace-text") return setReplaceTextOpen(true);
     if (id === "remove-background") return onRemoveBackground();
-    if (id === "split-layers") return onSplitLayersDedicated ? setActiveAction(id) : onSplitLayers();
+    if (id === "split-layers") {
+      // Box selection is the everyday path, so it is the plain click. The paid
+      // named-layer split stays one level down in the overflow menu instead of
+      // being the default action of a button that looks free.
+      if (onSplitLayersBox) return onSplitLayersBox();
+      return onSplitLayersDedicated ? setActiveAction(id) : onSplitLayers();
+    }
     if (id === "erase") return onErase();
     if (id === "outpaint") return onOutpaint?.();
     if (id === "regenerate" || id === "upscale") return setActiveAction(id);
@@ -98,6 +110,8 @@ export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop,
           <button type="button" aria-label="更多图片工具" onClick={() => setMenuOpen((v) => !v)} className="flex size-9 items-center justify-center rounded-lg hover:bg-muted"><Ellipsis className="size-5" /></button>
           {menuOpen && <div className="absolute right-0 top-11 z-[101] max-h-[60vh] w-64 overflow-y-auto rounded-xl border border-border bg-background p-1.5 shadow-xl">
             {more.map((item) => button(item, true))}
+            {onSplitLayersBox && <button type="button" onClick={() => { setMenuOpen(false); onSplitLayersBox(); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted"><Focus className="size-4" />框选剥离元素</button>}
+            {onSplitLayersDedicated && <button type="button" onClick={() => { setMenuOpen(false); setActiveAction("split-layers"); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted"><Layers3 className="size-4" />按名称拆分（付费）</button>}
             {onSplitLayersDedicated && <button type="button" onClick={() => { setMenuOpen(false); onSplitLayers(); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted"><Layers3 className="size-4" />本地快速拆分</button>}
             {accessToken && onSplitLayersQwen && <LayerBackendOption accessToken={accessToken} onRun={() => { setMenuOpen(false); onSplitLayersQwen(); }} />}
             <div className="my-1 h-px bg-border" />

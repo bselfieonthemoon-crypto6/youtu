@@ -34,11 +34,27 @@ function normalizedRegion(start: Point, end: Point): NormalizedImageRegion {
 export function ImageRegionMattingOverlay({
   bounds,
   angle = 0,
+  hint = "拖动框选想要的元素",
+  selectedHint = "已框选，确认后开始抠图",
+  confirmLabel = "确认抠图",
+  note,
+  error,
+  disabled = false,
   onCancel,
   onConfirm,
 }: {
   bounds: { x: number; y: number; width: number; height: number };
   angle?: number;
+  /** Copy shown before a box exists. */
+  hint?: string;
+  /** Copy shown once a usable box exists. */
+  selectedHint?: string;
+  confirmLabel?: string;
+  /** Cost or scope disclosure, e.g. the quoted paid calls. */
+  note?: string;
+  /** Blocks confirmation without discarding the drawn box. */
+  error?: string;
+  disabled?: boolean;
   onCancel: () => void;
   onConfirm: (region: NormalizedImageRegion) => void;
 }) {
@@ -98,7 +114,7 @@ export function ImageRegionMattingOverlay({
   };
 
   const confirm = () => {
-    if (!selection || !canConfirm) return;
+    if (!selection || !canConfirm || disabled) return;
     onConfirm(normalizedRegion(start!, end!));
   };
 
@@ -146,13 +162,15 @@ export function ImageRegionMattingOverlay({
       >
         <span className="flex items-center gap-1.5 px-1 text-xs text-muted-foreground">
           <MousePointer2 className="size-3.5" />
-          {canConfirm ? "已框选，确认后开始抠图" : "拖动框选想要的元素"}
+          {canConfirm ? selectedHint : hint}
         </span>
+        {note && <span className="px-1 text-[11px] text-muted-foreground">{note}</span>}
+        {error && <span role="alert" className="px-1 text-[11px] text-destructive">{error}</span>}
         <button type="button" onClick={onCancel} className="flex h-8 items-center gap-1 rounded-lg px-2 text-xs hover:bg-muted">
           <X className="size-3.5" />取消
         </button>
-        <button type="button" disabled={!canConfirm} onClick={confirm} className="flex h-8 items-center gap-1 rounded-lg bg-foreground px-3 text-xs text-background disabled:cursor-not-allowed disabled:opacity-40">
-          <Check className="size-3.5" />确认抠图
+        <button type="button" disabled={!canConfirm || disabled} onClick={confirm} className="flex h-8 items-center gap-1 rounded-lg bg-foreground px-3 text-xs text-background disabled:cursor-not-allowed disabled:opacity-40">
+          <Check className="size-3.5" />{confirmLabel}
         </button>
       </div>
     </div>
