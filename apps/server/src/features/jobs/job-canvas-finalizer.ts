@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type { BackgroundJobStatus, JobTargetFinalizationDto, Json } from "@loomic/shared";
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
@@ -200,6 +202,30 @@ function asRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
+/** Short canvas label for a failed placeholder: the job's real reason instead of
+ * the constant "图片生成失败" that told the user nothing about 429 vs 504. */
+export function canvasFailureLabel(status: string, errorCode: string | null): string {
+  if (status === "canceled") return "生成已取消";
+  switch (errorCode) {
+    case "provider_rate_limited": return "渠道过载，未生成";
+    case "provider_rejected": return "渠道拒绝，未生成";
+    case "image_generation_result_unknown": return "上游超时，结果未知";
+    case "invalid_input": return "参数不合法，未生成";
+    case "safety_filter": return "内容被安全策略拦截";
+    default: return "图片生成失败";
+  }
+}
+
+/**
+ * Deterministic id for a terminal notice, derived from the job id. The notice is
+ * written with `upsert`, so a retry or the recovery scan can never append the
+ * same outcome twice.
+ */
+function terminalNoticeId(seed: string): string {
+  const hash = createHash("sha256").update(seed).digest("hex");
+  return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-a${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
+}
+
 /** Converge a terminal image job's persisted chat and canvas placeholder. This
  * never creates or retries provider work; every write is bound to the job id. */
 export async function finalizeTerminalImageJobPlaceholder(  admin: AdminSupabaseClient,
@@ -257,6 +283,19 @@ export async function finalizeTerminalImageJobPlaceholder(  admin: AdminSupabase
       }],
     }, { onConflict: "id" });
     if (chatError) throw new Error(`Failed to settle terminal image chat ${job.id}: ${chatError.message}`);
+    // The submission card is rewritten in place, so it keeps the POSITION it was
+    // created at — which is earlier than the optimistic "正在生成中…出图后告诉你"
+    // line the same turn emitted. Without a notice created now, the last thing the
+    // user reads is that promise. Appending one row makes the real outcome the
+    // newest message; the deterministic id keeps it exactly-once.
+    const { error: noticeError } = await admin.from("chat_messages").upsert({
+      id: terminalNoticeId(`${job.id}:terminal-notice`),
+      session_id: job.session_id,
+      role: "assistant",
+      content: summary,
+      content_blocks: [{ type: "text", text: summary }],
+    }, { onConflict: "id" });
+    if (noticeError) throw new Error(`Failed to append terminal image notice ${job.id}: ${noticeError.message}`);
     finalizedResult.chat_terminal_finalized_at = new Date().toISOString();
     finalizedResult.chat_terminal_status = job.status;
     changed = true;
@@ -274,7 +313,7 @@ export async function finalizeTerminalImageJobPlaceholder(  admin: AdminSupabase
         job.canvas_id,
         placeholderId,
         job.id,
-        job.status === "canceled" ? "生成已取消" : "图片生成失败",
+        canvasFailureLabel(job.status, job.error_code ?? null),
       );
       finalizedResult.canvas_terminal_finalized_at = new Date().toISOString();
       finalizedResult.canvas_terminal_status = job.status;
@@ -356,6 +395,17 @@ export async function finalizeTerminalVideoJobPlaceholder(
     }],
   }, { onConflict: "id" });
   if (chatError) throw new Error(`Failed to settle terminal video chat ${job.id}: ${chatError.message}`);
+
+  // Same reason as the image path: the submission card keeps its original
+  // position, so the outcome must be a message created now to be the newest line.
+  const { error: noticeError } = await admin.from("chat_messages").upsert({
+    id: terminalNoticeId(`${job.id}:terminal-notice`),
+    session_id: job.session_id,
+    role: "assistant",
+    content: summary,
+    content_blocks: [{ type: "text", text: summary }],
+  }, { onConflict: "id" });
+  if (noticeError) throw new Error(`Failed to append terminal video notice ${job.id}: ${noticeError.message}`);
 
   const { error: updateError } = await admin.from("background_jobs").update({ result: {
     ...result,

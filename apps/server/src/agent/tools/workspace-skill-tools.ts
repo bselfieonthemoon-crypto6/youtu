@@ -46,7 +46,7 @@ export function createWorkspaceSkillTools(entries: readonly WorkspaceSkillEntry[
       const runtime = readSkillRuntimeMetadata(skill.metadata);
       if (outputKind && runtime && !skillSupportsDeliverable(runtime, outputKind)) return {
         status: "conflict", code: "skill_output_kind_conflict", activated: false, skill: selected,
-        message: `This Skill does not declare the ${outputKind} output kind. Select a package matching the actual deliverable transport.`,
+        message: `此技能没有声明 ${outputKind} 这类产出，不能按该产出加载。请改传此技能自己声明的 outputKinds（见 list_skills），或换一个与实际交付形式匹配的技能包。`,
       };
       return { status: "loaded", skill: selected, instructions: skill.content,
         selection: {

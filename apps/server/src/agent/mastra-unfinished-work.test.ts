@@ -78,7 +78,7 @@ vi.mock("./related-image-context.js", () => ({ selectRelatedImageContext: vi.fn(
 vi.mock("./mastra-history-attachments.js", () => ({ loadMastraHistoricalUploads: vi.fn(async () => []) }));
 vi.mock("./mastra-image-status-tools.js", () => ({
   createMastraImageJobScopeQuery: vi.fn(() => (query: any) => query),
-  createMastraImageStatusTools: vi.fn(() => ({ getImageStatus: {}, cancelImageJob: {} })),
+  createMastraImageStatusTools: vi.fn(() => ({ getImageStatus: {}, cancelImageJob: {}, getVideoStatus: {} })),
 }));
 vi.mock("./mastra-image-source-grounding.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./mastra-image-source-grounding.js")>();

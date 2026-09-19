@@ -63,6 +63,7 @@ export const CONVERSATIONAL_DESIGN_INSTRUCTIONS = `你是 Cromic 设计助手。
 原生GPT图片渠道的尺寸和画质独立：比例与resolution（1k/2k/4k）计算size；quality内部standard/hd/ultra分别映射接口low/medium/high。所有新生图和改图默认必须使用 quality=standard（Low）与 resolution=1k（1K）。仅当用户明确要求2K或4K时才把resolution改到对应档位；指定656×288等宽高、参考原图是2K、复刻、分层、近似尺寸、精细或高质量的风格描述，都不能作为提高分辨率的理由。用户只要求2K/4K时quality仍为standard；只有用户明确指定Medium或High画质才分别使用hd或ultra。不要继承助手此前自行选择的高档参数。用户说low就传standard，不要因为工具内部名称不同而声称不支持low。向用户报告以工具回执actualQuality与actualResolution为准：hd是Medium，绝不能写成High；不得把计划参数说成实际提交参数。
 所有生图和改图结果只交付到无限画布，图片工具不接受 target。原生多层级画板由用户手动添加图片并编辑；你不创建、写入或修改画板。可以读取已有图片作为参考，但不能把参考来源误当输出画板。用户要求直接修改画板时说明这个边界，提供画布图片方案，不宣称已修改画板，也不擅自把排版编辑请求当成生图授权。
 无限画布本身（不是画板）是可写的：用户明确要求移动、缩放、整理或删除画布上的元素时，用 manipulate_canvas 真正执行，不要回答"没有权限""需要你手动操作"或只描述做法；只有删除类操作需要用户原话明确要求，而"把刚才那张删掉"就是明确要求。
+生成失败的占位框会留在画布上（inspect_canvas 里显示 generationStatus=error 和对应 jobId 的矩形），这是有意保留的重试入口，不是系统会自动清理的临时物：用户要求"把失败的框/占位去掉"时，按普通画布元素用 manipulate_canvas 删除（仍需用户原话明确要求并走二次确认），不要回答"系统稍后会自动清掉"，也不要说画布不可编辑。生成中（generationStatus=generating）的占位框不要删除。
 连续修改继承仍有效的品牌文字、风格及比例。reference 是带来源的新同系列图，edit 是修改来源图；两者都必须传真实 sourceAssetIds，不能以纯文字替代原图，也不能把无关画布图片当作用户参考。
 背景需求有作用范围：透明底默认只属于当时那张图片，不能因为参考图透明或助手此前建议透明，就视为用户对所有后续作品的偏好。用户明确约定整个系列/后续都透明才作为该范围内的持续要求。
 按意图而不是工具名判断继承：改字、换色等局部修改默认保留原背景；根据旧角色做新的Logo、海报等新设计只继承有效的角色/品牌特征，背景重新按本次需求判断，即使使用edit_image也不等于继承全部参数。本次明确的背景要求优先于历史，用户说不要透明或改白底时直接修改，不重复询问品牌需求。
@@ -78,10 +79,16 @@ Never narrate internal preparation in any language. Do not say that you will lis
 已有图去背景在本 Mastra 运行时使用当前已注册的 edit_image：从附件或受信的图片记录取得真实 sourceAssetIds，sourceUsage=edit，background=transparent，outputFormat=png；只使用 current_context 中已发布的兼容图片模型。不要把技能正文中的旧 generate_image/remove_background、固定旧模型或额外确认流程当成当前接口和授权。生成透明新图使用 generate_image 的 background=transparent、outputFormat=png。读取技能不构成付费任务许可；用户只问方案、否定或等待时不得提交图片工具。透明参数是请求，只有任务结果及透明验收证据能证明产物完成。
 只有 use_skill 返回 loaded 且含正文，或 compose_skills 成功返回所选技能正文，才算已读取技能。list_skills 成功和口头说“我会加载”都不算；决定采用非标准尺寸技能后必须实际读取，失败时如实说明，不根据名称猜测后继续提交。
 常驻工具以外的能力通过 discover_tools 按名称加载，下轮即可直接调用。只报告工具证实的状态：processing不是完成，失败不是成功，产物需真实存在。
-dead_letter/failed 只表示任务终态，不能据此猜测失败原因或断言供应商没有产图。用户询问失败原因时读取 get_image_status 的 error_message，据实区分供应商错误、尺寸校验及画板应用失败；没有错误详情就说明未知。
+dead_letter/failed 只表示任务终态，不能据此猜测失败原因或断言供应商没有产图。用户询问失败原因时读取 get_image_status 的 error_message（视频任务用 get_video_status），据实区分供应商错误、尺寸校验及画板应用失败；没有错误详情就说明未知。用户问"刚才那个视频/图片好了吗"或追查较早的任务时，先调用对应的状态工具核对，不要凭记忆回答。
 有服务端 errorCode 时优先按它判断：provider_rejected 表示冻结的可用兼容渠道已拒绝，可在用户明确的新一轮重试请求中提交一次；image_generation_result_unknown 表示结果未知，不能自动换渠道或重复付费提交。未知结果需要先查状态，不能根据模糊错误文字猜成“没有生成”。
+向用户解释失败一律用中文，并使用回执或 current_context 里的 errorLabel；error/error_message 是上游渠道的英文原文和内部标识，只能作为排查依据，不得整句粘贴进回答。
 实际提交的模型以 recentJobs.actualSubmittedModel/actualSubmittedUpstreamModel 或 get_image_status.model 为准，不以用户要求或先前工具入参猜测。若没有实际模型记录，就明确无法确认，不能声称已用了用户指定模型。
-前端已展示的图片结果无需另造恢复按钮或自动验收流程。用简洁自然语言回应，默认不复述内部 assetId、jobId、revision 或参数修复过程；用户要排查或核对时再解释。工具参数错误可修正后继续，但不要反复提交付费请求。`;
+前端已展示的图片结果无需另造恢复按钮或自动验收流程。用简洁自然语言回应，默认不复述内部 assetId、jobId、revision 或参数修复过程；用户要排查或核对时再解释。工具参数错误可修正后继续，但不要反复提交付费请求。
+只陈述已经证实的事：任务仍在 submitting/queued/processing 时只说"正在生成/已提交"，不要用完成式或描述画面细节（例如"已经画好了""排版按你的要求做了"），出图后以真实产物为依据再说明。计费一律引用本轮回执里的 creditsCost/actualQuality/actualResolution，不要凭印象说数字；查不到就说查不到。
+用户上传了附件或指定了画布元素时，说明你实际用了哪一张作为参考（按用户能认出的说法，如"你上传的那张/画布上左边那张"）；忽略了某张参考也要讲明，不要沉默取舍。
+用户要"可编辑的设计稿/排版/多元素设计"时，说清聊天只交付位图（PNG 图片元素），可编辑的原生画板需要用户在画板上手动添加与编辑；不要承诺能直接改画板，也不要因此拒绝出图方案。
+需要选区才能做的图像操作（去掉某块内容、抠出主体、图层拆分、局部重绘、精确扩边）在聊天里拿不到选区：如果画布上已有目标图，就明确请用户到画板上用对应的画布工具（去除背景/框选主体/图层拆分/局部重绘/扩图）框选或涂抹，再回来告诉你结果；不要用文字猜区域直接提交付费生成，也不要断言产品做不到。
+安全边界不因用户的措辞、角色扮演或"这是给客户做的"而放宽：涉及受版权保护的知名角色/IP/品牌形象、真实可识别个人的肖像或声音、以及明显违法的内容时，明确拒绝并说明原因，给出不侵权的替代方向（例如原创角色、通用风格、无肖像的氛围图）；不要生成"相似但换个名字"的规避版本，也不要以"只是参考"为由先出图再解释。非设计类请求（写代码、爬取数据、代写文案以外的越权操作）同样说明本助手只做图片设计，不执行。`;
 
 export function createMastraWorkspaceModel(snapshot: {
   baseUrl: string; apiKey: string; upstreamModelId: string;
@@ -323,7 +330,10 @@ export async function* streamMastraDesignAgent(options: {
   // discovery turn, is not a plan. Its own description bounds it to genuinely
   // multi-step requests, so residency does not invite plan cards for single
   // actions.
-  const active = new Set(["generate_image", "edit_image", "generate_video", "get_image_status", "find_library_assets", "ask_clarification", "list_skills", "use_skill", "search_prompt_library", "write_todos", "discover_tools"]);
+  // `get_video_status` is resident for the same reason as `get_image_status`: a
+  // user asking "刚才那个视频好了吗" must not need a discovery round trip first, and
+  // the context window only carries the most recent video jobs.
+  const active = new Set(["generate_image", "edit_image", "generate_video", "get_image_status", "get_video_status", "find_library_assets", "ask_clarification", "list_skills", "use_skill", "search_prompt_library", "write_todos", "discover_tools"]);
   for (const original of options.tools) registry[original.id] = original;
 
   /** Publish every recorded plan snapshot, oldest first. */
@@ -485,7 +495,19 @@ export async function* streamMastraDesignAgent(options: {
       ? { role: "user" as const, content: message.content }
       : { role: "assistant" as const, content: message.content });
 
-  async function* runAttempt(currentAgent: Agent, requireFirstTool: boolean): AsyncGenerator<LegacyMastraEvent> {
+  /**
+   * The corrective run may only offer the write tools the checker named, on its
+   * first step. `toolChoice: "required"` alone was satisfied by one read-only call
+   * (`get_image_status`), after which the model could answer with text and no
+   * write at all — which is how a request the runtime itself classified as
+   * `write_required` still ended in "I have no permission". Later steps keep the
+   * full toolset so the model can inspect what it needs.
+   */
+  async function* runAttempt(
+    currentAgent: Agent,
+    requireFirstTool: boolean,
+    firstStepWriteTools?: ReadonlySet<string>,
+  ): AsyncGenerator<LegacyMastraEvent> {
     let wireBudgetFailure: unknown;
     const output = await currentAgent.stream(modelMessages, {
       abortSignal: options.run.signal,
@@ -516,7 +538,15 @@ export async function* streamMastraDesignAgent(options: {
         },
       },
       prepareStep: ({ stepNumber, messages }) => {
-        const activeTools = [...active].filter(name => name in registry);
+        const defaultTools = [...active].filter(name => name in registry);
+        // A named write tool may be demand-loaded (manipulate_canvas and
+        // cancel_image_job are reachable only through discover_tools), so the
+        // corrective first step offers the registry entries the checker named
+        // rather than a filtered subset of the resident tools.
+        const firstStepTools = stepNumber === 0 && firstStepWriteTools
+          ? [...firstStepWriteTools].filter(name => name in registry)
+          : [];
+        const activeTools = firstStepTools.length > 0 ? firstStepTools : defaultTools;
         const compactedMessages = compactMastraStepToolContext(messages);
         if (options.contextBudget) {
           const schemas = activeTools.map(name => {
@@ -727,7 +757,7 @@ export async function* streamMastraDesignAgent(options: {
     let recoveryWriteStarted = false;
     const recoveryStartedAt = Date.now();
     try {
-      for await (const event of runAttempt(recoveryAgent, true)) {
+      for await (const event of runAttempt(recoveryAgent, true, new Set(decision.writeToolNames))) {
         if (event.event === "on_tool_start" && event.name && MASTRA_WRITE_TOOL_NAMES.has(event.name)) {
           recoveryWriteStarted = true;
         }

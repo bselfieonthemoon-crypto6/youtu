@@ -51,12 +51,34 @@ export const SESSION_UNFINISHED_MAX_TITLE_LENGTH = 200;
 export const SESSION_UNFINISHED_MAX_PROMPT_LENGTH = 400;
 export const SESSION_UNFINISHED_MAX_SOURCE_IDS = 16;
 
+/** Bound shared with the jsonb CHECK constraint in the read_skills migration. */
+export const SESSION_READ_SKILLS_MAX_ITEMS = 12;
+/** Matches the length bound the active_skill column already enforces. */
+export const SESSION_READ_SKILL_MAX_LENGTH = 63;
+export const SESSION_READ_SKILL_VERSION_MAX_LENGTH = 32;
+
 /**
  * Per-run `configurable` key the image tool appends pre-submission refusals to.
  * The runtime merges it with the run's recorded plan steps and persists the
  * result at run end; nothing here is read as authorization by any gate.
  */
 export const SESSION_REFUSED_OUTPUTS_KEY = "session_refused_outputs";
+
+/**
+ * One Skill guide this conversation actually READ (`use_skill` /
+ * `compose_skills` returned a body, never a catalog listing or a model claim).
+ *
+ * The model receives no previous turns' tool results, so it cannot self-check
+ * whether a guide was loaded. Without this record a run that had loaded two
+ * guides denied having loaded any, then answered from memory.
+ */
+export type SessionReadSkill = {
+  slug: string;
+  /** The package version that was read; a later version makes the memory stale. */
+  version?: string;
+  /** ISO timestamp of the read, newest first in the stored list. */
+  at?: string;
+};
 
 export type SessionDesignContext = {
   activeSkill: string | null;
@@ -66,6 +88,8 @@ export type SessionDesignContext = {
   awaitingClarification: boolean;
   /** What the last run left undone; empty when the last run finished everything. */
   unfinishedOutputs: SessionUnfinishedOutput[];
+  /** Guides read in this conversation, newest first; evidence, never authority. */
+  readSkills: SessionReadSkill[];
 };
 
 /** Defaults on; set LOOMIC_SESSION_SKILL_MEMORY=0 to disable without a deploy. */
@@ -173,12 +197,64 @@ export function collectUnfinishedSessionOutputs(input: { refused: unknown; planS
   return items;
 }
 
+/** Normalize the persisted jsonb column (or any untrusted value of that shape). */
+function readSkillsFromJson(value: unknown): SessionReadSkill[] {
+  if (!Array.isArray(value)) return [];
+  const items: SessionReadSkill[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const record = raw as Record<string, unknown>;
+    // Drop an over-long slug rather than truncating it: a truncated slug names a
+    // Skill that does not exist, and this list is injected as evidence.
+    const slug = typeof record.slug === "string" ? record.slug.trim() : "";
+    if (!slug || slug.length > SESSION_READ_SKILL_MAX_LENGTH || seen.has(slug)) continue;
+    seen.add(slug);
+    const version = boundedString(record.version, SESSION_READ_SKILL_VERSION_MAX_LENGTH);
+    const at = boundedString(record.at, 40);
+    items.push({ slug, ...(version ? { version } : {}), ...(at ? { at } : {}) });
+    if (items.length >= SESSION_READ_SKILLS_MAX_ITEMS) break;
+  }
+  return items;
+}
+
+/**
+ * Fold this run's reads into the conversation's record, newest first.
+ *
+ * Pure and structural: it merges slugs, never inspects guide text, and never
+ * turns a read receipt into a selection or a permission. A repeated read of the
+ * same slug updates its entry in place (so a version bump is visible) instead of
+ * appending a duplicate, and the list is capped so a long session cannot grow it
+ * without bound. `changed` lets the caller skip a write on an unrelated turn.
+ */
+export function mergeSessionReadSkills(
+  existing: readonly SessionReadSkill[] | null | undefined,
+  incoming: readonly SessionReadSkill[],
+): { items: SessionReadSkill[]; changed: boolean } {
+  const normalizedExisting = readSkillsFromJson(existing ?? []);
+  const normalizedIncoming = readSkillsFromJson(incoming);
+  if (!normalizedIncoming.length) return { items: normalizedExisting, changed: false };
+  const enriched = normalizedIncoming.map(entry => ({ ...entry, at: entry.at ?? new Date().toISOString() }));
+  const incomingSlugs = new Set(enriched.map(entry => entry.slug));
+  const items = [...enriched, ...normalizedExisting.filter(entry => !incomingSlugs.has(entry.slug))]
+    .slice(0, SESSION_READ_SKILLS_MAX_ITEMS);
+  return { items, changed: JSON.stringify(items) !== JSON.stringify(normalizedExisting) };
+}
+
 /** Best-effort read: a missing table, row or permission must never block a run. */
 export async function loadSessionDesignContext(client: any, sessionId: string): Promise<SessionDesignContext | null> {
   try {
-    const { data, error } = await client.from("session_design_context")
-      .select("active_skill,active_skill_hash,series,awaiting_clarification,unfinished_outputs")
-      .eq("session_id", sessionId).maybeSingle();
+    const columns = "active_skill,active_skill_hash,series,awaiting_clarification,unfinished_outputs,read_skills";
+    const read = (selection: string) => client.from("session_design_context")
+      .select(selection).eq("session_id", sessionId).maybeSingle();
+    let { data, error } = await read(columns);
+    if (error) {
+      // `read_skills` is the newest column. On a deployment where that migration
+      // has not been applied yet, fall back to the previous selection instead of
+      // failing the whole read: returning null would silently disable series,
+      // clarification and unfinished-output memory along with it.
+      ({ data, error } = await read(columns.replace(",read_skills", "")));
+    }
     if (error || !data) return null;
     return {
       activeSkill: typeof data.active_skill === "string" ? data.active_skill : null,
@@ -186,6 +262,7 @@ export async function loadSessionDesignContext(client: any, sessionId: string): 
       series: seriesFromJson(data.series),
       awaitingClarification: data.awaiting_clarification === true,
       unfinishedOutputs: unfinishedFromJson(data.unfinished_outputs),
+      readSkills: readSkillsFromJson(data.read_skills),
     };
   } catch {
     return null;
@@ -200,6 +277,8 @@ export async function saveSessionDesignContext(client: any, sessionId: string, p
   awaitingClarification?: boolean;
   /** Unfinished work for the next turn; an empty list clears the column. */
   unfinishedOutputs?: SessionUnfinishedOutput[] | null;
+  /** Guides read so far; an empty list clears the column. */
+  readSkills?: SessionReadSkill[] | null;
 }): Promise<void> {
   try {
     const row: Record<string, unknown> = { session_id: sessionId };
@@ -209,6 +288,8 @@ export async function saveSessionDesignContext(client: any, sessionId: string, p
     if ("awaitingClarification" in patch) row.awaiting_clarification = patch.awaitingClarification === true;
     if ("unfinishedOutputs" in patch) row.unfinished_outputs = patch.unfinishedOutputs?.length
       ? patch.unfinishedOutputs : null;
+    if ("readSkills" in patch) row.read_skills = patch.readSkills?.length
+      ? readSkillsFromJson(patch.readSkills) : null;
     await client.from("session_design_context").upsert(row, { onConflict: "session_id" });
   } catch {
     // Remembering preferences must never fail the user's turn.

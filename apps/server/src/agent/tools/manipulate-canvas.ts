@@ -192,6 +192,9 @@ function targetsNativeDesignBoard(
 
 const MAX_CANVAS_WRITE_ATTEMPTS = 3;
 
+/** Gap kept between an element nudged aside and the element it avoided. */
+const OCCUPANCY_GAP = 24;
+
 /**
  * Destructive canvas operations require an explicit instruction in the raw
  * user message for the current run. This deliberately does not inspect the
@@ -222,16 +225,70 @@ export function hasExplicitCanvasDeleteIntent(prompt: unknown): boolean {
 // Operation handlers
 // ---------------------------------------------------------------------------
 
+/** Overlap ratio of `rect` with any other visible element, and the widest one's id. */
+function occupancyOf(
+  elements: readonly CanvasElement[],
+  self: CanvasElement,
+  rect: { x: number; y: number; width: number; height: number },
+): { ratio: number; withId: string | null } {
+  const area = Math.max(1, rect.width * rect.height);
+  let worst = 0;
+  let withId: string | null = null;
+  for (const other of elements) {
+    if (other === self || other.id === self.id || other.isDeleted) continue;
+    const width = Number(other.width ?? 0);
+    const height = Number(other.height ?? 0);
+    if (!(width > 0) || !(height > 0)) continue;
+    const overlapX = Math.min(rect.x + rect.width, Number(other.x ?? 0) + width) - Math.max(rect.x, Number(other.x ?? 0));
+    const overlapY = Math.min(rect.y + rect.height, Number(other.y ?? 0) + height) - Math.max(rect.y, Number(other.y ?? 0));
+    if (overlapX <= 0 || overlapY <= 0) continue;
+    const ratio = (overlapX * overlapY) / area;
+    if (ratio > worst) { worst = ratio; withId = String(other.id); }
+  }
+  return { ratio: worst, withId };
+}
+
+/**
+ * Move an element, refusing to drop it on top of another one.
+ *
+ * A simulated user asked to "put it to the right of the original" and the move
+ * landed exactly on top of an existing element (byte-identical x/y/width/height),
+ * while the reply claimed it had left "适当间距". When the requested position is
+ * mostly occupied the element is nudged to the right — the direction such a request
+ * almost always means — and the receipt reports the final coordinates either way.
+ */
 function applyMove(
   elements: CanvasElement[],
   op: Operation,
 ): HandlerResult {
   const el = findElement(elements, op.element_id!);
   if (!el) return { description: `[skip] element ${op.element_id} not found` };
-  el.x = op.x;
-  el.y = op.y;
+  const width = Number(el.width ?? 0);
+  const height = Number(el.height ?? 0);
+  const requested = { x: Number(op.x), y: Number(op.y) };
+  const requestedOccupancy = occupancyOf(elements, el, { ...requested, width, height });
+  let placement = requested;
+  let avoidedId: string | null = null;
+  if (requestedOccupancy.ratio >= 0.5 && requestedOccupancy.withId && width > 0) {
+    const occupant = findElement(elements, requestedOccupancy.withId);
+    if (occupant) {
+      // Land just past the occupied rectangle, keeping the requested top edge.
+      const candidateX = Number(occupant.x ?? 0) + Number(occupant.width ?? 0) + OCCUPANCY_GAP;
+      const candidate = { x: candidateX, y: requested.y };
+      if (occupancyOf(elements, el, { ...candidate, width, height }).ratio < requestedOccupancy.ratio) {
+        placement = candidate;
+        avoidedId = requestedOccupancy.withId;
+      }
+    }
+  }
+  el.x = placement.x;
+  el.y = placement.y;
   bumpVersion(el);
-  return { description: `moved ${shortLabel(el)} to (${op.x}, ${op.y})` };
+  return {
+    description: avoidedId
+      ? `moved ${shortLabel(el)} to (${placement.x}, ${placement.y}) avoiding the occupied position (${requested.x}, ${requested.y}) held by ${avoidedId}`
+      : `moved ${shortLabel(el)} to (${placement.x}, ${placement.y})`,
+  };
 }
 
 function applyResize(
@@ -699,6 +756,36 @@ function applyReorder(
   return { description: `reordered ${shortLabel(el)} to ${op.position}` };
 }
 
+/**
+ * Align/distribute normally legitimately stack their own targets, so they never
+ * refuse. They can still drop a target on top of an element that is *not* part of
+ * the operation (typically with a negative distribute gap) — report that instead
+ * of claiming a clean success so the agent can offer a follow-up move.
+ */
+function foreignOverlapWarning(
+  elements: readonly CanvasElement[],
+  targets: readonly CanvasElement[],
+): string {
+  const targetIds = new Set(targets.map((el) => el.id));
+  const others = elements.filter((el) => !targetIds.has(el.id));
+  const collisions: string[] = [];
+  for (const el of targets) {
+    const width = Number(el.width ?? 0);
+    const height = Number(el.height ?? 0);
+    if (!(width > 0) || !(height > 0)) continue;
+    const { ratio, withId } = occupancyOf(others, el, {
+      x: Number(el.x) || 0,
+      y: Number(el.y) || 0,
+      width,
+      height,
+    });
+    if (withId && ratio >= 0.25) {
+      collisions.push(`${shortLabel(el)} overlaps ${withId} by ${Math.round(ratio * 100)}%`);
+    }
+  }
+  return collisions.length ? ` warning: ${collisions.join("; ")}` : "";
+}
+
 function applyAlign(
   elements: CanvasElement[],
   op: Operation,
@@ -757,7 +844,8 @@ function applyAlign(
   }
 
   return {
-    description: `aligned ${targets.length} elements ${op.alignment}`,
+    description: `aligned ${targets.length} elements ${op.alignment}` +
+      foreignOverlapWarning(elements, targets),
   };
 }
 
@@ -812,7 +900,8 @@ function applyDistribute(
   }
 
   return {
-    description: `distributed ${targets.length} elements ${op.direction}ly`,
+    description: `distributed ${targets.length} elements ${op.direction}ly` +
+      foreignOverlapWarning(elements, targets),
   };
 }
 

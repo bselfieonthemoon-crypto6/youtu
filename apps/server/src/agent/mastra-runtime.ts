@@ -31,8 +31,9 @@ import { createDesignTurnIntentClassifier, describeDesignRouting, extractStyleHi
 import { explicitNonstandardRatio } from "./image-ratio-intent.js";
 import { mastraImageExecutionPolicy } from "./mastra-image-execution-policy.js";
 import { formatEnabledSkillCatalog } from "./design-skill-catalog.js";
-import { collectUnfinishedSessionOutputs, loadSessionDesignContext, saveSessionDesignContext, sessionSkillMemoryEnabled, SESSION_REFUSED_OUTPUTS_KEY, type SessionUnfinishedOutput } from "./session-design-context.js";
+import { collectUnfinishedSessionOutputs, loadSessionDesignContext, mergeSessionReadSkills, saveSessionDesignContext, sessionSkillMemoryEnabled, SESSION_REFUSED_OUTPUTS_KEY, type SessionReadSkill, type SessionUnfinishedOutput } from "./session-design-context.js";
 import { SESSION_PLAN_STEPS_KEY } from "./tools/plan-todos.js";
+import { providerFailureDescription } from "./provider-failure-copy.js";
 import {
   buildMastraImageSourceCandidates,
   buildMastraImageSourceEffectiveBrief,
@@ -89,11 +90,17 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
 export const MASTRA_RECENT_IMAGE_JOB_PROJECTION = "id,status,result,error_code,error_message,created_at,canvas_id,design_id,title:payload->>title,prompt:payload->>prompt,model:payload->>model,aspectRatio:payload->>aspect_ratio";
 
 export function projectMastraImageReceipt(job: any, images: readonly { id: string; upstreamModelId?: string }[]) {
+  const errorCode = typeof job.error_code === "string" ? job.error_code : undefined;
+  const errorLabel = providerFailureDescription(errorCode);
   return { id: job.id, status: job.status, assetId: job.result?.asset_id,
     actualSubmittedModel: job.model,
     actualSubmittedUpstreamModel: job.result?.upstream_model ?? images.find(item => item.id === job.model)?.upstreamModelId,
     requestedAspectRatio: job.aspectRatio,
-    errorCode: typeof job.error_code === "string" ? job.error_code : undefined,
+    errorCode,
+    // The raw message is the upstream channel's English text. It stays available
+    // as diagnostic data, but the label is what a user-facing description must
+    // use — nothing may paste the raw string into the answer.
+    ...(errorLabel ? { errorLabel } : {}),
     error: typeof job.error_message === "string" ? job.error_message.slice(0, 2000) : undefined,
     title: job.title, prompt: typeof job.prompt === "string" ? job.prompt.slice(0, 4000) : undefined };
 }
@@ -437,7 +444,7 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     const imageStatusTools = createMastraImageStatusTools({ jobService: options.jobService, user,
       scope: { userId: run.userId, workspaceId: run.workspaceId, sessionId: run.sessionId,
         canvasId: run.canvasId, liveDesignIds } });
-    toolkit.tools.push(imageStatusTools.getImageStatus, imageStatusTools.cancelImageJob);
+    toolkit.tools.push(imageStatusTools.getImageStatus, imageStatusTools.cancelImageJob, imageStatusTools.getVideoStatus);
     // Workspace material library picker (server-random). Read-only; generation
     // sources are re-authorized per asset before any submission.
     toolkit.tools.push(createMastraLibraryTools({ createUserClient: options.createUserClient! }).findLibraryAssets);
@@ -496,12 +503,14 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     // Video jobs live in the same table but were invisible to this context: the
     // agent could only guess whether a submitted video was still running, and a
     // simulated user was told "still generating" hours after the job had already
-    // dead-lettered. Status only — a video is never an image source candidate.
+    // dead-lettered. Five rows rather than three, because a long session pushes a
+    // terminal job out of the window and `get_video_status(jobId)` is the only way
+    // back to it. Status only — a video is never an image source candidate.
     const videoJobsQuery = scopeImageJobs(client.from("background_jobs")
       .select("id,status,error_code,error_message,created_at,started_at,completed_at,payload->>duration,payload->>resolution,payload->>aspect_ratio")
       .eq("created_by", run.userId).eq("workspace_id", run.workspaceId)
       .eq("session_id", run.sessionId).eq("job_type", "video_generation"))
-      .order("created_at", { ascending: false }).limit(3);
+      .order("created_at", { ascending: false }).limit(5);
     const [latestJobs, mentionedJobs, activeJobs, succeededSourceJobs, historicalUploads, videoJobs] = await Promise.all([
       scopeImageJobs(client.from("background_jobs")
         .select(MASTRA_RECENT_IMAGE_JOB_PROJECTION)
@@ -543,14 +552,18 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     };
     const videoExecutionState = videoJobs.error ? { verified: false } : {
       verified: true,
-      latestJobs: (videoJobs.data ?? []).map((job: any) => ({
-        id: job.id, status: job.status, duration: job.duration ?? null, resolution: job.resolution ?? null,
-        aspectRatio: job.aspect_ratio ?? null, createdAt: job.created_at, startedAt: job.started_at,
-        completedAt: job.completed_at, errorCode: job.error_code ?? null,
-        ...(job.error_message ? { error: String(job.error_message).slice(0, 300) } : {}),
-      })),
+      latestJobs: (videoJobs.data ?? []).map((job: any) => {
+        const errorLabel = providerFailureDescription(job.error_code);
+        return {
+          id: job.id, status: job.status, duration: job.duration ?? null, resolution: job.resolution ?? null,
+          aspectRatio: job.aspect_ratio ?? null, createdAt: job.created_at, startedAt: job.started_at,
+          completedAt: job.completed_at, errorCode: job.error_code ?? null,
+          ...(errorLabel ? { errorLabel } : {}),
+          ...(job.error_message ? { error: String(job.error_message).slice(0, 300) } : {}),
+        };
+      }),
       observedAt: new Date().toISOString(),
-      authority: "Database snapshot of this conversation's video jobs. A terminal status is final: never tell the user a video is still generating unless one of these rows is queued or running.",
+      authority: "Database snapshot of this conversation's video jobs. A terminal status is final: never tell the user a video is still generating unless one of these rows is queued or running. Describe a failure to the user with errorLabel in Chinese; `error` is the upstream channel's raw text and must never be pasted into the reply.",
     };
     const sourceCandidates = buildMastraImageSourceCandidates({
       currentAttachments: run.attachments,
@@ -631,6 +644,17 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
         uploadedAt: item.createdAt, messageId: item.messageId, originalRequest: item.promptExcerpt })),
       attachmentScope: "attachments lists only this turn. historicalAttachments are real prior user uploads in this same session and may be resolved on demand; an empty attachments list does not mean the original reference image is missing. Use original upload for a continuation referring to it; do not substitute a generated result or claim re-upload is required unless storage verification actually fails.",
       referenceAnalysis, scene, related, recentJobs: receipts, imageExecutionState, videoExecutionState, historyOmissions: history.omissions,
+      // Previous turns' tool results are not replayed (history is text only), so
+      // a run that had genuinely loaded two guides still answered that it had
+      // loaded none. This is the persisted record of guides ACTUALLY read in this
+      // conversation, newest first. Evidence for self-checking, never a selection
+      // or an authority: a guide listed here was read earlier, and any Skill not
+      // listed here has not been read unless this turn reads it.
+      ...(designContext?.readSkills.length ? { sessionReadSkills: {
+        verified: true,
+        guides: designContext.readSkills,
+        note: "本会话已实际读取正文的技能（历史回执不回放，这是记录）。读过的技能不等于已选中或已执行；未列出的技能本轮没读过，不能声称用过它的方法。",
+      } } : {}),
       ...(sessionDesignContextJson ? { sessionDesign: sessionDesignContextJson } : {}),
     }).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
     messages.push({ role: "user", content: `${run.prompt}\n\n<current_context>${currentContext}</current_context>` });
@@ -761,6 +785,22 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
       // the clarification flag which always reflects the latest turn.
       if (sessionMemoryOn) {
         const clarificationAsked = configurable.session_clarification_asked === true;
+        // Which guides THIS run actually read (recorded by the tool hook from a
+        // real `status=loaded`/`composed` receipt, never from prose or a routed
+        // guess). Persisted below so a later turn can tell "already loaded" from
+        // "never loaded" — the model cannot self-check, because history is text.
+        const readThisRun = (Array.isArray(configurable.session_read_skill_slugs)
+          ? configurable.session_read_skill_slugs as unknown[] : [])
+          .filter((value): value is string => typeof value === "string");
+        const readEntries: SessionReadSkill[] = readThisRun.map(slug => {
+          const version = skills.find(skill => skill.name === slug)?.version;
+          return { slug, ...(typeof version === "string" && version ? { version } : {}),
+            at: new Date().toISOString() };
+        });
+        const mergedReadSkills = mergeSessionReadSkills(designContext?.readSkills, readEntries);
+        if (mergedReadSkills.changed) {
+          await saveSessionDesignContext(client, run.sessionId, { readSkills: mergedReadSkills.items });
+        }
         if (designIntent === "new_generation" || designIntent === "series_continuation") {
           const loadedSkillSlug = typeof configurable.session_loaded_skill_slug === "string"
             ? configurable.session_loaded_skill_slug : undefined;
@@ -852,9 +892,7 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
         //   - `declared`: what this turn names outright or the session already
         //     adopted. A model that does not re-read one of these is ordinary
         //     behaviour, so it is reported but never counted as a defect.
-        const read = new Set((Array.isArray(configurable.session_read_skill_slugs)
-          ? configurable.session_read_skill_slugs as unknown[] : [])
-          .filter((value): value is string => typeof value === "string"));
+        const read = new Set(readThisRun);
         const candidateSkillNames = candidateHints.map(hint => hint.skill);
         console.info("[skill-dispatch-outcome]", { runId: run.runId, intent: designIntent,
           candidates: candidateSkillNames, declared: declaredSkillNames, read: [...read],

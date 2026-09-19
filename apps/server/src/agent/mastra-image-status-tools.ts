@@ -6,6 +6,7 @@ import type { AuthenticatedUser } from "../supabase/user.js";
 import { compactMastraToolResult } from "./tool-result-projection.js";
 import { createAgentTool } from "./tools/tool-run-context.js";
 import { sanitizeErrorForClient } from "../utils/error-sanitizer.js";
+import { GENERIC_PROVIDER_FAILURE_COPY, providerFailureDescription } from "./provider-failure-copy.js";
 
 function numeric(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -51,7 +52,7 @@ export function createMastraImageJobScopeQuery(
 }
 
 export function createMastraImageStatusTools(input: {
-  jobService: Pick<JobService, "getConversationImageJob" | "cancelJobAdmin">;
+  jobService: Pick<JobService, "getConversationImageJob" | "getConversationVideoJob" | "cancelJobAdmin">;
   user: AuthenticatedUser;
   scope: MastraImageJobScope;
 }) {
@@ -101,5 +102,38 @@ export function createMastraImageStatusTools(input: {
       } catch (error) { return failure(error); }
     },
   });
-  return { getImageStatus, cancelImageJob };
+  /**
+   * Video status, for a job the context window no longer carries.
+   *
+   * The context snapshot only lists this conversation's most recent video jobs, so
+   * a user returning after several turns to "刚才那个视频好了吗" could only be
+   * answered from the model's memory — and a simulated user was told a video was
+   * "still generating" hours after it had already dead-lettered. This reads the
+   * same table through the same membership and session/canvas fence. Read-only:
+   * it never resubmits, never charges and never cancels.
+   */
+  const getVideoStatus = createAgentTool({
+    id: "get_video_status",
+    description: "Read the latest or one exact video job in this workspace conversation, including its terminal status and a Chinese errorLabel for a failure. Use it before saying anything about an earlier video's progress or outcome. Never resubmits, cancels or charges.",
+    inputSchema: z.object({ jobId: z.string().uuid().optional() }),
+    execute: async ({ jobId }) => {
+      try {
+        assertIdentity();
+        const job = await input.jobService.getConversationVideoJob(input.user, input.scope, jobId);
+        if (!job) return compactMastraToolResult({ status: "not_found" });
+        const errorCode = typeof job.error_code === "string" ? job.error_code : null;
+        const errorLabel = providerFailureDescription(errorCode);
+        return compactMastraToolResult({
+          ...job,
+          completedAt: job.completed_at ?? null,
+          ...(errorLabel ? { errorLabel } : {}),
+          // The raw message is the upstream channel's English text; it is
+          // diagnostic data, and the reply must use errorLabel instead.
+          ...(typeof job.error_message === "string" ? { error_message: errorLabel ?? GENERIC_PROVIDER_FAILURE_COPY } : {}),
+          authority: "Database snapshot of this conversation's video jobs. A terminal status is final: never tell the user a video is still generating unless this row is queued or running.",
+        });
+      } catch (error) { return failure(error); }
+    },
+  });
+  return { getImageStatus, cancelImageJob, getVideoStatus };
 }

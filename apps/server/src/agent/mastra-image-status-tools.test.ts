@@ -19,7 +19,8 @@ function directTool(tool: { execute?: unknown }) {
 }
 
 function directTools(tools: ReturnType<typeof createMastraImageStatusTools>) {
-  return { getImageStatus: directTool(tools.getImageStatus), cancelImageJob: directTool(tools.cancelImageJob) };
+  return { getImageStatus: directTool(tools.getImageStatus), cancelImageJob: directTool(tools.cancelImageJob),
+    getVideoStatus: directTool(tools.getVideoStatus) };
 }
 
 const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12,"0")}`;
@@ -28,8 +29,12 @@ function fixture(status = "running") {
   const user = { id:id(1),accessToken:"token",email:"",userMetadata:{} };
   const getConversationImageJob=vi.fn(async()=>({id:id(6),status,model:"workspace:nano",requestedAspectRatio:"3:4",
     creditsCost:"7",creditsCostColumn:7,pricingVersion:"credits-v1",quality:"hd",resolution:"2k"}));
+  const getConversationVideoJob=vi.fn(async()=>({id:id(6),status,duration:"8",resolution:"1080p",
+    requestedAspectRatio:"16:9",completed_at:"2026-09-19T10:00:00.000Z"}));
   const cancelJobAdmin=vi.fn(async()=>({id:id(6),status:"canceled"}));
-  return {scope,user,getConversationImageJob,cancelJobAdmin,tools:directTools(createMastraImageStatusTools({user,scope,jobService:{getConversationImageJob,cancelJobAdmin} as never}))};
+  return {scope,user,getConversationImageJob,getConversationVideoJob,cancelJobAdmin,
+    tools:directTools(createMastraImageStatusTools({user,scope,
+      jobService:{getConversationImageJob,getConversationVideoJob,cancelJobAdmin} as never}))};
 }
 describe("Mastra image status tools",()=>{
   it("returns persisted model/ratio via the authorized service",async()=>{
@@ -74,5 +79,26 @@ describe("Mastra image status tools",()=>{
     const live=new Set<string>();const query={eq:vi.fn(),or:vi.fn()};const fence=createMastraImageJobScopeQuery(id(4),live);
     fence(query);expect(query.eq).toHaveBeenCalledWith("canvas_id",id(4));live.add(id(5));fence(query);
     expect(query.or).toHaveBeenCalledWith(`canvas_id.eq.${id(4)},design_id.in.(${id(5)})`);
+  });
+  it("reads an older video job through the same membership fence",async()=>{
+    const f=fixture("dead_letter");
+    await expect(f.tools.getVideoStatus.execute({jobId:id(6)}, toolExecutionContext({}))).resolves.toMatchObject({
+      status:"dead_letter",completedAt:"2026-09-19T10:00:00.000Z",requestedAspectRatio:"16:9"});
+    expect(f.getConversationVideoJob).toHaveBeenCalledWith(f.user,f.scope,id(6));
+    // compactMastraToolResult normalizes the numeric duration.
+    const result = await f.tools.getVideoStatus.execute({jobId:id(6)}, toolExecutionContext({})) as Record<string, unknown>;
+    expect(result.duration).toBe(8);
+  });
+  it("answers a failed video in Chinese instead of relaying the upstream text",async()=>{
+    const f=fixture("dead_letter");
+    f.getConversationVideoJob.mockResolvedValue({id:id(6),status:"dead_letter",error_code:"http_401",
+      error_message:"Invalid token",completed_at:null} as never);
+    const result=await f.tools.getVideoStatus.execute({jobId:id(6)}, toolExecutionContext({})) as Record<string,unknown>;
+    expect(result.errorLabel).toContain("凭据");
+    expect(JSON.stringify(result)).not.toContain("Invalid token");
+  });
+  it("fails closed on video read authorization",async()=>{
+    const f=fixture();f.getConversationVideoJob.mockRejectedValue(new ImageJobAccessError());
+    await expect(f.tools.getVideoStatus.execute({}, toolExecutionContext({}))).resolves.toMatchObject({status:"forbidden"});
   });
 });

@@ -159,6 +159,11 @@ import { registerImageProxyRoute } from "./http/image-proxy.js";
 import { registerImageTextRoutes } from "./http/image-text.js";
 import { registerImageLayerElementRoutes } from "./http/image-layer-elements.js";
 import { registerJobRoutes } from "./http/jobs.js";
+import {
+  finalizeTerminalImageJobPlaceholder,
+  finalizeTerminalVideoJobPlaceholder,
+  type FinalizableJob,
+} from "./features/jobs/job-canvas-finalizer.js";
 import { registerNodeImageSubmissionRoutes } from "./http/node-image-submissions.js";
 import { createNodeImageSubmissionService } from "./features/jobs/node-image-submission-service.js";
 import { registerModelRoutes } from "./http/models.js";
@@ -714,6 +719,18 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       viewerService,
       createUserClient,
       workspaceModelCatalogService,
+      // The worker settles a terminal job only while it is processing it; a job
+      // canceled while queued would otherwise leave "生成中" on screen until the
+      // throttled recovery scan ran (measured: 132-145s).
+      settleTerminalJob: async (jobId: string) => {
+        const row = await jobService.getJobAdmin(jobId) as FinalizableJob | null;
+        if (!row) return false;
+        const admin = getAdminClient();
+        if (row.job_type === "video_generation") {
+          return finalizeTerminalVideoJobPlaceholder(admin, row);
+        }
+        return finalizeTerminalImageJobPlaceholder(admin, row);
+      },
     });
   }
   void registerSkillRoutes(app, { auth, createUserClient, viewerService,

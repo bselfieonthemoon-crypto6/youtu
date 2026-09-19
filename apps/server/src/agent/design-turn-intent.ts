@@ -564,9 +564,17 @@ export function assessDesignTurnIntent(input: DesignTurnIntentInput): DesignTurn
   // is the second genuine conflict: the fixed order would silently prefer creation,
   // which reports a new round, never applies the continuation briefing, and — when
   // the turn also performs a design write — replaces the remembered series.
+  //
+  // A QUESTION that happens to carry a creation verb is the third uncertain shape.
+  // "生成一张图要花多少积分？" and "如果生成失败了，积分会退给我吗？" are information
+  // requests, but the verb rule published them as a confident `new_generation`, so
+  // the notice told the user a new round had been chosen for a pricing question.
+  // The regex cannot separate those from a polite directive ("帮我画一张海报好吗？"),
+  // so it reports low confidence and defers to the model instead of guessing.
   if (generation)
-    return { intent: "new_generation", reasonCode: "explicit_creation", confidence: edit ? 0.4 : 1,
-      rule: "generation_verb", rules, needsModel: edit };
+    return { intent: "new_generation", reasonCode: "explicit_creation",
+      confidence: interrogative ? 0.4 : edit ? 0.4 : 1,
+      rule: "generation_verb", rules, needsModel: edit || interrogative };
   // An edit verb outranks a bare deliverable noun: "把海报上的文字改成蓝色" names
   // the deliverable but is a property edit of an existing object.
   //
@@ -580,9 +588,11 @@ export function assessDesignTurnIntent(input: DesignTurnIntentInput): DesignTurn
   // defers to the model, falling back to that same verdict if the model is down.
   if (edit) {
     const editHasTarget = editTarget || elementChange || styleChange || deliverable;
+    // Same question caveat as the creation branch: "视频能做多轮修改吗？" is a
+    // capability question, not a property edit of an existing object.
     return { intent: "local_edit", reasonCode: "property_edit",
-      confidence: editHasTarget ? 1 : 0.4, rule: "edit_verb", rules,
-      needsModel: !editHasTarget };
+      confidence: editHasTarget && !interrogative ? 1 : 0.4, rule: "edit_verb", rules,
+      needsModel: !editHasTarget || interrogative };
   }
   // A brief that only names the deliverable ("游戏活动的产品主图") has no action
   // verb but is unambiguously a creation request. Interrogative prompts were

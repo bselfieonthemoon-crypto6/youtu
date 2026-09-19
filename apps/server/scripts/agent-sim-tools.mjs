@@ -13,14 +13,25 @@
 //   turn ... --text "..." [--out <json>]    send one user message and record the run
 //   state ... [--out <json>]                full evidence for a fixture/session
 //   wait-jobs ... [--timeout-minutes n]     wait for image/video jobs to settle
+//   check ... [--allow <code>] [--out <j>]   assert structural invariants, exit 1 on violation
 //   cancel ...                              cancel in-flight runs and jobs
 //
 // Session selection: either `--fixture <json>` (from `create`) or explicit
 // `--session <id> --canvas <id> --workspace <id>`.
 //
-// Turn options: --text, --skill <slug>, --attach <json file or inline JSON>,
-// --aspect <W:H>, --image-model <id>, --text-model <id>, --mode thinking|fast,
-// --image-pref manual|auto, --timeout-minutes, --no-wait, --out <report>.
+// Turn options: --text, --text-file <path>, --skill <slug>, --attach <json file
+// or inline JSON>, --aspect <W:H>, --image-model <id>, --text-model <id>,
+// --mode thinking|fast, --image-pref manual|auto, --timeout-minutes, --no-wait,
+// --out <report>.
+//
+// Operational notes learned from a 12-persona campaign:
+//   * Long prompts with quotes must use --text-file: PowerShell swallows part of
+//     a quoted argument, and a mangled prompt looks like an Agent defect.
+//   * The local gateway saturates under concurrency (429 "上游负载已饱和",
+//     504 "Upstream model timed out"). Those are provider failures, not product
+//     ones; do not run many image turns at once and re-run a dead_letter before
+//     filing it. `check --allow unfinished_jobs` when a job is deliberately left
+//     running.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -174,6 +185,9 @@ const jobView = (row) => ({
   id: row.id, status: row.status, jobType: row.job_type, operation: row.payload?.operation ?? null,
   model: row.payload?.model ?? null, createdAt: row.created_at, startedAt: row.started_at, completedAt: row.completed_at,
   creditsCost: row.credits_cost ?? null, creditsTransactionId: row.credits_transaction_id ?? null,
+  // A chat card is written for a Mastra-submitted job; the legacy proposal flow
+  // presents results differently, so `check` must not demand a card for it.
+  mastraSubmission: Boolean(row.payload?.mastra_submission_key),
   errorCode: row.error_code ?? null, errorMessage: row.error_message ? clip(redact(row.error_message), 1_200) : null,
   result: trim(row.result ?? {}),
 });
@@ -487,6 +501,17 @@ async function runDownload() {
 async function runState() {
   const settings = await session();
   assert(settings.sessionId, "session required");
+  const report = await collectEvidence(settings);
+  if (typeof flag("out") === "string") {
+    const path = resolve(flag("out"));
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, `${JSON.stringify(report, null, 2)}\n`);
+    console.log(`REPORT ${path}`);
+  }
+  console.log(JSON.stringify(report, null, 2));
+}
+
+async function collectEvidence(settings) {
   const { api } = await connect();
   const messages = await api("GET", `/api/sessions/${settings.sessionId}/messages`);
   const report = { kind: "agent-sim-state", at: new Date().toISOString(), sessionId: settings.sessionId,
@@ -497,13 +522,111 @@ async function runState() {
   report.billing = jobIds.length
     ? await rest(`credit_transactions?job_id=in.(${jobIds.join(",")})&select=transaction_type,amount,job_id,created_at`)
     : [];
+  return report;
+}
+
+/**
+ * Assertion mode: the structural invariants a persona otherwise re-derives by
+ * hand (and sometimes gets wrong).
+ *
+ * Personas disagreed about whether a failed placeholder was a leftover bug or
+ * intentional, and about whether a "正在生成中" tail after every job had settled
+ * was a real defect; a shared, executable definition removes that argument. Only
+ * structural facts are asserted here — never whether the design is any good.
+ *
+ * Options: --allow <code> (repeatable) to accept a known-environmental
+ * violation, --out <json> to save the full evidence beside the verdict.
+ */
+const CHECK_CODES = {
+  unfinished_runs: "an agent run never reached a terminal status",
+  unfinished_jobs: "a generation job never reached a terminal status",
+  card_not_settled: "a job reached a terminal status but its chat card still shows a non-terminal one",
+  missing_terminal_card: "a terminal Mastra-submitted job has no chat card at all, so its outcome never reached the user",
+  missing_canvas_delivery: "a succeeded image job has no canvas element carrying its asset",
+  stale_generating_placeholder: "the canvas still shows a generating placeholder for a job that already ended",
+  orphan_error_placeholder: "a failed placeholder points at a job that is not in this session",
+  optimistic_tail: "the last assistant message promises work in progress while every job is already terminal",
+};
+
+async function runCheck() {
+  const settings = await session();
+  assert(settings.sessionId, "session required");
+  const allowed = new Set(allFlags("allow"));
+  const evidence = await collectEvidence(settings);
+  const violations = [];
+  const add = (code, detail) => { if (!allowed.has(code)) violations.push({ code, detail }); };
+
+  for (const run of evidence.runs.filter(run => !RUN_TERMINAL.has(run.status)))
+    add("unfinished_runs", `run ${run.id} is ${run.status}`);
+
+  const jobsById = new Map(evidence.jobs.map(job => [job.id, job]));
+  const jobStatus = jobId => jobsById.get(jobId)?.status;
+  for (const job of evidence.jobs.filter(job => !JOB_TERMINAL.has(job.status)))
+    add("unfinished_jobs", `job ${job.id} is ${job.status}`);
+
+  // The chat card is keyed by the job id, so a terminal job whose card still
+  // reports processing is exactly the "user never sees the outcome" defect.
+  const cardStatus = new Map();
+  for (const message of evidence.messages)
+    for (const block of message.blocks)
+      if (block.type === "tool") for (const jobId of block.jobIds ?? []) cardStatus.set(jobId, block.status);
+  for (const job of evidence.jobs.filter(job => JOB_TERMINAL.has(job.status))) {
+    const status = cardStatus.get(job.id);
+    // Only the known in-flight labels count as "not settled": terminal cards use
+    // several labels (completed / succeeded / failed / canceled / error), and a
+    // whitelist would report a settled card as a defect.
+    if (status === undefined && job.mastraSubmission)
+      add("missing_terminal_card", `terminal job ${job.id} (${job.status}) has no chat card in this session`);
+    else if (status !== undefined && ["queued", "running", "processing", "submitting", "generating", "pending", "in_progress"].includes(String(status)))
+      add("card_not_settled", `job ${job.id} is ${job.status} but its card still shows ${status}`);
+  }
+
+  const canvasAssets = new Set((evidence.canvas?.images ?? []).map(image => image.assetId).filter(Boolean));
+  for (const job of evidence.jobs.filter(job => job.status === "succeeded" && job.jobType === "image_generation")) {
+    const assetId = job.result?.asset_id ?? job.result?.assetId;
+    if (assetId && !canvasAssets.has(assetId))
+      add("missing_canvas_delivery", `job ${job.id} succeeded with asset ${assetId} that is not on the canvas`);
+  }
+
+  const terminalStatuses = new Set(["succeeded", "failed", "canceled", "dead_letter"]);
+  for (const placeholder of evidence.canvas?.placeholders ?? []) {
+    const status = jobStatus(placeholder.jobId);
+    if (placeholder.status === "generating" && status && terminalStatuses.has(status))
+      add("stale_generating_placeholder", `placeholder ${placeholder.id} still generating for ${status} job ${placeholder.jobId}`);
+    if (placeholder.status === "error" && placeholder.jobId && !status)
+      add("orphan_error_placeholder", `placeholder ${placeholder.id} references job ${placeholder.jobId} outside this session`);
+  }
+
+  // Every job already ended, so a closing message that still promises a result is
+  // the exact defect a persona could only argue about anecdotally.
+  const allSettled = evidence.jobs.length > 0 && evidence.jobs.every(job => JOB_TERMINAL.has(job.status));
+  const lastAssistant = [...evidence.messages].reverse()
+    .find(message => message.role === "assistant" && (message.content ?? "").trim());
+  if (allSettled && lastAssistant && /正在生成|正在出图|生成中|出图后|稍后告诉你/.test(lastAssistant.content)
+    && !/已取消|取消|失败|未生成|没有生成/.test(lastAssistant.content))
+    add("optimistic_tail", `last assistant message still promises work in progress: ${clip(lastAssistant.content, 160)}`);
+
+  const verdict = {
+    ok: violations.length === 0,
+    sessionId: settings.sessionId,
+    checkedAt: new Date().toISOString(),
+    counts: { runs: evidence.runs.length, jobs: evidence.jobs.length,
+      jobStatuses: evidence.jobs.reduce((acc, job) => ({ ...acc, [job.status]: (acc[job.status] ?? 0) + 1 }), {}),
+      canvasImages: evidence.canvas?.images?.length ?? 0, placeholders: evidence.canvas?.placeholders?.length ?? 0,
+      billingRows: evidence.billing.length },
+    allowed: [...allowed],
+    violations,
+    definitions: CHECK_CODES,
+    runsWithError: evidence.runs.filter(run => run.errorCode).map(run => ({ id: run.id, status: run.status, errorCode: run.errorCode })),
+  };
   if (typeof flag("out") === "string") {
     const path = resolve(flag("out"));
     await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, `${JSON.stringify(report, null, 2)}\n`);
+    await writeFile(path, `${JSON.stringify({ ...verdict, evidence }, null, 2)}\n`);
     console.log(`REPORT ${path}`);
   }
-  console.log(JSON.stringify(report, null, 2));
+  console.log(JSON.stringify(verdict, null, 2));
+  if (!verdict.ok) process.exitCode = 1;
 }
 
 async function runWaitJobs() {
@@ -534,7 +657,7 @@ async function runCancel() {
 
 const handlers = { models: runModels, skills: runSkills, create: runCreate, upload: runUpload,
   "seed-canvas": runSeedCanvas, turn: runTurn, state: runState, "wait-jobs": runWaitJobs, cancel: runCancel,
-  download: runDownload };
+  download: runDownload, check: runCheck };
 const handler = handlers[mode];
 if (!handler) { console.error(`unknown mode: ${mode}\nknown: ${Object.keys(handlers).join(", ")}`); process.exit(2); }
 try {

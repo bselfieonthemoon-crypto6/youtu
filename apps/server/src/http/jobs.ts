@@ -62,6 +62,13 @@ export async function registerJobRoutes(
     viewerService: ViewerService;
     createUserClient?: (accessToken: string) => UserSupabaseClient;
     workspaceModelCatalogService?: WorkspaceModelCatalogService;
+    /**
+     * Converge a terminal job's chat card and canvas placeholder immediately.
+     * Injected from app wiring (admin client + finalizer) so the cancel path does
+     * not depend on the worker observing a message that was canceled before it was
+     * ever claimed. Must be idempotent.
+     */
+    settleTerminalJob?: (jobId: string) => Promise<unknown>;
   },
 ) {
   app.get("/api/images/semantic-layer-backend", async (request, reply) => {
@@ -727,6 +734,20 @@ export async function registerJobRoutes(
         return reply.code(400).send({ message: "Invalid job identifier" });
       }
       const job = await options.jobService.cancelJob(user, jobId);
+
+      // A job canceled while it is still queued is never picked up by the worker,
+      // and the worker is what normally settles the chat card and the canvas
+      // placeholder synchronously. Without this call the user kept seeing
+      // "生成中" for over two minutes after a cancel that had already succeeded.
+      if (options.settleTerminalJob) {
+        try {
+          await options.settleTerminalJob(job.id);
+        } catch (settleError) {
+          // The cancellation itself is durable; the recovery scan retries the
+          // settlement. Never turn a successful cancel into a failed request.
+          request.log.error(settleError, "Failed to settle canceled job immediately");
+        }
+      }
 
       // Do not depend solely on the worker observing a canceled queue message:
       // refund immediately from the authoritative job billing record. The DB

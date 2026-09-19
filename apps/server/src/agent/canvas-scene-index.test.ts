@@ -43,6 +43,23 @@ describe("canvas scene index", () => {
     expect(context).not.toMatch(/data:image|https?:\/\//);
   });
 
+  it("marks a failed generation placeholder so it can be identified and removed on request", () => {
+    const jobId = "80000000-0000-4000-8000-000000000001";
+    const index = buildCanvasSceneIndex([
+      element("failed-box", 0, { customData: { type: "image-generator", status: "error", jobId } }),
+      element("running-box", 1, { customData: { type: "image-generator", status: "generating", jobId } }),
+      // A stray `status` on an ordinary element is not a generation placeholder.
+      element("plain", 2, { customData: { status: "error" } }),
+    ]);
+    const failed = index.entries.find(entry => entry.id === "failed-box")!;
+    expect(failed).toMatchObject({ generationStatus: "error", generationJobId: jobId });
+    expect(index.entries.find(entry => entry.id === "running-box")).toMatchObject({ generationStatus: "generating" });
+    expect(index.entries.find(entry => entry.id === "plain")).not.toHaveProperty("generationStatus");
+    const context = renderCanvasSceneContext(index)!;
+    expect(context).toContain(`generationStatus=error jobId=${jobId}`);
+    expect(context).toContain("generationStatus=generating");
+  });
+
   it("preserves group, frame, container, bindings and design associations while reporting dangling references", () => {
     const index = buildCanvasSceneIndex([
       element("frame", 0, { type: "frame" }),

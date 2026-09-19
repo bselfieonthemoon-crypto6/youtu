@@ -494,6 +494,53 @@ describe("Mastra real SDK stream bridge (synthetic transport, not provider E2E)"
     expect(text).not.toContain("写入工具回执");
     expect(events.at(-1)?.type).toBe("run.completed");
   });
+
+  // `toolChoice: "required"` alone was satisfiable by an unrelated read-only tool
+  // call, after which the model could answer with text and no write — the shape of
+  // the "I have no permission to delete" incident on a turn the runtime itself
+  // classified as write_required.
+  it("offers the corrective run only the write tools the checker named", async () => {
+    const calls: any[] = [];
+    const streamText = (text: string) => new Response(
+      `data: ${JSON.stringify({ id: "test", object: "chat.completion.chunk", created: 1, model: "test",
+        choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }] })}\n\n` +
+      `data: ${JSON.stringify({ id: "test", object: "chat.completion.chunk", created: 1, model: "test",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`,
+      { headers: { "content-type": "text/event-stream" } },
+    );
+    const model = createOpenAICompatible({ name: "test", baseURL: "https://test.invalid/v1",
+      fetch: async (_url, init) => {
+        calls.push(JSON.parse(String(init?.body)));
+        if (calls.length === 2) return new Response(JSON.stringify({
+          id: "classification", object: "chat.completion", created: 1, model: "test",
+          choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: JSON.stringify({
+            decision: "write_required", writeToolNames: ["manipulate_canvas"], reasonCode: "delete",
+          }) } }], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        }), { headers: { "content-type": "application/json" } });
+        return streamText("no write performed");
+      },
+    }).chatModel("test");
+    const events = [];
+    for await (const event of streamMastraDesignAgent({
+      run: { runId: "run-write-only", sessionId: "session", conversationId: "conversation",
+        prompt: "Delete that image from my canvas", executionMode: "fast", attachments: [], mentions: [], signal: new AbortController().signal },
+      model, messages: [{ role: "user", content: "Delete that image from my canvas" }], configurable: {}, maxOutputTokens: 1_000,
+      tools: [
+        createAgentTool({ id: "manipulate_canvas", description: "Change the canvas", inputSchema: z.object({}), execute: vi.fn() }),
+        createAgentTool({ id: "get_image_status", description: "Read a job", inputSchema: z.object({}), execute: vi.fn() }),
+      ],
+    })) events.push(event);
+
+    // Calls: 1 = main attempt, 2 = write-repair classifier, 3+ = corrective run.
+    const recoveryTools = (calls[2]?.tools ?? []).map((tool: { function?: { name?: string } }) => tool.function?.name);
+    expect(recoveryTools).toEqual(["manipulate_canvas"]);
+    expect(calls[2]?.tool_choice).toBe("required");
+    // The main attempt keeps its resident toolset, where the canvas writer is
+    // demand-loaded: it becomes available exactly for the corrective first step.
+    const mainTools = (calls[0]?.tools ?? []).map((tool: { function?: { name?: string } }) => tool.function?.name);
+    expect(mainTools).toContain("get_image_status");
+    expect(mainTools).not.toContain("manipulate_canvas");
+  });
   it("does not force a write when an underspecified request receives a necessary clarification", async () => {
     const calls: any[] = [];
     const execute = vi.fn();

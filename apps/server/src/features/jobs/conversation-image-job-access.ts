@@ -29,10 +29,23 @@ export async function authorizeConversationImageJobs(admin: any, userId: string,
   return role.data;
 }
 
-export function scopeConversationImageJobs(query: any, scope: ConversationImageJobScope) {
+/**
+ * Scope a job query to this conversation, for one job type.
+ *
+ * The video status tool reads the same table through the same membership and
+ * session/canvas fence; only the `job_type` differs, and the image path must
+ * never widen to video (a video job is not an image source or a candidate for
+ * `cancel_image_job`).
+ */
+export function scopeConversationJobs(query: any, scope: ConversationImageJobScope,
+  jobType: "image_generation" | "video_generation" = "image_generation") {
   query = query.eq("workspace_id", scope.workspaceId).eq("session_id", scope.sessionId)
-    .eq("job_type", "image_generation");
+    .eq("job_type", jobType);
   return scope.liveDesignIds.size
     ? query.or(`canvas_id.eq.${scope.canvasId},design_id.in.(${[...scope.liveDesignIds].join(",")})`)
     : query.eq("canvas_id", scope.canvasId);
+}
+
+export function scopeConversationImageJobs(query: any, scope: ConversationImageJobScope) {
+  return scopeConversationJobs(query, scope, "image_generation");
 }

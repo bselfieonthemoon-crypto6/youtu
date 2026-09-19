@@ -134,7 +134,18 @@ describe("Mastra image job submitter", () => {
         if (status === "succeeded") await finalizeImageJobToCanvas(admin as never, finalized);
         else await finalizeTerminalImageJobPlaceholder(admin as never, finalized);
         const writeSpy = status === "succeeded" ? chatUpdate : upsert;
-        expect(writeSpy).toHaveBeenCalledOnce();
+        // A terminal status writes TWO chat rows: the submission card is rewritten
+        // in place (keeping its position in the transcript) and a terminal notice
+        // is appended so the real outcome, not the earlier "正在生成中" promise,
+        // is the newest message.
+        if (status === "succeeded") {
+          expect(writeSpy).toHaveBeenCalledOnce();
+        } else {
+          expect(writeSpy).toHaveBeenCalledTimes(2);
+          expect(upsert.mock.calls[1]?.[0]).toMatchObject({
+            content_blocks: [expect.objectContaining({ type: "text", text: expect.any(String) })],
+          });
+        }
         const card: any = writeSpy.mock.calls[0]?.[0];
         // The scoped UPDATE carries the target id in its WHERE clause instead.
         if (status !== "succeeded") expect(card.id).toBe(durableJob.id);

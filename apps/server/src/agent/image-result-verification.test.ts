@@ -52,7 +52,9 @@ describe("bounded image result pixel review", () => {
       expect(text).toContain('"count":1');
       expect(text).toContain("Other requested images may be in other batches");
     }
-    expect(result).toMatchObject({ viewed: true, status: "unavailable", uncertainties: ["本图文字模糊"] });
+    expect(result).toMatchObject({ viewed: true, status: "unavailable", uncertainties: ["本图文字模糊"],
+      // status=unavailable must never read as "the image was not inspected".
+      statusMeaning: expect.stringContaining("已查看实际像素") });
   });
   it.each([false, true])("rechecks contradictory blockers once and never silently approves (%s)", async repeated => {
     const bytes = await png();
@@ -117,7 +119,11 @@ describe("bounded image result pixel review", () => {
       images: [image], model: { generate: vi.fn(async () => ({ text: '{"blockingIssues":[],"suggestions":[],"uncertainties":["小字不可辨认"]}', usage: {} })) } as never,
       taskBrief: {}, mode: "result_verification", comparison: "individual",
     });
-    expect(uncertain).toMatchObject({ status: "unavailable", viewed: true, uncertainties: ["小字不可辨认"] });
+    expect(uncertain).toMatchObject({ status: "unavailable", viewed: true, uncertainties: ["小字不可辨认"],
+      statusMeaning: expect.stringContaining("不代表没有看到图") });
+    // A reviewed image that only leaves an acceptance gate open must never be
+    // reported as an unread one.
+    expect(uncertain.viewed).toBe(true);
   });
 
   it("parses only the bounded strict review contract", () => {

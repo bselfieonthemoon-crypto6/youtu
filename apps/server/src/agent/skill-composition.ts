@@ -68,7 +68,7 @@ export function composeWorkspaceSkills(
     authority: "method_suggestions_only" as const, executed: false as const,
   });
   const parsed = composeSkillsSchema.safeParse(rawInput);
-  if (!parsed.success) return conflict("invalid_composition", "Provide one deliverable label, one stage, exactly one primary and at most four helpers. No constraints or approval fields are accepted.");
+  if (!parsed.success) return conflict("invalid_composition", "需要一个交付物名称、一个阶段、恰好一个主技能、最多四个辅助技能；不接受任何约束或批准字段。");
   const input = parsed.data;
   const names = [input.primary, ...input.helpers];
   const selected = [];
@@ -77,35 +77,35 @@ export function composeWorkspaceSkills(
     const matches = entries.filter(entry =>
       entry.name === name || entry.displayName === name,
     );
-    if (!matches.length) return conflict("skill_not_enabled", "Choose only from list_skills for this run. Missing or disabled packages cannot join a composition.", [name]);
-    if (matches.length !== 1) return conflict("ambiguous_skill", "The enabled snapshot contains more than one package with this name. Resolve the package identity before composing.", [name]);
+    if (!matches.length) return conflict("skill_not_enabled", "只能选择本轮 list_skills 里的技能；缺失或未启用的技能包不能参与组合。", [name]);
+    if (matches.length !== 1) return conflict("ambiguous_skill", "本轮启用的技能包里存在同名项，请先确认技能身份再组合。", [name]);
     const skill = matches[0]!;
     if (!skill.content.trim() || skill.readiness?.status === "unavailable")
-      return conflict("skill_unavailable", "This package has empty instructions or unavailable dependencies. Inspect list_skills and choose an available method.", [name]);
+      return conflict("skill_unavailable", "此技能包正文为空或依赖不可用。请查看 list_skills 并选择一个可用的方法。", [name]);
     if (selectedNames.includes(skill.name))
-      return conflict("duplicate_skill", "Each Skill may appear only once. Remove duplicate display-name and slug selections.", [skill.name]);
+      return conflict("duplicate_skill", "每个技能只能出现一次；请去掉重复的显示名或 slug。", [skill.name]);
     selectedNames.push(skill.name);
     const metadata = readSkillRuntimeMetadata(skill.metadata);
     const composition = metadata?.composition;
-    if (!composition) return conflict("composition_metadata_missing", "This package has no valid composition role and stages. It can still be read with use_skill on its own; do not guess a role.", [name]);
+    if (!composition) return conflict("composition_metadata_missing", "此技能包没有可用的组合角色与阶段。它仍可以单独用 use_skill 读取；不要猜它的角色。", [name]);
     if (!composition.stages.includes(input.stage))
-      return conflict("stage_not_supported", `This package does not declare the ${input.stage} stage. Select a supported stage or another package.`, [name]);
+      return conflict("stage_not_supported", `此技能包没有声明 ${input.stage} 阶段。请换用它支持的阶段或另一个技能包。`, [name]);
     if (index === 0 && !primaryRoles[input.stage].includes(composition.role))
-      return conflict("primary_role_conflict", `A ${composition.role} package cannot lead the ${input.stage} stage. Select a compatible primary and use this package only as an applicable helper.`, [name]);
+      return conflict("primary_role_conflict", `${composition.role} 角色的技能包不能主导 ${input.stage} 阶段。请换一个匹配的主技能，把这个包只作为适用的辅助。`, [name]);
     if (index === 0 && input.outputKind && !skillSupportsDeliverable(metadata, input.outputKind))
-      return conflict("primary_output_kind_conflict", `This primary does not declare the ${input.outputKind} output kind. Select a domain package whose declared output matches the actual deliverable transport.`, [name]);
+      return conflict("primary_output_kind_conflict", `此主技能没有声明 ${input.outputKind} 这类产出。请选一个声明产出与实际交付形式一致的领域技能包。`, [name]);
     if (index > 0 && composition.role === "domain")
-      return conflict("competing_domain", "Only the primary may own the professional domain. Compose separate deliverables or stages independently instead of combining competing domain leads.", [name]);
+      return conflict("competing_domain", "只有主技能可以主导专业领域。请分开组合不同交付物或阶段，不要并列两个领域主导。", [name]);
     if (composition.role === "prompt" && input.stage !== "design" && input.stage !== "prompt")
-      return conflict("prompt_stage_conflict", "Prompt compilation belongs only to a design or prompt stage. Omit it for reference, review or delivery work.", [name]);
+      return conflict("prompt_stage_conflict", "提示词编译只属于 design 或 prompt 阶段；reference、review、delivery 阶段不要带上它。", [name]);
     selected.push({ skill, composition, position: index === 0 ? "primary" as const : "helper" as const });
   }
   const canonicalNames = selected.map(item => item.skill.name);
   if (new Set(canonicalNames).size !== canonicalNames.length)
-    return conflict("duplicate_skill", "Each Skill may appear only once. Remove duplicate display-name and slug selections.", canonicalNames);
+    return conflict("duplicate_skill", "每个技能只能出现一次；请去掉重复的显示名或 slug。", canonicalNames);
   const compilers = selected.filter(item => item.composition.role === "prompt");
   if (compilers.length > 1)
-    return conflict("multiple_prompt_compilers", "Choose exactly one prompt compiler; reference helpers supply material to that compiler instead of writing competing final prompts.", compilers.map(item => item.skill.name));
+    return conflict("multiple_prompt_compilers", "只能选一个提示词编译器；参考类辅助技能应为这个编译器提供素材，而不是各自写一份最终提示词。", compilers.map(item => item.skill.name));
   // Every composed guide comes back with its full body. There is no "already in
   // the instructions" case to elide any more: the runtime injects no guide text,
   // so the only way a body reaches the model is a tool result like this one.

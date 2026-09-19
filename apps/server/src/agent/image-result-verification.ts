@@ -59,6 +59,8 @@ export type ImagePixelReview = {
   uncertainties: string[];
   summary: string;
   error?: string;
+  /** Present when `status=unavailable` describes a completed view, not a failed one. */
+  statusMeaning?: string;
 };
 
 export async function runWithImageReviewDeadline<T>(
@@ -303,8 +305,20 @@ export async function reviewImagePixels(input: {
         : parsed.uncertainties.length ? "unavailable" : "passed";
       return {
         status, viewed: true, ...parsed,
+        // Read the status as "was an acceptance conclusion reached", never as
+        // "was the image inspected": `viewed` answers the second question. A
+        // simulated user's transcript had `status:"unavailable"` returned together
+        // with an accurate pixel description and `viewed:true`, which reads as a
+        // contradiction unless the distinction is spelled out.
+        ...(status === "unavailable" ? {
+          statusMeaning: "已查看实际像素，但存在无法确认项，因此不写验收结论；这不代表没有看到图，也不代表图片有问题。",
+        } : {}),
         summary: input.mode === "reference_analysis"
-          ? (status === "passed" ? "已查看本批参考图像素；本回执不代表全部参考图或生成结果已验收。" : "已查看本批参考图像素，存在本批需要说明的问题；不代表其他批次缺失。")
+          ? (status === "passed"
+            ? "已查看本批参考图像素；本回执不代表全部参考图或生成结果已验收。"
+            : status === "failed"
+              ? "已查看本批参考图像素，发现客观问题；不代表其他批次缺失。"
+              : "已查看本批参考图像素；其中有无法确认的点，因此本回执不构成验收结论，也不代表其他批次缺失。")
           : status === "passed" ? "已查看实际像素，未发现违背当前明确要求的客观问题。"
           : status === "failed" ? "已查看实际像素，发现违背当前明确要求的客观问题。"
             : "已查看实际像素，但存在无法确认项，不能声称视觉验收通过。",

@@ -23,6 +23,14 @@ export type CanvasSceneIndexEntry = {
   bindings: CanvasSceneRelation[];
   designId?: string;
   designObjectId?: string;
+  /**
+   * The image pipeline's own placeholder node (`customData.type=image-generator`,
+   * status `generating`/`error`). Without this the agent cannot tell a failed
+   * generation box from an ordinary rectangle, so it could neither remove one on
+   * request nor say which request left it there.
+   */
+  generationStatus?: string;
+  generationJobId?: string;
   raw: CanvasSceneElement;
 };
 
@@ -144,6 +152,12 @@ function normalizeElement(raw: unknown, ordinal: number): CanvasSceneIndexEntry 
   const assetId = string(customData.assetId, 2000) ?? string(element.assetId, 2000);
   const designId = string(customData.designId ?? customData.design_id, 200);
   const designObjectId = string(customData.designObjectId ?? customData.design_object_id, 200);
+  // Only the image pipeline's placeholder nodes carry a generation status; an
+  // ordinary element with a stray `status` key must not be reported as one.
+  const generationStatus = ["image-generator", "image-replacement"].includes(String(customData.type ?? ""))
+    ? string(customData.status, 40) : undefined;
+  const generationJobId = generationStatus
+    ? string(customData.jobId ?? customData.sourceJobId, 200) : undefined;
   return {
     ordinal, id, type, logicalType: isVideo ? "video" : type,
     x, y, width, height,
@@ -155,6 +169,8 @@ function normalizeElement(raw: unknown, ordinal: number): CanvasSceneIndexEntry 
     bindings: extractRelations(element),
     ...(designId ? { designId } : {}),
     ...(designObjectId ? { designObjectId } : {}),
+    ...(generationStatus ? { generationStatus } : {}),
+    ...(generationJobId ? { generationJobId } : {}),
     raw: element,
   };
 }
@@ -312,7 +328,7 @@ export function renderCanvasSceneContext(
   for (const entry of representatives) {
     const relation = [entry.frameId ? `frame=${entry.frameId}` : "", entry.containerId ? `container=${entry.containerId}` : "",
       entry.groupIds.length ? `groups=${entry.groupIds.join(",")}` : "", entry.bindings.length ? `links=${entry.bindings.map(link => `${link.kind}:${link.targetId}`).join(",")}` : ""].filter(Boolean).join(" ");
-    lines.push(`${selected.has(entry.id) ? "SELECTED " : ""}${entry.logicalType}#${entry.id} @(${Math.round(entry.x)},${Math.round(entry.y)}) ${Math.round(entry.width)}x${Math.round(entry.height)}${entry.assetId ? ` assetId=${entry.assetId}` : ""}${entry.text ? ` text=${JSON.stringify(entry.text.slice(0, 160))}` : ""}${relation ? ` ${relation}` : ""}`);
+    lines.push(`${selected.has(entry.id) ? "SELECTED " : ""}${entry.logicalType}#${entry.id} @(${Math.round(entry.x)},${Math.round(entry.y)}) ${Math.round(entry.width)}x${Math.round(entry.height)}${entry.assetId ? ` assetId=${entry.assetId}` : ""}${entry.generationStatus ? ` generationStatus=${entry.generationStatus}${entry.generationJobId ? ` jobId=${entry.generationJobId}` : ""}` : ""}${entry.text ? ` text=${JSON.stringify(entry.text.slice(0, 160))}` : ""}${relation ? ` ${relation}` : ""}`);
     if (lines.join("\n").length > bodyLimit) { lines.pop(); break; }
   }
   const body = lines.join("\n").slice(0, bodyLimit);

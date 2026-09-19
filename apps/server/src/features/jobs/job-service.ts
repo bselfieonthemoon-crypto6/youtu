@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
-import { authorizeConversationImageJobs, ImageJobAccessError, scopeConversationImageJobs,
+import { authorizeConversationImageJobs, ImageJobAccessError, scopeConversationImageJobs, scopeConversationJobs,
   type ConversationImageJobScope } from "./conversation-image-job-access.js";
 
 import type {
@@ -190,6 +190,14 @@ export type JobService = {
   ): Promise<BackgroundJob[]>;
   cancelJob(user: AuthenticatedUser, jobId: string): Promise<BackgroundJob>;
   getConversationImageJob(user: AuthenticatedUser, scope: ConversationImageJobScope, jobId?: string): Promise<Record<string, unknown> | null>;
+  /**
+   * Read the latest — or one exact — video job in this conversation.
+   *
+   * A video row drops out of the agent's context window after a few turns, so a
+   * user naming an older video job had no way to have it checked; the agent could
+   * only answer from memory. Read-only: this never resubmits and never charges.
+   */
+  getConversationVideoJob(user: AuthenticatedUser, scope: ConversationImageJobScope, jobId?: string): Promise<Record<string, unknown> | null>;
   cancelJobAdmin(user: AuthenticatedUser, jobId: string, scope: ConversationImageJobScope): Promise<BackgroundJob>;
   /**
    * Stop the still-in-flight jobs of a turn the user just replaced.
@@ -1258,6 +1266,17 @@ export function createJobService(options: {
       if (jobId) query = query.eq("id", jobId);
       const { data, error } = await query.order("created_at", { ascending: false }).limit(1).maybeSingle();
       if (error) throw new JobServiceError("job_query_failed", "Failed to query image status.", 500);
+      return data;
+    },
+
+    async getConversationVideoJob(user, scope, jobId) {
+      const admin = options.getAdminClient();
+      await authorizeConversationImageJobs(admin, user.id, scope);
+      let query = scopeConversationJobs(admin.from("background_jobs")
+        .select("id,status,result,error_code,error_message,created_at,started_at,completed_at,model:payload->>model,duration:payload->>duration,resolution:payload->>resolution,requestedAspectRatio:payload->>aspect_ratio,creditsCost:payload->>mastra_credits_cost,creditsCostColumn:credits_cost,pricingVersion:payload->>mastra_pricing_version"), scope, "video_generation");
+      if (jobId) query = query.eq("id", jobId);
+      const { data, error } = await query.order("created_at", { ascending: false }).limit(1).maybeSingle();
+      if (error) throw new JobServiceError("job_query_failed", "Failed to query video status.", 500);
       return data;
     },
 

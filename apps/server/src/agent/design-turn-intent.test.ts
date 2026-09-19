@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { MessageMention } from "@loomic/shared";
 
-import { classifyDesignTurnIntent, extractStyleHints, extractTargetSizes, matchedSkillHints, mergeStyleHints, shouldReplaceSessionSeries } from "./design-turn-intent.js";
+import { classifyDesignTurnIntent, assessDesignTurnIntent, extractStyleHints, extractTargetSizes, matchedSkillHints, mergeStyleHints, resolveDesignTurnIntent, shouldReplaceSessionSeries } from "./design-turn-intent.js";
 
 const skillMention = (slug: string): MessageMention => ({ mentionType: "skill", id: slug, label: slug, slug });
 
@@ -314,5 +314,45 @@ describe("edit label vocabulary is unchanged by the deferral", () => {
     ]) {
       expect(classify(prompt), prompt).toBe("local_edit");
     }
+  });
+});
+
+describe("a question carrying an action verb defers to the model", () => {
+  // These were published as confident generation/edit verdicts, so the routing
+  // notice told the user a new round had been chosen for a pricing or capability
+  // question. The regex cannot separate them from a polite directive, so it now
+  // reports low confidence and asks the classifier instead of guessing.
+  it.each([
+    ["如果生成失败了，积分会退给我吗？", "new_generation"],
+    ["视频能做多轮修改吗？", "local_edit"],
+  ] as const)("defers %s (label %s) with low confidence", (prompt, label) => {
+    const assessment = assessDesignTurnIntent({ prompt, mentions: [], activeSkill: null, hasSeries: false,
+      hasAttachments: false });
+    expect(assessment.intent).toBe(label);
+    expect(assessment.needsModel).toBe(true);
+    expect(assessment.confidence).toBeLessThan(1);
+  });
+
+  it("keeps a pure how/why question informational without a model call", () => {
+    // The explanatory rule already covers price/how-many questions and stays a
+    // confident non_design, so the deferral above does not add latency here.
+    const assessment = assessDesignTurnIntent({ prompt: "生成一张图要花多少积分？",
+      mentions: [], activeSkill: null, hasSeries: false, hasAttachments: false });
+    expect(assessment).toMatchObject({ intent: "non_design", rule: "explanatory_question", needsModel: false });
+  });
+
+  it("hands a deferred verdict to the classifier when one is supplied", async () => {
+    const input = { prompt: "如果生成失败了，积分会退给我吗？", mentions: [], activeSkill: null, hasSeries: false,
+      signal: new AbortController().signal,
+      classifier: async () => ({ intent: "non_design" as const, reasonCode: "informational_question" as const,
+        confidence: 0.9 }) };
+    const resolution = await resolveDesignTurnIntent(input as never);
+    expect(resolution).toMatchObject({ intent: "non_design", reasonCode: "informational_question", source: "model" });
+  });
+
+  it("falls back to the low-confidence guess when no classifier is available", async () => {
+    const resolution = await resolveDesignTurnIntent({ prompt: "如果生成失败了，积分会退给我吗？",
+      mentions: [], activeSkill: null, hasSeries: false, signal: new AbortController().signal } as never);
+    expect(resolution).toMatchObject({ intent: "new_generation", source: "fallback", clamped: false });
   });
 });

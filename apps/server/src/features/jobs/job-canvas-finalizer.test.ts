@@ -175,6 +175,44 @@ describe("image job canvas finalization", () => {
     }) });
   });
 
+  // The submission card keeps the position it was created at, which is earlier
+  // than the optimistic "正在生成中…出图后告诉你" line of the same turn. Without a
+  // notice appended at terminal time, the last thing a user reads is that promise.
+  it("appends the terminal outcome as a new message so it is the newest line", async () => {
+    const { admin, upsert } = createAdmin();
+    const noticeText = "图片生成结果不确定；为避免重复调用或扣费，系统未自动重试。";
+    const terminal = {
+      ...successfulJob,
+      session_id: "session-1",
+      status: "dead_letter" as const,
+      error_code: "image_generation_result_unknown",
+      error_message: "504 Upstream model timed out",
+      payload: { ...successfulJob.payload, mastra_submission_key: "run:digest" },
+      result: null,
+    };
+
+    await expect(finalizeTerminalImageJobPlaceholder(admin as never, terminal as never)).resolves.toBe(true);
+    expect(upsert).toHaveBeenCalledTimes(2);
+    const cards = (upsert.mock.calls as unknown[][]).map(call => call[0] as {
+      id: string; content: string; content_blocks: Array<{ type: string }>;
+    });
+    const card = cards.find(entry => entry.id === "job-1")!;
+    const notice = cards.find(entry => entry.id !== "job-1")!;
+    expect(card.content_blocks[0]!.type).toBe("tool");
+    expect(notice).toMatchObject({ session_id: "session-1", content: noticeText,
+      content_blocks: [{ type: "text", text: noticeText }] });
+    // No provider text leaks into the appended message.
+    expect(JSON.stringify(notice)).not.toContain("504");
+
+    // The id is derived from the job, so a retry (or the recovery scan) rewrites
+    // the same row instead of appending the outcome twice.
+    const firstId = notice.id;
+    upsert.mockClear();
+    await finalizeTerminalImageJobPlaceholder(admin as never, { ...terminal, result: null } as never);
+    const secondIds = (upsert.mock.calls as unknown[][]).map(call => (call[0] as { id: string }).id);
+    expect(secondIds).toContain(firstId);
+  });
+
   it("recovers terminal design chat cards omitted by canvas-placeholder recovery", async () => {
     const terminal = { ...successfulJob, session_id: "session-1", target_kind: "design",
       canvas_id: null, status: "dead_letter", error_code: "provider_rejected", error_message: "no channel",

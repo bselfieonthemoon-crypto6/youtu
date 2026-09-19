@@ -115,7 +115,7 @@ describe("Mastra SDK tool schema compatibility", () => {
         limits: { maxDuration: 10, allowedDurations: [5, 10], maxResolution: "1080p", maxInputImages: 1 } }],
     });
     const status = createMastraImageStatusTools({
-      jobService: { getConversationImageJob: vi.fn(), cancelJobAdmin: vi.fn() },
+      jobService: { getConversationImageJob: vi.fn(), getConversationVideoJob: vi.fn(), cancelJobAdmin: vi.fn() },
       user: { id: "00000000-0000-4000-8000-000000000001", accessToken: "token", email: "", userMetadata: {} },
       scope: { userId: "00000000-0000-4000-8000-000000000001",
         workspaceId: "00000000-0000-4000-8000-000000000002", sessionId: "00000000-0000-4000-8000-000000000003",
@@ -141,7 +141,7 @@ describe("Mastra SDK tool schema compatibility", () => {
           requiredTools: ["inspect_design"], optionalTools: [], models: [], limitations: [], examples: [], sources: [] } },
       }],
       promptLibraryService: { search: vi.fn(), getById: vi.fn() } as never,
-      nativeImageTools: [image.generateImage, image.editImage, video, status.getImageStatus, status.cancelImageJob],
+      nativeImageTools: [image.generateImage, image.editImage, video, status.getImageStatus, status.cancelImageJob, status.getVideoStatus],
     });
     const names = toolkit.tools.map(item => item.id);
     expect(names).toEqual(expect.arrayContaining([
@@ -149,7 +149,7 @@ describe("Mastra SDK tool schema compatibility", () => {
       "inspect_design", "get_design_objects", "search_design_resources", "list_designs",
       "generate_image", "edit_image", "list_skills", "use_skill", "compose_skills", "read_file",
       "generate_video",
-      "get_image_status", "cancel_image_job",
+      "get_image_status", "cancel_image_job", "get_video_status",
       "search_prompt_library", "get_prompt_library_entry", "get_brand_kit", "screenshot_canvas", "review_image_results",
     ]));
     expect(new Set(names).size).toBe(names.length);
