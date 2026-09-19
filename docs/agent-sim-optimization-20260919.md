@@ -70,7 +70,25 @@
 - `canvasSummary.placeholders` 现已同时统计 `image-generator` 与 `image-replacement` 两种占位节点，
   否则 `stale_generating_placeholder` 实际上什么都没检查。
 
-## 五、新代码上线后的一次真实端到端复验（2026-09-19 21:55）
+## 六、用户可见文案规范（可执行的规范）
+
+客户能读到的每一句失败/状态文案都必须满足：
+
+1. **中文**，且不出现任何拉丁字母（`http_401`、`workspace:<uuid>`、请求 id、上游英文原文都不得出现）。
+2. **由 error_code 派生**，不是常量兜底；`provider_rate_limited` / `provider_rejected` /
+   `provider_unavailable` / `provider_quota_insufficient` / `http_401` / `provider_snapshot_invalid` /
+   `image_generation_result_unknown` / `invalid_input` / `safety_filter` /
+   `local_repaint_geometry_mismatch` / `outpaint_geometry_mismatch` 各有各的说法。
+3. **未知 code 才用通用句**，且通用句不猜原因（"图片生成失败，未交付新图片。"/"视频生成失败，未交付视频。"）。
+4. **取消说取消**，不等于失败。
+5. 原始文本只留在 `background_jobs.error_message` 供排查；模型侧由 `errorLabel` 给出中文版，
+   提示词明确禁止整句粘贴 `error`。
+
+这条规范由 `job-canvas-finalizer.test.ts` 的 "user-visible failure copy" 三组断言强制执行——
+写规范时就靠它发现 `canvasFailureLabel`/`videoTerminalSummary` 还有 6 个 code 掉进通用句，
+已补齐。
+
+## 七、新代码上线后的一次真实端到端复验（2026-09-19 21:55）
 
 重启 API/worker 加载本批代码后，新建会话实测"生成 → 运行中取消"：
 

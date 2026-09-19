@@ -203,15 +203,23 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 /** Short canvas label for a failed placeholder: the job's real reason instead of
- * the constant "图片生成失败" that told the user nothing about 429 vs 504. */
+ * the constant "图片生成失败" that told the user nothing about 429 vs 504. Every
+ * code the worker can actually dead-letter with has its own label — a code that
+ * fell through to the generic sentence was the defect this fixes. */
 export function canvasFailureLabel(status: string, errorCode: string | null): string {
   if (status === "canceled") return "生成已取消";
   switch (errorCode) {
     case "provider_rate_limited": return "渠道过载，未生成";
     case "provider_rejected": return "渠道拒绝，未生成";
+    case "provider_unavailable": return "渠道暂时不可用";
+    case "provider_quota_insufficient": return "渠道额度不足，未生成";
+    case "http_401":
+    case "provider_snapshot_invalid": return "渠道凭据无效";
     case "image_generation_result_unknown": return "上游超时，结果未知";
     case "invalid_input": return "参数不合法，未生成";
     case "safety_filter": return "内容被安全策略拦截";
+    case "local_repaint_geometry_mismatch":
+    case "outpaint_geometry_mismatch": return "尺寸校验未通过";
     default: return "图片生成失败";
   }
 }
@@ -338,11 +346,22 @@ export function videoTerminalSummary(status: string, errorCode: string | null): 
       return "视频渠道当前过载，本次未生成视频，也不会扣费；可以稍后再让我重试。";
     case "provider_rejected":
       return "视频渠道拒绝了本次任务，未交付视频；可以稍后重试或换一个视频模型。";
+    case "provider_unavailable":
+      return "视频渠道暂时不可用，本次未生成视频；可以稍后重试。";
+    case "provider_quota_insufficient":
+      return "视频渠道额度不足，本次未生成视频；需要管理员检查供应商额度后重试。";
     case "http_401":
     case "provider_snapshot_invalid":
       return "视频渠道的凭据或配置无效，本次未生成视频；请管理员检查视频供应商配置后重试。";
     case "image_generation_result_unknown":
       return "视频生成结果不确定；为避免重复调用或扣费，系统未自动重试。";
+    case "invalid_input":
+      return "视频请求的参数不合法，未提交生成；请调整时长、分辨率或参考图后重试。";
+    case "safety_filter":
+      return "视频内容被渠道的安全策略拦截，本次未生成视频。";
+    case "local_repaint_geometry_mismatch":
+    case "outpaint_geometry_mismatch":
+      return "上游返回的画面尺寸与要求不一致，为避免拉伸和接缝，本次未交付视频。";
     default:
       return "视频生成失败，未交付视频。";
   }

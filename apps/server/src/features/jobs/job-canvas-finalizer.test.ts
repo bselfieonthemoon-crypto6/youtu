@@ -11,6 +11,7 @@ vi.mock("../canvas/canvas-element-writer.js", () => ({
 }));
 
 import {
+  canvasFailureLabel,
   finalizeDesignImageJobChat,
   finalizeImageJobToCanvas,
   finalizeTerminalImageJobPlaceholder,
@@ -876,5 +877,49 @@ describe("image job canvas finalization", () => {
       { p_limit: 100 },
     );
     expect(upsert).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The copy norm for anything a customer reads: Chinese, derived from the error
+ * CODE, never the upstream channel's raw English text or its internal
+ * identifiers (`workspace:<uuid>`, request ids, `http_401`). A simulated user was
+ * shown the sentence "504 Upstream model timed out. Try again later." verbatim,
+ * which is why this is asserted rather than left to review.
+ */
+describe("user-visible failure copy", () => {
+  const codes = [
+    "provider_rate_limited", "provider_rejected", "provider_unavailable",
+    "provider_quota_insufficient", "image_generation_result_unknown", "invalid_input",
+    "safety_filter", "http_401", "provider_snapshot_invalid",
+    "local_repaint_geometry_mismatch", "outpaint_geometry_mismatch",
+  ] as const;
+  const statuses = ["canceled", "dead_letter", "failed"] as const;
+
+  it("sticks to Chinese with no upstream identifiers for every known code", () => {
+    for (const status of statuses) {
+      for (const code of [...codes, "an_unknown_future_code"]) {
+        for (const text of [canvasFailureLabel(status, code), videoTerminalSummary(status, code)]) {
+          expect(text, `${status}/${code}`).not.toMatch(/[A-Za-z]/);
+          expect(text, `${status}/${code}`).not.toMatch(/workspace:|[0-9a-f]{8}-[0-9a-f]{4}|https?:/i);
+          expect(text.trim().length, `${status}/${code}`).toBeGreaterThan(4);
+        }
+      }
+    }
+  });
+
+  it("names the real cause instead of collapsing known codes into a generic failure", () => {
+    for (const code of codes) {
+      expect(canvasFailureLabel("dead_letter", code)).not.toBe("图片生成失败");
+      expect(videoTerminalSummary("dead_letter", code)).not.toBe("视频生成失败，未交付视频。");
+    }
+    // An unknown code still has to say something honest rather than guess a cause.
+    expect(canvasFailureLabel("dead_letter", "brand_new_code")).toBe("图片生成失败");
+    expect(videoTerminalSummary("dead_letter", "brand_new_code")).toBe("视频生成失败，未交付视频。");
+  });
+
+  it("tells the user a canceled job was canceled, not that it failed", () => {
+    expect(canvasFailureLabel("canceled", null)).toContain("取消");
+    expect(videoTerminalSummary("canceled", "provider_rejected")).toContain("取消");
   });
 });
