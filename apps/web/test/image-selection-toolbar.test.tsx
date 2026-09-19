@@ -16,7 +16,7 @@ it("shows only board import inside a board and restores tools outside", () => {
   expect(screen.getByRole("button", { name: "更多图片工具" })).toBeTruthy();
 });
 
-it("starts the box-selection split from the button and keeps the paid flows in the menu", () => {
+it("keeps every split mode behind one 图层拆分 entry, each with its own cost", () => {
   const onSplitLayersBox = vi.fn();
   const onSplitLayers = vi.fn();
   const onSplitLayersDedicated = vi.fn();
@@ -26,16 +26,23 @@ it("starts the box-selection split from the button and keeps the paid flows in t
     onRecognizeText: async () => [], onApplyTextReplacement: async () => {} };
   render(<ImageSelectionToolbar {...props} />);
 
-  // The visible split entry is the free box flow, not the paid named-layer dialog.
+  // Clicking the entry opens the mode panel; it does not start a paid flow by itself.
   fireEvent.click(screen.getByRole("button", { name: "图层拆分" }));
-  expect(onSplitLayersBox).toHaveBeenCalledOnce();
-  expect(onSplitLayersDedicated).not.toHaveBeenCalled();
+  const panel = screen.getByTestId("layer-split-menu");
+  expect(panel).toBeTruthy();
+  expect(onSplitLayersBox).not.toHaveBeenCalled();
+  expect(onSplitLayers).not.toHaveBeenCalled();
+  for (const mode of ["框选剥离", "按名称拆分", "本地快速拆分"]) expect(screen.getByText(mode)).toBeTruthy();
+  expect(panel.textContent).toContain("2 次图片调用");
+  expect(panel.textContent).toContain("免费 · 不出网");
 
-  // The earlier generative and local paths stay reachable, one level down.
+  // The overflow menu no longer repeats them: one entry point, described modes.
   fireEvent.click(screen.getByRole("button", { name: "更多图片工具" }));
-  fireEvent.click(screen.getByText("按名称拆分（付费）"));
-  expect(onSplitLayersDedicated).not.toHaveBeenCalled();
-  expect(screen.getByText("AI 图层拆分")).toBeTruthy();
+  expect(screen.queryByText("本地快速拆分")).toBeTruthy();
+  expect(screen.getAllByText("框选剥离")).toHaveLength(1);
+
+  fireEvent.click(screen.getByText("框选剥离"));
+  expect(onSplitLayersBox).toHaveBeenCalledOnce();
 });
 
 it("fills the named split from the automatic element listing", async () => {
@@ -46,15 +53,15 @@ it("fills the named split from the automatic element listing", async () => {
     onChatCommand: vi.fn(), onRecognizeText: async () => [], onApplyTextReplacement: async () => {} };
   render(<ImageSelectionToolbar {...props} />);
 
-  fireEvent.click(screen.getByRole("button", { name: "更多图片工具" }));
-  fireEvent.click(screen.getByText("全部剥离（自动识别元素，付费）"));
+  fireEvent.click(screen.getByRole("button", { name: "图层拆分" }));
+  fireEvent.click(screen.getByText("全部剥离"));
 
   // The proposed names prefill the editable dialog; they are not submitted blindly.
   await waitFor(() => expect(screen.getByLabelText("要拆分的元素名称")).toHaveValue("左侧人物\n标题文字"));
   expect(onSplitLayersAuto).toHaveBeenCalledOnce();
 });
 
-it("explains an empty element listing without leaving the split menu", async () => {
+it("explains an empty element listing without leaving the split panel", async () => {
   const onSplitLayersAuto = vi.fn(async () => []);
   const props = { image: { id: "image" } as any, screenBounds: { x: 100, y: 100, width: 100, height: 100 },
     onDownload: vi.fn(), onCrop: vi.fn(), onRegenerate: vi.fn(), onUpscale: vi.fn(), onRemoveBackground: vi.fn(),
@@ -62,10 +69,12 @@ it("explains an empty element listing without leaving the split menu", async () 
     onChatCommand: vi.fn(), onRecognizeText: async () => [], onApplyTextReplacement: async () => {} };
   render(<ImageSelectionToolbar {...props} />);
 
-  fireEvent.click(screen.getByRole("button", { name: "更多图片工具" }));
-  fireEvent.click(screen.getByText("全部剥离（自动识别元素，付费）"));
+  fireEvent.click(screen.getByRole("button", { name: "图层拆分" }));
+  fireEvent.click(screen.getByText("全部剥离"));
 
   await waitFor(() => expect(screen.getByRole("alert"))
-    .toHaveTextContent("没能从这张图里识别出独立元素，请改用框选剥离或自己填写名称。"));
+    .toHaveTextContent("没能从这张图里识别出独立元素，请改用框选剥离或自己填写元素名称。"));
+  // The panel stays open with the reason, and no dialog was opened behind it.
+  expect(screen.getByTestId("layer-split-menu")).toBeTruthy();
   expect(screen.queryByText("AI 图层拆分")).toBeNull();
 });

@@ -24,8 +24,7 @@ const icons: Record<ImageToolbarActionId, typeof Sparkles> = {
   "add-to-chat": MessageCirclePlus, details: Info, download: Download,
 };
 
-export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop, onRegenerate, onUpscale, onRemoveBackground, onSplitLayers, onSplitLayersDedicated, onSplitLayersQwen, onSplitLayersBox, onSplitLayersAuto, accessToken, onErase, onOutpaint, onChatCommand, onRecognizeText, onApplyTextReplacement, onAddToBoard, addToBoardLabel = "添加到画板", boardOnly = false }: {
-  image: SelectedCanvasImage;
+export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop, onRegenerate, onUpscale, onRemoveBackground, onSplitLayers, onSplitLayersDedicated, onSplitLayersQwen, onSplitLayersBox, onSplitLayersAuto, accessToken, onErase, onOutpaint, onChatCommand, onRecognizeText, onApplyTextReplacement, onAddToBoard, addToBoardLabel = "添加到画板", boardOnly = false }: {  image: SelectedCanvasImage;
   screenBounds: { x: number; y: number; width: number; height: number; viewportWidth?: number };
   onDownload: () => void;
   onAddToBoard?: () => void;
@@ -65,6 +64,7 @@ export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop,
   const [suggestedLayerNames, setSuggestedLayerNames] = useState<string[]>([]);
   const [autoSplitBusy, setAutoSplitBusy] = useState(false);
   const [autoSplitError, setAutoSplitError] = useState<string | null>(null);
+  const [splitMenuOpen, setSplitMenuOpen] = useState(false);
   const startAutomaticSplit = async () => {
     if (!onSplitLayersAuto || autoSplitBusy) return;
     setAutoSplitBusy(true);
@@ -72,11 +72,11 @@ export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop,
     try {
       const names = await onSplitLayersAuto();
       if (!names?.length) {
-        setAutoSplitError("没能从这张图里识别出独立元素，请改用框选剥离或自己填写名称。");
+        setAutoSplitError("没能从这张图里识别出独立元素，请改用框选剥离或自己填写元素名称。");
         return;
       }
       setSuggestedLayerNames(names);
-      setMenuOpen(false);
+      setSplitMenuOpen(false);
       setActiveAction("split-layers");
     } catch (error) {
       setAutoSplitError(error instanceof Error ? error.message : "自动识别元素失败，请重试或改用框选剥离。");
@@ -105,11 +105,11 @@ export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop,
     if (id === "replace-text") return setReplaceTextOpen(true);
     if (id === "remove-background") return onRemoveBackground();
     if (id === "split-layers") {
-      // Box selection is the everyday path, so it is the plain click. The paid
-      // named-layer split stays one level down in the overflow menu instead of
-      // being the default action of a button that looks free.
-      if (onSplitLayersBox) return onSplitLayersBox();
-      return onSplitLayersDedicated ? setActiveAction(id) : onSplitLayers();
+      // One entry, several modes. The panel states what each mode costs and what it
+      // produces, instead of scattering four look-alike entries through the menu.
+      // `onSplitLayers` is required, so the panel always has at least one mode.
+      setSplitMenuOpen(true);
+      return;
     }
     if (id === "erase") return onErase();
     if (id === "outpaint") return onOutpaint?.();
@@ -138,17 +138,46 @@ export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop,
           <button type="button" aria-label="更多图片工具" onClick={() => setMenuOpen((v) => !v)} className="flex size-9 items-center justify-center rounded-lg hover:bg-muted"><Ellipsis className="size-5" /></button>
           {menuOpen && <div className="absolute right-0 top-11 z-[101] max-h-[60vh] w-64 overflow-y-auto rounded-xl border border-border bg-background p-1.5 shadow-xl">
             {more.map((item) => button(item, true))}
-            {onSplitLayersBox && <button type="button" onClick={() => { setMenuOpen(false); onSplitLayersBox(); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted"><Focus className="size-4" />框选剥离元素</button>}
-            {onSplitLayersAuto && <button type="button" disabled={autoSplitBusy} onClick={() => void startAutomaticSplit()} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted disabled:opacity-60"><Sparkles className="size-4" />{autoSplitBusy ? "正在识别元素…" : "全部剥离（自动识别元素，付费）"}</button>}
-            {autoSplitError && <p role="alert" className="px-3 pb-1 text-[11px] text-destructive">{autoSplitError}</p>}
-            {onSplitLayersDedicated && <button type="button" onClick={() => { setMenuOpen(false); setSuggestedLayerNames([]); setActiveAction("split-layers"); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted"><Layers3 className="size-4" />按名称拆分（付费）</button>}
-            {onSplitLayersDedicated && <button type="button" onClick={() => { setMenuOpen(false); onSplitLayers(); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted"><Layers3 className="size-4" />本地快速拆分</button>}
-            {accessToken && onSplitLayersQwen && <LayerBackendOption accessToken={accessToken} onRun={() => { setMenuOpen(false); onSplitLayersQwen(); }} />}
             <div className="my-1 h-px bg-border" />
             <button type="button" onClick={() => { setMenuOpen(false); setCustomizeOpen(true); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted"><Settings2 className="size-4" />自定义工具栏</button>
           </div>}
         </div>
       </div>}
+
+    {/* 图层拆分 modes. One entry point: every way to split a flat image is described
+        here with its cost and output, so the toolbar does not grow one button per
+        implementation detail. */}
+    {splitMenuOpen && <div data-testid="layer-split-menu" role="dialog" aria-label="图层拆分方式"
+      className="fixed z-[101] w-80 rounded-2xl border border-border bg-background p-3 shadow-xl"
+      style={{ left: Math.max(12, Math.min(canvasWidth - 332, left)), top: top + 48 }}
+      onPointerDown={(event) => event.stopPropagation()}>
+      <h3 className="text-sm font-semibold">图层拆分</h3>
+      <p className="mt-1 text-[11px] leading-4 text-muted-foreground">把一张扁平图变成「修补后的底图 + 可独立摆放的透明元素」。选一种方式：</p>
+      <div className="mt-2 grid gap-1">
+        {onSplitLayersBox && <SplitMode icon={<Focus className="size-4" />} title="框选剥离"
+          detail="拖框圈住一个元素，只提取它并修补底图" cost="2 次图片调用"
+          onClick={() => { setSplitMenuOpen(false); onSplitLayersBox(); }} />}
+        {onSplitLayersAuto && <SplitMode icon={<Sparkles className="size-4" />}
+          title={autoSplitBusy ? "正在识别元素…" : "全部剥离"}
+          detail="先识别画面里的元素，再逐个提取并修补底图"
+          cost={autoSplitBusy ? undefined : "1 次识别 + N+1 次图片调用"} disabled={autoSplitBusy}
+          onClick={() => void startAutomaticSplit()} />}
+        <div className="my-0.5 h-px bg-border" />
+        {onSplitLayersDedicated && <SplitMode icon={<Layers3 className="size-4" />} title="按名称拆分"
+          detail="自己填写 2–4 个元素名，省掉识别那一次"
+          cost="N+1 次图片调用"
+          onClick={() => { setSplitMenuOpen(false); setSuggestedLayerNames([]); setActiveAction("split-layers"); }} />}
+        {onSplitLayers && <SplitMode icon={<Layers3 className="size-4" />} title="本地快速拆分"
+          detail="本地模型按前景连通块粗分，不修补底图" cost="免费 · 不出网"
+          onClick={() => { setSplitMenuOpen(false); onSplitLayers(); }} />}
+        {accessToken && onSplitLayersQwen && <LayerBackendOption accessToken={accessToken}
+          onRun={() => { setSplitMenuOpen(false); onSplitLayersQwen(); }} />}
+      </div>
+      {autoSplitError && <p role="alert" className="mt-2 text-[11px] text-destructive">{autoSplitError}</p>}
+      <div className="mt-2 flex justify-end">
+        <button type="button" onClick={() => setSplitMenuOpen(false)} className="rounded-lg border border-border px-3 py-1.5 text-xs">取消</button>
+      </div>
+    </div>}
     <ImageDetailsDialog image={image} open={detailsOpen} onOpenChange={setDetailsOpen} />
     <ImageToolbarCustomizeDialog open={customizeOpen} value={preferences} onOpenChange={setCustomizeOpen} onSave={setPreferences} onReset={reset} />
     {replaceTextOpen && <ImageTextReplacementPanel image={image} screenBounds={screenBounds} onRecognize={onRecognizeText} onApply={(replacements) => {
@@ -165,4 +194,28 @@ export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop,
       else if (action === "split-layers" && layerSplit) onSplitLayersDedicated?.(layerSplit);
     }} />
   </>, document.body);
+}
+
+/** One way to split an image, with its honest cost and output in the same row. */
+function SplitMode({ icon, title, detail, cost, disabled = false, onClick }: {
+  icon: React.ReactNode;
+  title: string;
+  detail: string;
+  cost?: string | undefined;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button type="button" disabled={disabled} onClick={onClick}
+      className="flex w-full items-start gap-2 rounded-lg px-2 py-2 text-left hover:bg-muted disabled:opacity-60">
+      <span className="mt-0.5 shrink-0">{icon}</span>
+      <span className="min-w-0">
+        <span className="flex items-baseline gap-2">
+          <span className="text-sm font-medium">{title}</span>
+          {cost && <span className="text-[10px] text-muted-foreground">{cost}</span>}
+        </span>
+        <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">{detail}</span>
+      </span>
+    </button>
+  );
 }
