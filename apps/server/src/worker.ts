@@ -548,8 +548,7 @@ export async function processMessage(
       const payload = job.payload ?? {};
       const isLocalOperation =
         jobType === "image_generation" &&
-        isLocalImageOperation(payload.operation) &&
-        !(payload.operation === "split_layers" && payload.layer_backend === "semantic");
+        isLocalImageOperation(payload.operation);
       const modelId =
         typeof payload.model === "string"
           ? payload.model

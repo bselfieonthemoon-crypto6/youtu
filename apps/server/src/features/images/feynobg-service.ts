@@ -9,7 +9,6 @@ import { fileURLToPath } from "node:url";
 export type FeynobgMode =
   | "remove_background"
   | "region_matting"
-  | "split_layers"
   | "erase_transparent"
   | "smart_erase";
 export type FeynobgSelectionRegion = {

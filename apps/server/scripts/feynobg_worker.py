@@ -577,53 +577,6 @@ def smart_erase(input_path: Path, mask_path: Path, output_dir: Path, lama_model:
     }
 
 
-def split_layers(model_dir: Path, lama_model: Path, input_path: Path, output_dir: Path) -> dict:
-    import cv2
-
-    source = Image.open(input_path).convert("RGB")
-    cutout = make_cutout(model_dir, source).convert("RGBA")
-    rgba = np.asarray(cutout).copy()
-    alpha = rgba[:, :, 3]
-    binary = (alpha >= 24).astype(np.uint8)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    image_area = source.width * source.height
-    minimum_area = max(96, int(image_area * 0.0015))
-    components = [
-        (index, stats[index])
-        for index in range(1, count)
-        if int(stats[index, cv2.CC_STAT_AREA]) >= minimum_area
-    ]
-    components.sort(key=lambda item: int(item[1][cv2.CC_STAT_AREA]), reverse=True)
-    components = components[:12]
-
-    files: list[dict] = []
-    # LaMa is designed for large irregular holes and gives materially better
-    # background reconstruction than local pixel propagation.
-    repaired = repair_background(source, binary, lama_model)
-    background_path = output_dir / "background.png"
-    repaired.save(background_path, format="PNG", optimize=True)
-    files.append({"kind": "background", "name": background_path.name, "x": 0, "y": 0,
-                  "width": source.width, "height": source.height})
-
-    if not components and binary.any():
-        ys, xs = np.where(binary > 0)
-        components = [(1, np.array([xs.min(), ys.min(), xs.max() - xs.min() + 1,
-                                    ys.max() - ys.min() + 1, len(xs)]))]
-        labels = binary
-
-    for output_index, (label_index, stat) in enumerate(components, start=1):
-        x, y, width, height = [int(value) for value in stat[:4]]
-        layer = rgba[y:y + height, x:x + width].copy()
-        component_mask = labels[y:y + height, x:x + width] == label_index
-        layer[:, :, 3] = np.where(component_mask, layer[:, :, 3], 0)
-        layer_path = output_dir / f"element-{output_index:02d}.png"
-        Image.fromarray(layer, mode="RGBA").save(layer_path, format="PNG", optimize=True)
-        files.append({"kind": "element", "name": layer_path.name, "x": x, "y": y,
-                      "width": width, "height": height, "index": output_index})
-
-    return {"width": source.width, "height": source.height, "files": files}
-
-
 def handle(request: dict, model_dir: Path, lama_model: Path, sam_model_dir: Path) -> dict:
     request_id = str(request.get("id", ""))
     input_path = Path(request["input_path"]).resolve()
@@ -653,7 +606,9 @@ def handle(request: dict, model_dir: Path, lama_model: Path, sam_model_dir: Path
             else smart_erase(input_path, mask_path, output_dir, lama_model)
         )
     elif mode == "split_layers":
-        result = split_layers(model_dir, lama_model, input_path, output_dir)
+        # The local fast split was removed; layer splitting is the semantic flow
+        # handled by the paid executor, never by this worker.
+        raise ValueError("split_layers is no longer a local operation.")
     else:
         raise ValueError(f"Unsupported FeyNoBG mode: {mode}")
     return {"id": request_id, "ok": True, **result}

@@ -245,6 +245,14 @@ function validateImageOperationInputs(
   } else if (value.layer_names !== undefined || value.repair_background !== undefined) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: "layer_names and repair_background require semantic layer_backend", path: ["layer_backend"] });
   }
+  if (value.operation === "split_layers" && value.layer_backend !== "semantic") {
+    // The local fast split was removed: layer splitting is always the semantic flow
+    // now (a framed element, or element names the model proposed), so a caller
+    // cannot quietly fall back to a lower-quality local split.
+    context.addIssue({ code: z.ZodIssueCode.custom,
+      message: "split_layers requires layer_backend semantic; the local fast split was removed",
+      path: ["operation"] });
+  }
   if (value.operation === "outpaint") {
     if (value.prompt.trim().length === 0) {
       context.addIssue({

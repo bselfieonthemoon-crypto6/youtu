@@ -162,7 +162,7 @@ describe("worker claim gate", () => {
 
   it("runs local image operations without resolving a third-party provider", async () => {
     const originalExecutor = getExecutor("image_generation");
-    const executeLocal = vi.fn(async () => ({ operation: "split_layers" }));
+    const executeLocal = vi.fn(async () => ({ operation: "region_matting" }));
     const resolve = vi.fn();
     const deleteMsg = vi.fn(async () => undefined);
     registerExecutor("image_generation", executeLocal);
@@ -171,7 +171,7 @@ describe("worker claim gate", () => {
       id: "job-local",
       status: "running",
       workspace_id: "workspace-1",
-      payload: { operation: "split_layers", model: "local:feynobg" },
+      payload: { operation: "region_matting", model: "local:feynobg" },
     };
     const ctx = {
       jobService: {

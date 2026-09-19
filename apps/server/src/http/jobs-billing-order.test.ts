@@ -344,8 +344,9 @@ describe("job route payment gate", () => {
       method: "POST",
       url: "/api/jobs/image-generation",
       payload: {
-        prompt: "remove background",
-        operation: "split_layers",
+        prompt: "cut out the framed subject",
+        operation: "region_matting",
+        selection_region: { x: 0.2, y: 0.2, width: 0.5, height: 0.5 },
         target: {
           kind: "design",
           design_id: designId,
@@ -418,8 +419,9 @@ describe("job route payment gate", () => {
       method: "POST",
       url: "/api/jobs/image-generation",
       payload: {
-        prompt: "remove background",
-        operation: "split_layers",
+        prompt: "cut out the framed subject",
+        operation: "region_matting",
+        selection_region: { x: 0.2, y: 0.2, width: 0.5, height: 0.5 },
         target: {
           kind: "design",
           design_id: designId,
@@ -484,7 +486,7 @@ describe("job route payment gate", () => {
   });
 
   it.each([
-    ["split_layers", undefined],
+    ["region_matting", undefined],
     ["smart_erase", "data:image/png;base64,bWFzaw=="],
   ] as const)(
     "queues self-hosted %s without charging generation credits",

@@ -63,7 +63,6 @@ describe("image processing job contracts", () => {
   it.each([
     "remove_background",
     "region_matting",
-    "split_layers",
     "erase_transparent",
     "smart_erase",
   ] as const)("accepts the %s local operation", (operation) => {
@@ -74,6 +73,19 @@ describe("image processing job contracts", () => {
       input_images: ["data:image/png;base64,AA=="],
     });
     expect(parsed.operation).toBe(operation);
+  });
+
+  it("rejects the removed local fast split", () => {
+    // Layer splitting is semantic-only now: a bare split_layers is the deleted
+    // local pipeline, so it must fail instead of quietly doing something else.
+    const result = createImageJobRequestSchema.safeParse({
+      prompt: "split",
+      operation: "split_layers",
+      model: "local:feynobg",
+      input_images: ["data:image/png;base64,AA=="],
+    });
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.some(issue => issue.path.includes("operation"))).toBe(true);
   });
 
   it("accepts an erase mask data URL", () => {

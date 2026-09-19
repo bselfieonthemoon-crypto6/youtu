@@ -50,7 +50,6 @@ import type { RequestAuthenticator } from "../supabase/user.js";
 import type { UserSupabaseClient } from "../supabase/user.js";
 import { isLocalImageOperation as usesLocalImageBackend } from "../features/images/local-image-operation.js";
 import { requiresTransparentForeground, prepareForegroundPolicy } from "../features/images/foreground-policy.js";
-import { checkQwenLayerBackend, QwenLayerError, QWEN_LAYER_MODEL } from "../features/images/qwen-layer-separation.js";
 import { validateImageGenerationRequestLimits } from "../generation/image-request-limits.js";
 
 export async function registerJobRoutes(
@@ -65,11 +64,6 @@ export async function registerJobRoutes(
     workspaceModelCatalogService?: WorkspaceModelCatalogService;
   },
 ) {
-  app.get("/api/images/layer-backend", async (request, reply) => {
-    const user = await options.auth.authenticate(request);
-    if (!user) return sendUnauthenticated(reply);
-    return reply.send(await checkQwenLayerBackend());
-  });
   app.get("/api/images/semantic-layer-backend", async (request, reply) => {
     try {
       const user = await options.auth.authenticate(request);
@@ -125,15 +119,6 @@ export async function registerJobRoutes(
           normalizedPayload.resolution = "1k";
         }
         const isBackgroundRemoval = payload.operation === "remove_background";
-        const usesDedicatedLayers = payload.model === QWEN_LAYER_MODEL;
-        if (payload.operation === "split_layers" && /qwen.*layer/i.test(payload.model ?? "") && !usesDedicatedLayers)
-          throw new QwenLayerError("invalid_input", "请使用已配置的专用分层模型标识 qwen-image-layered；未回退到本地抠图。", 422);
-        if (usesDedicatedLayers) {
-          if (payload.operation !== "split_layers") throw new QwenLayerError("invalid_input", "Qwen-Image-Layered 仅用于图片分层。", 422);
-          if (payload.input_images?.length !== 1 && normalizedPayload.target?.kind !== "design") throw new QwenLayerError("invalid_input", "专用分层需要单张已选择的原图。", 422);
-          const status = await checkQwenLayerBackend();
-          if (!status.available) throw new QwenLayerError("layer_backend_unavailable", status.reason);
-        }
         let workspaceId = viewer.workspace.id;
         let projectId = payload.project_id;
         let effectiveTarget = normalizedPayload.target;
@@ -155,7 +140,7 @@ export async function registerJobRoutes(
           : isBackgroundRemoval
           ? await resolveBackgroundRemovalModel(options.workspaceModelCatalogService, user, workspaceId)
           : isLocalImageOperation
-          ? usesDedicatedLayers ? QWEN_LAYER_MODEL : "local:feynobg"
+          ? "local:feynobg"
           : (payload.model ?? "black-forest-labs/flux-kontext-pro");
         const billingModel = await resolveBillingModel(
           options.workspaceModelCatalogService,
@@ -893,7 +878,6 @@ function sendJobError(
   reply: FastifyReply,
   fallbackCode: JobErrorFallbackCode,
 ) {
-  if (error instanceof QwenLayerError) return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
   if (error instanceof JobServiceError) {
     return reply.code(error.statusCode).send(
       applicationErrorResponseSchema.parse({

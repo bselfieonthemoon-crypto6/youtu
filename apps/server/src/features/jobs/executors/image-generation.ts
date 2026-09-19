@@ -32,8 +32,6 @@ import {
 import {
   directOutpaintRequest,
 } from "../../images/outpaint.js";
-import { processWithQwenLayers, QWEN_LAYER_MODEL } from "../../images/qwen-layer-separation.js";
-import { createQwenLayerCheckpoint } from "./qwen-layer-checkpoint.js";
 import { normalizePersistedGenerationJob } from "../design-target-normalizer.js";
 // Generated images are delivered without platform watermarks during product development.
 import { type ExecutorContext, registerExecutor } from "../job-executor.js";
@@ -103,7 +101,17 @@ registerExecutor(
     }
 
     try {
-      if (isLocalImageOperation(payload.operation) || payload.operation === "remove_background") {
+      if (isLocalImageOperation(payload.operation) || payload.operation === "remove_background"
+        || payload.operation === "split_layers") {
+        // Layer splitting is the semantic flow only. A row written before the local
+        // fast split was removed must fail loudly instead of quietly doing nothing.
+        if (payload.operation === "split_layers" && payload.layer_backend !== "semantic") {
+          const error = new Error(
+            "Layer splitting requires the semantic backend; the local fast split was removed.",
+          );
+          (error as Error & { code?: string }).code = "invalid_input";
+          throw error;
+        }
         const boundSourceAsset =
           payload.target?.kind === "design"
             ? payload.target.source_asset_object_id
@@ -165,7 +173,7 @@ registerExecutor(
           maskBuffer = mask.buffer;
         }
         await assertNotCanceled();
-        const processed = payload.operation === "split_layers" && payload.layer_backend === "semantic"
+        const processed = payload.operation === "split_layers"
           ? await processSemanticLayers({ source: source.buffer, admin, workspaceId,
               projectId: jobRow.project_id, createdBy, jobId, model,
               layerNames: payload.layer_names!, prompt: payload.prompt,
@@ -240,8 +248,6 @@ registerExecutor(
               return { model: "gpt-image-2", ...dimensions, layers: [{ kind: "foreground" as const,
                 buffer: cached.buffer, x: 0, y: 0, ...dimensions, index: 0 }] };
             })()
-          : payload.operation === "split_layers" && model === QWEN_LAYER_MODEL
-          ? await processWithQwenLayers(source.buffer, { jobId, checkpoint: createQwenLayerCheckpoint(admin, workspaceId, jobId), beforeInference: assertNotCanceled })
           : await processWithFeynobg(
           source.buffer,
           payload.operation,

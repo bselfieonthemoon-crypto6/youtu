@@ -20,7 +20,7 @@ try{
  const {project}=await api('/api/projects',{name:`图片编辑独立验收 ${Date.now()}`});
  const source=await sharp(Buffer.from('<svg width="128" height="128"><rect width="128" height="128" fill="white"/><circle cx="64" cy="64" r="26" fill="red"/></svg>')).png().toBuffer();
  const mask=await sharp(Buffer.from('<svg width="128" height="128"><rect width="128" height="128" fill="black"/><rect x="32" y="32" width="64" height="64" fill="white"/></svg>')).png().toBuffer();
- const modes=(process.env.LOOMIC_TEST_IMAGE_MODES??'erase_transparent,smart_erase,remove_background,region_matting,split_layers').split(',');
+ const modes=(process.env.LOOMIC_TEST_IMAGE_MODES??'erase_transparent,smart_erase,remove_background,region_matting').split(',');
  for(const mode of modes){
   const started=Date.now();
   const {job}=await api('/api/jobs/image-generation',{project_id:project.id,canvas_id:project.primaryCanvas.id,prompt:'Local isolated image operation test',operation:mode,input_images:[`data:image/png;base64,${source.toString('base64')}`],...(['erase_transparent','smart_erase'].includes(mode)?{mask_image:`data:image/png;base64,${mask.toString('base64')}`} :{}),...(mode==='region_matting'?{selection_region:{x:.2,y:.2,width:.6,height:.6}}:{})});
