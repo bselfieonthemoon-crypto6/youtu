@@ -335,6 +335,13 @@ export function CanvasToolMenu({
   const eraserSessionRef = useRef<EraserSession | null>(null);
   const [repaintBusy, setRepaintBusy] = useState(false);
   const [repaintError, setRepaintError] = useState<string>();
+  /**
+   * The panel is read-only whenever a request is already owned by the server:
+   * an unconfirmed submission must be replayed byte-identically, and a tracked
+   * unknown outcome may only be queried. Letting either look editable would
+   * submit (or silently ignore) edits the user believes took effect.
+   */
+  const [repaintLock, setRepaintLock] = useState<"submission" | "job" | null>(null);
   // Box-selection layer split. The quote is fetched when the box session opens,
   // because the paid calls are what the user must see before framing anything.
   const [layerBoxSession, setLayerBoxSession] = useState<RegionMattingSession | null>(null);
@@ -1552,7 +1559,7 @@ export function CanvasToolMenu({
       showError("前次重绘提交结果尚未确认，请先返回原重绘面板重试查询。");
       return;
     }
-    repaintJobRef.current = null; setRepaintError(undefined);
+    repaintJobRef.current = null; setRepaintError(undefined); setRepaintLock(null);
     setEraserSession({
       imageId: selectedImage.id,
       bounds: {
@@ -1595,6 +1602,9 @@ export function CanvasToolMenu({
             const response = await createImageGenerationJob(accessToken, payload);
             repaintJobRef.current = { id: response.job.id, placeholderId };
             repaintSubmissionRef.current = null;
+            // The job id owns the request from here on, so the mask and the
+            // description may change again for a later, separate repaint.
+            setRepaintLock(null);
             updateImageReplacementElement(excalidrawApi, placeholderId, { jobId: response.job.id });
           } catch (cause) {
             const status = cause && typeof cause === "object" && "status" in cause ? Number(cause.status) : 0;
@@ -1619,9 +1629,12 @@ export function CanvasToolMenu({
         }
         if (typeof job.result?.canvas_element_id !== "string") throw new Error("图片已生成，画布仍在同步；再次点击将查询原任务，不会重复生成。");
         await onCanvasRefreshRequest?.();
-        setEraserSession(null); repaintJobRef.current = null;
+        setEraserSession(null); repaintJobRef.current = null; setRepaintLock(null);
         showSuccess("局部重绘完成，新图片已放在原图旁边，原图保留。");
       } catch (error) {
+        // A failure never releases a request the server already owns: whatever
+        // still has a reference decides whether the panel stays read-only.
+        setRepaintLock(repaintSubmissionRef.current ? "submission" : repaintJobRef.current ? "job" : null);
         setRepaintError(error instanceof Error ? error.message : "局部重绘失败，选区和描述已保留。");
       } finally {
         repaintBusyRef.current = false; setRepaintBusy(false);
@@ -2095,6 +2108,11 @@ export function CanvasToolMenu({
           <ImageEraserOverlay
             repaint
             busy={repaintBusy}
+            locked={repaintLock !== null}
+            replayLabel={repaintLock === "job" ? "查询原任务" : "重试原请求"}
+            {...(repaintLock === "job"
+              ? { lockNote: "上一次生成结果未确认：选区与描述已锁定，点击「查询原任务」只会查询该任务，不会重复生成。如需改动选区，请先取消再重新开始。" }
+              : {})}
             {...(repaintError ? { error: repaintError } : {})}
             bounds={eraserSession.bounds}
             angle={eraserSession.angle}

@@ -92,13 +92,34 @@ export function localRepaintRequest(prepared: PreparedLocalRepaint, instruction:
 /**
  * Providers may redraw outside the requested region or return another size.
  * Re-compose against the original pixels so mask=0 remains byte-identical.
+ *
+ * A differently shaped frame cannot be spliced into the source frame without
+ * either warping the painted patch (stretch) or moving it (letterbox), so it is
+ * refused the same way the outpaint compose refuses one. The provider bytes are
+ * archived before this runs, so refusing never causes another paid call.
  */
 export async function composeLocalRepaint(
   prepared: PreparedLocalRepaint,
   generated: Buffer,
 ): Promise<Buffer> {
+  const generatedMetadata = await sharp(generated).metadata();
+  if (!generatedMetadata.width || !generatedMetadata.height) {
+    throw invalidInput("Local repaint provider image has no readable dimensions.");
+  }
+  const generatedRatio = generatedMetadata.width / generatedMetadata.height;
+  if (Math.abs(generatedRatio / (prepared.width / prepared.height) - 1) > 0.01) {
+    throw Object.assign(
+      new Error(
+        `局部重绘返回的图片尺寸 ${generatedMetadata.width}x${generatedMetadata.height} 与选区所在图片 ${prepared.width}x${prepared.height} 的比例不一致。为避免在选区内产生拉伸或错位，本次没有合成结果；供应商原始结果已保存，已扣费的积分会自动退回。请换用输出尺寸与该图片比例匹配的模型（例如 gpt-image-2）后重试。`,
+      ),
+      { code: "local_repaint_geometry_mismatch" },
+    );
+  }
   const [sourcePixels, generatedPixels] = await Promise.all([
     sharp(prepared.sourcePng).ensureAlpha().raw().toBuffer(),
+    // Matching shapes have already been proven above, so `fill` maps the model's
+    // frame onto the source frame proportionally: the patch keeps the position
+    // the model drew it at. `contain` would move it and `cover` would crop it.
     sharp(generated)
       .resize(prepared.width, prepared.height, { fit: "fill" })
       .toColourspace("srgb")

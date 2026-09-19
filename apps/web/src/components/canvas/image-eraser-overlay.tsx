@@ -72,6 +72,9 @@ export function ImageEraserOverlay({
   onConfirm,
   repaint = false,
   busy = false,
+  locked = false,
+  lockNote = "上一次提交结果未确认：选区与描述已锁定为原请求，点击「重试原请求」原样重试，不会重复扣费。",
+  replayLabel = "重试原请求",
   error,
 }: {
   bounds: { x: number; y: number; width: number; height: number };
@@ -83,6 +86,17 @@ export function ImageEraserOverlay({
   repaint?: boolean;
   /** Parent-controlled submission state; the panel keeps its draft while this changes. */
   busy?: boolean;
+  /**
+   * The parent already owns this exact request (an unconfirmed submission, or a
+   * job whose outcome is unknown). Editing the mask or the description would
+   * silently submit — or silently discard — something other than what the user
+   * sees, so the panel becomes read-only and the button replays the request.
+   */
+  locked?: boolean;
+  /** Read-only banner copy; the two recovery states explain different actions. */
+  lockNote?: string;
+  /** Label of the replay button while `locked`. */
+  replayLabel?: string;
   /** Parent-controlled repaint failure message. */
   error?: string;
 }) {
@@ -172,7 +186,7 @@ export function ImageEraserOverlay({
   }, [busy, onCancel]);
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (event.button !== 0 || busy) return;
+    if (event.button !== 0 || busy || locked) return;
     event.preventDefault();
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -213,7 +227,9 @@ export function ImageEraserOverlay({
 
   const panelWidth = Math.min(repaint ? 560 : 680, Math.max(240, window.innerWidth - 24));
   const panelLeft = clamp(bounds.x + bounds.width / 2 - panelWidth / 2, 12, window.innerWidth - panelWidth - 12);
-  const panelHeight = repaint ? 154 : 58;
+  // The read-only banner adds a line next to the failure message; keep the
+  // placement estimate in step so the panel is not pushed off screen.
+  const panelHeight = repaint ? (locked ? 172 : 154) : 58;
   const belowTop = bounds.y + bounds.height + 12;
   const panelTop = clamp(belowTop + panelHeight <= window.innerHeight ? belowTop : bounds.y - panelHeight - 12, 12, Math.max(12, window.innerHeight - panelHeight - 12));
   const canSubmitRepaint = !busy && prompt.trim().length > 0 && hasEffectiveMask;
@@ -240,7 +256,7 @@ export function ImageEraserOverlay({
       <canvas
         ref={canvasRef}
         aria-label={repaint ? "局部重绘涂抹区域" : "橡皮涂抹区域"}
-        className="pointer-events-auto fixed cursor-crosshair touch-none ring-2 ring-primary/70"
+        className={`fixed touch-none ring-2 ring-primary/70 ${locked ? "pointer-events-none cursor-not-allowed" : "pointer-events-auto cursor-crosshair"}`}
         style={{ left: bounds.x, top: bounds.y, width: bounds.width, height: bounds.height, transform: `rotate(${angle}rad)` }}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
@@ -258,26 +274,27 @@ export function ImageEraserOverlay({
             aria-label="修改要求"
             value={prompt}
             onChange={(event) => setPrompt(event.target.value)}
-            disabled={busy}
+            disabled={busy || locked}
             placeholder="描述要如何重绘选中的内容…"
             className="min-h-14 flex-1 resize-none rounded-lg border border-input bg-background px-2 py-1.5 text-xs outline-none placeholder:text-muted-foreground focus:ring-2 focus:ring-primary/50 disabled:opacity-60"
           />
-          <button type="button" aria-label="移除选中内容" disabled={busy} onClick={() => setPrompt("移除涂抹区域内的内容并自然补全背景")} className="flex h-8 shrink-0 items-center gap-1 rounded-lg px-2 text-xs hover:bg-muted" title="快速填写移除已涂抹内容的重绘要求">
+          <button type="button" aria-label="移除选中内容" disabled={busy || locked} onClick={() => setPrompt("移除涂抹区域内的内容并自然补全背景")} className="flex h-8 shrink-0 items-center gap-1 rounded-lg px-2 text-xs hover:bg-muted" title="快速填写移除已涂抹内容的重绘要求">
             <Trash2 className="size-3.5" />移除选中内容
           </button>
         </div>
         <div className="mt-2 flex min-w-0 items-center gap-1.5">
           <div className="flex shrink-0 rounded-lg bg-muted p-0.5">
-            <button type="button" aria-label="添加涂抹" aria-pressed={brushMode === "add"} disabled={busy} onClick={() => setBrushMode("add")} className={`flex h-7 items-center gap-1 rounded-md px-2 text-xs ${brushMode === "add" ? "bg-background shadow-sm" : "text-muted-foreground"}`}><Paintbrush className="size-3.5" />添加</button>
-            <button type="button" aria-label="减少涂抹" aria-pressed={brushMode === "subtract"} disabled={busy} onClick={() => setBrushMode("subtract")} className={`flex h-7 items-center gap-1 rounded-md px-2 text-xs ${brushMode === "subtract" ? "bg-background shadow-sm" : "text-muted-foreground"}`}><Eraser className="size-3.5" />减少</button>
+            <button type="button" aria-label="添加涂抹" aria-pressed={brushMode === "add"} disabled={busy || locked} onClick={() => setBrushMode("add")} className={`flex h-7 items-center gap-1 rounded-md px-2 text-xs ${brushMode === "add" ? "bg-background shadow-sm" : "text-muted-foreground"}`}><Paintbrush className="size-3.5" />添加</button>
+            <button type="button" aria-label="减少涂抹" aria-pressed={brushMode === "subtract"} disabled={busy || locked} onClick={() => setBrushMode("subtract")} className={`flex h-7 items-center gap-1 rounded-md px-2 text-xs ${brushMode === "subtract" ? "bg-background shadow-sm" : "text-muted-foreground"}`}><Eraser className="size-3.5" />减少</button>
           </div>
-          <label className="flex min-w-0 flex-1 items-center gap-1 text-xs text-muted-foreground">大小<input aria-label="重绘画笔大小" disabled={busy} type="range" min="8" max="120" step="2" value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} className="min-w-10 flex-1" /><span className="w-6 text-right tabular-nums">{brushSize}</span></label>
-          <button type="button" aria-label="撤销涂抹" disabled={busy || !strokes.length} onClick={undo} className="flex size-8 shrink-0 items-center justify-center rounded-lg hover:bg-muted disabled:opacity-30"><Undo2 className="size-4" /></button>
-          <button type="button" aria-label="重做涂抹" disabled={busy || !redoStack.length} onClick={redo} className="flex size-8 shrink-0 items-center justify-center rounded-lg hover:bg-muted disabled:opacity-30"><Redo2 className="size-4" /></button>
-          <button type="button" aria-label="清除涂抹" disabled={busy || !strokes.length} onClick={clear} className="flex size-8 shrink-0 items-center justify-center rounded-lg hover:bg-muted disabled:opacity-30"><RotateCcw className="size-4" /></button>
+          <label className="flex min-w-0 flex-1 items-center gap-1 text-xs text-muted-foreground">大小<input aria-label="重绘画笔大小" disabled={busy || locked} type="range" min="8" max="120" step="2" value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} className="min-w-10 flex-1" /><span className="w-6 text-right tabular-nums">{brushSize}</span></label>
+          <button type="button" aria-label="撤销涂抹" disabled={busy || locked || !strokes.length} onClick={undo} className="flex size-8 shrink-0 items-center justify-center rounded-lg hover:bg-muted disabled:opacity-30"><Undo2 className="size-4" /></button>
+          <button type="button" aria-label="重做涂抹" disabled={busy || locked || !redoStack.length} onClick={redo} className="flex size-8 shrink-0 items-center justify-center rounded-lg hover:bg-muted disabled:opacity-30"><Redo2 className="size-4" /></button>
+          <button type="button" aria-label="清除涂抹" disabled={busy || locked || !strokes.length} onClick={clear} className="flex size-8 shrink-0 items-center justify-center rounded-lg hover:bg-muted disabled:opacity-30"><RotateCcw className="size-4" /></button>
           <button type="button" aria-label="取消重绘" disabled={busy} onClick={onCancel} className="flex h-8 shrink-0 items-center gap-1 rounded-lg px-2 text-xs hover:bg-muted disabled:opacity-30"><X className="size-3.5" />取消</button>
-          <button type="button" disabled={!canSubmitRepaint} onClick={() => onConfirm("smart", strokes, prompt.trim())} className="flex h-8 shrink-0 items-center gap-1 rounded-lg bg-foreground px-3 text-xs text-background disabled:opacity-40"><Sparkles className="size-3.5" />{busy ? "重绘中…" : "开始重绘"}</button>
+          <button type="button" disabled={!canSubmitRepaint} onClick={() => onConfirm("smart", strokes, prompt.trim())} className="flex h-8 shrink-0 items-center gap-1 rounded-lg bg-foreground px-3 text-xs text-background disabled:opacity-40"><Sparkles className="size-3.5" />{busy ? "重绘中…" : locked ? replayLabel : "开始重绘"}</button>
         </div>
+        {locked ? <p className="mt-1 text-xs text-amber-600">{lockNote}</p> : null}
         {error ? <p role="alert" className="mt-1 text-xs text-destructive">{error}</p> : null}
       </div> : <div
         className="pointer-events-auto fixed flex h-11 items-center gap-1.5 rounded-xl border border-border bg-background/95 px-2 shadow-xl backdrop-blur"

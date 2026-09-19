@@ -39,6 +39,7 @@ let pngDataUri = "";
 let transparentPngDataUri = "";
 let emptyPngDataUri = "";
 let mismatchedPortraitPngDataUri = "";
+let rescaledRepaintPngDataUri = "";
 let repaintMaskDataUri = "";
 let semanticSourceDataUri = "";
 let semanticRepairDataUri = "";
@@ -120,6 +121,11 @@ beforeAll(async () => {
   ).toString("base64")}`;
   mismatchedPortraitPngDataUri = `data:image/png;base64,${(
     await sharp({ create: { width: 8, height: 12, channels: 4, background: "white" } }).png().toBuffer()
+  ).toString("base64")}`;
+  // The same 7:5 shape as the source at a different pixel scale: the splice
+  // restores the source dimensions without needing a shape change.
+  rescaledRepaintPngDataUri = `data:image/png;base64,${(
+    await sharp({ create: { width: 14, height: 10, channels: 4, background: "white" } }).png().toBuffer()
   ).toString("base64")}`;
   repaintMaskDataUri = `data:image/png;base64,${(
     await sharp(Buffer.from(Array.from({ length: 35 }, (_, index) =>
@@ -341,10 +347,10 @@ describe("image generation executor durable provider recovery", () => {
       maskImage: repaintMaskDataUri,
     });
     vi.mocked(generateImage).mockResolvedValue({
-      url: mismatchedPortraitPngDataUri,
+      url: rescaledRepaintPngDataUri,
       mimeType: "image/png",
-      width: 8,
-      height: 12,
+      width: 14,
+      height: 10,
     });
     const executor = getExecutor("image_generation")!;
     const context = executorContext(row, assets.admin);
@@ -368,6 +374,47 @@ describe("image generation executor durable provider recovery", () => {
         outputFormat: "png",
       }),
     );
+    expect(
+      assets.objects.has(
+        `${workspaceId}/generated/${jobId}-source-before-matting.png`,
+      ),
+    ).toBe(true);
+  });
+
+  it("refuses a repainted frame of another shape without calling the provider twice", async () => {
+    const jobId = randomUUID();
+    const workspaceId = randomUUID();
+    const assets = memoryAssets();
+    const row = imageJob({
+      jobId,
+      workspaceId,
+      target: {
+        kind: "canvas",
+        canvas_id: "77777777-7777-4777-8777-777777777777",
+        element_id: "repaint-placeholder-1",
+      },
+      operation: "local_repaint",
+      inputImages: [pngDataUri],
+      maskImage: repaintMaskDataUri,
+    });
+    vi.mocked(generateImage).mockResolvedValue({
+      url: mismatchedPortraitPngDataUri,
+      mimeType: "image/png",
+      width: 8,
+      height: 12,
+    });
+    const executor = getExecutor("image_generation")!;
+    const context = executorContext(row, assets.admin);
+
+    await expect(executor(jobId, {}, context as never)).rejects.toMatchObject({
+      code: "local_repaint_geometry_mismatch",
+    });
+    // The archive is the fence: a retry replays the same paid bytes and refuses
+    // again instead of buying another provider call.
+    await expect(executor(jobId, {}, context as never)).rejects.toMatchObject({
+      code: "local_repaint_geometry_mismatch",
+    });
+    expect(generateImage).toHaveBeenCalledTimes(1);
     expect(
       assets.objects.has(
         `${workspaceId}/generated/${jobId}-source-before-matting.png`,

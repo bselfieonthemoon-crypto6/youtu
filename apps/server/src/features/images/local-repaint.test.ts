@@ -105,6 +105,39 @@ describe("local repaint mask composition", () => {
     expect([...pixels.subarray(4, 8)]).toEqual([200, 210, 220, 255]);
   });
 
+  it("refuses a provider frame whose shape would have to be stretched", async () => {
+    const source = await sharp({
+      create: { width: 4, height: 4, channels: 4, background: { r: 10, g: 20, b: 30, alpha: 1 } },
+    })
+      .png()
+      .toBuffer();
+    const mask = await sharp(Buffer.alloc(16, 255), {
+      raw: { width: 4, height: 4, channels: 1 },
+    })
+      .png()
+      .toBuffer();
+    const prepared = await prepareLocalRepaint(source, mask);
+    // 3:2 for a 1:1 source: neither fill nor contain can splice this without
+    // distortion, so the compose must refuse instead of silently warping it.
+    const wider = await sharp({
+      create: { width: 6, height: 4, channels: 4, background: { r: 200, g: 210, b: 220, alpha: 1 } },
+    })
+      .png()
+      .toBuffer();
+
+    await expect(composeLocalRepaint(prepared, wider)).rejects.toMatchObject({
+      code: "local_repaint_geometry_mismatch",
+    });
+    // A ratio inside the 1% tolerance still composes: the frame is only resampled.
+    const nearSquare = await sharp({
+      create: { width: 200, height: 199, channels: 4, background: { r: 200, g: 210, b: 220, alpha: 1 } },
+    })
+      .png()
+      .toBuffer();
+    const output = await composeLocalRepaint(prepared, nearSquare);
+    expect(await sharp(output).metadata()).toMatchObject({ width: 4, height: 4 });
+  });
+
   it("rejects an empty or differently sized mask", async () => {
     const source = await sharp({
       create: { width: 2, height: 2, channels: 4, background: "white" },

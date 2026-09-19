@@ -671,6 +671,11 @@ export async function processMessage(
       "image_generation_checkpoint_invalid",
       "image_generation_result_unknown",
       "image_aspect_ratio_mismatch",
+      // A provider frame that does not match the composed frame shape is
+      // deterministic: the archived provider bytes are reused on every retry, so
+      // another attempt can only repeat the same refusal.
+      "local_repaint_geometry_mismatch",
+      "outpaint_geometry_mismatch",
       "model_not_found",
       "provider_not_found",
       "provider_snapshot_invalid",
