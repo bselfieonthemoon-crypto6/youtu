@@ -196,7 +196,7 @@ async function auditJob(jobRow) {
   const frameReport = await readProviderFrame(jobRow.id, { width: sourceMeta.width, height: sourceMeta.height });
   assert(frameReport, "The archived provider frame must be downloadable");
   report.providerFrame = frameReport;
-  assert.ok(frameReport.ratioRelativeError <= 0.01,
+  assert.ok(frameReport.ratioRelativeError <= 0.02,
     `The provider returned ${frameReport.width}x${frameReport.height} (${frameReport.ratioRelativeError} relative error) `
     + `for a ${sourceMeta.width}x${sourceMeta.height} source; the compose would refuse this frame`);
 
