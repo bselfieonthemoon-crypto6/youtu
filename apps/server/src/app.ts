@@ -159,6 +159,8 @@ import { registerImageProxyRoute } from "./http/image-proxy.js";
 import { registerImageTextRoutes } from "./http/image-text.js";
 import { registerImageLayerElementRoutes } from "./http/image-layer-elements.js";
 import { registerJobRoutes } from "./http/jobs.js";
+import { registerAdminOverviewRoutes } from "./http/admin-overview.js";
+import { createAdminOverviewService } from "./features/admin/admin-overview-service.js";
 import {
   finalizeTerminalImageJobPlaceholder,
   finalizeTerminalVideoJobPlaceholder,
@@ -748,6 +750,14 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     auth,
     createUserClient,
     viewerService,
+  });
+  // Read-only platform operations console. Registered unconditionally (unlike
+  // the payment routes): it depends on nothing but the database, and a platform
+  // admin should still be able to see job and channel health when payments are
+  // not configured.
+  void registerAdminOverviewRoutes(app, {
+    auth,
+    adminOverviewService: createAdminOverviewService({ getAdminClient }),
   });
 
   // Payment routes — only registered when Lemon Squeezy is configured

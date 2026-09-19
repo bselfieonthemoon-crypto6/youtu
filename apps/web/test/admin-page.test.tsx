@@ -7,17 +7,28 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import AdminPage from "../src/app/(workspace)/admin/page";
 
-const { fetchViewerMock } = vi.hoisted(() => ({ fetchViewerMock: vi.fn() }));
+const { fetchViewerMock, fetchAdminAccessMock } = vi.hoisted(() => ({
+  fetchViewerMock: vi.fn(),
+  fetchAdminAccessMock: vi.fn(),
+}));
 
 vi.mock("../src/lib/auth-context", () => ({
   useAuth: () => ({ session: { access_token: "token" } }),
 }));
-vi.mock("../src/lib/server-api", () => ({ fetchViewer: fetchViewerMock }));
+vi.mock("../src/lib/server-api", () => ({
+  fetchViewer: fetchViewerMock,
+  fetchAdminAccess: fetchAdminAccessMock,
+}));
 vi.mock("../src/components/settings/workspace-members-section", () => ({
   WorkspaceMembersSection: () => <div>成员面板</div>,
 }));
 vi.mock("../src/components/settings/provider-settings-section", () => ({
   ProviderSettingsSection: () => <div>供应商面板</div>,
+}));
+vi.mock("../src/components/admin/admin-overview-section", () => ({
+  AdminOverviewSection: ({ accessToken }: { accessToken: string }) => (
+    <div>平台总览面板:{accessToken}</div>
+  ),
 }));
 
 function viewer(role: "owner" | "admin" | "member") {
@@ -25,7 +36,10 @@ function viewer(role: "owner" | "admin" | "member") {
 }
 
 describe("admin page", () => {
-  beforeEach(() => fetchViewerMock.mockReset());
+  beforeEach(() => {
+    fetchViewerMock.mockReset();
+    fetchAdminAccessMock.mockReset().mockResolvedValue({ platformAdmin: false });
+  });
   afterEach(() => cleanup());
 
   it("blocks ordinary workspace members", async () => {
@@ -65,5 +79,37 @@ describe("admin page", () => {
 
     expect(await screen.findByText("成员面板")).toBeInTheDocument();
     expect(fetchViewerMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("offers the platform overview only to a platform admin", async () => {
+    fetchViewerMock.mockResolvedValue(viewer("owner"));
+    fetchAdminAccessMock.mockResolvedValue({ platformAdmin: false });
+    render(<AdminPage />);
+
+    expect(await screen.findByText("成员面板")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "平台总览" })).not.toBeInTheDocument();
+    expect(fetchAdminAccessMock).toHaveBeenCalledWith("token");
+  });
+
+  it("opens the read-only overview tab for a platform admin and passes the token", async () => {
+    fetchViewerMock.mockResolvedValue(viewer("owner"));
+    fetchAdminAccessMock.mockResolvedValue({ platformAdmin: true });
+    render(<AdminPage />);
+
+    const tab = await screen.findByRole("button", { name: "平台总览" });
+    await userEvent.click(tab);
+    expect(screen.getByText("平台总览面板:token")).toBeInTheDocument();
+    // Workspace administration is still reachable from the same page.
+    await userEvent.click(screen.getByRole("button", { name: "用户管理" }));
+    expect(screen.getByText("成员面板")).toBeInTheDocument();
+  });
+
+  it("keeps workspace administration working when the platform probe fails", async () => {
+    fetchViewerMock.mockResolvedValue(viewer("owner"));
+    fetchAdminAccessMock.mockRejectedValue(new Error("probe down"));
+    render(<AdminPage />);
+
+    expect(await screen.findByText("成员面板")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "平台总览" })).not.toBeInTheDocument();
   });
 });

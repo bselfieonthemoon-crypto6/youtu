@@ -39,6 +39,8 @@ import type {
   WorkspaceMemberListResponse,
   WorkspaceMemberResponse,
   WorkspaceMemberUpdateRequest,
+  AdminAccessResponse,
+  AdminOverviewResponse,
 } from "@loomic/shared";
 import {
   canvasGetResponseSchema,
@@ -1157,4 +1159,30 @@ export async function importSkillFromUrl(
   });
   if (!response.ok) return handleErrorResponse(response);
   return (await response.json()) as SkillDetailResponse;
+}
+
+/**
+ * Whether the signed-in user is a platform admin, so the console can decide
+ * whether to render its tab. This is presentation only: every data route
+ * re-checks the same condition server-side.
+ */
+export async function fetchAdminAccess(
+  accessToken: string,
+): Promise<AdminAccessResponse> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/access`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminAccessResponse;
+}
+
+/** Read-only platform overview. The server refuses a non-admin with 403. */
+export async function fetchAdminOverview(
+  accessToken: string,
+): Promise<AdminOverviewResponse> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/overview`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminOverviewResponse;
 }

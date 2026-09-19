@@ -6,10 +6,11 @@ import { useCallback, useEffect, useState } from "react";
 import { DesignResourceAdminSection } from "@/components/settings/design-resource-admin-section";
 import { ProviderSettingsSection } from "@/components/settings/provider-settings-section";
 import { WorkspaceMembersSection } from "@/components/settings/workspace-members-section";
+import { AdminOverviewSection } from "@/components/admin/admin-overview-section";
 import { useAuth } from "@/lib/auth-context";
-import { fetchViewer } from "@/lib/server-api";
+import { fetchAdminAccess, fetchViewer } from "@/lib/server-api";
 
-type AdminTab = "users" | "providers" | "resources";
+type AdminTab = "overview" | "users" | "providers" | "resources";
 
 export default function AdminPage() {
   const { session } = useAuth();
@@ -17,6 +18,10 @@ export default function AdminPage() {
   const [tab, setTab] = useState<AdminTab>("users");
   const [role, setRole] = useState<"owner" | "admin" | "member" | null>(null);
   const [workspaceId, setWorkspaceId] = useState<string | null>(null);
+  // Platform administration is a separate role from workspace administration:
+  // the overview tab is offered only when the server says this user is an active
+  // platform admin. It is presentation only — the data route re-checks.
+  const [platformAdmin, setPlatformAdmin] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -40,8 +45,16 @@ export default function AdminPage() {
           ? error.message
           : "加载管理权限失败，请稍后重试。",
       );
+      return;
     } finally {
       setLoading(false);
+    }
+    // A failed probe only hides the tab; it must never block the workspace
+    // administration this page already had.
+    try {
+      setPlatformAdmin((await fetchAdminAccess(accessToken)).platformAdmin);
+    } catch {
+      setPlatformAdmin(false);
     }
   }, [accessToken]);
 
@@ -98,10 +111,11 @@ export default function AdminPage() {
       <div className="mb-7 inline-flex rounded-lg bg-muted p-1">
         {(
           [
+            ...(platformAdmin ? ([["overview", "平台总览"]] as const) : []),
             ["users", "用户管理"],
             ["providers", "第三方模型供应商"],
             ["resources", "设计资源"],
-          ] as const
+          ] as ReadonlyArray<readonly [AdminTab, string]>
         ).map(([id, label]) => (
           <button
             key={id}
@@ -113,8 +127,10 @@ export default function AdminPage() {
           </button>
         ))}
       </div>
-      <div className="max-w-3xl">
-        {tab === "users" ? (
+      <div className={tab === "overview" && platformAdmin ? "w-full" : "max-w-3xl"}>
+        {tab === "overview" && platformAdmin ? (
+          <AdminOverviewSection accessToken={authenticatedToken} />
+        ) : tab === "users" ? (
           <WorkspaceMembersSection
             accessToken={authenticatedToken}
             viewerRole={role}
