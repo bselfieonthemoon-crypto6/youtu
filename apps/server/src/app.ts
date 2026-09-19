@@ -160,7 +160,9 @@ import { registerImageTextRoutes } from "./http/image-text.js";
 import { registerImageLayerElementRoutes } from "./http/image-layer-elements.js";
 import { registerJobRoutes } from "./http/jobs.js";
 import { registerAdminOverviewRoutes } from "./http/admin-overview.js";
+import { registerAdminAccessRoutes } from "./http/admin-access.js";
 import { createAdminOverviewService } from "./features/admin/admin-overview-service.js";
+import { createAdminAccessService } from "./features/admin/admin-access-service.js";
 import {
   finalizeTerminalImageJobPlaceholder,
   finalizeTerminalVideoJobPlaceholder,
@@ -758,6 +760,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   void registerAdminOverviewRoutes(app, {
     auth,
     adminOverviewService: createAdminOverviewService({ getAdminClient }),
+  });
+  // Platform-admin access management and the audit trail. The writes go through
+  // database functions that re-check the actor and write the audit row in the same
+  // transaction, so this layer authorizes and translates errors, nothing more.
+  void registerAdminAccessRoutes(app, {
+    auth,
+    adminAccessService: createAdminAccessService({ getAdminClient }),
   });
 
   // Payment routes — only registered when Lemon Squeezy is configured

@@ -41,6 +41,8 @@ import type {
   WorkspaceMemberUpdateRequest,
   AdminAccessResponse,
   AdminOverviewResponse,
+  AdminPlatformAdminListResponse,
+  AdminAuditListResponse,
 } from "@loomic/shared";
 import {
   canvasGetResponseSchema,
@@ -1185,4 +1187,58 @@ export async function fetchAdminOverview(
   });
   if (!response.ok) return handleErrorResponse(response);
   return (await response.json()) as AdminOverviewResponse;
+}
+
+export async function fetchAdminPlatformAdmins(
+  accessToken: string,
+): Promise<AdminPlatformAdminListResponse> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/platform-admins`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminPlatformAdminListResponse;
+}
+
+/** Both access changes require a reason; the server stores it in the audit row. */
+export async function grantAdminPlatformAdmin(
+  accessToken: string,
+  input: { email: string; reason: string },
+): Promise<AdminPlatformAdminListResponse["admins"][number]> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/platform-admins`, {
+    method: "POST",
+    headers: authJsonHeaders(accessToken),
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return ((await response.json()) as { admin: AdminPlatformAdminListResponse["admins"][number] }).admin;
+}
+
+export async function revokeAdminPlatformAdmin(
+  accessToken: string,
+  userId: string,
+  reason: string,
+): Promise<AdminPlatformAdminListResponse["admins"][number]> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/platform-admins/${userId}`, {
+    method: "DELETE",
+    headers: authJsonHeaders(accessToken),
+    body: JSON.stringify({ reason }),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return ((await response.json()) as { admin: AdminPlatformAdminListResponse["admins"][number] }).admin;
+}
+
+export async function fetchAdminAudit(
+  accessToken: string,
+  options: { limit?: number; targetKind?: string; targetId?: string } = {},
+): Promise<AdminAuditListResponse> {
+  const query = new URLSearchParams();
+  if (options.limit !== undefined) query.set("limit", String(options.limit));
+  if (options.targetKind) query.set("targetKind", options.targetKind);
+  if (options.targetId) query.set("targetId", options.targetId);
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/audit${suffix}`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminAuditListResponse;
 }

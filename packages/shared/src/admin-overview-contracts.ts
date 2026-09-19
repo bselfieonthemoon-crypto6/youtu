@@ -115,6 +115,7 @@ export const adminOverviewResponseSchema = z.object({
 export const adminOverviewErrorCodeSchema = z.enum([
   "platform_admin_required",
   "admin_overview_failed",
+  "admin_invalid_request",
 ]);
 
 export const adminOverviewErrorResponseSchema = z.object({
