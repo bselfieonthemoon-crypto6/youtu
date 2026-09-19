@@ -74,7 +74,10 @@ export async function registerJobRoutes(
     try {
       const user = await options.auth.authenticate(request);
       if (!user) return sendUnauthenticated(reply);
-      const query = z.object({ layer_count: z.coerce.number().int().min(2).max(4), model: z.string().optional() }).parse(request.query);
+      // `layer_count: 1` is the box-selection flow: one framed element plus the
+      // repaired background. It quotes the same two paid calls as any 1-element
+      // split, so the user sees the exact cost before drawing the box.
+      const query = z.object({ layer_count: z.coerce.number().int().min(1).max(4), model: z.string().optional() }).parse(request.query);
       const viewer = await options.viewerService.ensureViewer(user);
       const workspaceId = viewer.workspace.id;
       const model = await resolveSemanticLayerModel(options.workspaceModelCatalogService, user, workspaceId, query.model);

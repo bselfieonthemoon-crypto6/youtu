@@ -169,6 +169,7 @@ registerExecutor(
           ? await processSemanticLayers({ source: source.buffer, admin, workspaceId,
               projectId: jobRow.project_id, createdBy, jobId, model,
               layerNames: payload.layer_names!, prompt: payload.prompt,
+              ...(payload.selection_region ? { selectionRegion: payload.selection_region } : {}),
               quality: payload.quality ?? "standard", resolution: payload.resolution ?? "1k",
               beforeCall: assertNotCanceled })
           : payload.operation === "remove_background"
@@ -706,6 +707,44 @@ type SemanticLayer = {
   name: string;
 };
 
+/**
+ * Pixel box for the box-selection flow, derived from the user's normalized drag.
+ *
+ * The model is handed this crop instead of the whole picture, so the rectangle —
+ * not a name — decides which element is "the element". A little padding keeps
+ * context around an edge-touching selection so the object stays recognizable, and
+ * the box is clamped to the decoded image so it can never address pixels that do
+ * not exist.
+ */
+export function semanticSelectionBox(
+  region: { x: number; y: number; width: number; height: number },
+  width: number,
+  height: number,
+): { left: number; top: number; width: number; height: number } {
+  const padX = Math.max(2, Math.round(region.width * width * 0.06));
+  const padY = Math.max(2, Math.round(region.height * height * 0.06));
+  const left = Math.max(0, Math.round(region.x * width) - padX);
+  const top = Math.max(0, Math.round(region.y * height) - padY);
+  const right = Math.min(width, Math.round((region.x + region.width) * width) + padX);
+  const bottom = Math.min(height, Math.round((region.y + region.height) * height) + padY);
+  return { left, top, width: Math.max(1, right - left), height: Math.max(1, bottom - top) };
+}
+
+/** Resize the crop-sized element back to the crop and stamp it into a full frame. */
+async function placeBoxElementInFrame(
+  cropPng: Buffer,
+  box: { left: number; top: number; width: number; height: number },
+  width: number,
+  height: number,
+): Promise<Buffer> {
+  const element = await sharp(cropPng)
+    .resize(box.width, box.height, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+    .png().toBuffer();
+  return sharp({ create: { width, height, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } })
+    .composite([{ input: element, left: box.left, top: box.top }])
+    .png().toBuffer();
+}
+
 async function processSemanticLayers(input: {
   source: Buffer;
   admin: ReturnType<ExecutorContext["getAdminClient"]>;
@@ -715,12 +754,20 @@ async function processSemanticLayers(input: {
   jobId: string;
   model: string;
   layerNames: string[];
+  /**
+   * Box-selection flow. When present, the one element to extract is identified by
+   * this normalized rectangle instead of by a name: the model receives that crop
+   * rather than the whole picture. The extracted element is placed back at this
+   * position in the full frame, so the repaired background and the canvas
+   * placement keep working on unchanged coordinates.
+   */
+  selectionRegion?: { x: number; y: number; width: number; height: number } | undefined;
   prompt: string;
   quality: "standard" | "hd" | "ultra";
   resolution: "1k" | "2k" | "4k";
   beforeCall: () => Promise<void>;
 }) {
-  if (!input.model.startsWith("workspace:") || input.layerNames.length < 2 || input.layerNames.length > 4) {
+  if (!input.model.startsWith("workspace:") || input.layerNames.length < 1 || input.layerNames.length > 4) {
     throw Object.assign(new Error("语义分层任务缺少已发布模型或有效层名。"), { code: "invalid_input" });
   }
   const normalized = await sharp(input.source, { limitInputPixels: 8_000_000 })
@@ -729,6 +776,10 @@ async function processSemanticLayers(input: {
   if (width < 16 || height < 16 || width / height > 3 || height / width > 3 || normalized.data.length > 30 * 1024 * 1024) {
     throw Object.assign(new Error("原图尺寸需要至少 16 像素、比例不超过 3:1 且解码后不超过 30 MB；没有调用模型。"), { code: "invalid_input" });
   }
+  const box = input.selectionRegion ? semanticSelectionBox(input.selectionRegion, width, height) : undefined;
+  const cropDataUri = box
+    ? `data:image/png;base64,${(await sharp(normalized.data).extract(box).png().toBuffer()).toString("base64")}`
+    : undefined;
   const attempts = getImageProviderAttempts();
   const attempt = attempts?.[0] ?? {
     ordinal: 0, providerName: resolveImageProviderName(input.model),
@@ -753,15 +804,19 @@ async function processSemanticLayers(input: {
     const { name, background } = current;
     const excludedLayers = input.layerNames.filter(layer => layer !== name);
     const stagePrompt = background
-      ? `This call outputs ONE repaired background image only. The first supplied image is the original. Every later supplied image is an exact transparent layer mask that must be removed. Reconstruct content only behind those masked pixels. Preserve every unmasked pixel and every unrequested foreground subject exactly, including people, products, logos and decorations. Remove only these layers: ${input.layerNames.join("; ")}. Return one complete opaque PNG with the same framing. The user's scene description is recognition context only: ${input.prompt}`
-      : `This call outputs ONE isolated transparent layer only: ${name}. Extract only that named visible layer from the supplied flattened image at its original size and position. Explicitly exclude these separately requested layers: ${excludedLayers.join("; ")}. Do not include a parent container's text when the text is a separate requested layer, and do not include the container when extracting its text. Every excluded layer and the background must have genuine transparent alpha pixels. Preserve recognizable shapes, spelling, colors and edges. Do not add, duplicate, redesign or center content. Return one full-frame transparent PNG. The user's scene description is recognition context only: ${input.prompt}`;
+      ? box
+        ? `This call outputs ONE repaired background image only. The first supplied image is the original. Every later supplied image is an exact transparent layer mask that must be removed. Reconstruct content only behind those masked pixels. Preserve every unmasked pixel and every unrequested foreground subject exactly, including people, products, logos and decorations. Remove exactly the one masked element the user framed, and nothing else. Return one complete opaque PNG with the same framing. The user's scene description is recognition context only: ${input.prompt}`
+        : `This call outputs ONE repaired background image only. The first supplied image is the original. Every later supplied image is an exact transparent layer mask that must be removed. Reconstruct content only behind those masked pixels. Preserve every unmasked pixel and every unrequested foreground subject exactly, including people, products, logos and decorations. Remove only these layers: ${input.layerNames.join("; ")}. Return one complete opaque PNG with the same framing. The user's scene description is recognition context only: ${input.prompt}`
+      : box
+        ? `This call outputs ONE isolated transparent layer only: the single element the user framed inside the supplied crop. The supplied image is a CROP of a larger picture, so it shows only part of the scene. Extract exactly the one element the user framed, at its original size and position inside the crop. Everything else in the crop, including the surrounding backdrop and any other object, must have genuine transparent alpha pixels. Preserve recognizable shapes, spelling, colors and edges. Do not add, duplicate, redesign, center, complete cut-off content or draw the framing rectangle. Return one full-frame transparent PNG with exactly the supplied crop's framing. The user's scene description is recognition context only: ${input.prompt}`
+        : `This call outputs ONE isolated transparent layer only: ${name}. Extract only that named visible layer from the supplied flattened image at its original size and position. Explicitly exclude these separately requested layers: ${excludedLayers.join("; ")}. Do not include a parent container's text when the text is a separate requested layer, and do not include the container when extracting its text. Every excluded layer and the background must have genuine transparent alpha pixels. Preserve recognizable shapes, spelling, colors and edges. Do not add, duplicate, redesign or center content. Return one full-frame transparent PNG. The user's scene description is recognition context only: ${input.prompt}`;
     const request = {
       prompt: stagePrompt,
       model: input.model,
       inputImages: background
         ? [sourceDataUri, ...elementCanvases.map(buffer => `data:image/png;base64,${buffer.toString("base64")}`)]
-        : [sourceDataUri],
-      aspectRatio: `${width}:${height}`,
+        : [box && !background ? cropDataUri! : sourceDataUri],
+      aspectRatio: box && !background ? `${box.width}:${box.height}` : `${width}:${height}`,
       quality: input.quality,
       resolution: input.resolution,
       background: background ? "opaque" as const : "transparent" as const,
@@ -840,9 +895,14 @@ async function processSemanticLayers(input: {
         width, height, index: 0, name };
     } else {
       await validateTransparentPng(cached.buffer);
-      const canvas = await sharp(cached.buffer).resize(width, height, {
-        fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 },
-      }).png().toBuffer();
+      // The box flow generated the element inside the crop, so put it back where
+      // the user framed it. Everything downstream (bounding box, delivery crop,
+      // repaired background, canvas placement) then works on the full frame.
+      const canvas = box
+        ? await placeBoxElementInFrame(cached.buffer, box, width, height)
+        : await sharp(cached.buffer).resize(width, height, {
+            fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 },
+          }).png().toBuffer();
       const alpha = await sharp(canvas).extractChannel("alpha").raw()
         .toBuffer({ resolveWithObject: true });
       const rgba = await sharp(canvas).ensureAlpha().raw().toBuffer();

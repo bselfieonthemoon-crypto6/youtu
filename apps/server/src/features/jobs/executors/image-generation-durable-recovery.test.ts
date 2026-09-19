@@ -8,7 +8,8 @@ import { OpenAIImageProvider } from "../../../generation/providers/openai-image.
 import { getImageProviderAttempts } from "../../../generation/providers/registry.js";
 import { getExecutor } from "../job-executor.js";
 import { generationSourceAssetBinding } from "./image-generation-checkpoint.js";
-import "./image-generation.js";
+// The named import also registers the executor this suite drives.
+import { semanticSelectionBox } from "./image-generation.js";
 
 vi.mock("../../../generation/image-generation.js", () => ({
   generateImage: vi.fn(),
@@ -44,6 +45,8 @@ let semanticRepairDataUri = "";
 let semanticLeftDataUri = "";
 let semanticRightDataUri = "";
 let semanticSourceMatchingLayerDataUri = "";
+/** Crop-sized result of the box flow: the framed element inside an 18x16 crop. */
+let framedElementDataUri = "";
 
 beforeAll(async () => {
   const source = await sharp({ create: { width: 32, height: 16, channels: 4,
@@ -71,6 +74,14 @@ beforeAll(async () => {
   }
   semanticSourceMatchingLayerDataUri = `data:image/png;base64,${(
     await sharp(matchingPixels, { raw: { width: 32, height: 16, channels: 4 } }).png().toBuffer()
+  ).toString("base64")}`;
+  const framedPixels = Buffer.alloc(18 * 16 * 4);
+  for (let y = 3; y < 13; y++) for (let x = 2; x < 10; x++) {
+    const i = (y * 18 + x) * 4;
+    framedPixels[i] = 200; framedPixels[i + 1] = 30; framedPixels[i + 2] = 50; framedPixels[i + 3] = 255;
+  }
+  framedElementDataUri = `data:image/png;base64,${(
+    await sharp(framedPixels, { raw: { width: 18, height: 16, channels: 4 } }).png().toBuffer()
   ).toString("base64")}`;
   const png = await sharp({
     create: {
@@ -127,6 +138,21 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("semanticSelectionBox", () => {
+  it("pads the framed region before cropping it", () => {
+    // A small frame gets real context around the element, or the model cannot tell
+    // what it is looking at.
+    expect(semanticSelectionBox({ x: 0.25, y: 0.25, width: 0.5, height: 0.5 }, 400, 200))
+      .toEqual({ left: 88, top: 44, width: 224, height: 112 });
+  });
+  it("clamps a frame that touches the image edge to the pixels that exist", () => {
+    expect(semanticSelectionBox({ x: 0, y: 0, width: 1, height: 1 }, 32, 16))
+      .toEqual({ left: 0, top: 0, width: 32, height: 16 });
+    expect(semanticSelectionBox({ x: 0.9, y: 0.9, width: 0.2, height: 0.2 }, 32, 16))
+      .toEqual({ left: 27, top: 12, width: 5, height: 4 });
+  });
+});
+
 describe("image generation executor durable provider recovery", () => {
   it("archives each semantic paid stage and retries layer storage without three new provider calls", async () => {
     const jobId = randomUUID(); const workspaceId = randomUUID();
@@ -160,6 +186,55 @@ describe("image generation executor durable provider recovery", () => {
       semanticSourceDataUri, expect.stringMatching(/^data:image\/png;base64,/),
       expect.stringMatching(/^data:image\/png;base64,/),
     ] });
+    const background = assets.objects.get(`${workspaceId}/generated/${jobId}-0-background.png`)!;
+    const pixels = await sharp(background).raw().toBuffer({ resolveWithObject: true });
+    const outside = (0 * pixels.info.width + 15) * pixels.info.channels;
+    const inside = (6 * pixels.info.width + 5) * pixels.info.channels;
+    expect([...pixels.data.subarray(outside, outside + 3)]).toEqual([40, 50, 60]);
+    expect(pixels.data[inside]).toBeGreaterThan(150);
+  });
+  it("extracts only the framed element and then repairs the background behind it", async () => {
+    const jobId = randomUUID(); const workspaceId = randomUUID();
+    const model = "workspace:77777777-7777-4777-8777-777777777777";
+    const assets = memoryAssets();
+    vi.mocked(getImageProviderAttempts).mockReturnValue([{ ordinal: 0,
+      providerName: "test-provider", modelId: model,
+      upstreamModelId: "gpt-image-2.5-flare" }]);
+    // The element stage now receives a CROP of the source, so the fixture it
+    // returns is crop-sized with the element where the user framed it.
+    const returned = [framedElementDataUri, semanticRepairDataUri];
+    vi.mocked(generateImage).mockImplementation(async () => ({
+      url: returned.shift()!, mimeType: "image/png", width: 18, height: 16,
+    }));
+    const row = imageJob({ jobId, workspaceId, target: null,
+      operation: "split_layers", model, inputImages: [semanticSourceDataUri],
+      layerBackend: "semantic", layerNames: ["框选元素"], repairBackground: true,
+      selectionRegion: { x: 0, y: 0, width: 0.5, height: 1 } });
+    const executor = getExecutor("image_generation")!;
+    const result = await executor(jobId, {}, executorContext(row, assets.admin) as never);
+    // Exactly two paid calls: the framed element, then the repaired background.
+    expect(generateImage).toHaveBeenCalledTimes(2);
+    const elementRequest = vi.mocked(generateImage).mock.calls[0]![1] as {
+      inputImages: string[]; aspectRatio: string; background: string; prompt: string };
+    // The element call sees the crop instead of the whole picture, and is told to
+    // return exactly the crop's framing.
+    expect(elementRequest.aspectRatio).toBe("18:16");
+    expect(elementRequest.background).toBe("transparent");
+    expect(elementRequest.prompt).toContain("the single element the user framed");
+    expect(elementRequest.prompt).not.toContain("框选元素");
+    const cropped = await sharp(Buffer.from(elementRequest.inputImages[0]!.split(",")[1]!, "base64")).metadata();
+    expect([cropped.width, cropped.height]).toEqual([18, 16]);
+    // The background call receives the extracted element as the mask to remove.
+    const backgroundRequest = vi.mocked(generateImage).mock.calls[1]![1] as {
+      inputImages: string[]; background: string };
+    expect(backgroundRequest.background).toBe("opaque");
+    expect(backgroundRequest.inputImages).toHaveLength(2);
+    // The element is delivered at the position the user framed in the FULL frame.
+    expect(result).toMatchObject({ source_width: 32, source_height: 16,
+      layers: [{ kind: "background", name: "修补底图", width: 32, height: 16 },
+        { kind: "element", name: "框选元素", x: 2, y: 3, width: 8, height: 10 }] });
+    // The repair is applied only through the element's own alpha: pixels outside it
+    // stay the original source, pixels inside it take the generated repair.
     const background = assets.objects.get(`${workspaceId}/generated/${jobId}-0-background.png`)!;
     const pixels = await sharp(background).raw().toBuffer({ resolveWithObject: true });
     const outside = (0 * pixels.info.width + 15) * pixels.info.channels;
@@ -924,6 +999,7 @@ function imageJob(input: {
   layerBackend?: string;
   layerNames?: string[];
   repairBackground?: boolean;
+  selectionRegion?: { x: number; y: number; width: number; height: number };
   model?: string;
   inputImages?: string[];
   maskImage?: string;
@@ -958,6 +1034,7 @@ function imageJob(input: {
       ...(input.layerBackend ? { layer_backend: input.layerBackend } : {}),
       ...(input.layerNames ? { layer_names: input.layerNames } : {}),
       ...(input.repairBackground ? { repair_background: input.repairBackground } : {}),
+      ...(input.selectionRegion ? { selection_region: input.selectionRegion } : {}),
       ...(input.inputImages ? { input_images: input.inputImages } : {}),
       ...(input.maskImage ? { mask_image: input.maskImage } : {}),
       ...(input.foregroundPolicy ? { foreground_policy: input.foregroundPolicy } : {}),

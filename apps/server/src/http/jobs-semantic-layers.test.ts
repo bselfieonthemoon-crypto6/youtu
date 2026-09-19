@@ -61,6 +61,34 @@ describe("published semantic layer splitting", () => {
     expect(creditService.deductCreditsIdempotent).toHaveBeenCalledWith(ids.workspace,
       ids.user, 36, ids.job, expect.any(String));
   });
+  it("quotes the two-call bill for a single framed element", async () => {
+    // The box flow is one element plus the repaired background, so the quote must
+    // be available before the user draws the box (layer_count 1 was rejected when
+    // only the multi-name generative flow existed).
+    const { server } = await app();
+    const response = await server.inject({ method: "GET",
+      url: "/api/images/semantic-layer-backend?layer_count=1" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ available: true, model: ids.model,
+      calls: 2, credits: 24, layerCount: 1 });
+  });
+  it("accepts one framed element plus its selection region and charges two calls", async () => {
+    const { server, jobService, creditService } = await app();
+    const response = await server.inject({ method: "POST", url: "/api/jobs/image-generation",
+      payload: { operation: "split_layers", layer_backend: "semantic",
+        layer_names: ["框选元素"], repair_background: true,
+        selection_region: { x: 0.1, y: 0.2, width: 0.3, height: 0.4 },
+        prompt: "提取框选元素并修补背景", quality: "standard", resolution: "1k",
+        input_images: ["https://example.test/source.png"] } });
+    expect(response.statusCode).toBe(201);
+    expect(jobService.createJob).toHaveBeenCalledWith(user, expect.objectContaining({
+      providerBilling: expect.objectContaining({ creditsCost: 24 }),
+      payload: expect.objectContaining({ model: ids.model, layer_backend: "semantic",
+        layer_names: ["框选元素"],
+        selection_region: { x: 0.1, y: 0.2, width: 0.3, height: 0.4 } }) }));
+    expect(creditService.deductCreditsIdempotent).toHaveBeenCalledWith(ids.workspace,
+      ids.user, 24, ids.job, expect.any(String));
+  });
   it("rejects an unapproved model before creating a paid job", async () => {
     const { server, jobService, creditService } = await app();
     const response = await server.inject({ method: "POST", url: "/api/jobs/image-generation",

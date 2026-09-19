@@ -122,7 +122,13 @@ const imageGenerationShape = {
   prompt: z.string().min(1),
   operation: imageOperationSchema.optional(),
   layer_backend: z.enum(["semantic"]).optional(),
-  layer_names: z.array(z.string().trim().min(1).max(80)).min(2).max(4).optional(),
+  /**
+   * Named elements to extract. One name is the box-selection flow: the element
+   * is identified by `selection_region` instead of by its name, so the single
+   * entry only labels the result. Two to four names stay the generative flow
+   * where the model is told exactly which layers to pull apart.
+   */
+  layer_names: z.array(z.string().trim().min(1).max(80)).min(1).max(4).optional(),
   repair_background: z.boolean().optional(),
   output_format: z.enum(["png", "jpg", "webp"]).optional(),
   background: z.enum(["transparent", "opaque", "auto"]).optional(),
@@ -230,7 +236,7 @@ function validateImageOperationInputs(
     if (value.operation !== "split_layers" || value.layer_names?.length === undefined || value.repair_background !== true ||
       (value.input_images?.length !== 1 && value.target?.kind !== "design")) {
       context.addIssue({ code: z.ZodIssueCode.custom,
-        message: "semantic layer splitting requires split_layers, one source image, 2-4 layer names and repaired background",
+        message: "semantic layer splitting requires split_layers, one source image, 1-4 layer names and repaired background",
         path: ["layer_backend"] });
     }
     if (value.layer_names && new Set(value.layer_names.map(name => name.trim().toLocaleLowerCase())).size !== value.layer_names.length) {

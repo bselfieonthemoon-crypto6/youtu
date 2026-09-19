@@ -25,8 +25,14 @@ describe("image processing job contracts", () => {
       layer_backend: "semantic", layer_names: ["subject", "text"],
       repair_background: true, input_images: ["https://example.test/source.png"] };
     expect(normalizeImageGenerationPayload(valid)).toMatchObject(valid);
-    expect(createImageJobRequestSchema.safeParse({ ...valid, layer_names: ["subject"] }).success).toBe(false);
+    // One element is the box-selection flow: the region identifies it and the
+    // single name only labels the delivered layer.
+    expect(createImageJobRequestSchema.safeParse({ ...valid, layer_names: ["框选元素"],
+      selection_region: { x: 0.25, y: 0.25, width: 0.5, height: 0.5 } }).success).toBe(true);
     expect(createImageJobRequestSchema.safeParse({ ...valid, layer_names: ["subject", "SUBJECT"] }).success).toBe(false);
+    expect(createImageJobRequestSchema.safeParse({ ...valid, layer_names: [] }).success).toBe(false);
+    expect(createImageJobRequestSchema.safeParse({ ...valid,
+      layer_names: ["a", "b", "c", "d", "e"] }).success).toBe(false);
     expect(createImageJobRequestSchema.safeParse({ ...valid, repair_background: false }).success).toBe(false);
     expect(createImageJobRequestSchema.safeParse({ ...valid, layer_backend: undefined }).success).toBe(false);
   });
