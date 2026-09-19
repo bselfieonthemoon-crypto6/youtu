@@ -113,4 +113,42 @@ describe("adaptAgentStream tool results", () => {
     });
     expect(completed[0]!.artifacts).toBeUndefined();
   });
+
+  // A real workspace has 15 enabled Skills, and their list_skills payload is
+  // 24.8KB. The 10KB guard used to drop the whole payload, so the client and the
+  // transcript received `{}` and no card could render the entries.
+  it("bounds an oversized tool payload instead of dropping it whole", async () => {
+    const skills = Array.from({ length: 15 }, (_, index) => ({
+      name: `skill-${index}`, displayName: `技能 ${index}`,
+      description: "为确实需要位图生成的任务整理主体、保留项、构图和素材提示；不强制 JSON 格式。".repeat(3),
+      version: "2.2.0", contentHash: "a".repeat(64),
+      runtime: { outputKinds: ["raster-image", "image-prompt"], instructions: "x".repeat(400) },
+    }));
+    const result = await collect(events([
+      { event: "on_tool_end", name: "list_skills", run_id: "call-skills",
+        data: { output: { skills, scope: "Enabled packages for this run only" } } },
+    ]));
+
+    const completed = completedEvents(result);
+    const output = completed[0]!.output as { skills?: unknown[]; truncated?: boolean; scope?: string };
+    expect(JSON.stringify(output).length).toBeLessThanOrEqual(10240);
+    expect(output.truncated).toBe(true);
+    // Structure survives: the entries and their identifiers stay readable.
+    expect(Array.isArray(output.skills)).toBe(true);
+    expect(output.skills!.length).toBeGreaterThan(0);
+    expect(JSON.stringify(output.skills)).toContain("skill-0");
+    expect(JSON.stringify(output.skills)).toContain("[truncated");
+    expect(output.scope).toBe("Enabled packages for this run only");
+  });
+
+  it("leaves a payload inside the limit untouched", async () => {
+    const result = await collect(events([
+      { event: "on_tool_end", name: "ask_clarification", run_id: "call-small",
+        data: { output: { status: "awaiting_user_input", questions: ["品牌名是什么？"] } } },
+    ]));
+
+    const output = completedEvents(result)[0]!.output;
+    expect(output).toEqual({ status: "awaiting_user_input", questions: ["品牌名是什么？"] });
+    expect(output).not.toHaveProperty("truncated");
+  });
 });

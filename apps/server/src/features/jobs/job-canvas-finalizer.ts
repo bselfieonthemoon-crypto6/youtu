@@ -202,8 +202,7 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 /** Converge a terminal image job's persisted chat and canvas placeholder. This
  * never creates or retries provider work; every write is bound to the job id. */
-export async function finalizeTerminalImageJobPlaceholder(
-  admin: AdminSupabaseClient,
+export async function finalizeTerminalImageJobPlaceholder(  admin: AdminSupabaseClient,
   job: FinalizableJob,
 ): Promise<boolean> {
   if (job.job_type !== "image_generation" || !TERMINAL_IMAGE_STATUSES.has(job.status)) return false;
@@ -212,14 +211,19 @@ export async function finalizeTerminalImageJobPlaceholder(
   const finalizedResult: Record<string, unknown> = { ...result };
   let changed = false;
   const terminalStatus = job.status === "canceled" ? "canceled" : "failed";
-  const retryEligible = job.status === "dead_letter" && job.error_code === "provider_rejected";
+  // Both codes mean "no image was produced": the channels refused the request, or
+  // the upstream was momentarily overloaded. Either way the user may ask again.
+  const retryEligible = job.status === "dead_letter"
+    && (job.error_code === "provider_rejected" || job.error_code === "provider_rate_limited");
   const summary = job.status === "canceled"
     ? "图片生成已取消，未交付新图片。"
-    : retryEligible
-      ? "当前兼容图片渠道均明确拒绝了本次任务，未交付新图片；可在新一轮明确要求重试。"
-      : job.error_code === "image_generation_result_unknown"
-        ? "图片生成结果不确定；为避免重复调用或扣费，系统未自动重试。"
-        : "图片生成失败，未交付新图片。";
+    : job.error_code === "provider_rate_limited"
+      ? "图片渠道当前过载（429），本次未生成也未交付图片；重试多次后仍未通过，可稍后再试，不会重复扣费。"
+      : retryEligible
+        ? "当前兼容图片渠道均明确拒绝了本次任务，未交付新图片；可在新一轮明确要求重试。"
+        : job.error_code === "image_generation_result_unknown"
+          ? "图片生成结果不确定；为避免重复调用或扣费，系统未自动重试。"
+          : "图片生成失败，未交付新图片。";
 
   // Only the direct Mastra submitter creates a job-id chat placeholder. Legacy
   // proposal jobs have a different presentation flow and must not gain a new
@@ -241,7 +245,11 @@ export async function finalizeTerminalImageJobPlaceholder(
           status: job.status,
           jobId: job.id,
           ...(job.error_code ? { error_code: job.error_code } : {}),
-          ...(job.error_message ? { error: job.error_message.slice(0, 2_000) } : {}),
+          // The card shows this string to the customer, so it carries the same
+          // code-derived copy as the summary. The raw provider text (upstream
+          // English errors, request ids, `workspace:<uuid>`) stays in
+          // background_jobs.error_message for diagnostics only.
+          ...(job.error_code ? { error: summary } : {}),
           retryEligible,
         },
         outputSummary: summary,
@@ -279,6 +287,108 @@ export async function finalizeTerminalImageJobPlaceholder(
   } as Json }).eq("id", job.id).eq("status", job.status);
   if (error) throw new Error(`Failed to mark terminal image job ${job.id} settled: ${error.message}`);
   return true;
+}
+
+/** User-facing copy for a terminal video job. Derived from the error CODE, never
+ * from the raw provider text, which carries internal identifiers ("workspace:<uuid>",
+ * upstream request ids, English provider errors) that must not reach a customer. */
+export function videoTerminalSummary(status: string, errorCode: string | null): string {
+  if (status === "canceled") return "视频生成已取消，未交付视频。";
+  switch (errorCode) {
+    case "provider_rate_limited":
+      return "视频渠道当前过载，本次未生成视频，也不会扣费；可以稍后再让我重试。";
+    case "provider_rejected":
+      return "视频渠道拒绝了本次任务，未交付视频；可以稍后重试或换一个视频模型。";
+    case "http_401":
+    case "provider_snapshot_invalid":
+      return "视频渠道的凭据或配置无效，本次未生成视频；请管理员检查视频供应商配置后重试。";
+    case "image_generation_result_unknown":
+      return "视频生成结果不确定；为避免重复调用或扣费，系统未自动重试。";
+    default:
+      return "视频生成失败，未交付视频。";
+  }
+}
+
+/**
+ * Converge a terminal video job's persisted chat card.
+ *
+ * Video jobs used to have no terminal path anywhere: `finalizeTerminalImageJobPlaceholder`
+ * returns immediately for another job_type, so a failed or canceled video left its
+ * chat card at "processing" and the user never learned that nothing was coming —
+ * while the agent, equally blind, told them it was still generating. This writes
+ * only the code-derived copy and is idempotent through `chat_terminal_finalized_at`.
+ */
+export async function finalizeTerminalVideoJobPlaceholder(
+  admin: AdminSupabaseClient,
+  job: FinalizableJob,
+): Promise<boolean> {
+  if (job.job_type !== "video_generation" || !TERMINAL_IMAGE_STATUSES.has(job.status)) return false;
+  if (!job.session_id) return false;
+  const payload = asRecord(job.payload);
+  // Only the direct Mastra submitter owns a job-id chat placeholder; legacy
+  // proposal flows must not gain a new historical card during reconciliation.
+  if (typeof payload.video_submission_key !== "string" || !payload.video_submission_key) return false;
+  const result = asRecord(job.result);
+  if (typeof result.chat_terminal_finalized_at === "string") return false;
+
+  const summary = videoTerminalSummary(job.status, job.error_code ?? null);
+  const { error: chatError } = await admin.from("chat_messages").upsert({
+    id: job.id,
+    session_id: job.session_id,
+    role: "assistant",
+    content: summary,
+    content_blocks: [{
+      type: "tool",
+      toolCallId: `job-result-${job.id}`,
+      toolName: "generate_video",
+      status: job.status === "canceled" ? "canceled" : "failed",
+      output: {
+        status: job.status,
+        jobId: job.id,
+        ...(typeof payload.duration === "number" ? { durationSeconds: payload.duration } : {}),
+        ...(typeof payload.resolution === "string" ? { resolution: payload.resolution } : {}),
+        ...(job.error_code ? { error_code: job.error_code } : {}),
+        error: summary,
+        retryable: job.error_code === "provider_rate_limited" || job.error_code === "provider_rejected",
+      },
+      outputSummary: summary,
+      retryable: false,
+    }],
+  }, { onConflict: "id" });
+  if (chatError) throw new Error(`Failed to settle terminal video chat ${job.id}: ${chatError.message}`);
+
+  const { error: updateError } = await admin.from("background_jobs").update({ result: {
+    ...result,
+    chat_terminal_finalized_at: new Date().toISOString(),
+    chat_terminal_status: job.status,
+  } as Json }).eq("id", job.id).eq("status", job.status);
+  if (updateError) throw new Error(`Failed to mark terminal video job ${job.id} settled: ${updateError.message}`);
+  return true;
+}
+
+/** Recover terminal video jobs whose worker stopped before the chat card landed. */
+export async function reconcileTerminalVideoJobPlaceholders(
+  admin: AdminSupabaseClient,
+): Promise<{ checked: number; finalized: number; failed: number }> {
+  const { data, error } = await admin.from("background_jobs")
+    .select("id,workspace_id,canvas_id,target_kind,design_id,session_id,job_type,status,payload,result,error_code,error_message,updated_at")
+    .eq("job_type", "video_generation")
+    .in("status", ["canceled", "dead_letter"])
+    .is("result->>chat_terminal_finalized_at", null)
+    .order("updated_at", { ascending: false }).limit(RECONCILE_BATCH_SIZE);
+  if (error) throw new Error(`Failed to scan terminal video jobs: ${error.message}`);
+  const jobs = (data ?? []) as unknown as FinalizableJob[];
+  let finalized = 0;
+  let failed = 0;
+  for (const job of jobs) {
+    try {
+      if (await finalizeTerminalVideoJobPlaceholder(admin, job)) finalized += 1;
+    } catch (settleError) {
+      failed += 1;
+      console.error(`[canvas-finalizer] Failed to settle terminal video job ${job.id}:`, settleError);
+    }
+  }
+  return { checked: jobs.length, finalized, failed };
 }
 
 /** Recover terminal jobs archived before their placeholder was settled. New

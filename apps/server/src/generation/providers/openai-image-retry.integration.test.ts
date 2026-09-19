@@ -43,7 +43,7 @@ describe("OpenAIImageProvider paid retry boundary with the real OpenAI SDK", () 
   it.each([
     [401, "invalid_api_key", "authentication_error", "provider_rejected"],
     [404, "model_not_found", "not_found_error", "provider_rejected"],
-    [429, "rate_limit_exceeded", "rate_limit_error", "provider_rejected"],
+    [429, "rate_limit_exceeded", "rate_limit_error", "provider_rate_limited"],
     [400, "invalid_request", "invalid_request_error", "invalid_input"],
     [403, "permission_denied", "permission_error", "invalid_input"],
     [422, "unprocessable_entity", "invalid_request_error", "invalid_input"],

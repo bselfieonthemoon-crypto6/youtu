@@ -58,9 +58,11 @@ export const CONVERSATIONAL_DESIGN_INSTRUCTIONS = `你是 Cromic 设计助手。
 需求已明确时，新图调用 generate_image，服务端可从当前会话核验并绑定隐式参考来源；该工具不接受来源参数。修改既有图或以既有图作视觉参考时，优先从当前附件、检查结果或 recentJobs 取得工具支持数量内的真实 assetId，再调用 edit_image。不要猜测、自动附带或用纯文字替代来源；不要再要求重复确认，不调用旧的审批流程。
 用户明确要求视频时，调用 generate_video；仅使用 current_context 中当前工作区可用模型，参考图必须传真实 sourceAssetIds，不能传 URL。processing 表示排队或执行中，未知提交不得改参数再次提交。
 只讨论方案、不执行、取消、先等等时不要提交付费任务。生成失败只代表一次请求失败，不使整段会话失效。未知或进行中任务先查询，不自动再次提交；用户明确要求重新生成才创建新请求。
+用户在生成中就改需求（"改成…""换成…""等等，要X不要Y"）时，先处理被替代的那条在途任务：能确定它已被取代就先用 cancel_image_job 取消，再提交新请求；无法确认是否已提交就必须告诉用户"这会成为第二个任务、可能产生第二次费用"，不要沉默地再提交一条，让用户以为只下单了一张。
 图片比例和模型的明确UI选择优先；Auto按用途选择当前已发布可用渠道，logo常用1:1。不得编造模型。
 原生GPT图片渠道的尺寸和画质独立：比例与resolution（1k/2k/4k）计算size；quality内部standard/hd/ultra分别映射接口low/medium/high。所有新生图和改图默认必须使用 quality=standard（Low）与 resolution=1k（1K）。仅当用户明确要求2K或4K时才把resolution改到对应档位；指定656×288等宽高、参考原图是2K、复刻、分层、近似尺寸、精细或高质量的风格描述，都不能作为提高分辨率的理由。用户只要求2K/4K时quality仍为standard；只有用户明确指定Medium或High画质才分别使用hd或ultra。不要继承助手此前自行选择的高档参数。用户说low就传standard，不要因为工具内部名称不同而声称不支持low。向用户报告以工具回执actualQuality与actualResolution为准：hd是Medium，绝不能写成High；不得把计划参数说成实际提交参数。
 所有生图和改图结果只交付到无限画布，图片工具不接受 target。原生多层级画板由用户手动添加图片并编辑；你不创建、写入或修改画板。可以读取已有图片作为参考，但不能把参考来源误当输出画板。用户要求直接修改画板时说明这个边界，提供画布图片方案，不宣称已修改画板，也不擅自把排版编辑请求当成生图授权。
+无限画布本身（不是画板）是可写的：用户明确要求移动、缩放、整理或删除画布上的元素时，用 manipulate_canvas 真正执行，不要回答"没有权限""需要你手动操作"或只描述做法；只有删除类操作需要用户原话明确要求，而"把刚才那张删掉"就是明确要求。
 连续修改继承仍有效的品牌文字、风格及比例。reference 是带来源的新同系列图，edit 是修改来源图；两者都必须传真实 sourceAssetIds，不能以纯文字替代原图，也不能把无关画布图片当作用户参考。
 背景需求有作用范围：透明底默认只属于当时那张图片，不能因为参考图透明或助手此前建议透明，就视为用户对所有后续作品的偏好。用户明确约定整个系列/后续都透明才作为该范围内的持续要求。
 按意图而不是工具名判断继承：改字、换色等局部修改默认保留原背景；根据旧角色做新的Logo、海报等新设计只继承有效的角色/品牌特征，背景重新按本次需求判断，即使使用edit_image也不等于继承全部参数。本次明确的背景要求优先于历史，用户说不要透明或改白底时直接修改，不重复询问品牌需求。
@@ -712,7 +714,11 @@ export async function* streamMastraDesignAgent(options: {
       event: "on_chat_model_stream",
       data: { chunk: createAssistantStreamMessage({
         id: `execution-correction-${options.run.runId}`,
-        content: "刚才的回复没有本轮写入工具回执，不能视为已提交或完成。我现在按你的原请求执行。",
+        // User-facing copy for an internal check. A simulated user read the old
+        // wording ("没有本轮写入工具回执…我现在按你的原请求执行") as jargon followed
+        // by a promise the runtime then failed to keep, so the hold-on line says
+        // only what the user can observe.
+        content: "我先确认这一步是否真的执行成功。",
       }) },
     };
 
@@ -743,7 +749,7 @@ export async function* streamMastraDesignAgent(options: {
       event: "on_chat_model_stream",
       data: { chunk: createAssistantStreamMessage({
         id: `execution-recovery-${options.run.runId}`,
-        content: "本轮没有获得与当前请求配对的写入工具回执，因此没有提交或完成新的生成或修改。已有内容和任务不受影响，请重试。",
+        content: "这次没有执行成功：本轮没有产生新的图片、修改或任务，已有内容不受影响。你可以再说一次，我来重做。",
       }) },
     };
   }

@@ -464,7 +464,10 @@ registerExecutor(
           lap(`image_provider_attempt_${attempt.ordinal + 1}_start`);
           let generated: Awaited<ReturnType<typeof generateImage>>;
           try {
-            generated = await generateImage(attempt.providerName, providerRequest);
+            generated = await generateWithRateLimitRetry(
+              () => generateImage(attempt.providerName, providerRequest),
+              { tag, assertNotCanceled },
+            );
           } catch (genError) {
             const detail = genError instanceof Error ? genError.message : String(genError);
             const upstreamCode = (genError as { code?: string })?.code ?? "executor_error";
@@ -696,11 +699,41 @@ const DEFINITE_NO_PROVIDER_RESULT_CODES = new Set([
   "provider_snapshot_invalid",
   "safety_filter",
   "provider_rejected",
+  "provider_rate_limited",
 ]);
 
 // Only errors proving that no image was produced may cross to another frozen
 // provider. Safety/invalid-input errors are terminal and unknown outcomes stop.
-const FALLBACK_ELIGIBLE_PROVIDER_CODES = new Set(["provider_rejected"]);
+const FALLBACK_ELIGIBLE_PROVIDER_CODES = new Set(["provider_rejected", "provider_rate_limited"]);
+
+/**
+ * A gateway rate limit (HTTP 429) answers before dispatch, so no image can exist
+ * and calling again cannot double-charge. A real run hit
+ * `429 当前分组上游负载已饱和，请稍后再试` and the user's request died on a
+ * transient overload; these bounded in-attempt retries keep the same frozen
+ * request, the same checkpoint and the same attempt ordinal. The provider fence
+ * (`saveRejected`) is only written after every retry is exhausted.
+ */
+export const RATE_LIMIT_RETRY_DELAYS_MS = [15_000, 30_000, 60_000] as const;
+
+export async function generateWithRateLimitRetry<T>(
+  generate: () => Promise<T>,
+  options: { tag: string; assertNotCanceled: () => Promise<void>; sleep?: (ms: number) => Promise<void> },
+): Promise<T> {
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await generate();
+    } catch (error) {
+      const code = (error as { code?: string } | null)?.code;
+      const delay = RATE_LIMIT_RETRY_DELAYS_MS[attempt];
+      if (code !== "provider_rate_limited" || delay === undefined) throw error;
+      console.warn(`${options.tag} provider rate limited; retrying the same attempt in ${delay}ms`);
+      await sleep(delay);
+      await options.assertNotCanceled();
+    }
+  }
+}
 
 type SemanticLayer = {
   kind: "background" | "element";

@@ -280,11 +280,17 @@ export class OpenAIImageProvider implements ImageProvider {
         ? "provider_rejected"
         : isStructuredSafetyRejection(error)
           ? "safety_filter"
-          : status === 401 || status === 404 || status === 429
-            ? "provider_rejected"
-            : status === 400 || status === 403 || status === 422
-              ? "invalid_input"
-              : "api_error";
+          // A gateway rate limit is a pre-dispatch rejection: nothing was
+          // generated, so it is safe to retry the same attempt briefly instead of
+          // failing the user's request permanently. `provider_rejected` stays for
+          // the "this request will not be served" answers (401/404).
+          : status === 429
+            ? "provider_rate_limited"
+            : status === 401 || status === 404
+              ? "provider_rejected"
+              : status === 400 || status === 403 || status === 422
+                ? "invalid_input"
+                : "api_error";
       throw new GenerationError(
         this.name,
         classification,

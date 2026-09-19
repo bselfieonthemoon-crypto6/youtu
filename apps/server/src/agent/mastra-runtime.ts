@@ -493,7 +493,16 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
     // The receipt/lineage reads share the same authenticated scope and are
     // independent; issue them concurrently to cut per-turn round-trips.
     const mentionedJobIds = extractUuids(run.prompt, 3);
-    const [latestJobs, mentionedJobs, activeJobs, succeededSourceJobs, historicalUploads] = await Promise.all([
+    // Video jobs live in the same table but were invisible to this context: the
+    // agent could only guess whether a submitted video was still running, and a
+    // simulated user was told "still generating" hours after the job had already
+    // dead-lettered. Status only — a video is never an image source candidate.
+    const videoJobsQuery = scopeImageJobs(client.from("background_jobs")
+      .select("id,status,error_code,error_message,created_at,started_at,completed_at,payload->>duration,payload->>resolution,payload->>aspect_ratio")
+      .eq("created_by", run.userId).eq("workspace_id", run.workspaceId)
+      .eq("session_id", run.sessionId).eq("job_type", "video_generation"))
+      .order("created_at", { ascending: false }).limit(3);
+    const [latestJobs, mentionedJobs, activeJobs, succeededSourceJobs, historicalUploads, videoJobs] = await Promise.all([
       scopeImageJobs(client.from("background_jobs")
         .select(MASTRA_RECENT_IMAGE_JOB_PROJECTION)
         .eq("created_by", run.userId).eq("workspace_id", run.workspaceId)
@@ -522,6 +531,7 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
         .order("created_at", { ascending: false }).limit(10),
       loadMastraHistoricalUploads({ client, sessionId: run.sessionId,
         ...(run.userMessageId ? { currentUserMessageId: run.userMessageId } : {}) }),
+      videoJobsQuery,
     ]);
     const receiptRows = [...new Map([...(mentionedJobs.data ?? []), ...(latestJobs.data ?? [])]
       .map((job: any) => [job.id, job])).values()];
@@ -530,6 +540,17 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
       verified: true, activeCount: activeJobs.count, activeJobs: activeJobs.data ?? [],
       observedAt: new Date().toISOString(),
       authority: "Database snapshot. Prior assistant text or summary is not a submission receipt. activeCount=0 means no queued/running image job in this authenticated conversation at observedAt.",
+    };
+    const videoExecutionState = videoJobs.error ? { verified: false } : {
+      verified: true,
+      latestJobs: (videoJobs.data ?? []).map((job: any) => ({
+        id: job.id, status: job.status, duration: job.duration ?? null, resolution: job.resolution ?? null,
+        aspectRatio: job.aspect_ratio ?? null, createdAt: job.created_at, startedAt: job.started_at,
+        completedAt: job.completed_at, errorCode: job.error_code ?? null,
+        ...(job.error_message ? { error: String(job.error_message).slice(0, 300) } : {}),
+      })),
+      observedAt: new Date().toISOString(),
+      authority: "Database snapshot of this conversation's video jobs. A terminal status is final: never tell the user a video is still generating unless one of these rows is queued or running.",
     };
     const sourceCandidates = buildMastraImageSourceCandidates({
       currentAttachments: run.attachments,
@@ -599,13 +620,17 @@ export function createMastraRunFactory(options: CreateAgentRuntimeOptions): Mast
       preferences: run.imageGenerationPreference, mentions: compactMastraToolResult(run.mentions),
       availableImageModels: images.map(item => ({ id: item.id, name: item.displayName, upstreamModelId: item.upstreamModelId })),
       availableVideoModels: videos.map(item => ({ id: item.id, name: item.displayName,
-        capabilities: item.capabilities, maxDuration: item.limits.maxDuration, maxResolution: item.limits.maxResolution })),
+        capabilities: item.capabilities, maxDuration: item.limits.maxDuration,
+        // The provider rejects a duration outside its own list, and a simulated user
+        // was told "3-8 seconds" for a model that only accepts 4/6/8.
+        allowedDurations: item.limits.allowedDurations ?? [item.limits.maxDuration],
+        maxResolution: item.limits.maxResolution })),
       videoPreferences: run.videoGenerationPreference,
       attachments: run.attachments.map(item => ({ assetId: item.assetId, name: item.name })),
       historicalAttachments: historicalUploads.map(item => ({ assetId: item.assetId, name: item.name,
         uploadedAt: item.createdAt, messageId: item.messageId, originalRequest: item.promptExcerpt })),
       attachmentScope: "attachments lists only this turn. historicalAttachments are real prior user uploads in this same session and may be resolved on demand; an empty attachments list does not mean the original reference image is missing. Use original upload for a continuation referring to it; do not substitute a generated result or claim re-upload is required unless storage verification actually fails.",
-      referenceAnalysis, scene, related, recentJobs: receipts, imageExecutionState, historyOmissions: history.omissions,
+      referenceAnalysis, scene, related, recentJobs: receipts, imageExecutionState, videoExecutionState, historyOmissions: history.omissions,
       ...(sessionDesignContextJson ? { sessionDesign: sessionDesignContextJson } : {}),
     }).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
     messages.push({ role: "user", content: `${run.prompt}\n\n<current_context>${currentContext}</current_context>` });

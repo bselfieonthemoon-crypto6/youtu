@@ -487,8 +487,11 @@ describe("Mastra real SDK stream bridge (synthetic transport, not provider E2E)"
 
     const text = events.filter(event => event.type === "message.delta").map(event => event.delta).join("");
     expect(calls).toHaveLength(3);
-    expect(text).toContain("不能视为已提交或完成");
-    expect(text).toContain("没有获得与当前请求配对的写入工具回执");
+    // The internal write-receipt check speaks to the user in plain language: it
+    // must never claim completion, and it must not promise work it cannot keep.
+    expect(text).toContain("我先确认这一步是否真的执行成功");
+    expect(text).toContain("这次没有执行成功");
+    expect(text).not.toContain("写入工具回执");
     expect(events.at(-1)?.type).toBe("run.completed");
   });
   it("does not force a write when an underspecified request receives a necessary clarification", async () => {

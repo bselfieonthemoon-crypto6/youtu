@@ -10,7 +10,9 @@ const skillName = z.string().trim().min(1).max(100);
 export const composeSkillsSchema = z.object({
   deliverable: z.string().trim().min(1).max(200),
   stage: z.enum(SKILL_COMPOSITION_STAGES),
-  outputKind: z.string().trim().min(1).max(100).optional(),
+  /** The primary Skill's own declared output kind, not the turn's deliverable. */
+  outputKind: z.string().trim().min(1).max(100).optional()
+    .describe("One of the primary skill's declared runtime.outputKinds from list_skills (its own output, for example raster-image or image-prompt) — never the deliverable you are producing for the user. A value the primary skill does not declare is refused."),
   primary: skillName,
   helpers: z.array(skillName).max(4).default([]),
 }).strict();

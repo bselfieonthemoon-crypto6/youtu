@@ -78,7 +78,10 @@ export function currentUserImageOutputCount(text: string): number | undefined {
   let total = 0;
   let found = false;
   for (const clause of text.split(/[。！？!?;；\n]/)) {
-    if (/(?:不要|不需要|别|禁止|勿|无需|为什么|检查|讨论|解释|是否|吗|why\b|check\b|explain\b|do\s+not|don['’]t)/i.test(clause)) continue;
+    // A pricing or capability question states no output count even when it names
+    // one ("生成一张图要花多少积分？" used to compress the whole turn's image
+    // budget to one image and the agent then repeated that number as a rule).
+    if (/(?:不要|不需要|别|禁止|勿|无需|为什么|检查|讨论|解释|是否|吗|多少|几|单价|价格|报价|计费|费用|收费|扣费|积分|why\b|check\b|explain\b|do\s+not|don['’]t|how\s+much|price|cost|credit)/i.test(clause)) continue;
     // `出` and `来` belong here. Both state a count with no other verb present —
     // "再出三版不同风格的主图", "来两款方案" — and without them the scan started at
     // the NEXT verb (or found none), so an explicit count was never read and the

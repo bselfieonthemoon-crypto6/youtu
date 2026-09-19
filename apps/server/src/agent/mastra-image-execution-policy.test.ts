@@ -37,4 +37,21 @@ describe("current original user image execution authorization", () => {
     // 页 names a deliverable as often as an image count.
     expect(mastraImageExecutionPolicy("做一个详情页").limit).toBe(4);
   });
+
+  it("does not read a pricing or capability question as an output count", () => {
+    // A simulated user asked how much one image costs; the question compressed
+    // the turn's budget to a single image and the agent then repeated "本轮最多
+    // 1 张" to the user as if it were the rule.
+    for (const question of [
+      "生成一张图要花多少积分？",
+      "一张图多少钱？",
+      "生成一张的计费方式是什么",
+      "这个模型支持生成几张？",
+      "生图的单价怎么算",
+    ]) {
+      expect(mastraImageExecutionPolicy(question).limit).toBe(4);
+    }
+    // A real count request still reads its count.
+    expect(mastraImageExecutionPolicy("生成一张 1:1 的无线耳机产品图").limit).toBe(1);
+  });
 });

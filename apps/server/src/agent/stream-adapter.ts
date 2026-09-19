@@ -361,6 +361,55 @@ const ARTIFACT_KEYS = new Set([
   "placement",
 ]);
 const OUTPUT_SIZE_LIMIT = 10240; // 10KB
+/**
+ * Bounding applied before the size limit gives up. A tool result that exceeds the
+ * limit used to arrive with NO payload at all: `list_skills` (24.8KB for the 15
+ * enabled packages) and a prompt-library search both reached the client and the
+ * transcript as `{}`, so no UI card could render them and nothing was auditable —
+ * while the model itself still saw the full result. Truncating structurally keeps
+ * the entries and identifiers that make a result checkable.
+ *
+ * The stages are tried in order and the first one that fits wins, so a payload
+ * only as large as it must be is shortened only as far as it must be.
+ */
+const OUTPUT_BOUNDING_STAGES = [
+  { stringLimit: 400, arrayLimit: 16, keyLimit: 40 },
+  { stringLimit: 240, arrayLimit: 8, keyLimit: 24 },
+  { stringLimit: 120, arrayLimit: 4, keyLimit: 16 },
+  { stringLimit: 60, arrayLimit: 2, keyLimit: 8 },
+] as const;
+const OUTPUT_DEPTH_LIMIT = 4;
+
+/** Depth- and size-bounded copy of a tool payload; never throws on plain data. */
+function boundPayload(
+  value: unknown,
+  stage: (typeof OUTPUT_BOUNDING_STAGES)[number],
+  depth = 0,
+): unknown {
+  if (typeof value === "string") {
+    return value.length <= stage.stringLimit
+      ? value
+      : `${value.slice(0, stage.stringLimit)}…[truncated ${value.length - stage.stringLimit} chars]`;
+  }
+  if (Array.isArray(value)) {
+    const kept = depth >= OUTPUT_DEPTH_LIMIT
+      ? []
+      : value.slice(0, stage.arrayLimit).map(entry => boundPayload(entry, stage, depth + 1));
+    return value.length > kept.length
+      ? [...kept, `…[truncated ${value.length - kept.length} entries]`]
+      : kept;
+  }
+  if (value && typeof value === "object") {
+    if (depth >= OUTPUT_DEPTH_LIMIT) return "[truncated: nesting too deep]";
+    const entries = Object.entries(value as Record<string, unknown>);
+    const kept = entries.slice(0, stage.keyLimit)
+      .map(([key, entry]) => [key, boundPayload(entry, stage, depth + 1)] as const);
+    const result: Record<string, unknown> = Object.fromEntries(kept);
+    if (entries.length > kept.length) result.truncatedKeys = entries.length - kept.length;
+    return result;
+  }
+  return value;
+}
 
 /** A cyclic or otherwise non-serializable tool result must not fail the run. */
 function safeStringify(value: unknown): string {
@@ -401,9 +450,15 @@ function extractOutput(
   // Skip if empty after stripping
   if (Object.keys(result).length === 0) return undefined;
 
-  // Size limit check
-  const serialized = JSON.stringify(result);
-  if (serialized.length > OUTPUT_SIZE_LIMIT) return undefined;
+  // Size limit check: shorten a large payload instead of dropping it whole.
+  if (JSON.stringify(result).length > OUTPUT_SIZE_LIMIT) {
+    for (const stage of OUTPUT_BOUNDING_STAGES) {
+      const bounded = boundPayload(result, stage) as Record<string, unknown>;
+      const serialized = safeStringify(bounded);
+      if (serialized && serialized.length <= OUTPUT_SIZE_LIMIT) return { ...bounded, truncated: true };
+    }
+    return undefined;
+  }
 
   return result;
 }

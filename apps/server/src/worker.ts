@@ -70,6 +70,8 @@ import {
   reconcileSucceededImageJobs,
   reconcileTerminalImageJobChats,
   reconcileTerminalImageJobPlaceholders,
+  reconcileTerminalVideoJobPlaceholders,
+  finalizeTerminalVideoJobPlaceholder,
   type FinalizableJob,
 } from "./features/jobs/job-canvas-finalizer.js";
 import { createProviderSnapshotService } from "./features/providers/index.js";
@@ -254,6 +256,12 @@ async function main() {
           `${tag} Terminal canvas recovery finalized=${terminalImages.finalized} failed=${terminalImages.failed}`,
         );
       }
+      const terminalVideos = await reconcileTerminalVideoJobPlaceholders(getAdminClient());
+      if (terminalVideos.finalized > 0 || terminalVideos.failed > 0) {
+        console.log(
+          `${tag} Terminal video recovery finalized=${terminalVideos.finalized} failed=${terminalVideos.failed}`,
+        );
+      }
       const terminalImageChats = await reconcileTerminalImageJobChats(getAdminClient());
       if (terminalImageChats.finalized > 0 || terminalImageChats.failed > 0) {
         console.log(
@@ -421,6 +429,10 @@ export async function processMessage(
     admin: ReturnType<ExecutorContext["getAdminClient"]>,
     job: FinalizableJob,
   ) => Promise<boolean> = finalizeTerminalImageJobPlaceholder,
+  terminalVideoPlaceholderFinalizer: (
+    admin: ReturnType<ExecutorContext["getAdminClient"]>,
+    job: FinalizableJob,
+  ) => Promise<boolean> = finalizeTerminalVideoJobPlaceholder,
 ) {
   const jobId = msg.message.job_id as string;
   const jobType =
@@ -442,9 +454,15 @@ export async function processMessage(
     `${tag} Processing job ${jobId} (${jobType})${sessionShort ? ` session:${sessionShort}` : ""}`,
   );
   const settleTerminalPlaceholder = async (job?: FinalizableJob) => {
-    if (jobType !== "image_generation") return;
+    if (jobType !== "image_generation" && jobType !== "video_generation") return;
     try {
       const current = job ?? await ctx.jobService.getJobAdmin(jobId) as FinalizableJob;
+      // Video jobs had no terminal path at all: a failed or canceled video left
+      // the chat card at "processing" and the user with no notice.
+      if (jobType === "video_generation") {
+        await terminalVideoPlaceholderFinalizer(ctx.getAdminClient(), current);
+        return;
+      }
       await terminalImagePlaceholderFinalizer(ctx.getAdminClient(), current);
     } catch (settleError) {
       // The terminal job state and refund are already durable. Periodic
@@ -680,6 +698,10 @@ export async function processMessage(
       "provider_not_found",
       "provider_snapshot_invalid",
       "provider_rejected",
+      // The executor already retried this attempt in-process with backoff; the
+      // rejected checkpoint then fences the same provider, so another worker
+      // attempt could only repeat the refusal.
+      "provider_rate_limited",
       "safety_filter",
       "design_renderer_unavailable",
       "design_export_pixel_budget_exceeded",

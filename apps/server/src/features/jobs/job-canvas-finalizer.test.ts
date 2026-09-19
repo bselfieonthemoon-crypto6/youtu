@@ -14,6 +14,8 @@ import {
   finalizeDesignImageJobChat,
   finalizeImageJobToCanvas,
   finalizeTerminalImageJobPlaceholder,
+  finalizeTerminalVideoJobPlaceholder,
+  videoTerminalSummary,
   reconcileSucceededDesignImageChats,
   reconcileSucceededImageJobs,
   reconcileTerminalImageJobChats,
@@ -211,6 +213,56 @@ describe("image job canvas finalization", () => {
     } as never)).resolves.toBe(false);
     expect(upsert).not.toHaveBeenCalled();
     expect(update).not.toHaveBeenCalled();
+  });
+
+  // Video jobs used to have no terminal path at all: the image finalizer returns
+  // immediately for another job_type, so a failed video left its chat card at
+  // "processing" and the user never learned that nothing was coming.
+  it("settles a terminal video job with code-derived copy instead of the raw provider error", async () => {
+    const { admin, upsert } = createAdmin();
+    const rawProviderError = "Video generation failed for model workspace:debd662d: Invalid token. (request id: 2026091911215231969217496e93ae325D4nIF1)";
+    const settled = await finalizeTerminalVideoJobPlaceholder(admin as never, {
+      ...successfulJob,
+      job_type: "video_generation",
+      session_id: "session-video",
+      status: "dead_letter",
+      error_code: "http_401",
+      error_message: rawProviderError,
+      payload: { video_submission_key: "run:key", duration: 8, resolution: "1080p" },
+      result: null,
+    } as never);
+
+    expect(settled).toBe(true);
+    const card = (upsert.mock.calls[0] as unknown[])[0] as {
+      content: string; content_blocks: Array<{ toolName: string; status: string; output: Record<string, unknown> }>;
+    };
+    expect(card.content).toBe(videoTerminalSummary("dead_letter", "http_401"));
+    expect(card.content).toContain("凭据或配置无效");
+    expect(card.content).not.toContain("workspace:");
+    expect(card.content).not.toContain("request id");
+    expect(card.content_blocks[0]).toMatchObject({
+      toolName: "generate_video", status: "failed",
+      output: { error_code: "http_401", durationSeconds: 8, resolution: "1080p" },
+    });
+    // The raw provider string must never be the user-visible copy.
+    expect(JSON.stringify(card)).not.toContain("Invalid token");
+  });
+
+  it("ignores a video job that is not terminal, not Mastra-submitted, or already settled", async () => {
+    const cases = [
+      { status: "succeeded" as const, payload: { video_submission_key: "run:key" }, result: null },
+      { status: "dead_letter" as const, payload: {}, result: null },
+      { status: "dead_letter" as const, payload: { video_submission_key: "run:key" },
+        result: { chat_terminal_finalized_at: "2026-09-19T11:00:00.000Z" } },
+    ];
+    for (const entry of cases) {
+      const { admin, upsert } = createAdmin();
+      await expect(finalizeTerminalVideoJobPlaceholder(admin as never, {
+        ...successfulJob, job_type: "video_generation", session_id: "session-video",
+        error_code: "http_401", ...entry,
+      } as never)).resolves.toBe(false);
+      expect(upsert).not.toHaveBeenCalled();
+    }
   });
 
   it("recovers a previously archived terminal placeholder once and persists its marker", async () => {

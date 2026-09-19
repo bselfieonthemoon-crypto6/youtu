@@ -76,7 +76,7 @@ function buildVideoGenerateSchema(models: AvailableVideoModel[]) {
       .optional()
       .default(5)
       .describe(
-        "Video duration in seconds. Valid range depends on model (see model descriptions). Google Veo supports 4/6/8, Replicate models support 3-16.",
+        "Video duration in seconds. Use ONLY a value in the selected model's allowedDurations from current_context.availableVideoModels — that list is authoritative and a value outside it is refused by the provider. Do not infer a range from general model families.",
       ),
     resolution: z
       .enum(["480p", "720p", "1080p", "4k"])
