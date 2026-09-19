@@ -67,18 +67,23 @@ export function buildImageActionPrompt(
   }
 }
 
-export function ImageActionDialog({ action, image, screenBounds, onOpenChange, onConfirm, accessToken }: {
+export function ImageActionDialog({ action, image, screenBounds, onOpenChange, onConfirm, accessToken, initialLayerNames }: {
   action: ImageToolbarActionId | null;
   image: SelectedCanvasImage;
   screenBounds: { x: number; y: number; width: number; height: number; viewportWidth?: number };
   onOpenChange: (open: boolean) => void;
   onConfirm: (prompt: string, quality?: "hd" | "ultra", layerSplit?: SemanticLayerSplitRequest) => void;
   accessToken?: string;
+  /** Prefilled from the automatic element listing; the user still edits and confirms. */
+  initialLayerNames?: readonly string[];
 }) {
   const [values, setValues] = useState<Record<string, string>>({});
   const [quote, setQuote] = useState<SemanticLayerQuote | null>(null);
   const [quoteError, setQuoteError] = useState<string | null>(null);
-  useEffect(() => setValues(action === "split-layers" ? { layerNames: DEFAULT_LAYER_NAMES.join("\n") } : {}), [action]);
+  const suggestedLayerNames = (initialLayerNames ?? []).join("\n");
+  useEffect(() => setValues(action === "split-layers"
+    ? { layerNames: suggestedLayerNames || DEFAULT_LAYER_NAMES.join("\n") } : {}),
+  [action, suggestedLayerNames]);
   const requestedLayerNames = (values.layerNames ?? "").split("\n").map((name) => name.trim()).filter(Boolean);
   const uniqueRequestedLayerNames = [...new Set(requestedLayerNames)];
   const layerNamesValid = uniqueRequestedLayerNames.length >= 2 && uniqueRequestedLayerNames.length <= 4 && uniqueRequestedLayerNames.length === requestedLayerNames.length;

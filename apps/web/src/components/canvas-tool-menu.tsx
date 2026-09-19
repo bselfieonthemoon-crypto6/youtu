@@ -68,6 +68,7 @@ import {
   fetchJob,
   getNodeImageSubmission,
   recognizeCanvasImageText,
+  suggestLayerElements,
   uploadFile,
 } from "../lib/server-api";
 import {
@@ -1531,6 +1532,25 @@ export function CanvasToolMenu({
     [handleDirectImageAction, layerSplitQuote],
   );
 
+  /**
+   * Automatic element listing for the named split.
+   *
+   * One paid vision call proposes 2-4 element names; the user then sees them in
+   * the split dialog, edits them if needed and reads the per-element quote before
+   * anything is generated. A failure here changes nothing: the dialog can still be
+   * opened and filled in by hand.
+   */
+  const handleSuggestLayerElements = useCallback(async () => {
+    if (!selectedImage) return null;
+    const original = await readOperationImage(selectedImage.id);
+    const result = await suggestLayerElements(accessToken, canvasId, {
+      assetId: selectedImage.assetId ?? selectedImage.id,
+      url: original.dataURL,
+      mimeType: original.mimeType,
+    });
+    return result.elements;
+  }, [accessToken, canvasId, selectedImage, readOperationImage]);
+
   const handleStartErase = useCallback(async () => {
     if (!selectedImage || !selectedImageBounds) return;
     if (repaintBusyRef.current) return;
@@ -2040,6 +2060,7 @@ export function CanvasToolMenu({
             onSplitLayersDedicated={handleDedicatedSplitImageLayers}
             onSplitLayersQwen={handleQwenSplitImageLayers}
             onSplitLayersBox={() => void handleStartLayerBox()}
+            onSplitLayersAuto={handleSuggestLayerElements}
             accessToken={accessToken}
             onErase={handleStartErase}
             onOutpaint={() => {

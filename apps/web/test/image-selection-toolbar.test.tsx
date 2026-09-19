@@ -1,4 +1,5 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import "@testing-library/jest-dom/vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { ImageSelectionToolbar } from "../src/components/canvas/image-selection-toolbar";
 afterEach(cleanup);
@@ -35,4 +36,36 @@ it("starts the box-selection split from the button and keeps the paid flows in t
   fireEvent.click(screen.getByText("按名称拆分（付费）"));
   expect(onSplitLayersDedicated).not.toHaveBeenCalled();
   expect(screen.getByText("AI 图层拆分")).toBeTruthy();
+});
+
+it("fills the named split from the automatic element listing", async () => {
+  const onSplitLayersAuto = vi.fn(async () => ["左侧人物", "标题文字"]);
+  const props = { image: { id: "image" } as any, screenBounds: { x: 100, y: 100, width: 100, height: 100 },
+    onDownload: vi.fn(), onCrop: vi.fn(), onRegenerate: vi.fn(), onUpscale: vi.fn(), onRemoveBackground: vi.fn(),
+    onSplitLayers: vi.fn(), onSplitLayersDedicated: vi.fn(), onSplitLayersAuto, onErase: vi.fn(),
+    onChatCommand: vi.fn(), onRecognizeText: async () => [], onApplyTextReplacement: async () => {} };
+  render(<ImageSelectionToolbar {...props} />);
+
+  fireEvent.click(screen.getByRole("button", { name: "更多图片工具" }));
+  fireEvent.click(screen.getByText("全部剥离（自动识别元素，付费）"));
+
+  // The proposed names prefill the editable dialog; they are not submitted blindly.
+  await waitFor(() => expect(screen.getByLabelText("要拆分的元素名称")).toHaveValue("左侧人物\n标题文字"));
+  expect(onSplitLayersAuto).toHaveBeenCalledOnce();
+});
+
+it("explains an empty element listing without leaving the split menu", async () => {
+  const onSplitLayersAuto = vi.fn(async () => []);
+  const props = { image: { id: "image" } as any, screenBounds: { x: 100, y: 100, width: 100, height: 100 },
+    onDownload: vi.fn(), onCrop: vi.fn(), onRegenerate: vi.fn(), onUpscale: vi.fn(), onRemoveBackground: vi.fn(),
+    onSplitLayers: vi.fn(), onSplitLayersAuto, onErase: vi.fn(),
+    onChatCommand: vi.fn(), onRecognizeText: async () => [], onApplyTextReplacement: async () => {} };
+  render(<ImageSelectionToolbar {...props} />);
+
+  fireEvent.click(screen.getByRole("button", { name: "更多图片工具" }));
+  fireEvent.click(screen.getByText("全部剥离（自动识别元素，付费）"));
+
+  await waitFor(() => expect(screen.getByRole("alert"))
+    .toHaveTextContent("没能从这张图里识别出独立元素，请改用框选剥离或自己填写名称。"));
+  expect(screen.queryByText("AI 图层拆分")).toBeNull();
 });

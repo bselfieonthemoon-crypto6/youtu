@@ -1,7 +1,11 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-const sql = readFileSync(new URL("../../../../../supabase/migrations/20260913000010_mastra_image_submission.sql", import.meta.url), "utf8");
+// Line endings are the checkout's business (`core.autocrlf` is on for this
+// working copy), never the migration's contract, so the assertions below read a
+// normalized copy instead of depending on how the file happened to be checked out.
+const sql = readFileSync(new URL("../../../../../supabase/migrations/20260913000010_mastra_image_submission.sql", import.meta.url), "utf8")
+  .replace(/\r\n/g, "\n");
 
 describe("Mastra direct image submission migration", () => {
   it("has a concurrent durable key and an atomic billing plus queue commit", () => {

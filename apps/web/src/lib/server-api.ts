@@ -706,8 +706,33 @@ export async function recognizeCanvasImageText(
   };
 }
 
-// --- Workspace provider configurations (admin only) ---
+/**
+ * Names the elements a generative layer split should extract. One paid vision
+ * call; the split itself is quoted separately before anything is generated.
+ */
+export async function suggestLayerElements(
+  accessToken: string,
+  canvasId: string,
+  image: { assetId: string; url: string; mimeType: string },
+): Promise<{ elements: string[] }> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/images/layer-elements`,
+    {
+      method: "POST",
+      headers: authJsonHeaders(accessToken),
+      body: JSON.stringify({ canvasId, image }),
+    },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  const payload = (await response.json()) as { elements?: unknown };
+  return {
+    elements: Array.isArray(payload.elements)
+      ? payload.elements.filter((item): item is string => typeof item === "string")
+      : [],
+  };
+}
 
+// --- Workspace provider configurations (admin only) ---
 export async function fetchProviderConfigs(
   accessToken: string,
 ): Promise<ProviderConfigListResponse> {

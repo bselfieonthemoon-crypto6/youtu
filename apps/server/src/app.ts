@@ -96,6 +96,10 @@ import {
   createImageTextRecognizer,
 } from "./features/images/image-text-recognizer.js";
 import {
+  type LayerElementSuggester,
+  createLayerElementSuggester,
+} from "./features/images/layer-element-suggester.js";
+import {
   type JobService,
   createJobService,
 } from "./features/jobs/job-service.js";
@@ -153,6 +157,7 @@ import { registerHealthRoutes } from "./http/health.js";
 import { registerImageModelRoutes } from "./http/image-models.js";
 import { registerImageProxyRoute } from "./http/image-proxy.js";
 import { registerImageTextRoutes } from "./http/image-text.js";
+import { registerImageLayerElementRoutes } from "./http/image-layer-elements.js";
 import { registerJobRoutes } from "./http/jobs.js";
 import { registerNodeImageSubmissionRoutes } from "./http/node-image-submissions.js";
 import { createNodeImageSubmissionService } from "./features/jobs/node-image-submission-service.js";
@@ -229,6 +234,7 @@ export type BuildAppOptions = {
   providerSnapshotService?: ProviderSnapshotService;
   workspaceModelCatalogService?: WorkspaceModelCatalogService;
   imageTextRecognizer?: ImageTextRecognizer;
+  layerElementSuggester?: LayerElementSuggester;
   settingsService?: SettingsService;
   threadService?: ThreadService;
   viewerService?: ViewerService;
@@ -356,6 +362,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     createUploadService({ createUserClient, getAdminClient });
   const imageTextRecognizer =
     options.imageTextRecognizer ?? createImageTextRecognizer(env);
+  const layerElementSuggester =
+    options.layerElementSuggester ?? createLayerElementSuggester(env);
   const pgmq = env.supabaseDbUrl
     ? createPgmqClient(env.supabaseDbUrl)
     : undefined;
@@ -373,7 +381,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     options.creditService ?? createCreditService({ getAdminClient });
   const tierGuard = options.tierGuard ?? createTierGuard({ getAdminClient });
 
-  // Payment service 鈥?only created when Lemon Squeezy is configured
+  // Payment service — only created when Lemon Squeezy is configured
   let paymentService: PaymentService | undefined = options.paymentService;
   if (!paymentService && env.lemonSqueezyApiKey && env.lemonSqueezyStoreId) {
     const lsClient = createLemonSqueezyClient({
@@ -571,6 +579,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     createUserClient,
     recognizer: imageTextRecognizer,
   });
+  void registerImageLayerElementRoutes(app, {
+    auth,
+    canvasService,
+    createUserClient,
+    suggester: layerElementSuggester,
+  });
   void registerRunRoutes(app, agentRuns, {
     agentRunMetadataService,
     auth,
@@ -719,7 +733,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     viewerService,
   });
 
-  // Payment routes 鈥?only registered when Lemon Squeezy is configured
+  // Payment routes — only registered when Lemon Squeezy is configured
   if (paymentService) {
     void registerPaymentRoutes(app, { auth, paymentService, viewerService });
 

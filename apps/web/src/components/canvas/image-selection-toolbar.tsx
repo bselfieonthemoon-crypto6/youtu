@@ -24,7 +24,7 @@ const icons: Record<ImageToolbarActionId, typeof Sparkles> = {
   "add-to-chat": MessageCirclePlus, details: Info, download: Download,
 };
 
-export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop, onRegenerate, onUpscale, onRemoveBackground, onSplitLayers, onSplitLayersDedicated, onSplitLayersQwen, onSplitLayersBox, accessToken, onErase, onOutpaint, onChatCommand, onRecognizeText, onApplyTextReplacement, onAddToBoard, addToBoardLabel = "添加到画板", boardOnly = false }: {
+export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop, onRegenerate, onUpscale, onRemoveBackground, onSplitLayers, onSplitLayersDedicated, onSplitLayersQwen, onSplitLayersBox, onSplitLayersAuto, accessToken, onErase, onOutpaint, onChatCommand, onRecognizeText, onApplyTextReplacement, onAddToBoard, addToBoardLabel = "添加到画板", boardOnly = false }: {
   image: SelectedCanvasImage;
   screenBounds: { x: number; y: number; width: number; height: number; viewportWidth?: number };
   onDownload: () => void;
@@ -44,6 +44,12 @@ export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop,
    * short menu instead of going straight to the named-layer dialog.
    */
   onSplitLayersBox?: () => void;
+  /**
+   * Automatic element listing for the named generative split: one paid vision
+   * call proposes the names, which then prefill the dialog for the user to edit.
+   * Returning an empty list leaves the dialog on its manual path.
+   */
+  onSplitLayersAuto?: () => Promise<string[] | null>;
   accessToken?: string;
   onErase: () => void;
   onOutpaint?: () => void;
@@ -56,6 +62,28 @@ export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop,
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [customizeOpen, setCustomizeOpen] = useState(false);
   const [activeAction, setActiveAction] = useState<ImageToolbarActionId | null>(null);
+  const [suggestedLayerNames, setSuggestedLayerNames] = useState<string[]>([]);
+  const [autoSplitBusy, setAutoSplitBusy] = useState(false);
+  const [autoSplitError, setAutoSplitError] = useState<string | null>(null);
+  const startAutomaticSplit = async () => {
+    if (!onSplitLayersAuto || autoSplitBusy) return;
+    setAutoSplitBusy(true);
+    setAutoSplitError(null);
+    try {
+      const names = await onSplitLayersAuto();
+      if (!names?.length) {
+        setAutoSplitError("没能从这张图里识别出独立元素，请改用框选剥离或自己填写名称。");
+        return;
+      }
+      setSuggestedLayerNames(names);
+      setMenuOpen(false);
+      setActiveAction("split-layers");
+    } catch (error) {
+      setAutoSplitError(error instanceof Error ? error.message : "自动识别元素失败，请重试或改用框选剥离。");
+    } finally {
+      setAutoSplitBusy(false);
+    }
+  };
   const [replaceTextOpen, setReplaceTextOpen] = useState(false);
   const available = useMemo(() => IMAGE_TOOLBAR_ACTIONS.filter((item) => item.available), []);
   const pinned = preferences.pinned.map((id) => available.find((item) => item.id === id)).filter(Boolean) as typeof available;
@@ -111,7 +139,9 @@ export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop,
           {menuOpen && <div className="absolute right-0 top-11 z-[101] max-h-[60vh] w-64 overflow-y-auto rounded-xl border border-border bg-background p-1.5 shadow-xl">
             {more.map((item) => button(item, true))}
             {onSplitLayersBox && <button type="button" onClick={() => { setMenuOpen(false); onSplitLayersBox(); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted"><Focus className="size-4" />框选剥离元素</button>}
-            {onSplitLayersDedicated && <button type="button" onClick={() => { setMenuOpen(false); setActiveAction("split-layers"); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted"><Layers3 className="size-4" />按名称拆分（付费）</button>}
+            {onSplitLayersAuto && <button type="button" disabled={autoSplitBusy} onClick={() => void startAutomaticSplit()} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted disabled:opacity-60"><Sparkles className="size-4" />{autoSplitBusy ? "正在识别元素…" : "全部剥离（自动识别元素，付费）"}</button>}
+            {autoSplitError && <p role="alert" className="px-3 pb-1 text-[11px] text-destructive">{autoSplitError}</p>}
+            {onSplitLayersDedicated && <button type="button" onClick={() => { setMenuOpen(false); setSuggestedLayerNames([]); setActiveAction("split-layers"); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted"><Layers3 className="size-4" />按名称拆分（付费）</button>}
             {onSplitLayersDedicated && <button type="button" onClick={() => { setMenuOpen(false); onSplitLayers(); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted"><Layers3 className="size-4" />本地快速拆分</button>}
             {accessToken && onSplitLayersQwen && <LayerBackendOption accessToken={accessToken} onRun={() => { setMenuOpen(false); onSplitLayersQwen(); }} />}
             <div className="my-1 h-px bg-border" />
@@ -127,7 +157,7 @@ export function ImageSelectionToolbar({ image, screenBounds, onDownload, onCrop,
       setReplaceTextOpen(false);
       return onApplyTextReplacement(replacements);
     }} onCancel={() => setReplaceTextOpen(false)} />}
-    <ImageActionDialog action={activeAction} image={image} screenBounds={screenBounds} {...(accessToken !== undefined ? { accessToken } : {})} onOpenChange={(open) => { if (!open) setActiveAction(null); }} onConfirm={(prompt, quality, layerSplit) => {
+    <ImageActionDialog action={activeAction} image={image} screenBounds={screenBounds} {...(accessToken !== undefined ? { accessToken } : {})} initialLayerNames={suggestedLayerNames} onOpenChange={(open) => { if (!open) setActiveAction(null); }} onConfirm={(prompt, quality, layerSplit) => {
       const action = activeAction;
       setActiveAction(null);
       if (action === "regenerate") onRegenerate(prompt);
