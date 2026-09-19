@@ -128,14 +128,27 @@ describe("local repaint mask composition", () => {
     await expect(composeLocalRepaint(prepared, wider)).rejects.toMatchObject({
       code: "local_repaint_geometry_mismatch",
     });
-    // A ratio inside the 1% tolerance still composes: the frame is only resampled.
-    const nearSquare = await sharp({
-      create: { width: 200, height: 199, channels: 4, background: { r: 200, g: 210, b: 220, alpha: 1 } },
+    // Shape differences at the pipeline's own scale still compose: the native size
+    // resolver snaps a ratio onto a 16px grid with up to 1% error (a real 900x1200
+    // repaint came back as 880x1184, 0.90%), and that is an invisible resample.
+    for (const [width, height] of [[200, 199], [101, 100]] as const) {
+      const nearSquare = await sharp({
+        create: { width, height, channels: 4, background: { r: 200, g: 210, b: 220, alpha: 1 } },
+      })
+        .png()
+        .toBuffer();
+      const output = await composeLocalRepaint(prepared, nearSquare);
+      expect(await sharp(output).metadata()).toMatchObject({ width: 4, height: 4 });
+    }
+    // Beyond that bound the patch could only be delivered distorted.
+    const visiblyWider = await sharp({
+      create: { width: 104, height: 100, channels: 4, background: { r: 200, g: 210, b: 220, alpha: 1 } },
     })
       .png()
       .toBuffer();
-    const output = await composeLocalRepaint(prepared, nearSquare);
-    expect(await sharp(output).metadata()).toMatchObject({ width: 4, height: 4 });
+    await expect(composeLocalRepaint(prepared, visiblyWider)).rejects.toMatchObject({
+      code: "local_repaint_geometry_mismatch",
+    });
   });
 
   it("rejects an empty or differently sized mask", async () => {

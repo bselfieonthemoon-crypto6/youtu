@@ -97,6 +97,14 @@ export function localRepaintRequest(prepared: PreparedLocalRepaint, instruction:
  * either warping the painted patch (stretch) or moving it (letterbox), so it is
  * refused the same way the outpaint compose refuses one. The provider bytes are
  * archived before this runs, so refusing never causes another paid call.
+ *
+ * The 2% bound is measured, not arbitrary: the native size resolver
+ * (`resolveNativeImageSize`) itself snaps a requested ratio onto a 16px grid with
+ * up to 1% error, and a real 900x1200 repaint was served at 880x1184 - a 0.90%
+ * shape difference. A 1% guard would sit exactly on the pipeline's own noise
+ * floor and could refuse a paid result for an invisible difference, while the
+ * mismatches worth refusing (an orientation-only size such as 3:2 for a 16:9
+ * source, or a square answer for a wide image) are an order of magnitude larger.
  */
 export async function composeLocalRepaint(
   prepared: PreparedLocalRepaint,
@@ -107,7 +115,7 @@ export async function composeLocalRepaint(
     throw invalidInput("Local repaint provider image has no readable dimensions.");
   }
   const generatedRatio = generatedMetadata.width / generatedMetadata.height;
-  if (Math.abs(generatedRatio / (prepared.width / prepared.height) - 1) > 0.01) {
+  if (Math.abs(generatedRatio / (prepared.width / prepared.height) - 1) > 0.02) {
     throw Object.assign(
       new Error(
         `局部重绘返回的图片尺寸 ${generatedMetadata.width}x${generatedMetadata.height} 与选区所在图片 ${prepared.width}x${prepared.height} 的比例不一致。为避免在选区内产生拉伸或错位，本次没有合成结果；供应商原始结果已保存，已扣费的积分会自动退回。请换用输出尺寸与该图片比例匹配的模型（例如 gpt-image-2）后重试。`,
