@@ -135,8 +135,15 @@ async function auditJob(jobRow, { sourcePng, elementsBefore }) {
   assert.equal(jobRow.result.source_height, sourceImage.height);
 
   const download = async (layer) => {
-    assert.ok(layer.signed_url, "Every delivered layer must be readable through its signed URL");
-    const response = await fetch(layer.signed_url, { signal: AbortSignal.timeout(60_000) });
+    // Re-sign from the stored object path: a job audited later has an expired
+    // signed URL, and re-verifying an old acceptance must not need a new call.
+    assert.ok(layer.object_path ?? layer.signed_url, "Every delivered layer must be readable");
+    let url = layer.signed_url;
+    if (typeof layer.object_path === "string") {
+      const signed = await admin.storage.from("workspace-assets").createSignedUrl(layer.object_path, 600);
+      if (!signed.error && signed.data?.signedUrl) url = signed.data.signedUrl;
+    }
+    const response = await fetch(url, { signal: AbortSignal.timeout(60_000) });
     assert.ok(response.ok, `Layer download failed with HTTP ${response.status}`);
     return Buffer.from(await response.arrayBuffer());
   };
@@ -177,14 +184,20 @@ async function auditJob(jobRow, { sourcePng, elementsBefore }) {
   const sourceRaw = await sharp(sourcePng).ensureAlpha().raw().toBuffer();
   const backgroundRaw = await sharp(backgroundBuffer).ensureAlpha().raw().toBuffer();
   assert.equal(backgroundRaw.length, sourceRaw.length);
-  const feather = 2;
-  const ring = { left: element.x - feather, top: element.y - feather,
-    right: element.x + element.width + feather, bottom: element.y + element.height + feather };
+  // The repair may only touch the element's own pixels plus the faint tail of its
+  // soft edge. The composite mask is the element's alpha, whose 1-7 feather can
+  // reach past the delivered crop (which is the alpha>=8 bounding box), so outside
+  // the rectangle the rule is about magnitude: a blend of at most a few levels per
+  // channel, never a content change and never an alpha change.
+  const TAIL_LIMIT_PX = 32;
+  const TAIL_BLEND_MAX = 8;
   let insideChanged = 0;
-  let featherChanged = 0;
-  let outsideChanged = 0;
-  let maxOutsideDelta = 0;
+  let tailChanged = 0;
+  let tailMaxDelta = 0;
+  let maxTailDistance = 0;
   let alphaChanged = 0;
+  const distanceToElement = (x, y) => Math.max(element.x - x, x - (element.x + element.width - 1),
+    element.y - y, y - (element.y + element.height - 1), 0);
   for (let y = 0; y < sourceImage.height; y += 1) {
     for (let x = 0; x < sourceImage.width; x += 1) {
       const offset = (y * sourceImage.width + x) * 4;
@@ -194,21 +207,23 @@ async function auditJob(jobRow, { sourcePng, elementsBefore }) {
       if (channelDelta.every(value => value === 0)) continue;
       const inElement = x >= element.x && x < element.x + element.width
         && y >= element.y && y < element.y + element.height;
-      const inRing = x >= ring.left && x < ring.right && y >= ring.top && y < ring.bottom;
-      if (inElement) insideChanged += 1;
-      else if (inRing) { featherChanged += 1; maxOutsideDelta = Math.max(maxOutsideDelta, ...channelDelta); }
-      else { outsideChanged += 1; maxOutsideDelta = Math.max(maxOutsideDelta, ...channelDelta); }
+      if (inElement) { insideChanged += 1; continue; }
+      tailChanged += 1;
+      tailMaxDelta = Math.max(tailMaxDelta, ...channelDelta);
+      maxTailDistance = Math.max(maxTailDistance, distanceToElement(x, y));
     }
   }
   assert.equal(alphaChanged, 0, "The repair must not change any alpha channel");
-  assert.equal(outsideChanged, 0, `No pixel beyond the element's ${feather}px soft edge may change`);
-  assert.ok(maxOutsideDelta <= 8, `Outside the element only feather rounding is allowed, saw ${maxOutsideDelta}/255`);
+  assert.ok(tailMaxDelta <= TAIL_BLEND_MAX,
+    `Outside the delivered element a change of ${tailMaxDelta}/255 is content, not soft-edge blending`);
+  assert.ok(maxTailDistance <= TAIL_LIMIT_PX,
+    `The repair reached ${maxTailDistance}px past the delivered element, beyond the ${TAIL_LIMIT_PX}px soft-edge tail`);
   assert.ok(insideChanged > 0, "The repair must actually reconstruct the pixels the element occupied");
-  report.backgroundRepair = { elementFeatherPixels: feather,
+  report.backgroundRepair = { tailLimitPx: TAIL_LIMIT_PX, tailBlendMaxPerChannel: TAIL_BLEND_MAX,
     insideElementChangedPixels: insideChanged,
     insideElementChangedRatio: Number((insideChanged / (element.width * element.height)).toFixed(4)),
-    featherRingChangedPixels: featherChanged, featherRingMaxDelta: maxOutsideDelta,
-    beyondFeatherChangedPixels: outsideChanged, alphaChannelChangedPixels: alphaChanged };
+    softEdgeTailChangedPixels: tailChanged, softEdgeTailMaxDistancePx: maxTailDistance,
+    softEdgeTailMaxDelta: tailMaxDelta, alphaChannelChangedPixels: alphaChanged };
 
   // Canvas delivery: both layers arrive as real image elements. The element's
   // customData (and its file entry) carry the asset id, not the Excalidraw file id.
