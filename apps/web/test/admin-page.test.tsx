@@ -200,6 +200,21 @@ describe("admin page", () => {
     expect(screen.queryByRole("button", { name: "存储" })).not.toBeInTheDocument();
   });
 
+  it("describes what the page holds for each audience", async () => {
+    fetchViewerMock.mockResolvedValue(viewer("owner"));
+    fetchAdminAccessMock.mockResolvedValue({ platformAdmin: false });
+    render(<AdminPage />);
+    expect(await screen.findByText(/管理本工作区的成员、模型渠道与默认模型/)).toBeInTheDocument();
+    expect(screen.queryByText(/作为平台管理员/)).not.toBeInTheDocument();
+    expect(screen.getByText("Workspace administration")).toBeInTheDocument();
+
+    cleanup();
+    fetchAdminAccessMock.mockResolvedValue({ platformAdmin: true });
+    render(<AdminPage />);
+    expect(await screen.findByText(/作为平台管理员/)).toBeInTheDocument();
+    expect(screen.getByText("Platform & workspace administration")).toBeInTheDocument();
+  });
+
   it("keeps workspace administration working when the platform probe fails", async () => {
     fetchViewerMock.mockResolvedValue(viewer("owner"));
     fetchAdminAccessMock.mockRejectedValue(new Error("probe down"));

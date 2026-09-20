@@ -111,11 +111,14 @@ export default function AdminPage() {
     <div className="mx-auto w-full max-w-5xl px-4 py-6 sm:px-6 md:p-8">
       <div className="mb-7">
         <p className="text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
-          Workspace administration
+          {platformAdmin ? "Platform & workspace administration" : "Workspace administration"}
         </p>
         <h1 className="mt-1 text-2xl font-semibold">管理后台</h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          统一管理工作区用户、第三方模型供应商与设计资源。
+          管理本工作区的成员、模型渠道与默认模型，以及设计资源。
+          {platformAdmin
+            ? "作为平台管理员，这里还能查看与处理平台级的总览、任务、渠道健康、首页内容、存储与权限审计等页面。"
+            : ""}
         </p>
       </div>
       <div className="mb-7 inline-flex rounded-lg bg-muted p-1">
