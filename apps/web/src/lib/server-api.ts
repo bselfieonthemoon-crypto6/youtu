@@ -46,6 +46,7 @@ import type {
   AdminUserDirectoryResponse,
   AdminWorkspaceDirectoryResponse,
   AdminAssignableRole,
+  AdminWorkspaceBillingResponse,
 } from "@loomic/shared";
 import {
   canvasGetResponseSchema,
@@ -1316,6 +1317,45 @@ export async function adminRemoveWorkspaceMember(
     method: "DELETE",
     headers: authJsonHeaders(accessToken),
     body: JSON.stringify({ reason }),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+}
+
+export async function fetchAdminWorkspaceBilling(
+  accessToken: string,
+  workspaceId: string,
+  limit = 20,
+): Promise<AdminWorkspaceBillingResponse> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/admin/workspaces/${workspaceId}/billing?limit=${limit}`,
+    { headers: authHeaders(accessToken) },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminWorkspaceBillingResponse;
+}
+
+export async function adminSetWorkspacePlan(
+  accessToken: string,
+  workspaceId: string,
+  input: { plan: string; grantCredits: number; reason: string },
+): Promise<void> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/workspaces/${workspaceId}/plan`, {
+    method: "POST",
+    headers: authJsonHeaders(accessToken),
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+}
+
+export async function adminAdjustWorkspaceCredits(
+  accessToken: string,
+  workspaceId: string,
+  input: { delta: number; reason: string },
+): Promise<void> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/workspaces/${workspaceId}/credits`, {
+    method: "POST",
+    headers: authJsonHeaders(accessToken),
+    body: JSON.stringify(input),
   });
   if (!response.ok) return handleErrorResponse(response);
 }

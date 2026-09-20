@@ -65,6 +65,8 @@ export const adminWriteErrorCodeSchema = z.enum([
   "admin_member_already_exists",
   "admin_owner_immutable",
   "admin_invalid_role",
+  "admin_insufficient_balance",
+  "admin_invalid_amount",
 ]);
 
 export const adminWriteErrorResponseSchema = z.object({

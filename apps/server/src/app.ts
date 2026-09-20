@@ -162,9 +162,11 @@ import { registerJobRoutes } from "./http/jobs.js";
 import { registerAdminOverviewRoutes } from "./http/admin-overview.js";
 import { registerAdminAccessRoutes } from "./http/admin-access.js";
 import { registerAdminUserRoutes } from "./http/admin-users.js";
+import { registerAdminBillingRoutes } from "./http/admin-billing.js";
 import { createAdminOverviewService } from "./features/admin/admin-overview-service.js";
 import { createAdminAccessService } from "./features/admin/admin-access-service.js";
 import { createAdminUserService } from "./features/admin/admin-user-service.js";
+import { createAdminBillingService } from "./features/admin/admin-billing-service.js";
 import {
   finalizeTerminalImageJobPlaceholder,
   finalizeTerminalVideoJobPlaceholder,
@@ -776,6 +778,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   void registerAdminUserRoutes(app, {
     auth,
     adminUserService: createAdminUserService({ getAdminClient }),
+  });
+  // Plan and credit management, plus the per-workspace reconciliation view. The
+  // writes move the balance through the same ledger the billing code reads, so a
+  // generation charged later still reconciles against an admin adjustment.
+  void registerAdminBillingRoutes(app, {
+    auth,
+    adminBillingService: createAdminBillingService({ getAdminClient }),
   });
 
   // Payment routes — only registered when Lemon Squeezy is configured
