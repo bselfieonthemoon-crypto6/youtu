@@ -51,6 +51,8 @@ import type {
   AdminSkillPreviewListResponse,
   PublishedSkillPreviewsResponse,
   PublishedSkillPreviewBatchResponse,
+  AdminJobListResponse,
+  AdminJobDetailResponse,
 } from "@loomic/shared";
 import {
   canvasGetResponseSchema,
@@ -1453,8 +1455,7 @@ export async function reorderAdminSkillPreviews(
 }
 
 /** Published previews only; available to any signed-in user. */
-export async function fetchPublishedSkillPreviews(
-  accessToken: string,
+export async function fetchPublishedSkillPreviews(  accessToken: string,
   slug: string,
 ): Promise<PublishedSkillPreviewsResponse> {
   const response = await fetch(`${getServerBaseUrl()}/api/skills/${encodeURIComponent(slug)}/previews`, {
@@ -1474,4 +1475,43 @@ export async function fetchPublishedSkillPreviewGroups(
   });
   if (!response.ok) return handleErrorResponse(response);
   return (await response.json()) as PublishedSkillPreviewBatchResponse;
+}
+
+export async function fetchAdminJobs(
+  accessToken: string,
+  filters: { status?: string; jobType?: string; workspaceId?: string; errorCode?: string; sinceHours?: number; limit?: number; offset?: number } = {},
+): Promise<AdminJobListResponse> {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== "") query.set(key, String(value));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/jobs${suffix}`, { headers: authHeaders(accessToken) });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminJobListResponse;
+}
+
+export async function fetchAdminJobDetail(accessToken: string, jobId: string): Promise<AdminJobDetailResponse> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/jobs/${jobId}`, { headers: authHeaders(accessToken) });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminJobDetailResponse;
+}
+
+/** Both job actions require a reason; the server stores it in the audit row. */
+export async function cancelAdminJob(accessToken: string, jobId: string, reason: string): Promise<void> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/jobs/${jobId}/cancel`, {
+    method: "POST",
+    headers: authJsonHeaders(accessToken),
+    body: JSON.stringify({ reason: reason.trim() }),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+}
+
+export async function acknowledgeAdminJob(accessToken: string, jobId: string, reason: string): Promise<void> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/jobs/${jobId}/acknowledge`, {
+    method: "POST",
+    headers: authJsonHeaders(accessToken),
+    body: JSON.stringify({ reason: reason.trim() }),
+  });
+  if (!response.ok) return handleErrorResponse(response);
 }

@@ -164,11 +164,13 @@ import { registerAdminAccessRoutes } from "./http/admin-access.js";
 import { registerAdminUserRoutes } from "./http/admin-users.js";
 import { registerAdminBillingRoutes } from "./http/admin-billing.js";
 import { registerAdminSkillRoutes } from "./http/admin-skills.js";
+import { registerAdminJobRoutes } from "./http/admin-jobs.js";
 import { createAdminOverviewService } from "./features/admin/admin-overview-service.js";
 import { createAdminAccessService } from "./features/admin/admin-access-service.js";
 import { createAdminUserService } from "./features/admin/admin-user-service.js";
 import { createAdminBillingService } from "./features/admin/admin-billing-service.js";
 import { createAdminSkillService } from "./features/admin/admin-skill-service.js";
+import { createAdminJobService } from "./features/admin/admin-job-service.js";
 import {
   finalizeTerminalImageJobPlaceholder,
   finalizeTerminalVideoJobPlaceholder,
@@ -715,6 +717,19 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     ...(tierGuard ? { tierGuard } : {}),
   });
   void registerCreditRoutes(app, { auth, creditService, viewerService });
+  // The worker settles a terminal job only while it is processing it; a job
+  // canceled while queued would otherwise leave "生成中" on screen until the
+  // throttled recovery scan ran (measured: 132-145s). Both the user-facing cancel
+  // route and the console's cancel share this hook.
+  const settleTerminalJob = async (jobId: string) => {
+    const row = await jobService!.getJobAdmin(jobId) as FinalizableJob | null;
+    if (!row) return false;
+    const admin = getAdminClient();
+    if (row.job_type === "video_generation") {
+      return finalizeTerminalVideoJobPlaceholder(admin, row);
+    }
+    return finalizeTerminalImageJobPlaceholder(admin, row);
+  };
   if (jobService) {
     void registerNodeImageSubmissionRoutes(app, {
       auth,
@@ -729,18 +744,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       viewerService,
       createUserClient,
       workspaceModelCatalogService,
-      // The worker settles a terminal job only while it is processing it; a job
-      // canceled while queued would otherwise leave "生成中" on screen until the
-      // throttled recovery scan ran (measured: 132-145s).
-      settleTerminalJob: async (jobId: string) => {
-        const row = await jobService.getJobAdmin(jobId) as FinalizableJob | null;
-        if (!row) return false;
-        const admin = getAdminClient();
-        if (row.job_type === "video_generation") {
-          return finalizeTerminalVideoJobPlaceholder(admin, row);
-        }
-        return finalizeTerminalImageJobPlaceholder(admin, row);
-      },
+      settleTerminalJob,
     });
   }
   void registerSkillRoutes(app, { auth, createUserClient, viewerService,
@@ -794,6 +798,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   void registerAdminSkillRoutes(app, {
     auth,
     adminSkillService: createAdminSkillService({ getAdminClient }),
+  });
+  // Job inspection and disposition. Cancelling reuses the same settlement hook as
+  // the user-facing cancel route, so a canceled job never keeps showing as live.
+  void registerAdminJobRoutes(app, {
+    auth,
+    adminJobService: createAdminJobService({ getAdminClient }),
+    settleTerminalJob,
   });
 
   // Payment routes — only registered when Lemon Squeezy is configured

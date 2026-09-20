@@ -30,3 +30,4 @@ export * from "./admin-access-contracts.js";
 export * from "./admin-user-contracts.js";
 export * from "./admin-billing-contracts.js";
 export * from "./admin-skill-contracts.js";
+export * from "./admin-job-contracts.js";
