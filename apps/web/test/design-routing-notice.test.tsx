@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { DesignRoutingEvent } from "@loomic/shared";
 
 import { ToastProvider } from "../src/components/toast";
-import { useDesignRoutingNotice } from "../src/hooks/use-design-routing-notice";
+import { ROUTING_DETAIL_STORAGE_KEY, useDesignRoutingNotice } from "../src/hooks/use-design-routing-notice";
 
 let present: ((event: DesignRoutingEvent) => boolean) | undefined;
 
@@ -45,10 +45,28 @@ function renderHarness() {
   return () => present!;
 }
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  // Advanced mode is a persisted switch, so every test starts from the default.
+  globalThis.localStorage?.clear();
+});
 
 describe("useDesignRoutingNotice", () => {
-  it("shows the candidate Skill, the reason and the helper candidates once", () => {
+  it("gives a normal user the short line only, with no routing telemetry", () => {
+    const notice = renderHarness();
+    act(() => { notice()(routedNotice()); });
+
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("候选技能：活动海报与宣传图（命中 活动/海报）");
+    // The judgement basis, helper guides and size enable are diagnostic: a user
+    // cannot act on them, so they stay behind advanced mode.
+    expect(text).not.toContain("判定依据：");
+    expect(text).not.toContain("候选助手指南");
+    expect(text).not.toContain("已启用非标准尺寸技能");
+  });
+
+  it("shows the reason, the helper candidates and the size enable in advanced mode", () => {
+    globalThis.localStorage.setItem(ROUTING_DETAIL_STORAGE_KEY, "1");
     const notice = renderHarness();
     act(() => { notice()(routedNotice()); });
 
@@ -60,13 +78,21 @@ describe("useDesignRoutingNotice", () => {
     expect(screen.getAllByText(/候选技能：活动海报与宣传图/)).toHaveLength(1);
   });
 
-  it("shows a model-authored verdict with its confidence", () => {
+  it("shows a model-authored verdict with its confidence in advanced mode", () => {
+    globalThis.localStorage.setItem(ROUTING_DETAIL_STORAGE_KEY, "1");
     const notice = renderHarness();
     act(() => {
       notice()(routedNotice({ source: "model", confidence: 0.88, clamped: false,
         detail: "判定依据：明确要求出图（模型判定 · 置信度 88%）" }));
     });
     expect(document.body.textContent).toContain("模型判定 · 置信度 88%");
+  });
+
+  it("treats any other stored value as advanced mode off", () => {
+    globalThis.localStorage.setItem(ROUTING_DETAIL_STORAGE_KEY, "true");
+    const notice = renderHarness();
+    act(() => { notice()(routedNotice()); });
+    expect(document.body.textContent).not.toContain("判定依据：");
   });
 
   it("ignores a reconnect replay of the same turn", () => {
