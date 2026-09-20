@@ -165,12 +165,14 @@ import { registerAdminUserRoutes } from "./http/admin-users.js";
 import { registerAdminBillingRoutes } from "./http/admin-billing.js";
 import { registerAdminSkillRoutes } from "./http/admin-skills.js";
 import { registerAdminJobRoutes } from "./http/admin-jobs.js";
+import { registerAdminChannelRoutes } from "./http/admin-channels.js";
 import { createAdminOverviewService } from "./features/admin/admin-overview-service.js";
 import { createAdminAccessService } from "./features/admin/admin-access-service.js";
 import { createAdminUserService } from "./features/admin/admin-user-service.js";
 import { createAdminBillingService } from "./features/admin/admin-billing-service.js";
 import { createAdminSkillService } from "./features/admin/admin-skill-service.js";
 import { createAdminJobService } from "./features/admin/admin-job-service.js";
+import { createAdminChannelService } from "./features/admin/admin-channel-service.js";
 import {
   finalizeTerminalImageJobPlaceholder,
   finalizeTerminalVideoJobPlaceholder,
@@ -805,6 +807,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     auth,
     adminJobService: createAdminJobService({ getAdminClient }),
     settleTerminalJob,
+  });
+  // Channel health: the cross-workspace directory, one channel with its self-test
+  // history, and failure rates by error code. Read-only, like the plan asks - the
+  // console never edits another workspace's channel configuration.
+  void registerAdminChannelRoutes(app, {
+    auth,
+    adminChannelService: createAdminChannelService({ getAdminClient }),
   });
 
   // Payment routes — only registered when Lemon Squeezy is configured

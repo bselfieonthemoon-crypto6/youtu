@@ -75,6 +75,7 @@ export const adminWriteErrorCodeSchema = z.enum([
   "admin_job_not_found",
   "admin_job_already_terminal",
   "admin_job_not_terminal",
+  "admin_channel_not_found",
 ]);
 
 export const adminWriteErrorResponseSchema = z.object({

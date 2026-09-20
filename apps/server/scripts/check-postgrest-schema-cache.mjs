@@ -32,6 +32,13 @@ const ADMIN_FUNCTIONS = [
   "admin_delete_skill_preview",
   "admin_reorder_skill_previews",
   "admin_skill_catalog",
+  "admin_job_directory",
+  "admin_job_detail",
+  "admin_cancel_job",
+  "admin_acknowledge_job",
+  "admin_channel_directory",
+  "admin_channel_detail",
+  "admin_channel_failure_rates",
 ];
 
 const expected = process.argv.slice(2).filter(argument => !argument.startsWith("--"));

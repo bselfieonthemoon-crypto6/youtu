@@ -53,6 +53,9 @@ import type {
   PublishedSkillPreviewBatchResponse,
   AdminJobListResponse,
   AdminJobDetailResponse,
+  AdminChannelListResponse,
+  AdminChannelDetailResponse,
+  AdminChannelFailureRatesResponse,
 } from "@loomic/shared";
 import {
   canvasGetResponseSchema,
@@ -1514,4 +1517,56 @@ export async function acknowledgeAdminJob(accessToken: string, jobId: string, re
     body: JSON.stringify({ reason: reason.trim() }),
   });
   if (!response.ok) return handleErrorResponse(response);
+}
+
+/** Channel health, read-only: the directory, one channel, and the failure rates. */
+export async function fetchAdminChannels(
+  accessToken: string,
+  filters: {
+    workspaceId?: string; query?: string; enabled?: boolean; testStatus?: string;
+    days?: number; limit?: number; offset?: number;
+  } = {},
+): Promise<AdminChannelListResponse> {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    // `false` is a real filter value, so only undefined and "" are skipped.
+    if (value !== undefined && value !== "") query.set(key, String(value));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/channels${suffix}`, { headers: authHeaders(accessToken) });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminChannelListResponse;
+}
+
+export async function fetchAdminChannelDetail(
+  accessToken: string,
+  configId: string,
+  options: { days?: number; historyLimit?: number; jobLimit?: number } = {},
+): Promise<AdminChannelDetailResponse> {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(options)) {
+    if (value !== undefined) query.set(key, String(value));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/channels/${configId}${suffix}`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminChannelDetailResponse;
+}
+
+export async function fetchAdminChannelFailureRates(
+  accessToken: string,
+  options: { days?: number; limit?: number } = {},
+): Promise<AdminChannelFailureRatesResponse> {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(options)) {
+    if (value !== undefined) query.set(key, String(value));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/channels/failure-rates${suffix}`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminChannelFailureRatesResponse;
 }
