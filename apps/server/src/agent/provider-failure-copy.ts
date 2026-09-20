@@ -11,6 +11,31 @@
  * customer copy. Returns `undefined` for an unknown code so the caller can fall
  * back to a generic Chinese sentence instead of inventing a cause.
  */
+/**
+ * Every code this function names, in one place.
+ *
+ * The switch below is the authority for the wording, but nothing else could see
+ * WHICH codes it covers, so `job-failure-class.test.ts` had no way to check that
+ * the failure classifier knows them all. A code named here but unknown there would
+ * reach the user as "原因未知" while a specific Chinese sentence existed right
+ * next to it. The test asserts both directions stay in sync.
+ */
+export const PROVIDER_FAILURE_CODES: readonly string[] = Object.freeze([
+  "provider_rate_limited",
+  "provider_rejected",
+  "provider_unavailable",
+  "provider_quota_insufficient",
+  "image_generation_result_unknown",
+  "local_repaint_geometry_mismatch",
+  "outpaint_geometry_mismatch",
+  "safety_filter",
+  "invalid_input",
+  "http_401",
+  "provider_snapshot_invalid",
+  "provider_snapshot_unavailable",
+  "provider_snapshot_not_found",
+]);
+
 export function providerFailureDescription(errorCode: string | null | undefined): string | undefined {
   switch (errorCode) {
     case "provider_rate_limited":
