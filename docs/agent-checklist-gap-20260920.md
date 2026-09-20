@@ -46,6 +46,46 @@
 | 5 | 执行过程可观测性（每轮执行摘要） | ❌ | 未做：用户意图 / 匹配 Skill / 使用工具 / 创建任务数 / 最终交付资产 的每轮摘要。 |
 | 6 | 测试报告即时读取竞态 | ✅ | 已修：`run.completed` 到助手消息落库之间存在竞态，harness 立即读取会得到空 `assistantMessages`（campaign 里出现过一次）。现在有界轮询（≤12s，400ms 间隔）并记录 `assistantMessageWaitMs`，让"没回答"与"稍后回答"可区分。 |
 
+## 剩余项的实施计划（按文件，供后续轮次机械执行）
+
+按依赖关系排序；标注 **依赖** 的项必须等对应工作流落地后再动，避免同文件互踩。
+
+1. **编辑 / 变体 / 覆盖区分**（阶段二 #2）
+   - 现状：单点改字后台记录是 `generate`，画布**新增**一张并保留原稿；`canvas-element-writer.ts` 已有 `replaceElementId`（"替换某个元素"）这条通路。
+   - 做法：在 image job 的 payload/回执里显式区分 `editTarget: "replace" | "new_version"`（并区分局部重绘/全图重生成），由 `edit_image` 的输入决定；UI 在提交前给"替换原图 / 保留为新版本"选择。**默认必须安全**：未明确选择时保留为新版本，绝不销毁原稿。
+   - 文件：`apps/server/src/agent/mastra-image-tool.ts`（edit 工具输入/回执）、`apps/server/src/features/jobs/generation-identity.ts`（本轮新建，可承载身份与目标）、交付卡片/画布选择控件（web）。测试：工具回执断言 + web 交互断言。
+   - **依赖**：D 的 `canvas-element-writer.ts` 改动落地后（replace/insert 语义）。
+
+2. **参考图角色显式绑定**（阶段二 #3）
+   - 现状：服务端 grounding 评审已区分 `usage=edit`（改它本身）/`usage=reference`（据它做新图）且要求用户证据原文；用户看不到逐图角色。
+   - 做法：对每张候选图输出角色 `edit_target` / `style_reference` / `content_reference` / `ignored`；**用户显式指定优先**，模型推断的必须标注"推断"并要求证据原文；UI 允许点选角色。
+   - 文件：`mastra-image-source-grounding.ts`、`related-image-context.ts`、回执投影。测试：评审输入/输出 + 渲染文本。
+   - **依赖**：B 的 `related-image-context.ts` / `mastra-runtime.ts` 改动落地后。
+
+3. **路由双层状态 `detectedIntent` / `executedAction`**（P1 组 #2）+ **执行摘要**（阶段三 #5）
+   - 做法（合并做，同一写入点）：run 结束后追加一条执行记录，字段 = 是否调用 `generate_image`/`edit_image`、是否 `ask_clarification`、是否纯文本、创建任务数、最终交付资产 id；即"用户意图 / 匹配 Skill / 使用工具 / 创建任务数 / 最终交付资产"的每轮摘要，与 `design.routing` 并列（高级模式展示）。
+   - 文件：`mastra-runtime.ts`（B 正在改）、`packages/shared` 事件契约、web 展示。测试：runtime 事件字段 + web 渲染。
+   - **依赖**：B 的 `mastra-runtime.ts` 改动落地后。
+
+4. **错误分类**（阶段三 #3）
+   - 做法：新增单一分类模块 `classifyJobFailure({ status, errorCode })` → 六类（用户输入 / Agent 路由 / DB·API / 图片供应商 / 任务取消 / 测试入口不支持），输出稳定的 class + 中文文案；所有用户可见文案从它取，**只有确实未知**才允许回落到"生成失败"。
+   - 文件：新建 `apps/server/src/features/jobs/job-failure-class.ts` + 测试（可先独立完成）；再改 `provider-failure-copy.ts`（无人占用）；`canvasFailureLabel`（在 D 的 `job-canvas-finalizer.ts`）落地后接入。
+   - **依赖**：接入 finalizer 那一步需要 D 落地。
+
+5. **非标准尺寸精确交付**（阶段二 #6，清单里最大的一项）
+   - 目标流程（用户给定）：识别目标尺寸 → 选接近比例的原生尺寸生成素材 → 极端横幅优先生成"透明主体 / 背景 / 可编辑文字" → **程序画布按精确尺寸合成** → 导出后**读文件头验证真实像素** → 交付卡片同时显示 目标尺寸 / 实际导出尺寸 / 文件格式 / 是否含透明通道。
+   - 现状：只有"把尺寸写进请求文本 → 替代 `3:1` 并披露偏差"的逻辑验证（已有单测）。合成、导出、文件头校验这条链**不存在**。
+   - 文件：新增精确尺寸合成 + 导出验证模块（`features/designs/` 下）、`export-dimension-contract.ts`（B 本轮新建，正好承载导出尺寸契约）、交付卡片（web）。若需持久化"目标尺寸/导出尺寸"，先评估复用现有 design/export 表，**非必要不加迁移**。
+   - 建议单独一轮做，并配一条 `--paid` 回归流程。
+
+6. **多图系列"开始前一次性确定"**（阶段二 #1 的剩余半条）与 **技能输出协议统一**（阶段三 #1）
+   - 现状：`use_skill` 要求传入该技能**自己声明的** `runtime.outputKinds`，模型传错即 `skill_output_kind_conflict`（可恢复）；系列流程的"数量/主参考图/逐张一致性"没有前置确定。
+   - 做法：统一为清单建议的五类输出（`guidance` / `prompt` / `copy` / `generation_request` / `canvas_operation`），在每个技能的 manifest 里显式声明；冲突回执必须**总是**回带该技能允许的 outputKind 列表；系列流程写入技能方法层。
+   - **关键约束**：技能正文与 manifest **同时经 SQL 迁移入库**（如 `20260915000004_nonstandard_image_size_approximation.sql`），单独改 `skills/**` 到不了运行时。必须先找到生成该迁移的打包脚本，连同迁移一起改，否则改了等于没改。
+   - **依赖**：需要先确认打包脚本位置（下一轮第一步）。
+
+7. **删除确认浏览器验收**（阶段二 #5）— 本轮 E 工作流在做（创建/过期/执行/刷新四阶段 + 判定 CLI 的 `not_found` 是否只存在于 CLI）。
+
 ## 总体判断（与用户一致）
 
 主链路可用，不需要推倒重做。真正该收紧的是**状态准确、路由安全、资产绑定、尺寸可信、多图完成度**这五件基础事。
