@@ -81,8 +81,17 @@
 6. **多图系列"开始前一次性确定"**（阶段二 #1 的剩余半条）与 **技能输出协议统一**（阶段三 #1）
    - 现状：`use_skill` 要求传入该技能**自己声明的** `runtime.outputKinds`，模型传错即 `skill_output_kind_conflict`（可恢复）；系列流程的"数量/主参考图/逐张一致性"没有前置确定。
    - 做法：统一为清单建议的五类输出（`guidance` / `prompt` / `copy` / `generation_request` / `canvas_operation`），在每个技能的 manifest 里显式声明；冲突回执必须**总是**回带该技能允许的 outputKind 列表；系列流程写入技能方法层。
-   - **关键约束**：技能正文与 manifest **同时经 SQL 迁移入库**（如 `20260915000004_nonstandard_image_size_approximation.sql`），单独改 `skills/**` 到不了运行时。必须先找到生成该迁移的打包脚本，连同迁移一起改，否则改了等于没改。
-   - **依赖**：需要先确认打包脚本位置（下一轮第一步）。
+   - **关键约束（已查明，2026-09-20）**：技能正文与 manifest **同时经 SQL 迁移入库**，流水线是
+     `scripts/build-design-skill-catalog.mjs`：`readCatalog()` 读 `skills/catalog.json` + 每个技能的
+     `manifest.json` / `SKILL.md` / references，`generateMigration()` 生成迁移，落点是
+     `MIGRATION_PATH = supabase/migrations/20260909000013_skill_library_composition.sql`；CLI 为
+     `node scripts/build-design-skill-catalog.mjs [--check|--write]`，**`--check` 会在生成物过期时失败**。
+     因此改技能的**正确顺序**是：① 改 `skills/**` → ② `--write` 重新生成目录迁移 → ③ 在本机库应用并登记版本。
+     只改 `skills/**` 不重新生成，等于改了没生效**且**会让校验失败。另有单技能增量同步的先例
+     （`scripts/sync-local-nonstandard-skill.mjs` 等：保留既有 UUID、只更新该技能，不动其它技能与安装状态），
+     若只需改一个技能，走那条路更小、更安全。
+   - **做之前先想清楚**：`--write` 会重写覆盖全部技能的生成 SQL（大 diff）。若本次只改
+     `series-visual-design` 一个技能，优先用单技能增量脚本而不是整体重建目录。
 
 7. **删除确认浏览器验收**（阶段二 #5）— 本轮 E 工作流在做（创建/过期/执行/刷新四阶段 + 判定 CLI 的 `not_found` 是否只存在于 CLI）。
 
