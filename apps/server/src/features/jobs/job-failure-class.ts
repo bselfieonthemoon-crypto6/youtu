@@ -57,21 +57,41 @@ export const JOB_FAILURE_CLASS_LABELS: Record<JobFailureClass, string> = {
 };
 
 const CODE_CLASSES: Record<string, JobFailureClass> = {
+  // The rule applied throughout: WHO can fix it. If the user's words or values
+  // must change it is `user_input`; if the same words would fail again because the
+  // plan/model choice was wrong it is `agent_routing`; if the deployment must be
+  // reconfigured it is `platform`; if the upstream service failed it is `provider`.
+  // The list was reconciled against every `code:` literal the server mints (the
+  // executors, the image/video tools, the catalogs and the canvas writer), because
+  // a classifier that silently returns `unknown` for a code the product DOES
+  // explain is worse than no classifier.
+
   // --- user input ---------------------------------------------------------
   // The channel's safety system judged the REQUEST, so the request is what has to
   // change. Classifying it as a provider fault would send the user to "try again".
   invalid_input: "user_input",
   safety_filter: "user_input",
+  // The request exceeded a documented limit or named a value the model can be
+  // asked for but the turn did not authorise.
+  image_prompt_too_long: "user_input",
+  image_reference_limit_exceeded: "user_input",
+  image_aspect_ratio_invalid: "user_input",
+  image_generation_requested_count_unsupported: "user_input",
+  image_quality_not_authorized: "user_input",
+  image_resolution_not_authorized: "user_input",
+  video_reference_limit_exceeded: "user_input",
 
   // --- provider -----------------------------------------------------------
   provider_rate_limited: "provider",
   provider_rejected: "provider",
   provider_unavailable: "provider",
   provider_quota_insufficient: "provider",
+  provider_tool_schema_unsupported: "provider",
   // The upstream timed out with the result unknown: a provider outcome, and the
   // user must not be told to retry automatically.
   image_generation_result_unknown: "provider",
   // The provider returned a frame that does not match the geometry we asked for.
+  image_aspect_ratio_mismatch: "provider",
   local_repaint_geometry_mismatch: "provider",
   outpaint_geometry_mismatch: "provider",
 
@@ -82,21 +102,56 @@ const CODE_CLASSES: Record<string, JobFailureClass> = {
   provider_snapshot_invalid: "platform",
   provider_snapshot_unavailable: "platform",
   provider_snapshot_not_found: "platform",
+  provider_snapshot_invalid_request: "platform",
+  provider_snapshot_create_failed: "platform",
+  provider_snapshot_not_terminal: "platform",
   job_create_failed: "platform",
   job_attempt_increment_failed: "platform",
   agent_context_summary_failed: "platform",
+  // Our post-processing and checkpoint plumbing, not the model's output.
+  image_postprocess_failed: "platform",
+  image_generation_checkpoint_unavailable: "platform",
+  image_generation_checkpoint_invalid: "platform",
+  // A durable video submission we could not confirm or that our own fence refused.
+  video_commit_unknown: "platform",
+  video_commit_rejected: "platform",
+  // No published video model is a workspace/deployment gap, not a user mistake.
+  video_model_unavailable: "platform",
 
   // --- agent routing ------------------------------------------------------
   // The proposal could not be grounded in the user's own evidence.
   source_grounding_ambiguous: "agent_routing",
   source_grounding_unavailable: "agent_routing",
-  // A model alias that matches more than one catalog entry.
+  source_historical_upload_unavailable: "agent_routing",
+  // A model alias that matches more than one catalog entry, or none.
   image_model_identifier_ambiguous: "agent_routing",
+  image_model_identifier_unavailable: "agent_routing",
   // An approximate size without this turn's Skill receipt.
   image_approximation_not_authorized: "agent_routing",
   image_nonstandard_size_skill_required: "agent_routing",
+  // A ratio the Agent could not resolve from the request.
+  image_aspect_ratio_ambiguous: "agent_routing",
+  // The chosen tier/model/executor cannot honour the request: retrying the same
+  // words picks the same thing again, so the PLAN has to change.
+  image_resolution_not_supported: "agent_routing",
+  image_execution_tier_invalid: "agent_routing",
+  image_legacy_background_removal_contract_required: "agent_routing",
+  video_model_required: "agent_routing",
+  video_text_to_video_unsupported: "agent_routing",
+  video_image_to_video_unsupported: "agent_routing",
+  video_duration_unsupported: "agent_routing",
+  video_resolution_unsupported: "agent_routing",
+  video_audio_unsupported: "agent_routing",
   // A guide asked for an output kind its own manifest does not declare.
   skill_output_kind_conflict: "agent_routing",
+
+  // --- not a failure at all -----------------------------------------------
+  // Both mean "stopped on purpose". `job_canceled` is how an executor reports a
+  // cancellation mid-flight, so a dead-lettered job can carry it; and a superseded
+  // turn keeps its generated image while the attachment is dropped, which its own
+  // card copy already states ("图片已生成并保留…未应用到当前画布").
+  job_canceled: "canceled",
+  agent_task_superseded: "canceled",
 
   // --- unsupported entry --------------------------------------------------
   // The WebSocket command schema rejected a value the real UI cannot produce

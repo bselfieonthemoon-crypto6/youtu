@@ -30,20 +30,46 @@ describe("job failure classification", () => {
   it.each([
     ["invalid_input", "user_input"],
     ["safety_filter", "user_input"],
+    ["image_prompt_too_long", "user_input"],
+    ["image_quality_not_authorized", "user_input"],
+    ["image_reference_limit_exceeded", "user_input"],
     ["provider_rate_limited", "provider"],
     ["provider_rejected", "provider"],
+    ["provider_tool_schema_unsupported", "provider"],
     ["image_generation_result_unknown", "provider"],
+    ["image_aspect_ratio_mismatch", "provider"],
     ["outpaint_geometry_mismatch", "provider"],
     ["http_401", "platform"],
     ["provider_snapshot_invalid", "platform"],
+    ["provider_snapshot_not_found", "platform"],
     ["job_attempt_increment_failed", "platform"],
+    ["image_postprocess_failed", "platform"],
+    ["image_generation_checkpoint_unavailable", "platform"],
+    ["video_commit_unknown", "platform"],
+    ["video_model_unavailable", "platform"],
     ["source_grounding_ambiguous", "agent_routing"],
     ["source_grounding_unavailable", "agent_routing"],
+    ["source_historical_upload_unavailable", "agent_routing"],
     ["skill_output_kind_conflict", "agent_routing"],
     ["image_nonstandard_size_skill_required", "agent_routing"],
+    ["image_aspect_ratio_ambiguous", "agent_routing"],
+    ["image_resolution_not_supported", "agent_routing"],
+    ["image_legacy_background_removal_contract_required", "agent_routing"],
+    ["video_text_to_video_unsupported", "agent_routing"],
+    ["video_duration_unsupported", "agent_routing"],
     ["invalid_command", "unsupported_entry"],
   ] as const)("classifies %s as %s", (code, expected) => {
     expect(classifyJobFailure({ status: "dead_letter", errorCode: code })).toBe(expected);
+  });
+
+  // An executor reports a cancellation mid-flight as an error code, so the row can
+  // be dead-lettered carrying `job_canceled`; the user must still read "canceled".
+  it("reads a dead-lettered plan cancellation as a cancellation, not a failure", () => {
+    expect(classifyJobFailure({ status: "dead_letter", errorCode: "job_canceled" })).toBe("canceled");
+    expect(classifyJobFailure({ status: "canceled", errorCode: null })).toBe("canceled");
+    // A superseded turn keeps its generated image; its own card copy says so, and
+    // nothing about it is retryable.
+    expect(classifyJobFailure({ status: "dead_letter", errorCode: "agent_task_superseded" })).toBe("canceled");
   });
 
   it("classifies every code the provider copy function names", () => {
