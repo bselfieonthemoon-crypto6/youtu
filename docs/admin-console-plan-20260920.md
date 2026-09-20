@@ -125,6 +125,30 @@
 **建议**：`/admin → 内容`：首页案例与发现内容的 CRUD + 配图 + 排序 + 上架状态；
 设计目录沿用现有 API，补上预览图与批量启停；导入任务列表（进度/失败原因/重试）。
 
+### B6b 现状复核（2026-09-20，B6a 完成后动手前核对了一遍）
+
+首页内容已在 **B6a** 完成（`docs/admin-console-b6a-20260920.md`）。设计目录这一半复核后**比原判断小**：
+
+- **已经有**：工作区级 UI（`apps/web/src/components/settings/design-resource-admin-section.tsx`，约 1640 行）
+  已支持状态筛选与变更、标签筛选、分类、删除/恢复、字体上传、批量导入任务与进度；
+  API 侧 `updateDesignResourceRequestSchema` 也已接受 `preview_asset_object_id` / `category_id` / `tag_ids`，
+  `design_resources` 表本来就有 `preview_asset_object_id`、`status`、`published_at/by`、`deleted_at/by`。
+  也就是说"标签、上架状态"**不缺**，原规划低估了现状。
+- **真正缺的是预览图的可视化**：`design-resources.ts` 有 `GET /api/design-resources/:id/preview`
+  （无预览图时回退到 `asset_object_id`），但它是**需要 Authorization 头的二进制响应**，
+  浏览器的 `<img src>` 发不出这个头，所以列表里没法直接显示缩略图。
+  技能图片那批（B4a）解决同一问题的办法是**服务端签发短时 URL**（`admin-skill-service.ts` 的 `signedUrl`），
+  设计目录要走同一条路。
+- **批量操作**：现有"批量导入"是导入任务，不是多选批量改状态/上下架。
+- **一个需要在实现时想清楚的点**：设计目录既有 `scope='workspace'` 也有 `scope='platform'` 的条目，
+  而预览图上传目前只走 `workspace-assets`（字体上传那条路径要求 `workspace_id`）。
+  平台级条目的预览图要落在哪个桶、由谁签 URL，得先定下来——这也是本批没有仓促开工的原因。
+
+**B6b 的建议做法**：新增一个只读的 `GET /api/admin/design-catalog/:collection/:entityId/preview-url`
+（先按现有 `references()` 的做法用**用户态客户端**确认该条目对调用者可见，再用服务角色签发短时 URL，
+签不出就返回 `null` 让界面显示占位符而不是坏图）+ 列表缩略图列 + "上传/清除预览图"两个动作；
+批量操作先用"多选 + 逐条调用既有 update/status 接口"，不新造批量语义。
+
 ---
 
 ## 七、资产与存储
