@@ -93,6 +93,26 @@ export class DesignExportService {
       height: design.height,
       multiplier: input.multiplier,
     });
+    // An exact delivery frame replaces `canvas × multiplier` as ①, so it has to
+    // clear the same side/pixel/working-set budget — otherwise a request could
+    // name a frame far larger than the canvas and push the renderer past limits
+    // this service exists to enforce. Checked here as well as in the renderer so
+    // an unrenderable frame is refused before a job is created.
+    if (input.target_size) {
+      try {
+        assertDesignExportBudget({
+          width: input.target_size.width,
+          height: input.target_size.height,
+          multiplier: 1,
+        });
+      } catch {
+        throw new DesignExportError(
+          "design_export_unsupported",
+          "The requested export target size exceeds the server rendering budget.",
+          422,
+        );
+      }
+    }
     const payload = designExportPayloadSchema.parse({
       ...input,
       requested_by: user.id,

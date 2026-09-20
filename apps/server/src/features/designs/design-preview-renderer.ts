@@ -2,6 +2,7 @@ import {
   type DesignObject,
   type DesignPaint,
   type DesignShadow,
+  type DesignExportPayload,
   type LoomicSceneV1,
   designCommandSchema,
   loomicSceneV1Schema,
@@ -11,11 +12,18 @@ import type { Font } from "fontkit";
 import { loadDesignFontBinaries, parseDesignFonts, renderBoundText, splitDesignTextLines } from "./design-font-renderer.js";
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
+import {
+  assertTargetSize,
+  contentBox,
+  type ExportDimensionReceipt,
+  type PixelSize,
+} from "../../agent/nonstandard-export-deliverable.js";
 import type {
   DesignExportRenderer,
   DesignPreviewRenderer,
 } from "./design-async-worker.js";
 import { applyDesignCommands } from "./design-command-applier.js";
+import { verifiedDesignExportArtifact, reverifiedDesignExportReceipt } from "./design-export-receipt.js";
 import {
   DESIGN_EXPORT_MAX_ESTIMATED_BYTES,
   DESIGN_EXPORT_MAX_PIXELS,
@@ -175,9 +183,8 @@ export function createSupabaseDesignExportRenderer(): DesignExportRenderer {
         document.id,
         input.payload.revision,
       );
-      let budget: ReturnType<typeof assertDesignExportBudget>;
       try {
-        budget = assertDesignExportBudget({
+        assertDesignExportBudget({
           width: scene.canvas.width,
           height: scene.canvas.height,
           multiplier: input.payload.multiplier,
@@ -188,7 +195,21 @@ export function createSupabaseDesignExportRenderer(): DesignExportRenderer {
           `Export exceeds side=${DESIGN_EXPORT_MAX_SIDE}, pixels=${DESIGN_EXPORT_MAX_PIXELS}, or estimatedBytes=${DESIGN_EXPORT_MAX_ESTIMATED_BYTES}.`,
         );
       }
-      const { width, height } = budget;
+      // ① is the exact frame the request named when it named one; otherwise the
+      // export keeps the frame this path has always produced. Either way ④ comes
+      // from the encoded bytes below, never from this variable.
+      const { width, height } = exportTargetFrame(input.payload, scene);
+      // The same budget, applied to the frame that will actually be composed: a
+      // target size is not exempt from the side/pixel/working-set limits just
+      // because the canvas it replaces was small.
+      try {
+        assertDesignExportBudget({ width, height, multiplier: 1 });
+      } catch {
+        throw new DesignPreviewRenderError(
+          "design_export_pixel_budget_exceeded",
+          `The requested export frame ${width}x${height} exceeds side=${DESIGN_EXPORT_MAX_SIDE} or pixels=${DESIGN_EXPORT_MAX_PIXELS}.`,
+        );
+      }
       await assertSceneResourcesAuthorized(admin, scene, document.workspace_id);
       const assets = await loadReferencedAssets(
         admin,
@@ -231,19 +252,41 @@ export function createSupabaseDesignExportRenderer(): DesignExportRenderer {
             expiryUpdate.error.message,
           );
         }
+        // The durable artifact is reused, but its size is not: the receipt is
+        // re-read from the stored bytes on this replay too, so a crash between
+        // upload and markSucceeded cannot turn an unverified frame into a
+        // verified one. `existing.byteSize` alone is not evidence of pixels.
+        const stored = await admin.storage
+          .from(PREVIEW_BUCKET)
+          .download(objectPath);
+        if (stored.error || !stored.data) {
+          throw new DesignPreviewRenderError(
+            "design_export_asset_conflict",
+            "The durable export artifact could not be read back.",
+          );
+        }
+        const storedBytes = Buffer.from(await stored.data.arrayBuffer());
         return exportResult(
           input,
           document.id,
-          width,
-          height,
-          existing.byteSize,
+          storedBytes.byteLength,
+          await reverifiedDesignExportReceipt({
+            target: { width, height },
+            bytes: storedBytes,
+            format: input.payload.format,
+            transparent: input.payload.transparent,
+            claim: input.payload.target_size ? { width, height } : null,
+          }),
         );
       }
       await context.renewVt(300);
-      const output = await renderDesignExportBuffer(scene, assets, {
+      // The bytes that get uploaded are the verified composition, and the receipt
+      // beside them was read back from those same bytes.
+      const output = await renderVerifiedDesignExport(scene, assets, {
         format: input.payload.format,
         multiplier: input.payload.multiplier,
         transparent: input.payload.transparent,
+        targetSize: input.payload.target_size ?? null,
         deadlineAt,
       });
       await assertExportAuthorized(admin, input);
@@ -251,7 +294,7 @@ export function createSupabaseDesignExportRenderer(): DesignExportRenderer {
       const expiresAt = exportExpiresAt(input);
       const uploaded = await admin.storage
         .from(PREVIEW_BUCKET)
-        .upload(objectPath, output, {
+        .upload(objectPath, output.buffer, {
           contentType: mimeType,
           cacheControl: "31536000",
           upsert: true,
@@ -271,7 +314,7 @@ export function createSupabaseDesignExportRenderer(): DesignExportRenderer {
           bucket: PREVIEW_BUCKET,
           object_path: objectPath,
           mime_type: mimeType,
-          byte_size: output.byteLength,
+          byte_size: output.buffer.byteLength,
           created_by: input.payload.requested_by,
           gc_eligible_at: expiresAt,
         },
@@ -283,9 +326,38 @@ export function createSupabaseDesignExportRenderer(): DesignExportRenderer {
           inserted.error.message,
         );
       }
-      return exportResult(input, document.id, width, height, output.byteLength);
+      return exportResult(input, document.id, output.buffer.byteLength, output.receipt);
     },
   };
+}
+
+/**
+ * ① The frame this export must deliver, in pixels.
+ *
+ * An exact `target_size` on the payload wins — that is the request that names a
+ * pixel frame. Otherwise the export keeps its historical frame (the design's own
+ * canvas at the requested multiplier). Both branches are a TARGET: the delivered
+ * size is reported from the bytes, and this function is what the receipt compares
+ * them against.
+ */
+function exportTargetFrame(
+  payload: DesignExportPayload,
+  scene: LoomicSceneV1,
+): PixelSize {
+  if (payload.target_size) return assertTargetSize(payload.target_size);
+  return {
+    width: scene.canvas.width * payload.multiplier,
+    height: scene.canvas.height * payload.multiplier,
+  };
+}
+
+/**
+ * The design's own background, when it has one, as the colour to pad with. The
+ * canvas background is a CSS colour string (it is emitted verbatim as the SVG
+ * background rect), so "no background" means the caller falls back.
+ */
+function solidCanvasBackground(scene: LoomicSceneV1): string | null {
+  return scene.canvas.background ?? null;
 }
 
 async function assertExportAuthorized(
@@ -535,22 +607,51 @@ async function loadExistingRenderAsset(
   return { byteSize: asset.byte_size };
 }
 
+/**
+ * The export job result.
+ *
+ * `width`/`height` ARE ④ — the delivered pixels — so they are taken from the
+ * receipt, which read them out of the encoded deliverable's own header. There is
+ * deliberately no target-frame parameter here to fall back on: a receipt without
+ * a verified size throws instead of letting the old budget echo back into the
+ * result, and a receipt whose byte-verified FORMAT is not the requested format
+ * throws too, rather than publishing the requested format as if it were the
+ * delivered one. The frame the request ASKED for stays on the receipt as
+ * `targetSize`, and a delivered frame that differs from it is reported through
+ * that receipt (`matches: false`, `mismatches: ["size"]`) rather than hidden by
+ * failing the job: the delivery is honest, so the user can see exactly what was
+ * produced instead of receiving an error that names no artifact.
+ */
 function exportResult(
   input: Parameters<DesignExportRenderer["render"]>[0],
   designId: string,
-  width: number,
-  height: number,
   byteSize: number,
+  receipt: ExportDimensionReceipt,
 ) {
+  const actual = receipt.actualExportSize;
+  if (!actual) {
+    throw new DesignPreviewRenderError(
+      "design_export_artifact_unverified",
+      "The export artifact could not be verified from its encoded bytes; refusing to report an unread size as the export result.",
+    );
+  }
+  if (receipt.format && receipt.format !== input.payload.format) {
+    throw new DesignPreviewRenderError(
+      "design_export_artifact_format_mismatch",
+      `The export artifact is ${receipt.format} but the request asked for ${input.payload.format}.`,
+    );
+  }
   return {
     asset_object_id: input.job.id,
     design_id: designId,
     revision: input.payload.revision,
+    // The requested format, which the check above proves the bytes agree with.
     format: input.payload.format,
-    width,
-    height,
+    width: actual.width,
+    height: actual.height,
     byte_size: byteSize,
     expires_at: exportExpiresAt(input),
+    dimension_receipt: receipt,
   };
 }
 
@@ -673,12 +774,14 @@ export async function renderDesignExportBuffer(
     format: "png" | "jpeg";
     multiplier: 1 | 2;
     transparent: boolean;
+    /** Render the scene into this exact raster instead of canvas × multiplier. */
+    outputSize?: { width: number; height: number };
     deadlineAt?: number;
   },
 ): Promise<Buffer> {
   const scene = loomicSceneV1Schema.parse(rawScene);
-  const width = scene.canvas.width * options.multiplier;
-  const height = scene.canvas.height * options.multiplier;
+  const width = options.outputSize?.width ?? scene.canvas.width * options.multiplier;
+  const height = options.outputSize?.height ?? scene.canvas.height * options.multiplier;
   if (width * height > DESIGN_EXPORT_MAX_PIXELS) {
     throw new DesignPreviewRenderError(
       "design_export_pixel_budget_exceeded",
@@ -704,6 +807,75 @@ export async function renderDesignExportBuffer(
         .jpeg({ quality: 92 })
         .toBuffer()
     : pipeline.png().toBuffer();
+}
+
+/**
+ * The verified exact-size export: compose the frozen scene into the requested
+ * frame, then read the ENCODED BYTES back and report what they really are.
+ *
+ * This is the call site of the composition + byte-read-back primitive. The
+ * returned `receipt.actualExportSize` is parsed from the deliverable's own
+ * header (cross-checked by an independent decode); the frame computed here and
+ * the `claim` are inputs and evidence, never the answer. A caller that used to
+ * write `canvas × multiplier` into the job result now has nothing to write it
+ * from — see `design-export-receipt.ts` and the delivery-card contract in
+ * `agent/export-dimension-contract.ts`.
+ */
+export async function renderVerifiedDesignExport(
+  rawScene: LoomicSceneV1,
+  assets: ReadonlyMap<string, AssetBinary>,
+  options: {
+    format: "png" | "jpeg";
+    multiplier: 1 | 2;
+    transparent: boolean;
+    /**
+     * The exact target frame. Omitted, the target stays the frame this path has
+     * always used (canvas × multiplier), and the receipt verifies THAT frame —
+     * what changes is only that the number is now byte-derived.
+     */
+    targetSize?: { width: number; height: number } | null;
+    deadlineAt?: number;
+  },
+): Promise<{ buffer: Buffer; receipt: ExportDimensionReceipt; target: PixelSize }> {
+  const scene = loomicSceneV1Schema.parse(rawScene);
+  const target = options.targetSize
+    ? assertTargetSize(options.targetSize)
+    : { width: scene.canvas.width * options.multiplier, height: scene.canvas.height * options.multiplier };
+  // The scene is rendered once, into the largest frame of its OWN ratio that fits
+  // the target. The composition then pads it up to the exact target frame without
+  // stretching a single axis and without cropping a single object.
+  const box = contentBox(
+    { width: scene.canvas.width, height: scene.canvas.height },
+    target,
+    "contain",
+  );
+  const content = await renderDesignExportBuffer(scene, assets, {
+    format: "png",
+    multiplier: 1,
+    transparent: options.transparent,
+    outputSize: { width: box.width, height: box.height },
+    ...(options.deadlineAt ? { deadlineAt: options.deadlineAt } : {}),
+  });
+  assertRenderDeadline(options.deadlineAt);
+  const verified = await verifiedDesignExportArtifact({
+    target,
+    content,
+    format: options.format,
+    transparent: options.transparent,
+    // An opaque export pads with the design's own background when it has a solid
+    // one, so letterboxing cannot frame a dark design in white bars. A paper
+    // with no solid colour falls back to white. (Transparency wins in the
+    // composition, which is why this is not sent at all when it was promised.)
+    ...(options.transparent ? {} : { padding: solidCanvasBackground(scene) ?? "#ffffff" }),
+    // The only claim that is a claim ABOUT THE ARTIFACT is the exact frame the
+    // request named. The old code reported `canvas × multiplier` as if it were
+    // the artifact's size; that was the render budget, and quoting it here would
+    // keep the two confused. With no exact frame requested the target IS the
+    // budget, and `matches` answers it from the bytes instead of echoing it.
+    claim: options.targetSize ? target : null,
+  });
+  assertRenderDeadline(options.deadlineAt);
+  return { ...verified, target };
 }
 
 async function loadReferencedAssets(

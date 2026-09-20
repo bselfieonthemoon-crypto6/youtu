@@ -143,6 +143,30 @@ describe("composeTargetSizeRaster", () => {
     expect(contentBox({ width: 40, height: 20 }, { width: 400, height: 200 }, "none"))
       .toEqual({ width: 40, height: 20, scale: 1 });
   });
+
+  it("contains a same-ratio source UP to the target instead of letterboxing it in its own frame", () => {
+    // A 320x180 design delivered as 640x360 is the same picture at twice the
+    // resolution: the box is the whole target, so the scene renders crisply at
+    // 640x360 rather than being rasterized at 320x180 and stretched afterwards.
+    expect(contentBox({ width: 320, height: 180 }, { width: 640, height: 360 }, "contain"))
+      .toEqual({ width: 640, height: 360, scale: 2 });
+    // A different ratio still only fills one axis, up or down.
+    expect(contentBox({ width: 320, height: 180 }, { width: 1280, height: 200 }, "contain"))
+      .toEqual({ width: 356, height: 200, scale: 356 / 320 });
+    // `fit` stays a shrink-only mode: it never enlarges past the source.
+    expect(contentBox({ width: 320, height: 180 }, { width: 640, height: 360 }, "fit"))
+      .toEqual({ width: 320, height: 180, scale: 1 });
+  });
+
+  it("delivers a larger same-ratio frame as a real upscale, not a letterboxed small raster", async () => {
+    const composed = await composeTargetSizeRaster({ sources: [await solidPng(320, 180)],
+      target: { width: 640, height: 360 }, format: "png" });
+    expect(composed.content).toEqual({ width: 640, height: 360, scale: 2 });
+    // No padding at all: every pixel of the target is content, so nothing was
+    // framed inside the source's own 320x180 raster.
+    expect(composed.margin).toEqual({ left: 0, right: 0, top: 0, bottom: 0 });
+    expect(await verifyEncodedImageBytes(composed.buffer)).toMatchObject({ width: 640, height: 360 });
+  });
 });
 
 describe("verifyEncodedImageBytes", () => {
@@ -198,6 +222,19 @@ describe("verifyEncodedImageBytes", () => {
     const broken = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
       Buffer.alloc(16)]);
     await expect(verifyEncodedImageBytes(broken)).rejects.toThrow(/nonstandard_export_header_invalid/);
+  });
+
+  it("refuses to decode a header that claims a frame beyond the verification bound", async () => {
+    // A stored artifact read back on the replay path is not budget-checked by its
+    // producer any more, so its own header must not be able to make the decoder
+    // allocate an unbounded raster. The header claim is refused before any decode.
+    const composed = await composeTargetSizeRaster({ sources: [await solidPng(64, 64)],
+      target: { width: 320, height: 70 }, format: "png" });
+    await expect(verifyEncodedImageBytes(composed.buffer, { maxPixels: 1_000 }))
+      .rejects.toThrow(/nonstandard_export_pixel_budget_exceeded/);
+    // Under the bound, the same bytes verify normally.
+    await expect(verifyEncodedImageBytes(composed.buffer, { maxPixels: 320 * 70 }))
+      .resolves.toMatchObject({ width: 320, height: 70 });
   });
 });
 
@@ -272,6 +309,76 @@ describe("evaluateExportDimensionReceipt", () => {
     const opaqueReceipt = await evaluateExportDimensionReceipt({ target: extremeTarget, bytes: opaque.buffer });
     expect(opaqueReceipt).toMatchObject({ matches: true, alphaVerdict: "opaque", hasAlpha: false });
     expect(describeExportDimensionReceipt(opaqueReceipt)).toContain("有 alpha 通道但全部不透明");
+  });
+
+  it("judges a FORMAT expectation the request named, and only when it named one", async () => {
+    const png = await composeTargetSizeRaster({ sources: [await solidPng(320, 70)],
+      target: extremeTarget, format: "png" });
+    const jpeg = await composeTargetSizeRaster({ sources: [await solidPng(320, 70)],
+      target: extremeTarget, format: "jpeg" });
+
+    // The request said png; the artifact is jpeg. That is a named mismatch, and
+    // the receipt still reports the format the bytes really are.
+    const wrongFormat = await evaluateExportDimensionReceipt({ target: extremeTarget,
+      bytes: jpeg.buffer, expectation: { format: "png" } });
+    expect(wrongFormat.format).toBe("jpeg");
+    expect(wrongFormat.mismatches).toContain("format");
+    expect(wrongFormat.matches).toBe(false);
+    // Same artifact, same request shape except the format it named: no mismatch.
+    const rightFormat = await evaluateExportDimensionReceipt({ target: extremeTarget,
+      bytes: jpeg.buffer, expectation: { format: "jpeg" } });
+    expect(rightFormat.mismatches).toEqual([]);
+    expect(rightFormat.matches).toBe(true);
+    // A request that never named a format cannot fail one: the png artifact is
+    // reported as png and judged on its size alone.
+    const unstated = await evaluateExportDimensionReceipt({ target: extremeTarget, bytes: png.buffer });
+    expect(unstated.format).toBe("png");
+    expect(unstated.mismatches).toEqual([]);
+  });
+
+  it("judges a TRANSPARENCY expectation against real pixels, never against the promise", async () => {
+    // The request promised transparency and the artifact has none at all (jpeg
+    // bytes cannot carry an alpha channel): an alpha mismatch.
+    const jpeg = await composeTargetSizeRaster({ sources: [await transparentPng(80, 70)],
+      target: extremeTarget, format: "jpeg", background: "#ffffff", scale: "fit" });
+    const missing = await evaluateExportDimensionReceipt({ target: extremeTarget,
+      bytes: jpeg.buffer, expectation: { transparent: true } });
+    expect(missing.alphaVerdict).toBe("absent");
+    expect(missing.mismatches).toContain("alpha");
+    expect(missing.matches).toBe(false);
+
+    // A png with an alpha channel whose every sample is opaque does not keep a
+    // transparency promise either — "has an alpha channel" is not the promise.
+    const opaque = await composeTargetSizeRaster({ sources: [await solidPng(320, 70)],
+      target: extremeTarget, format: "png", padding: "#ffffff" });
+    const opaquePromise = await evaluateExportDimensionReceipt({ target: extremeTarget,
+      bytes: opaque.buffer, expectation: { transparent: true } });
+    expect(opaquePromise.alphaVerdict).toBe("opaque");
+    expect(opaquePromise.mismatches).toContain("alpha");
+
+    // The same artifact satisfies a request that never promised transparency.
+    const noPromise = await evaluateExportDimensionReceipt({ target: extremeTarget,
+      bytes: opaque.buffer, expectation: { transparent: false } });
+    expect(noPromise.mismatches).toEqual([]);
+    expect(noPromise.matches).toBe(true);
+
+    // Real transparency keeps the promise, and a transparent request also passes
+    // its own format expectation: the mismatches list stays empty.
+    const real = await composeTargetSizeRaster({ sources: [await transparentPng(80, 70)],
+      target: extremeTarget, format: "png", padding: "transparent", scale: "fit" });
+    const kept = await evaluateExportDimensionReceipt({ target: extremeTarget, bytes: real.buffer,
+      expectation: { format: "png", transparent: true } });
+    expect(kept.alphaVerdict).toBe("present");
+    expect(kept.mismatches).toEqual([]);
+    expect(kept.matches).toBe(true);
+  });
+
+  it("fails no expectation it cannot answer: an unverified receipt judges nothing", async () => {
+    const receipt = await evaluateExportDimensionReceipt({ target: extremeTarget, bytes: null,
+      expectation: { format: "png", transparent: true } });
+    expect(receipt.mismatches).toEqual(["unverified"]);
+    expect(receipt.format).toBeNull();
+    expect(receipt.hasAlpha).toBeNull();
   });
 
   it("round-trips a receipt across a JSON boundary and refuses a malformed one", async () => {

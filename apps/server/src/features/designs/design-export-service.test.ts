@@ -123,6 +123,40 @@ describe("DesignExportService", () => {
     expect(createJob).not.toHaveBeenCalled();
   });
 
+  it("rejects an exact target frame that exceeds the render budget before creating a job", async () => {
+    const { createJob, service } = setup();
+
+    await expect(
+      service.enqueue(user, {
+        ...request,
+        target_size: { width: 40_000, height: 40_000 },
+      }),
+    ).rejects.toMatchObject({
+      code: "design_export_unsupported",
+      statusCode: 422,
+    } satisfies Partial<DesignExportError>);
+    expect(createJob).not.toHaveBeenCalled();
+  });
+
+  it("accepts an exact target frame the canvas itself could not reach", async () => {
+    const { createJob, service } = setup();
+
+    // The design is 1080x1080; the request asks for 320x70. That is ① a frame
+    // the canvas never had, and it is well inside the budget.
+    await expect(
+      service.enqueue(user, {
+        ...request,
+        target_size: { width: 320, height: 70 },
+      }),
+    ).resolves.toMatchObject({ id: ids.job });
+    expect(createJob).toHaveBeenCalledWith(
+      user,
+      expect.objectContaining({
+        payload: expect.objectContaining({ target_size: { width: 320, height: 70 } }),
+      }),
+    );
+  });
+
   it("freezes the current revision and canonical design target", async () => {
     const { createJob, service } = setup();
 

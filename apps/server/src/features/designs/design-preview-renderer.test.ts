@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import type { LoomicSceneV1 } from "@loomic/shared";
+import type { DesignExportResult, LoomicSceneV1 } from "@loomic/shared";
 import sharp from "sharp";
 import { describe, expect, it, vi } from "vitest";
 
@@ -13,6 +13,7 @@ import {
   renderDesignPreviewBuffer,
   renderDesignPreviewSvg,
 } from "./design-preview-renderer.js";
+import { parseExportDimensionReceipt } from "../../agent/nonstandard-export-deliverable.js";
 
 describe("design preview renderer", () => {
   it("reconstructs a frozen revision from its nearest snapshot and command chain", async () => {
@@ -181,6 +182,7 @@ describe("design preview renderer", () => {
     const scene = baseScene(64, 32);
     const objectPath = `${workspaceId}/design-exports/${designId}/2-${jobId}.png`;
     let assetRow: Record<string, unknown> | null = null;
+    let storedBytes: Buffer | null = null;
     const designQuery = {
       select: vi.fn(() => designQuery),
       eq: vi.fn(() => designQuery),
@@ -242,8 +244,14 @@ describe("design preview renderer", () => {
         error: null,
       })),
     };
-    const upload = vi.fn(async () => ({
-      data: { path: objectPath },
+    const upload = vi.fn(async (_path: string, body: Buffer) => {
+      storedBytes = body;
+      return { data: { path: objectPath }, error: null };
+    });
+    // The replay path re-reads the stored artifact instead of trusting the
+    // persisted byte_size, so a replayed export is verified from the same bytes.
+    const download = vi.fn(async () => ({
+      data: storedBytes ? new Blob([new Uint8Array(storedBytes)]) : null,
       error: null,
     }));
     const admin = {
@@ -258,7 +266,7 @@ describe("design preview renderer", () => {
                 ? jobQuery
                 : assetQuery,
       ),
-      storage: { from: vi.fn(() => ({ upload })) },
+      storage: { from: vi.fn(() => ({ upload, download })) },
     };
     const renderer = createSupabaseDesignExportRenderer();
     const input = {
@@ -290,6 +298,19 @@ describe("design preview renderer", () => {
     expect(replay).toEqual(first);
     expect(first.asset_object_id).toBe(jobId);
     expect(first.expires_at).toBe("2026-09-11T00:00:00.000Z");
+    // The replayed result is verified from the stored bytes: its receipt and its
+    // width/height are byte-derived on both passes, not only on the first.
+    expect(download).toHaveBeenCalledWith(objectPath);
+    expect(first).toMatchObject({
+      width: 64,
+      height: 32,
+      dimension_receipt: {
+        actualExportSize: { width: 64, height: 32 },
+        pixelVerification: { source: "encoded_bytes", format: "png" },
+        matches: true,
+        mismatches: [],
+      },
+    });
     expect(upload).toHaveBeenCalledTimes(1);
     expect(assetQuery.upsert).toHaveBeenCalledTimes(1);
     expect(assetQuery.upsert).toHaveBeenCalledWith(
@@ -729,6 +750,300 @@ describe("design preview renderer", () => {
       width: 512,
       height: 384,
     });
+  });
+
+  it("delivers an exact target frame and reports the size read back from the uploaded bytes", async () => {
+    const jobId = randomUUID();
+    const designId = randomUUID();
+    const workspaceId = randomUUID();
+    const projectId = randomUUID();
+    const requestedBy = randomUUID();
+    // A 1280x416 (3:1) board asked for as a 320x70 (4.571:1) delivery: the frame
+    // the export must deliver is NOT canvas × multiplier, so the old path could
+    // only ever have reported the wrong one.
+    const scene = baseScene(1280, 416);
+    scene.objects.push({
+      objectId: randomUUID(),
+      objectVersion: 1,
+      type: "rect",
+      name: "Band",
+      x: 0,
+      y: 0,
+      width: 1280,
+      height: 416,
+      rotation: 0,
+      opacity: 1,
+      zIndex: 0,
+      locked: false,
+      visible: true,
+      fill: { kind: "solid", color: "#ff3366" },
+      stroke: null,
+      strokeWidth: 0,
+    });
+    const objectPath = `${workspaceId}/design-exports/${designId}/2-${jobId}.png`;
+    let uploaded: Buffer | null = null;
+    const designQuery = {
+      select: vi.fn(() => designQuery),
+      eq: vi.fn(() => designQuery),
+      is: vi.fn(() => designQuery),
+      maybeSingle: vi.fn(async () => ({
+        data: {
+          id: designId,
+          workspace_id: workspaceId,
+          project_id: projectId,
+          revision: 2,
+          scene,
+          deleted_at: null,
+        },
+        error: null,
+      })),
+    };
+    const versionQuery = {
+      select: vi.fn(() => versionQuery),
+      eq: vi.fn(() => versionQuery),
+      lte: vi.fn(() => versionQuery),
+      order: vi.fn(() => versionQuery),
+      range: vi.fn(async () => ({
+        data: [
+          {
+            revision: 2,
+            parent_revision: 1,
+            command_batch: [],
+            snapshot: scene,
+          },
+        ],
+        error: null,
+      })),
+    };
+    const assetQuery = {
+      select: vi.fn(() => assetQuery),
+      eq: vi.fn(() => assetQuery),
+      maybeSingle: vi.fn(async () => ({ data: null, error: null })),
+      upsert: vi.fn(async () => ({ error: null })),
+    };
+    const memberQuery = {
+      select: vi.fn(() => memberQuery),
+      eq: vi.fn(() => memberQuery),
+      maybeSingle: vi.fn(async () => ({
+        data: { workspace_id: workspaceId, user_id: requestedBy },
+        error: null,
+      })),
+    };
+    const jobQuery = {
+      select: vi.fn(() => jobQuery),
+      eq: vi.fn(() => jobQuery),
+      maybeSingle: vi.fn(async () => ({
+        data: { id: jobId, status: "running" },
+        error: null,
+      })),
+    };
+    const upload = vi.fn(async (_path: string, body: Buffer) => {
+      uploaded = body;
+      return { data: { path: objectPath }, error: null };
+    });
+    const admin = {
+      from: vi.fn((table: string) =>
+        table === "design_documents"
+          ? designQuery
+          : table === "design_document_versions"
+            ? versionQuery
+            : table === "workspace_members"
+              ? memberQuery
+              : table === "background_jobs"
+                ? jobQuery
+                : assetQuery,
+      ),
+      storage: { from: vi.fn(() => ({ upload })) },
+    };
+    const renderer = createSupabaseDesignExportRenderer();
+
+    const result: DesignExportResult = await renderer.render(
+      {
+        job: {
+          id: jobId,
+          workspace_id: workspaceId,
+          project_id: projectId,
+          created_at: "2026-09-04T00:00:00.000Z",
+        },
+        payload: {
+          design_id: designId,
+          revision: 2,
+          idempotency_key: randomUUID(),
+          requested_by: requestedBy,
+          format: "png",
+          multiplier: 1,
+          transparent: true,
+          target_size: { width: 320, height: 70 },
+        },
+      } as never,
+      { getAdminClient: () => admin, renewVt: vi.fn(async () => undefined) } as never,
+    );
+
+    // ① the requested frame, ④ read out of the uploaded artifact's own header.
+    expect(result).toMatchObject({
+      width: 320,
+      height: 70,
+      format: "png",
+      dimension_receipt: {
+        targetSize: { width: 320, height: 70 },
+        actualExportSize: { width: 320, height: 70 },
+        format: "png",
+        matches: true,
+        mismatches: [],
+        pixelVerification: {
+          source: "encoded_bytes",
+          actualSize: { width: 320, height: 70 },
+          headerSize: { width: 320, height: 70 },
+          decodedSize: { width: 320, height: 70 },
+        },
+      },
+    });
+    // The receipt's size and the number in the job result agree with the bytes
+    // that were actually stored, and the stored artifact really is 320x70.
+    const receipt = parseExportDimensionReceipt(result.dimension_receipt);
+    expect(receipt).not.toBeNull();
+    expect(receipt?.actualExportSize).toEqual({ width: 320, height: 70 });
+    expect(result.width).toBe(receipt?.actualExportSize?.width);
+    expect(uploaded).not.toBeNull();
+    await expect(sharp(uploaded as unknown as Buffer).metadata()).resolves.toMatchObject({
+      format: "png",
+      width: 320,
+      height: 70,
+    });
+    expect(result.byte_size).toBe((uploaded as unknown as Buffer).byteLength);
+    // The receipt followed the artifact, not the budget: canvas × multiplier
+    // (1280x416) is nowhere in the reported delivery.
+    expect(result.width).not.toBe(scene.canvas.width);
+  });
+
+  it("keeps the delivered frame unchanged when the request names no target size", async () => {
+    const jobId = randomUUID();
+    const designId = randomUUID();
+    const workspaceId = randomUUID();
+    const projectId = randomUUID();
+    const requestedBy = randomUUID();
+    const scene = baseScene(320, 180);
+    const objectPath = `${workspaceId}/design-exports/${designId}/0-${jobId}.png`;
+    let uploaded: Buffer | null = null;
+    const designQuery = {
+      select: vi.fn(() => designQuery),
+      eq: vi.fn(() => designQuery),
+      is: vi.fn(() => designQuery),
+      maybeSingle: vi.fn(async () => ({
+        data: {
+          id: designId,
+          workspace_id: workspaceId,
+          project_id: projectId,
+          revision: 0,
+          scene,
+          deleted_at: null,
+        },
+        error: null,
+      })),
+    };
+    const versionQuery = {
+      select: vi.fn(() => versionQuery),
+      eq: vi.fn(() => versionQuery),
+      lte: vi.fn(() => versionQuery),
+      order: vi.fn(() => versionQuery),
+      range: vi.fn(async () => ({
+        data: [{ revision: 0, parent_revision: null, command_batch: [], snapshot: scene }],
+        error: null,
+      })),
+    };
+    const assetQuery = {
+      select: vi.fn(() => assetQuery),
+      eq: vi.fn(() => assetQuery),
+      maybeSingle: vi.fn(async () => ({ data: null, error: null })),
+      upsert: vi.fn(async () => ({ error: null })),
+    };
+    const memberQuery = {
+      select: vi.fn(() => memberQuery),
+      eq: vi.fn(() => memberQuery),
+      maybeSingle: vi.fn(async () => ({
+        data: { workspace_id: workspaceId, user_id: requestedBy },
+        error: null,
+      })),
+    };
+    const jobQuery = {
+      select: vi.fn(() => jobQuery),
+      eq: vi.fn(() => jobQuery),
+      maybeSingle: vi.fn(async () => ({
+        data: { id: jobId, status: "running" },
+        error: null,
+      })),
+    };
+    const upload = vi.fn(async (_path: string, body: Buffer) => {
+      uploaded = body;
+      return { data: { path: objectPath }, error: null };
+    });
+    const admin = {
+      from: vi.fn((table: string) =>
+        table === "design_documents"
+          ? designQuery
+          : table === "design_document_versions"
+            ? versionQuery
+            : table === "workspace_members"
+              ? memberQuery
+              : table === "background_jobs"
+                ? jobQuery
+                : assetQuery,
+      ),
+      storage: { from: vi.fn(() => ({ upload })) },
+    };
+    const renderer = createSupabaseDesignExportRenderer();
+
+    const result = await renderer.render(
+      {
+        job: {
+          id: jobId,
+          workspace_id: workspaceId,
+          project_id: projectId,
+          created_at: "2026-09-04T00:00:00.000Z",
+        },
+        payload: {
+          design_id: designId,
+          revision: 0,
+          idempotency_key: randomUUID(),
+          requested_by: requestedBy,
+          format: "png",
+          multiplier: 2,
+          transparent: false,
+        },
+      } as never,
+      { getAdminClient: () => admin, renewVt: vi.fn(async () => undefined) } as never,
+    );
+
+    // No request size: canvas × multiplier, as before — and now confirmed by the
+    // bytes rather than asserted by the budget.
+    expect(result).toMatchObject({
+      width: 640,
+      height: 360,
+      dimension_receipt: {
+        targetSize: { width: 640, height: 360 },
+        actualExportSize: { width: 640, height: 360 },
+        matches: true,
+        mismatches: [],
+      },
+    });
+    await expect(sharp(uploaded as unknown as Buffer).metadata()).resolves.toMatchObject({
+      width: 640,
+      height: 360,
+    });
+    // A same-ratio frame must be a real 2x render, not a 320x180 raster padded or
+    // stretched into 640x360: the delivered pixels are the scene rasterized at the
+    // delivered frame, so they are identical to a direct 640x360 render. (The two
+    // files differ in container detail — the composition re-encodes with explicit
+    // compression settings — so the PIXELS are what is compared.)
+    const renderedAtTarget = await renderDesignExportBuffer(scene, new Map(), {
+      format: "png",
+      multiplier: 1,
+      transparent: false,
+      outputSize: { width: 640, height: 360 },
+    });
+    const rgb = (buffer: Buffer) =>
+      sharp(buffer).removeAlpha().raw().toBuffer();
+    expect((await rgb(uploaded as unknown as Buffer)).equals(await rgb(renderedAtTarget))).toBe(true);
   });
 });
 

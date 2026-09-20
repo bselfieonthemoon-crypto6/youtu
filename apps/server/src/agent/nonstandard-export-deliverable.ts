@@ -34,15 +34,26 @@ import {
  *      bytes into the delivery-card receipt declared in
  *      `export-dimension-contract.ts`.
  *
- * Two things it deliberately is NOT: it is not wired into the design-export
- * renderer (which still reports the requested budget as the export result
- * rather than reading its own artifact back), and it is not exposed as an agent
- * tool. Both are stated as the remaining work in the delivery report; an
- * unverifiable export cannot become a verified delivery by itself.
+ * Two things it deliberately is NOT: it does not decide what an export SHOULD
+ * be (the composition is asked for at the exact target frame by its caller), and
+ * it is not an agent tool. The design export path calls all three —
+ * `design-export-receipt.ts` composes the frozen scene into the target frame,
+ * reads the encoded bytes back, and puts the receipt on the export job result —
+ * and the agent reads the receipt from that job result instead of gaining a
+ * second, divergent pipeline. An unverifiable export cannot become a verified
+ * delivery by itself.
  */
 
 /** A positive integer pixel count. Fractions and non-numbers are programming errors, not user input. */
 export type PixelSize = { width: number; height: number };
+
+/**
+ * The largest frame this module will decode to verify. It is not a product
+ * limit: it exists so a corrupt or hostile stored artifact cannot turn a
+ * read-back into an unbounded allocation. Legitimate exports are far below it
+ * (the design export budget tops out at 64M pixels).
+ */
+export const MAX_VERIFIABLE_PIXELS = 512_000_000;
 
 function positivePixel(value: unknown, label: string): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
@@ -126,9 +137,10 @@ function applyFormat(pipeline: Sharp, format: ExportDeliverableFormat, quality: 
  *
  * Each source is first scaled uniformly to fit INSIDE the target (letterbox
  * padding, not a per-axis squeeze), then padded up to the exact target frame,
- * then placed on the program canvas. Asserting the encoded result is the
- * caller's job ({@link verifyEncodedImageBytes}) — this function's return value
- * is intent plus the bytes, never proof.
+ * then placed on the program canvas. The width/height on this return value are
+ * the composition PLAN (the target it was asked for) and are not proof: the
+ * encoded bytes are settled by {@link verifyEncodedImageBytes}, which every
+ * caller in this repo runs before publishing a size.
  */
 export async function composeTargetSizeRaster(input: ComposeTargetSizeInput): Promise<ComposeTargetSizeResult> {
   const target = assertTargetSize(input.target);
@@ -206,6 +218,12 @@ function offset(leftover: number, align: ComposeTargetSizeInput["align"]): numbe
  *
  * The box keeps the CONTENT's ratio — that is what makes the scale uniform and
  * prevents a per-axis stretch. The leftover margins are carried separately.
+ *
+ * `contain` may return a box LARGER than the source: a 320×180 design delivered
+ * as 640×360 is the same picture at twice the resolution, and refusing to scale
+ * up would letterbox it inside its own content at 320×180. Callers that rasterize
+ * through a scalable scene (SVG text, vector objects) therefore get crisp
+ * detail at the delivered frame rather than an upscaled small bitmap.
  */
 export function contentBox(source: PixelSize, target: PixelSize, scale: SourceScale = "contain"):
   { width: number; height: number; scale: number } {
@@ -213,7 +231,7 @@ export function contentBox(source: PixelSize, target: PixelSize, scale: SourceSc
   const safeTarget = assertTargetSize(target);
   if (scale === "none") return { width: safeSource.width, height: safeSource.height, scale: 1 };
   const sourceRatio = safeSource.width / safeSource.height;
-  let width = Math.min(safeTarget.width, safeSource.width);
+  let width = safeTarget.width;
   let height = Math.max(1, Math.round(width / sourceRatio));
   if (height > safeTarget.height) { height = safeTarget.height; width = Math.max(1, Math.round(height * sourceRatio)); }
   if (scale === "fit" && (width > safeSource.width || height > safeSource.height)) {
@@ -252,13 +270,24 @@ export type EncodedImageVerification = {
  * is true only when an alpha channel exists AND at least one sample is below
  * 255, because "has an alpha channel" and "is actually transparent" are
  * different claims on a delivery card.
+ *
+ * The header claim is bounded before anything is decoded: a caller that reads
+ * back a STORED artifact (rather than bytes it just encoded under a budget) must
+ * not be able to make the decoder allocate an arbitrarily large raster for a
+ * frame that could never have been a legitimate export.
  */
-export async function verifyEncodedImageBytes(bytes: Buffer | Uint8Array): Promise<EncodedImageVerification> {
+export async function verifyEncodedImageBytes(
+  bytes: Buffer | Uint8Array,
+  options?: { maxPixels?: number },
+): Promise<EncodedImageVerification> {
   const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes ?? []);
   if (!buffer.byteLength) throw new Error("nonstandard_export_empty_bytes");
   const header = parseImageHeader(buffer);
   if (!header) throw new Error("nonstandard_export_unknown_format: only png and jpeg deliverables can be verified here.");
   const format = normalizeFormat(header.format);
+  const maxPixels = options?.maxPixels ?? MAX_VERIFIABLE_PIXELS;
+  if (header.width * header.height > maxPixels) throw new Error(
+    `nonstandard_export_pixel_budget_exceeded: the header claims ${header.width}x${header.height}, beyond the ${maxPixels}-pixel verification bound; refusing to decode it.`);
   const decoded = await decodeEncodedImage(buffer);
   if (decoded.width !== header.width || decoded.height !== header.height) throw new Error(
     `nonstandard_export_verification_conflict: header ${header.width}x${header.height} disagrees with decoded ${decoded.width}x${decoded.height}; refusing to report either as the export size.`);
@@ -346,6 +375,23 @@ export type ExportDimensionReceiptInput = {
    * trusted. Omit when nobody claimed a size.
    */
   claim?: PixelSize | null;
+  /**
+   * What the REQUEST asked the artifact to be, beyond its size — the only
+   * grounds on which `format` and `alpha` may be called mismatches.
+   *
+   * Both fields are optional and both are opt-in: an export that never stated a
+   * format or a transparency promise produces a receipt with neither judgment,
+   * because a channel that is merely REPORTED (see {@link EncodedImageVerification})
+   * is not an expectation anything can fail. A caller that does carry the
+   * expectation — the design export payload has both `format` and `transparent`
+   * — passes them here and gets a named mismatch when the bytes disagree.
+   */
+  expectation?: {
+    /** The format the request named (e.g. the export payload's `format`). */
+    format?: ExportDeliverableFormat | null;
+    /** True when the request promised a transparent result (e.g. `transparent: true`). */
+    transparent?: boolean | null;
+  } | null;
   /** The encoded deliverable bytes; the only source of ④. */
   bytes?: Buffer | Uint8Array | null;
   /** Which native legal ratio the composition actually used, when it was not the target ratio. */
@@ -356,10 +402,18 @@ export type ExportDimensionReceiptInput = {
  * Build the delivery-card size block. Every field is either byte-verified or
  * explicitly unknown; `matches` is true only for a verified artifact whose real
  * size equals the target.
+ *
+ * `format` and `alpha` are judged only against `expectation`. The rule both
+ * judgments share: an expectation that the REQUEST did not state cannot be
+ * failed by the bytes, and an expectation that no bytes could answer (the
+ * `unverified` path) fails nothing either.
  */
 export async function evaluateExportDimensionReceipt(input: ExportDimensionReceiptInput): Promise<ExportDimensionReceipt> {
   const target = assertTargetSize(input.target);
   const claim = input.claim ? assertTargetSize(input.claim) : null;
+  const expectationFormat = input.expectation?.format
+    ? normalizeFormat(input.expectation.format) : null;
+  const expectationTransparent = input.expectation?.transparent === true;
   const mismatches = new Set<ExportDimensionReceipt["mismatches"][number]>();
   const approximation: ExportApproximationEvidence | null = input.approximation
     ? { requestedRatio: input.approximation.requestedRatio, nativeRatio: input.approximation.nativeRatio,
@@ -375,6 +429,12 @@ export async function evaluateExportDimensionReceipt(input: ExportDimensionRecei
   const actual = { width: verified.width, height: verified.height };
   if (actual.width !== target.width || actual.height !== target.height) mismatches.add("size");
   if (claim && (claim.width !== actual.width || claim.height !== actual.height)) mismatches.add("size");
+  // A named format the deliverable does not have is a format mismatch, not a
+  // silent re-report of whatever came out of the encoder.
+  if (expectationFormat && verified.format !== expectationFormat) mismatches.add("format");
+  // "Transparent" is a promise about pixels: an alpha channel that is absent or
+  // entirely opaque does not keep it, and real transparency does.
+  if (expectationTransparent && !verified.alpha.realTransparency) mismatches.add("alpha");
   const evidence: PixelVerificationEvidence = {
     source: "encoded_bytes", format: verified.format, actualSize: actual, alpha: verified.alpha,
     decodedSize: verified.decoded ? { width: verified.decoded.width, height: verified.decoded.height } : null,

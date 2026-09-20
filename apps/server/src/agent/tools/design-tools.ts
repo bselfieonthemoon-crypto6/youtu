@@ -483,6 +483,7 @@ export function createDesignTools(deps: DesignToolDependencies) {
             format: input.format,
             multiplier: input.multiplier,
             transparent: input.transparent,
+            ...(input.target_size ? { target_size: input.target_size } : {}),
           });
         return parsedJson(exportDesignToolOutputSchema, {
           design_id: input.design_id,
@@ -490,6 +491,9 @@ export function createDesignTools(deps: DesignToolDependencies) {
           job_id: job.id,
           status: job.status,
           replayed,
+          // ① only. The delivered pixels (④) appear on the job result after the
+          // export reads its own encoded bytes back; they are never assumed here.
+          ...(input.target_size ? { target_size: input.target_size } : {}),
         });
       } catch (error) {
         return designError(error);
@@ -498,7 +502,7 @@ export function createDesignTools(deps: DesignToolDependencies) {
     {
       name: "export_design",
       description:
-        "Queue an idempotent authorized export for an exact native design revision.",
+        "Queue an idempotent authorized export for an exact native design revision. Pass target_size {width,height} in pixels when the user named an exact delivery frame (e.g. 320x70): the export composes the frozen design into that exact frame — uniformly scaled and letterboxed, never stretched or cropped — and then verifies the delivered pixels by reading the encoded file header back. The verified numbers arrive on the succeeded job's result as width/height plus dimension_receipt (targetSize, actualExportSize, format, hasAlpha, matches, mismatches). Report the delivered size ONLY as dimension_receipt.actualExportSize — never from this queued reply, the canvas, or the design's own width/height. When the receipt carries approximation, also report approximation.ratioDeviation as the ratio error of the source frame it was composed from; when approximation is null, no ratio deviation was measured and none may be quoted.",
       schema: exportDesignToolInputSchema,
     },
   );

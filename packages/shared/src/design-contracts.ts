@@ -1581,6 +1581,26 @@ export type JobTarget = z.infer<typeof jobTargetSchema>;
 
 export const designExportFormatSchema = z.enum(["png", "jpeg"]);
 
+/**
+ * An exact delivery frame, in pixels: the ① of the export-size contract when the
+ * request names pixels instead of a multiplier.
+ *
+ * Without this field a design export can only ever deliver `canvas × multiplier`,
+ * so an extreme frame like 320×70 is reachable only by building the design at
+ * 320×70. With it, a request can demand that exact frame and the export path
+ * composes the frozen scene into it — uniformly scaled and letterboxed, never
+ * stretched and never cropped — then verifies the delivered pixels from the
+ * encoded bytes. The field is optional, so every existing export keeps producing
+ * exactly the frame it produced before.
+ */
+export const designExportTargetSizeSchema = z
+  .object({
+    width: z.number().int().positive(),
+    height: z.number().int().positive(),
+  })
+  .strict();
+export type DesignExportTargetSize = z.infer<typeof designExportTargetSizeSchema>;
+
 export const designExportRequestSchema = z
   .object({
     design_id: designUuidSchema,
@@ -1589,6 +1609,7 @@ export const designExportRequestSchema = z
     format: designExportFormatSchema,
     multiplier: z.union([z.literal(1), z.literal(2)]),
     transparent: z.boolean(),
+    target_size: designExportTargetSizeSchema.optional(),
   })
   .strict()
   .refine((value) => value.format === "png" || !value.transparent, {
@@ -1606,6 +1627,7 @@ export const designExportPayloadSchema = z
     format: designExportFormatSchema,
     multiplier: z.union([z.literal(1), z.literal(2)]),
     transparent: z.boolean(),
+    target_size: designExportTargetSizeSchema.optional(),
   })
   .strict()
   .refine((value) => value.format === "png" || !value.transparent, {
@@ -1614,6 +1636,17 @@ export const designExportPayloadSchema = z
   });
 export type DesignExportPayload = z.infer<typeof designExportPayloadSchema>;
 
+/**
+ * ④ on the export job result, and the reason `width`/`height` beside it can be
+ * trusted: the delivery-card receipt whose `actualExportSize` was read out of the
+ * encoded deliverable's own header (see the note on `ENCODED_BYTES_AUTHORITY` in
+ * apps/server/src/agent/export-dimension-contract.ts).
+ *
+ * Optional because a receipt only exists where the bytes were read back: a
+ * result without one means "size not verified", never "verified as anything".
+ * Validated by the server's own receipt schema at the point it is put on the
+ * result, so the shape cannot drift from the contract that built it.
+ */
 export const designExportResultSchema = z
   .object({
     asset_object_id: designUuidSchema,
@@ -1624,6 +1657,7 @@ export const designExportResultSchema = z
     height: z.number().int().positive(),
     byte_size: z.number().int().nonnegative(),
     expires_at: timestampSchema,
+    dimension_receipt: z.record(z.string(), z.unknown()).optional(),
   })
   .strict();
 export type DesignExportResult = z.infer<typeof designExportResultSchema>;
@@ -3217,6 +3251,7 @@ export const exportDesignToolInputSchema = z
     format: designExportFormatSchema,
     multiplier: z.union([z.literal(1), z.literal(2)]),
     transparent: z.boolean(),
+    target_size: designExportTargetSizeSchema.optional(),
   })
   .strict()
   .refine((value) => value.format === "png" || !value.transparent, {
@@ -3239,6 +3274,12 @@ const exportDesignToolSuccessOutputSchema = z
       "dead_letter",
     ]),
     replayed: z.boolean(),
+    /**
+     * ① the exact frame this export was asked to deliver, echoed while the job is
+     * still queued. ④ is NOT here: it exists only on the succeeded job's result,
+     * as `width`/`height` plus the `dimension_receipt` read back from the bytes.
+     */
+    target_size: designExportTargetSizeSchema.optional(),
   })
   .strict();
 export const exportDesignToolOutputSchema = z.union([

@@ -50,7 +50,7 @@ export type ImageSourcePixels = { width: number; height: number };
 
 /** ④ EXPORT — the produced artifact's size, and why a receipt cannot report it. */
 export const EXPORT_SIZE_AUTHORITY =
-  "Export size is a separate question: a generation job receipt cannot answer it, and neither ①requested ②source pixels nor ③canvas frame may be substituted for it. An export artifact's real pixel size exists only on the succeeded design_export job's own result (background_jobs.result.width/height, validated by designExportResultSchema), because the export re-renders the board at payload.multiplier × the design's own width/height. No export job in scope means the export size is unknown, not equal to any other size here.";
+  "Export size is a separate question: a generation job receipt cannot answer it, and neither ①requested ②source pixels nor ③canvas frame may be substituted for it. An export artifact's real pixel size exists only on the succeeded design_export job's own result (background_jobs.result.width/height, validated by designExportResultSchema). Those two numbers are read back from the ENCODED deliverable by the export path itself and are carried next to them as result.dimension_receipt (targetSize, actualExportSize, format, hasAlpha, matches, mismatches, approximation); the design's width/height × payload.multiplier is the REQUESTED frame, never the delivered pixels. No export job in scope means the export size is unknown, not equal to any other size here.";
 
 /** ③ CANVAS FRAME — the canvas element carries the display frame, never pixels. */
 export const CANVAS_FRAME_AUTHORITY =
@@ -108,10 +108,13 @@ const pixelSizeSchema = z.object({
 /**
  * How an alpha channel was judged, on the delivery card.
  *
- * `absent` and `opaque` are only claimed for bytes that CANNOT carry alpha
- * (JPEG has three channels by definition). `unknown` is refused for PNG: a PNG
- * either has an alpha channel and then its pixels decide `present`/`opaque`, or
- * it has none at all.
+ * - `absent`: the format cannot carry alpha at all (JPEG has three channels by
+ *   definition), so no pixel could be transparent.
+ * - `present`: an alpha channel exists and at least one sample is below 255.
+ * - `opaque`: an alpha channel exists and every sample is 255, i.e. the file
+ *   carries a channel that promises nothing.
+ * - `unknown`: reserved for a receipt with no readable bytes; a receipt built
+ *   from bytes never uses it, because those bytes always settle the question.
  */
 export const alphaChannelVerdictSchema = z.enum(["present", "opaque", "absent", "unknown"]);
 export type AlphaChannelVerdict = z.infer<typeof alphaChannelVerdictSchema>;
@@ -156,6 +159,13 @@ export const exportDimensionReceiptSchema = z.object({
   claimedSize: pixelSizeSchema.nullable(),
   actualExportSize: pixelSizeSchema.nullable(),
   format: exportDeliverableFormatSchema.nullable(),
+  /**
+   * "The delivered pixels contain real transparency" — i.e.
+   * `pixelVerification.alpha.realTransparency`, true only for an alpha channel
+   * with at least one sample below 255. It is NOT "an alpha channel exists":
+   * that is `pixelVerification.alpha.channel`. Read `alphaVerdict` for which of
+   * the two a PNG turned out to be.
+   */
   hasAlpha: z.boolean().nullable(),
   alphaVerdict: alphaChannelVerdictSchema.nullable(),
   matches: z.boolean(),
@@ -246,6 +256,19 @@ export function projectImageJobDimensions(
 }
 
 /**
+ * Re-parse a receipt that crossed a JSON boundary (a job result, session state,
+ * a chat payload) using the same schema the export path validates against.
+ *
+ * Deliberately defined here rather than imported from
+ * `nonstandard-export-deliverable.ts`: that module imports THIS one for the
+ * schema, so the dependency must not run both ways.
+ */
+export function parseExportDimensionReceipt(value: unknown): ExportDimensionReceipt | null {
+  const parsed = exportDimensionReceiptSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+/**
  * ④ EXPORT — read a design export artifact's real size from its own job result.
  *
  * Exported so the export question has one named answer instead of the image
@@ -253,12 +276,24 @@ export function projectImageJobDimensions(
  * `createDesignExportExecutor` persisted through `markSucceeded`, so this reads
  * what the worker actually wrote and rejects anything else (including a
  * generation result, which has an `asset_id` and no `format`).
+ *
+ * The receipt is not decoration. When a result carries one, its byte-verified
+ * `actualExportSize` must be the same size the result reports — a receipt that
+ * disagrees with the numbers beside it means the row is not a trustworthy size
+ * source at all, and this returns null rather than picking one of the two. A
+ * result WITHOUT a receipt is an older row written before the read-back existed;
+ * it still carries the export job's own numbers, which is what this accessor has
+ * always returned, so it is not rejected. Callers that need the verified card
+ * read `result.dimension_receipt`.
  */
 export function projectDesignExportDimensions(result: unknown):
   { source: "design_export_result"; width: number; height: number; format: string; designId: string; revision: number } | null {
   const parsed = designExportResultSchema.safeParse(result);
-  return parsed.success
-    ? { source: "design_export_result", width: parsed.data.width, height: parsed.data.height,
-        format: parsed.data.format, designId: parsed.data.design_id, revision: parsed.data.revision }
-    : null;
+  if (!parsed.success) return null;
+  const receipt = parseExportDimensionReceipt(parsed.data.dimension_receipt);
+  if (parsed.data.dimension_receipt !== undefined && !receipt) return null;
+  if (receipt?.actualExportSize
+    && (receipt.actualExportSize.width !== parsed.data.width || receipt.actualExportSize.height !== parsed.data.height)) return null;
+  return { source: "design_export_result", width: parsed.data.width, height: parsed.data.height,
+    format: parsed.data.format, designId: parsed.data.design_id, revision: parsed.data.revision };
 }

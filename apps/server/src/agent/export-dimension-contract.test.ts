@@ -90,6 +90,35 @@ describe("image job dimension contract", () => {
     expect(projectDesignExportDimensions(EXPORT_RESULT)!.width).not.toBe(generation.sourcePixelWidth);
   });
 
+  it("refuses to read a size off a result whose own byte receipt disagrees with it", () => {
+    const receipt = {
+      targetSize: { width: 2_160, height: 2_160 },
+      claimedSize: null,
+      actualExportSize: { width: 640, height: 640 },
+      format: "png",
+      hasAlpha: false,
+      alphaVerdict: "absent",
+      matches: false,
+      mismatches: ["size"],
+      approximation: null,
+      pixelVerification: null,
+      authority: { target: "① user-requested frame, in pixels.", actual: ENCODED_BYTES_AUTHORITY },
+    };
+    // The receipt says 640x640 while the row says 2160x2160: the row is not a
+    // trustworthy size source, so neither number is published.
+    expect(projectDesignExportDimensions({ ...EXPORT_RESULT, dimension_receipt: receipt })).toBeNull();
+    // A receipt that agrees (or carries no verified size) does not block the read.
+    const agreeing = { ...receipt, actualExportSize: { width: 2_160, height: 2_160 }, matches: true };
+    expect(projectDesignExportDimensions({ ...EXPORT_RESULT, dimension_receipt: agreeing })).toMatchObject({
+      width: 2_160, height: 2_160,
+    });
+    expect(projectDesignExportDimensions({ ...EXPORT_RESULT,
+      dimension_receipt: { ...receipt, actualExportSize: null } })).toMatchObject({ width: 2_160, height: 2_160 });
+    // A receipt that is not a receipt at all is a corrupt row, not a missing one.
+    expect(projectDesignExportDimensions({ ...EXPORT_RESULT,
+      dimension_receipt: { targetSize: { width: 0, height: 0 } } })).toBeNull();
+  });
+
   it("names every delivery-card field the extreme-size requirement asks for", () => {
     // 目标尺寸、实际导出尺寸、文件格式、是否包含透明通道 (+ match + deviation).
     for (const field of ["targetSize", "actualExportSize", "format", "hasAlpha", "matches", "mismatches", "approximation"])

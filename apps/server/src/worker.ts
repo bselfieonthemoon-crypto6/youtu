@@ -728,6 +728,11 @@ export async function processMessage(
       "design_export_forbidden",
       "design_export_revision_missing",
       "design_export_revision_corrupt",
+      // The encoder produced bytes that do not answer the request (unreadable
+      // artifact, or a format other than the one asked for). Re-running the same
+      // deterministic render can only produce the same refusal.
+      "design_export_artifact_unverified",
+      "design_export_artifact_format_mismatch",
     ]);
     const shouldDeadLetter =
       attempt_count >= max_attempts || NON_RETRYABLE_CODES.has(errorCode);
