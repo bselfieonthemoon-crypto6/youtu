@@ -2,7 +2,7 @@
   "slug": "gpt-image-2-style-library",
   "name": "图文提示词风格参考",
   "description": "为开放设计需求或用户要求优化的生图提示，跨现有图文库检索并筛选构图、风格和场景参考；配合专业设计 Skill，不改写原样执行的节点提示或单纯改字任务。",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "category": "design",
   "iconName": "palette",
   "license": "MIT",
@@ -26,7 +26,9 @@
       "execution": "guidance",
       "composition": { "role": "reference", "stages": ["design", "reference", "prompt"] },
       "intents": ["style-reference", "prompt-library-search", "prompt-optimization"],
-      "outputKinds": ["prompt-references", "style-guidance"],
+      "outputKinds": [
+        "guidance"
+      ],
       "requiredTools": ["search_prompt_library", "get_prompt_library_entry"],
       "optionalTools": ["compose_skills", "inspect_design", "get_brand_kit"],
       "models": [{ "role": "planner", "required": true, "preferredIds": [] }],

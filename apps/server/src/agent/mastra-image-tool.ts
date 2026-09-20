@@ -25,8 +25,13 @@ import type {
   MastraImageSourceGroundingContext,
   MastraImageSourceGroundingProposal,
   MastraImageSourceGroundingResult,
+  MastraImageSourceOrigin,
+  MastraImageSourceReference,
 } from "./mastra-image-source-grounding.js";
-import { MASTRA_IMAGE_SOURCE_MAX_INPUTS } from "./mastra-image-source-grounding.js";
+import {
+  MASTRA_IMAGE_SOURCE_MAX_INPUTS,
+  createMastraImageSourceReference,
+} from "./mastra-image-source-grounding.js";
 import { bindNativeImageRatioUsage, nativeImageRatioArgs, resolveNativeImageRatio } from "./mastra-image-ratio-state.js";
 import { mastraImageExecutionPolicy, mastraImageRunLimitReceipt, validateMastraImageExecution, validateMastraImageResolutionSupport } from "./mastra-image-execution-policy.js";
 import { mastraImageSubmissionKey } from "./mastra-image-jobs.js";
@@ -37,6 +42,9 @@ export type {
   MastraImageSourceGrounder,
   MastraImageSourceGroundingProposal,
   MastraImageSourceGroundingResult,
+  MastraImageSourceReference,
+  MastraImageSourceRole,
+  MastraImageSourceOrigin,
 } from "./mastra-image-source-grounding.js";
 
 type NativeImageSubmission = MastraImageJobInput;
@@ -281,6 +289,16 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
       return refusal("image_model_constraint_invalid", "无法校验本轮图片模型选择，未提交生成。");
     let sourceAssetIds = mode === "edit" ? (raw as z.infer<typeof editImageSchema>).sourceAssetIds : [];
     const sourceUsage = mode === "edit" ? (raw as z.infer<typeof editImageSchema>).sourceUsage : undefined;
+    // Who decided the role of a reference: the request itself (`user`, the
+    // submission's own `sourceUsage`/`sourceAssetIds`) or the server (`inferred`,
+    // the grounding reviewer, the library picker, or the library appender). A
+    // source that arrives through a server picker is inferred even though the
+    // model asked for references.
+    let sourcesFromUser = sourceAssetIds.length > 0;
+    // Server-picked library assets. A reference-style edit appends its own
+    // library references next to the model's, and those additions are inferred
+    // even when every other source in the same job is user-chosen.
+    const inferredLibraryAssetIds = new Set<string>();
     const proposal = sourceAssetIds.length ? { ...raw, inputImages: sourceAssetIds, sourceUsage } : raw;
     const seriesSizes = Array.isArray(configurable.session_series_sizes)
       ? configurable.session_series_sizes.filter((value): value is string => typeof value === "string") : undefined;
@@ -294,7 +312,28 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
       skillLoaded: configurable.nonstandard_size_skill_loaded_run_id === submitContext.runId
         || configurable.nonstandard_size_skill_enabled_run_id === submitContext.runId,
       ...(seriesSizes?.length ? { seriesSizes } : {}) });
-    if (!initialRatio.ok) return refusal(initialRatio.code, initialRatio.error);
+    if (!initialRatio.ok) {
+      // An unauthorized approximation is the one ratio refusal this run cannot
+      // undo: approximation authority comes from the user's own frozen words or
+      // a size this series already recorded, and neither can change inside the
+      // run — so the output really is still missing, and the next continuation
+      // turn is told so (progress state only, exactly like the other recording
+      // sites). The other ratio codes are deliberately NOT recorded here:
+      // `image_nonstandard_size_skill_required` is resolved by reading the Skill
+      // and resubmitting in this same run, and an ambiguous ratio is a question
+      // for the user — recording either would brief the next turn to "finish"
+      // an output that was never missing.
+      if (initialRatio.code === "image_approximation_not_authorized") {
+        const proposed = proposal as Record<string, unknown>;
+        const title = typeof proposed.title === "string" ? proposed.title : "";
+        const prompt = typeof proposed.prompt === "string" ? proposed.prompt : undefined;
+        const operation = typeof proposed.operation === "string" ? proposed.operation : undefined;
+        const aspectRatio = typeof proposed.aspectRatio === "string" ? proposed.aspectRatio : undefined;
+        recordRefusedOutput(configurable, { title, ...(prompt ? { prompt } : {}),
+          ...(operation ? { operation } : {}), ...(aspectRatio ? { aspectRatio } : {}) });
+      }
+      return refusal(initialRatio.code, initialRatio.error);
+    }
     let ratioState = initialRatio.state;
     let model = resolveNativeImageModelProposal(nativeImageRatioArgs(proposal as Record<string, unknown>, ratioState), input.availableImageModels,
       constraint.success ? constraint.data : undefined);
@@ -305,6 +344,10 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
     let normalized = parseNativeImageProposal(schema, proposalArgs,
       sourceAssetIds.length && sourceUsage ? { sourceAssetIds, sourceUsage } : undefined);
     let groundedInputImages: string[] | undefined;
+    // The grounding reviewer's own edit/reference verdict. Retained so a
+    // grounded reference's role is never re-derived from the tool's default
+    // `sourceUsage` (which reads `edit` for any edit-mode call).
+    let groundedUsage: "edit" | "reference" | undefined;
     const hasUserAttachments = Object.keys(
       (configurable.user_attachment_map as Record<string, string> | undefined) ?? {}).length > 0;
     // A loaded promo Skill (for example game-promo-visuals) requires consulting
@@ -324,6 +367,8 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
         if (wellFormed) {
           sourceAssetIds = auto.sourceAssetIds;
           groundedInputImages = auto.inputImages;
+          sourcesFromUser = false;
+          for (const assetId of auto.sourceAssetIds) inferredLibraryAssetIds.add(assetId);
           ratioState = bindNativeImageRatioUsage(ratioState, "reference");
           model = resolveNativeImageModelProposal({ ...nativeImageRatioArgs(proposalArgs, ratioState), model: raw.model,
             inputImages: sourceAssetIds, sourceUsage: "reference" } as Record<string, unknown>,
@@ -372,6 +417,9 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
           return refusal("source_grounding_unavailable", "参考图来源核验结果不完整，未提交图片生成。");
         sourceAssetIds = grounding.sourceAssetIds;
         groundedInputImages = grounding.inputImages;
+        groundedUsage = grounding.usage;
+        // The server, not the request, decided these sources and their usage.
+        sourcesFromUser = false;
         // Grounding changes an independent proposal into one with real input
         // images. Re-run the catalog/manual constraint resolver against that
         // source-bound proposal before durable submission.
@@ -403,6 +451,8 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
         if (wellFormed) {
           sourceAssetIds = auto.sourceAssetIds;
           groundedInputImages = auto.inputImages;
+          sourcesFromUser = false;
+          for (const assetId of auto.sourceAssetIds) inferredLibraryAssetIds.add(assetId);
           ratioState = bindNativeImageRatioUsage(ratioState, "reference");
           model = resolveNativeImageModelProposal({ ...nativeImageRatioArgs(proposalArgs, ratioState), model: raw.model,
             inputImages: sourceAssetIds, sourceUsage: "reference" } as Record<string, unknown>,
@@ -433,6 +483,7 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
           for (const entry of additions) {
             sourceAssetIds.push(entry.assetId);
             appendedLibraryCarriers[entry.assetId] = entry.image as string;
+            inferredLibraryAssetIds.add(entry.assetId);
           }
         } catch {
           // A library lookup failure must not block the edit.
@@ -541,6 +592,33 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
         sourceAssetIds: [...sourceAssetIds] });
       return refusal(limitViolation.code, limitViolation.message);
     }
+    // What each reference image IS to this job, as structured data rather than
+    // prose anyone has to interpret. One entry per submitted carrier, in the
+    // same order, built from the ONE verdict the server already owns — the
+    // grounding reviewer's usage, or the submission's own sourceUsage for an
+    // explicit edit/reference — never from a second guess. The reviewer's
+    // "reference" verdict carries no style/content signal, so it maps to the
+    // honest `undetermined` role instead of a label the server never reached.
+    //
+    // This is carried in `sourceReferences`, which the durable submitter splits
+    // off BEFORE deriving the submission key, so it is not part of the
+    // submission identity and cannot fork a replay of an existing job. A request
+    // with no references adds no field at all.
+    const sourceReferences: MastraImageSourceReference[] = inputImages
+      ? inputImages.map((_carrier, index) => {
+          const referenceAssetId = sourceAssetIds[index];
+          // `user` only when the request itself named this asset AND the role it
+          // states still applies to the whole set; a library addition is
+          // inferred even when its neighbours are user-chosen.
+          const source: MastraImageSourceOrigin = referenceAssetId !== undefined && sourcesFromUser
+            && !inferredLibraryAssetIds.has(referenceAssetId) ? "user" : "inferred";
+          return createMastraImageSourceReference({
+            assetId: referenceAssetId!,
+            usage: sourceUsage ?? groundedUsage ?? "edit",
+            source,
+          });
+        })
+      : [];
     const submission: NativeImageSubmission = {
       operation: normalized.operation,
       title: normalized.title,
@@ -554,6 +632,12 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
       ...(normalized.background === "transparent" ? { outputFormat: "png" } : {}),
       ...(inputImages?.length ? { inputImages } : {}),
     };
+    // The role data travels BESIDE the submission, never inside it: the durable
+    // submitter strips it before it derives the submission key, so both sides
+    // hash the same reference-free request and an already-stored submission
+    // stays replayable. Putting it in `submission` would fork the key.
+    const submitted: NativeImageSubmission & { sourceReferences?: MastraImageSourceReference[] } =
+      sourceReferences.length ? { ...submission, sourceReferences } : submission;
     // Record the frame this run actually resolved. The session series persists a
     // size to authorize later renders in the same series, so it must record the
     // real output rather than a regex reading of the prompt.
@@ -604,7 +688,7 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
       if (!replay) state.inFlight++;
       let result: NativeImageSubmitResult;
       try {
-        result = await input.submitter.submit(submitContext, submission);
+        result = await input.submitter.submit(submitContext, submitted);
         if (!replay) state.accepted.add(key);
       } finally {
         if (!replay) state.inFlight--;
@@ -615,6 +699,9 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
         jobType: "image_generation" as const,
         ...(approximateSizePlan ? { approximateSizePlan } : {}),
         ...(sourceAssetIds.length ? { sourceAssetIds: groundedInputImages ? sourceAssetIds : sources?.map(source => source.assetId) } : {}),
+        // The same structured roles the job persists, so the immediate receipt
+        // names each reference's role instead of leaving it to prose.
+        ...(sourceReferences.length ? { sourceReferences } : {}),
         summary: (result.error
           ? "图片任务未完成；未自动重试或创建新任务。"
           : result.status === "succeeded"

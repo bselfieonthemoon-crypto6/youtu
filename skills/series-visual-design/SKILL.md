@@ -3,7 +3,7 @@ name: series-visual-design
 description: 规划或生成多张内容不同但身份一致的位图物料；尺寸适配不重复规划成系列，批量制作遵守张数与预算。
 metadata:
   author: loomic
-  version: "2.2.0"
+  version: "2.2.1"
 ---
 
 # 系列视觉设计

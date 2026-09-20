@@ -469,3 +469,83 @@ describe("Mastra image job submitter", () => {
     expect(createJobWithReplay).not.toHaveBeenCalled();
   });
 });
+
+describe("structured reference roles persisted with the image job", () => {
+  const targetReference = "10000000-0000-4000-8000-0000000000a1";
+  const styleReference = "10000000-0000-4000-8000-0000000000a2";
+  const sourceReferences = [
+    { assetId: targetReference, role: "edit_target" as const, certain: true, source: "user" as const },
+    { assetId: styleReference, role: "undetermined" as const, certain: false, source: "inferred" as const },
+  ];
+
+  function durableSubmitter() {
+    const database = client();
+    // The real createJobWithReplay echoes the payload it persisted, including
+    // the reserved mastra_* keys the submitter supplies.
+    const createJobWithReplay = vi.fn(async (_user: unknown, request: any) => ({
+      job: { ...queuedJob(), payload: { ...request.payload,
+        mastra_submission_key: request.mastraSubmission.key,
+        mastra_credits_cost: request.providerBilling.creditsCost,
+        mastra_pricing_version: request.providerBilling.pricingVersion } },
+      replayed: false, billingCommitted: false,
+    }));
+    const submitter = createMastraImageJobSubmitter({ createUserClient: () => database.value,
+      jobService: { assertMastraImageRun: vi.fn(async () => ({ requestMessageId: ids.message })),
+        createJobWithReplay, commitMastraImageJob: vi.fn(async () => undefined) } as unknown as JobService,
+      workspaceModelCatalogService: { resolvePublishedModel: vi.fn(async () => ({ upstreamModelId: "gpt-image-2" })) } as never });
+    return { database, createJobWithReplay, submitter };
+  }
+
+  it("persists each reference's role and whether the user or the server chose it", async () => {
+    const { database, createJobWithReplay, submitter } = durableSubmitter();
+    const references = ["data:image/png;base64,cmVmMA==", "data:image/png;base64,cmVmMQ=="];
+    const submitted = await submitter.submit(context(), { ...input(),
+      inputImages: references, sourceReferences });
+    expect(createJobWithReplay.mock.calls[0]?.[1]).toMatchObject({
+      payload: { source_references: [
+        { assetId: targetReference, role: "edit_target", certain: true, source: "user" },
+        { assetId: styleReference, role: "undetermined", certain: false, source: "inferred" },
+      ] },
+    });
+    // The same structured roles reach the immediate receipt and the queued card.
+    expect(submitted).toMatchObject({ sourceReferences });
+    expect(database.upsert.mock.calls.at(-1)?.[0]).toMatchObject({ content_blocks: [expect.objectContaining({
+      output: expect.objectContaining({ sourceReferences }),
+    })] });
+  });
+
+  it("persists no role field at all for a job with no references", async () => {
+    const { database, createJobWithReplay, submitter } = durableSubmitter();
+    const submitted = await submitter.submit(context(), input());
+    const payload = createJobWithReplay.mock.calls[0]?.[1].payload;
+    expect(payload).not.toHaveProperty("source_references");
+    expect(payload).not.toHaveProperty("input_images");
+    expect(submitted).not.toHaveProperty("sourceReferences");
+    expect(database.upsert.mock.calls.at(-1)?.[0]).toMatchObject({ content_blocks: [expect.objectContaining({
+      output: expect.not.objectContaining({ sourceReferences: expect.anything() }),
+    })] });
+  });
+
+  it("stores no role data it could not validate", async () => {
+    const { createJobWithReplay, submitter } = durableSubmitter();
+    const references = ["data:image/png;base64,cmVmMA=="];
+    // A role whose `certain` flag contradicts its own role is corrupt, so the
+    // job carries no role claim rather than an unusable one.
+    await submitter.submit(context(), { ...input(), inputImages: references,
+      sourceReferences: [{ assetId: targetReference, role: "undetermined", certain: true, source: "user" }] });
+    expect(createJobWithReplay.mock.calls[0]?.[1].payload).not.toHaveProperty("source_references");
+  });
+
+  it("stores no role data that does not match the submitted carriers", async () => {
+    const { createJobWithReplay, submitter } = durableSubmitter();
+    const references = ["data:image/png;base64,cmVmMA=="];
+    // Roles that describe a different number of images than the job carries are
+    // not usable per-reference data, so none of them is persisted.
+    await submitter.submit(context(), { ...input(), inputImages: references, sourceReferences });
+    expect(createJobWithReplay.mock.calls[0]?.[1].payload).not.toHaveProperty("source_references");
+    // A role list with no carriers at all is equally meaningless.
+    const bare = durableSubmitter();
+    await bare.submitter.submit(context(), { ...input(), sourceReferences });
+    expect(bare.createJobWithReplay.mock.calls[0]?.[1].payload).not.toHaveProperty("source_references");
+  });
+});

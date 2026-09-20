@@ -7,7 +7,7 @@ import {
   reconcileCanvasAssetReferences,
 } from "../../features/canvas/canvas-asset-references.js";
 import {
-  assertDestructiveTargetsUnchanged,
+  assertDestructiveTargetsStillCurrent,
   type DestructiveConfirmationService,
   type DestructiveProposal,
   type DestructiveTarget,
@@ -950,6 +950,11 @@ type ManipulationOptions = {
   /** Only the confirmation service's frozen execute closure sets this. */
   destructiveDeletionAuthorized?: boolean;
   expectedDestructiveTargets?: DestructiveTarget[];
+  /**
+   * Canonical content shapes of the expected targets, provided by the confirmation
+   * service so a version-only drift does not abort an authorized deletion.
+   */
+  expectedDestructiveTargetShapes?: Map<string, Record<string, unknown>>;
 };
 
 /**
@@ -1000,10 +1005,14 @@ export async function manipulateCanvasWithCas(
       options.expectedDestructiveTargets
     ) {
       // Revalidate inside every CAS attempt. This closes the gap between the
-      // confirmation service's check and the actual read-modify-write.
-      assertDestructiveTargetsUnchanged(
+      // confirmation service's check and the actual read-modify-write. The target's
+      // version counter can have moved without the object changing (the browser's
+      // canvas session re-serializes elements it merges), so the same content-
+      // fingerprint fallback the confirmation service uses applies here too.
+      assertDestructiveTargetsStillCurrent(
         content,
         options.expectedDestructiveTargets,
+        options.expectedDestructiveTargetShapes,
       );
     }
 
@@ -1041,12 +1050,22 @@ export async function manipulateCanvasWithCas(
           files: {},
         };
       };
+      // The confirmation service snapshots the delete targets and their content
+      // fingerprints together; the same target objects then travel into `execute`, so
+      // the CAS writer applies the same version-drift rule as the service.
+      const targets = options.confirmationService.targetsSnapshot(
+        content,
+        structuredClone(operations) as FrozenCanvasOperation[],
+      );
+      const destructiveTargetShapes =
+        options.confirmationService.targetShapesFor(targets);
       const confirmation = options.confirmationService.propose({
         userId: options.userId,
         canvasId,
         content,
         operations: structuredClone(operations) as FrozenCanvasOperation[],
         loadCanvas,
+        targets,
         execute: async (frozenOperations, expectedTargets) =>
           manipulateCanvasWithCas(
             client,
@@ -1056,6 +1075,9 @@ export async function manipulateCanvasWithCas(
             {
               destructiveDeletionAuthorized: true,
               expectedDestructiveTargets: expectedTargets,
+              ...(destructiveTargetShapes
+                ? { expectedDestructiveTargetShapes: destructiveTargetShapes }
+                : {}),
             },
           ),
       });

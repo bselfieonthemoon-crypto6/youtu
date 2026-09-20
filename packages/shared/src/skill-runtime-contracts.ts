@@ -2,6 +2,38 @@ import { z } from "zod";
 
 export const skillModelRoleSchema = z.enum(["planner", "vision", "image"]);
 
+/**
+ * The one declared output-kind vocabulary shared by Skill packages and the
+ * `use_skill` / `compose_skills` contract.
+ *
+ * It is three things in one list, which is why the values are the canonical
+ * names and not per-package inventions:
+ * - it is what a manifest may declare in `metadata.loomic.outputKinds`;
+ * - it is what the model may pass as `outputKind`, so the always-on
+ *   instructions can name the whole vocabulary instead of the model having to
+ *   guess a package-specific word;
+ * - it is what a refusal quotes back ("this Skill accepts …"), so a rejected
+ *   call is recoverable without a second mistake.
+ *
+ * Packages may declare several kinds because the same method can be used for
+ * different outputs (a design method both guides a plan and can lead the
+ * generation request). A `guidance` declaration on a non-`native` package is
+ * what makes it eligible to lead a downstream deliverable's method.
+ */
+export const SKILL_OUTPUT_KINDS = [
+  /** Planning, critique, sizing or method advice: no image, prompt or text artifact is produced. */
+  "guidance",
+  /** A reusable image-generation prompt. */
+  "prompt",
+  /** User-facing copy (headline, selling points, CTA). */
+  "copy",
+  /** An actual paid image generation/edit request for a raster result. */
+  "generation_request",
+  /** A mutation of the infinite canvas (placement, transparency, removal). */
+  "canvas_operation",
+] as const;
+export type SkillOutputKind = (typeof SKILL_OUTPUT_KINDS)[number];
+
 export const SKILL_COMPOSITION_ROLES = ["domain", "workflow", "reference", "prompt", "constraint"] as const;
 export const SKILL_COMPOSITION_STAGES = ["design", "reference", "prompt", "review", "delivery"] as const;
 export const skillCompositionMetadataSchema = z.object({

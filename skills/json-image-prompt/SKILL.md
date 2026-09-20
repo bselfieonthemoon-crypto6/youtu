@@ -3,7 +3,7 @@ name: json-image-prompt
 description: 为确实需要位图生成的任务整理主体、保留项、构图和素材提示；不强制 JSON 格式，也不把改字转成生图。
 metadata:
   author: loomic
-  version: "2.2.0"
+  version: "2.2.1"
 ---
 
 # 图像需求结构化

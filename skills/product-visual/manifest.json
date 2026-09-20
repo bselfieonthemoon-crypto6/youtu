@@ -2,7 +2,7 @@
   "slug": "product-visual",
   "name": "商品与产品视觉",
   "description": "规划或生成商品主图、产品场景与卖点图片，保护真实产品外形、包装和标识；不编造功效或配件。",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "category": "design",
   "iconName": "palette",
   "license": null,
@@ -19,8 +19,9 @@
         "product-preservation"
       ],
       "outputKinds": [
-        "raster-image",
-        "image-prompt"
+        "guidance",
+        "generation_request",
+        "prompt"
       ],
       "requiredTools": [
         "generate_image",

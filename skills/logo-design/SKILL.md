@@ -3,7 +3,7 @@ name: logo-design
 description: 为新 Logo、图形标记和字标规划或生成位图概念，并检查识别与小尺寸；普通海报排版不使用此技能。
 metadata:
   author: loomic
-  version: "2.2.0"
+  version: "2.2.1"
 ---
 
 # Logo 与品牌标识

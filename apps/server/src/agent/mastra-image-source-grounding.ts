@@ -63,6 +63,111 @@ export type MastraImageSourceGroundingResult =
   | { decision: "recoverable"; code: "source_grounding_ambiguous" | "source_grounding_unavailable" | "source_historical_upload_unavailable";
       summary: string; authorizationGranted: false };
 
+/**
+ * The user-facing role of one reference image attached to a task.
+ *
+ * The server has exactly ONE verdict about how a source is used — the
+ * grounding reviewer's `usage: "edit" | "reference"` — and this vocabulary is
+ * its honest projection, not a second concept:
+ *
+ * - `edit_target` is the exact statement `usage: "edit"` (the source itself is
+ *   changed).
+ * - `style_reference` / `content_reference` are the two meanings of
+ *   `usage: "reference"` (borrow the look vs. borrow the subject matter).
+ * - `undetermined` is `usage: "reference"` where nothing on the server
+ *   distinguishes those two meanings: the reviewer answers only
+ *   edit-vs-reference, the tool's `sourceUsage` argument only says
+ *   `"reference"`, and neither carries a style/content signal. Reporting a
+ *   style or content label here would invent an answer the server never
+ *   reached. The reviewer's own prose says "visually related", which spans both.
+ * - `ignored` is a source counted by the request that the server did NOT put in
+ *   the task's input images (the promo library replaced it, or server grounding
+ *   superseded it). It is never asserted for a source that was used.
+ */
+export type MastraImageSourceRole =
+  | "edit_target"
+  | "style_reference"
+  | "content_reference"
+  | "undetermined"
+  | "ignored";
+
+/** Every role value, so callers and tests enumerate the same vocabulary. */
+export const MASTRA_IMAGE_SOURCE_ROLES: readonly MastraImageSourceRole[] = Object.freeze([
+  "edit_target", "style_reference", "content_reference", "undetermined", "ignored",
+]);
+
+/**
+ * How a reference's role was decided. `user` means the request itself stated
+ * the role (the submission's own `sourceUsage`); `inferred` means the server
+ * derived it (the grounding reviewer, the server-side library picker, or the
+ * library reference appender). A user-stated role is never relabelled as
+ * inferred, and vice versa.
+ */
+export type MastraImageSourceOrigin = "user" | "inferred";
+
+/** One reference's role as structured task data — never prose to interpret. */
+export type MastraImageSourceReference = {
+  assetId: string;
+  role: MastraImageSourceRole;
+  /** Derived from {@link MastraImageSourceRole}: false only for `undetermined`. */
+  certain: boolean;
+  source: MastraImageSourceOrigin;
+};
+
+/** True only when the role is a definite statement, never for `undetermined`. */
+export function isCertainMastraImageSourceRole(role: MastraImageSourceRole): boolean {
+  return role !== "undetermined";
+}
+
+/** The one honest projection of the reviewer's `usage` verdict onto a role. */
+export function mastraImageSourceRoleFromUsage(usage: "edit" | "reference"): MastraImageSourceRole {
+  return usage === "edit" ? "edit_target" : "undetermined";
+}
+
+export function createMastraImageSourceReference(input: {
+  assetId: string;
+  usage: "edit" | "reference";
+  source: MastraImageSourceOrigin;
+}): MastraImageSourceReference {
+  const role = mastraImageSourceRoleFromUsage(input.usage);
+  return { assetId: input.assetId, role, certain: isCertainMastraImageSourceRole(role), source: input.source };
+}
+
+/** A reference the request carried but the server did not use for this job. */
+export function createIgnoredMastraImageSourceReference(input: {
+  assetId: string;
+  source: MastraImageSourceOrigin;
+}): MastraImageSourceReference {
+  return { assetId: input.assetId, role: "ignored", certain: true, source: input.source };
+}
+
+const sourceReferenceRoleSchema = z.enum(["edit_target", "style_reference", "content_reference", "undetermined", "ignored"]);
+const sourceReferenceSchema = z.object({
+  assetId: uuid,
+  role: sourceReferenceRoleSchema,
+  certain: z.boolean(),
+  source: z.enum(["user", "inferred"]),
+}).strict();
+
+/**
+ * Validate a persisted `source_references` payload. A job with no references has
+ * no such field, so absence and `[]` both parse to `undefined` — an empty array
+ * must never be persisted or reported as if it claimed roles. The cap allows the
+ * submitted carriers plus `ignored` references beside them.
+ */
+export function parseMastraImageSourceReferences(value: unknown): MastraImageSourceReference[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value) || value.length === 0
+    || value.length > MASTRA_IMAGE_SOURCE_MAX_INPUTS * 2) return undefined;
+  const parsed = z.array(sourceReferenceSchema).safeParse(value);
+  if (!parsed.success) return undefined;
+  if (new Set(parsed.data.map(reference => reference.assetId)).size !== parsed.data.length) return undefined;
+  // `certain` is derived from `role`, so a persisted row that disagrees with the
+  // derivation is corrupt data, not an alternative reading.
+  if (parsed.data.some(reference => reference.certain !== isCertainMastraImageSourceRole(reference.role))) return undefined;
+  return parsed.data;
+}
+
 export type MastraImageSourceGroundingContext = {
   userId: string;
   accessToken: string;

@@ -122,7 +122,7 @@ describe("adaptAgentStream tool results", () => {
       name: `skill-${index}`, displayName: `技能 ${index}`,
       description: "为确实需要位图生成的任务整理主体、保留项、构图和素材提示；不强制 JSON 格式。".repeat(3),
       version: "2.2.0", contentHash: "a".repeat(64),
-      runtime: { outputKinds: ["raster-image", "image-prompt"], instructions: "x".repeat(400) },
+      runtime: { outputKinds: ["generation_request", "prompt"], instructions: "x".repeat(400) },
     }));
     const result = await collect(events([
       { event: "on_tool_end", name: "list_skills", run_id: "call-skills",

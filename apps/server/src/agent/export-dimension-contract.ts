@@ -1,4 +1,5 @@
 import { designExportResultSchema } from "@loomic/shared";
+import { z } from "zod";
 
 /**
  * The FOUR sizes of "one image", and which layer is allowed to state which.
@@ -57,6 +58,124 @@ export const CANVAS_FRAME_AUTHORITY =
 
 /** The one sentence that keeps the four apart on a job receipt. */
 export const JOB_RECEIPT_SIZE_NOTE = `Sizes at a glance: image_requested_frame = ① what the user asked for (authenticated submission: aspect ratio + resolution tier, not pixels, surfaced here as requestedFrame); image_source_pixels = ② the AI image's real pixel size, returned by this job and authoritative (sourcePixelWidth/sourcePixelHeight); image_canvas_frame = ③ the display frame of THIS canvas element (the join key is canvasElementId) — a frame, never the image's pixels; image_export_size = ④ not produced by this job. ${EXPORT_SIZE_AUTHORITY}`;
+
+/**
+ * ④ EXPORT, EXACT-SIZE VARIANT — the extreme-target case the four-size contract
+ * above did not yet cover.
+ *
+ * The contract above keeps four sizes apart. It does not answer the other half
+ * of the same question: when the user names an exact pixel frame the provider
+ * cannot emit (320×70), the artifact that is DELIVERED is composed locally at
+ * that exact size, and every size on the delivery card has to be a size that
+ * was actually observed. On that shape:
+ *
+ * - `target` is ① — the user's requested frame, in pixels, exactly as asked.
+ * - `actual` is ④ — and it is NOT the canvas frame, the source pixels, nor the
+ *   composed input size. It is read back from the ENCODED deliverable bytes
+ *   (see {@link ENCODED_BYTES_AUTHORITY}); the byte-verified dimensions are the
+ *   only ones a delivery card may print as "实际导出尺寸".
+ * - `matches` is the answer to "did we deliver what was asked", and it is
+ *   `false` whenever the byte-verified size differs from the target, or when
+ *   the caller's claim about the artifact disagrees with its own bytes.
+ * - `approximation` is the only place a ratio deviation may be stated, and it
+ *   exists only when the generated source was NOT at the target ratio.
+ *
+ * The one thing this file must never do is accept a composed or planned size as
+ * evidence of the exported pixels: a program canvas can be built at 320×70 and
+ * still encode a different size (resize-on-write, a provider re-encode, a
+ * mis-set option). Only the encoded bytes settle it.
+ */
+export const ENCODED_BYTES_AUTHORITY =
+  "实际导出尺寸只能来自交付文件自身的编码字节：读取 PNG IHDR / JPEG SOFn 等文件头得到真实像素、格式与是否存在带真实透明的 alpha 通道。程序画布的目标尺寸、生成原图像素、画布显示框和调用方传入的任何数字都不是导出像素的证据；本文件中的 actual 字段必须由读回的字节填充，二者不一致时 matches=false，并如实报告，不得把计划尺寸或缩放后的画布尺寸当作最终像素。";
+
+/** Which layer observed one size in a receipt. Every size must name its own. */
+export const exportDimensionSourceAuthority = {
+  target: "① 用户要求尺寸：本轮请求原话/界面给出的目标帧，是目标而不是任何已产出像素。",
+  claim: "调用方（任务回执、画布或模型）声称的该产物尺寸；claim 与字节不一致本身就是需要报告的证据。",
+  actual: ENCODED_BYTES_AUTHORITY,
+} as const;
+
+/** Formats a deliverable can be read back as; anything else is not a receipt format. */
+export const exportDeliverableFormats = ["png", "jpeg"] as const;
+export const exportDeliverableFormatSchema = z.enum(exportDeliverableFormats);
+export type ExportDeliverableFormat = z.infer<typeof exportDeliverableFormatSchema>;
+
+const pixelSizeSchema = z.object({
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
+}).strict();
+
+/**
+ * How an alpha channel was judged, on the delivery card.
+ *
+ * `absent` and `opaque` are only claimed for bytes that CANNOT carry alpha
+ * (JPEG has three channels by definition). `unknown` is refused for PNG: a PNG
+ * either has an alpha channel and then its pixels decide `present`/`opaque`, or
+ * it has none at all.
+ */
+export const alphaChannelVerdictSchema = z.enum(["present", "opaque", "absent", "unknown"]);
+export type AlphaChannelVerdict = z.infer<typeof alphaChannelVerdictSchema>;
+
+/** The measured evidence behind one export dimension receipt. */
+export const pixelVerificationEvidenceSchema = z.object({
+  source: z.literal("encoded_bytes"),
+  format: exportDeliverableFormatSchema,
+  actualSize: pixelSizeSchema,
+  alpha: z.object({
+    channel: z.boolean(),
+    verdict: alphaChannelVerdictSchema,
+    /** Lowest alpha sample in the decoded artifact, 0–255; null when there is no alpha channel. */
+    minAlpha: z.number().int().min(0).max(255).nullable(),
+    /** True only for `present`: an alpha channel with at least one non-opaque pixel. */
+    realTransparency: z.boolean(),
+  }).strict(),
+  /** Cross-check evidence: the same bytes parsed independently by two readers. */
+  decodedSize: pixelSizeSchema.nullable(),
+  headerSize: pixelSizeSchema.nullable(),
+}).strict();
+export type PixelVerificationEvidence = z.infer<typeof pixelVerificationEvidenceSchema>;
+
+/** Which native (legal-ratio) frame the composition actually used. */
+export const exportApproximationEvidenceSchema = z.object({
+  requestedRatio: z.string().min(1),
+  nativeRatio: z.string().min(1),
+  /** Signed deviation of the native ratio from the requested ratio, as a fraction. */
+  ratioDeviation: z.number().finite(),
+}).strict();
+export type ExportApproximationEvidence = z.infer<typeof exportApproximationEvidenceSchema>;
+
+/**
+ * One delivery card's size block: target, actual export size, format, alpha,
+ * whether they match, and the ratio deviation when an approximation was used.
+ *
+ * `actualExportSize` is `null` when nothing has been verified yet (no bytes to
+ * read); it is never filled with the target, the claim, or the composed size.
+ */
+export const exportDimensionReceiptSchema = z.object({
+  targetSize: pixelSizeSchema,
+  claimedSize: pixelSizeSchema.nullable(),
+  actualExportSize: pixelSizeSchema.nullable(),
+  format: exportDeliverableFormatSchema.nullable(),
+  hasAlpha: z.boolean().nullable(),
+  alphaVerdict: alphaChannelVerdictSchema.nullable(),
+  matches: z.boolean(),
+  /** Why not, when `matches` is false: named, not a prose guess. */
+  mismatches: z.array(z.enum(["size", "format", "alpha", "unverified"])),
+  approximation: exportApproximationEvidenceSchema.nullable(),
+  pixelVerification: pixelVerificationEvidenceSchema.nullable(),
+  authority: z.object({
+    target: z.string().min(1),
+    actual: z.string().min(1),
+  }).strict(),
+}).strict();
+export type ExportDimensionReceipt = z.infer<typeof exportDimensionReceiptSchema>;
+
+/**
+ * The sizes a delivery card must name, and where each one comes from. Kept next
+ * to the schema so a card cannot print "尺寸" and mean three different numbers.
+ */
+export const EXPORT_DIMENSION_CARD_NOTE =
+  `交付卡片尺寸字段：targetSize=①用户目标尺寸；actualExportSize=④实际导出尺寸（${ENCODED_BYTES_AUTHORITY}）；format=读回的文件格式；hasAlpha=是否存在带真实透明的 alpha 通道；matches=实际是否等于目标；mismatches=不相符的具体原因；approximation.ratioDeviation=使用近似原生比例时的比例偏差。目标尺寸、画布显示尺寸、生成原图像素与放大参照都不是实际导出尺寸。`;
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)

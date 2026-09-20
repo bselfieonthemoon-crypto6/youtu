@@ -5,7 +5,7 @@ import type { MastraImageSubmitContext } from "./mastra-image-tool.js";
 import { createMastraImageEditTool, createMastraImageTool, createMastraImageTools } from "./mastra-image-tool.js";
 import { createMastraImageSourceGrounder } from "./mastra-image-source-grounding.js";
 import type { MastraImageSourceReviewer } from "./mastra-image-source-grounding.js";
-import { MastraImagePreflightError } from "./mastra-image-jobs.js";
+import { MastraImagePreflightError, mastraImageSubmissionKey } from "./mastra-image-jobs.js";
 import { SESSION_REFUSED_OUTPUTS_KEY, SESSION_UNFINISHED_MAX_ITEMS } from "./session-design-context.js";
 import { toolExecutionContext } from "./tools/tool-run-context.js";
 import type { AgentToolExecutionContext } from "./tools/tool-run-context.js";
@@ -62,6 +62,8 @@ type DirectImageToolResult = {
   approximateSizePlan?: { target: { width: number; height: number }; aspectRatio: string };
   limit?: number;
   summary?: string;
+  /** Per-reference role data the tool both submits and returns. */
+  sourceReferences?: Array<{ assetId: string; role: string; certain: boolean; source: string }>;
   /** Present exactly when the request was refused before any submission attempt. */
   refused?: boolean;
 };
@@ -92,6 +94,10 @@ function fixture(options: {
     creditsCost: 0, pricingVersion: "credits-v1",
     actualQuality: (_input.quality === "ultra" ? "High" : _input.quality === "hd" ? "Medium" : "Low") as "High" | "Medium" | "Low",
     actualResolution: (_input.resolution ?? "1k").toUpperCase() as "1K" | "2K" | "4K",
+    // The real submitter echoes the structured reference roles back from the
+    // persisted receipt; the stub does the same so the tool's own result is
+    // asserted against the same data.
+    ...(_input.sourceReferences ? { sourceReferences: _input.sourceReferences } : {}),
   }));
   const deps = { createUserClient: vi.fn(), submitter: { submit }, availableImageModels: options.availableImageModels ?? models,
     currentUserMessage: { runId: "run", text: options.currentUserText ?? "制作横幅" },
@@ -937,5 +943,146 @@ describe("unfinished work recorded for the next continuation turn", () => {
     expect(f.submit).not.toHaveBeenCalled();
     // Progress state only: recording a missing output is never a design write.
     expect(configurable.session_design_write_run_id).toBeUndefined();
+  });
+
+  it("records an unauthorized approximation refusal, which this run cannot turn into an authorization", async () => {
+    // The reproduced 320×70 case: nothing was submitted and nothing was charged,
+    // and the authority the gate wants ("用户明确接受近似" / a recorded series
+    // size) comes from the user's own frozen words, so no later call in THIS run
+    // can authorize the ratio it just refused. The output is genuinely missing.
+    const configurable: Record<string, unknown> = { ...baseConfig.configurable,
+      user_prompt: "制作横幅", image_generation_aspect_ratio: "auto" };
+    const f = fixture({ currentUserText: "制作横幅" });
+    expect(await f.generate.execute({ title: "横幅 320×70", prompt: "banner 320x70",
+      aspectRatio: "3:1", aspectRatioIntent: "approximate" },
+    toolExecutionContext({ ...baseConfig, configurable })))
+      .toMatchObject({ status: "failed", error: "image_approximation_not_authorized", refused: true });
+    expect(f.submit).not.toHaveBeenCalled();
+
+    const recorded = configurable[SESSION_REFUSED_OUTPUTS_KEY] as Array<{ title: string; prompt: string; operation: string; aspectRatio: string }>;
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]).toMatchObject({ title: "横幅 320×70", prompt: "banner 320x70",
+      operation: "generate", aspectRatio: "3:1" });
+    // Progress state only: still never a design write.
+    expect(configurable.session_design_write_run_id).toBeUndefined();
+  });
+
+  it("records nothing for the ratio refusals this same run can still resolve", async () => {
+    // A non-standard frame only needs its Skill read, which this run can do
+    // before resubmitting, and an ambiguous ratio is a question for the user.
+    // Recording either would brief the next turn to finish an output that was
+    // never missing — a new untruth in place of the one this change removes.
+    const skillConfigurable: Record<string, unknown> = { ...baseConfig.configurable,
+      user_prompt: "把这张图改成 658×176", image_generation_aspect_ratio: "auto" };
+    const skill = fixture({ currentUserText: "把这张图改成 658×176" });
+    expect(await skill.generate.execute({ title: "横幅", prompt: "banner" },
+      toolExecutionContext({ ...baseConfig, configurable: skillConfigurable })))
+      .toMatchObject({ status: "failed", error: "image_nonstandard_size_skill_required", refused: true });
+    expect(skillConfigurable[SESSION_REFUSED_OUTPUTS_KEY]).toBeUndefined();
+
+    const ambiguousConfigurable: Record<string, unknown> = { ...baseConfig.configurable,
+      user_prompt: "生成一张1:1和一张16:9的宣传图", image_generation_aspect_ratio: "auto" };
+    const ambiguous = fixture({ currentUserText: "生成一张1:1和一张16:9的宣传图" });
+    expect(await ambiguous.generate.execute({ title: "宣传图", prompt: "brand" },
+      toolExecutionContext({ ...baseConfig, configurable: ambiguousConfigurable })))
+      .toMatchObject({ status: "failed", error: "image_aspect_ratio_ambiguous", refused: true });
+    expect(ambiguousConfigurable[SESSION_REFUSED_OUTPUTS_KEY]).toBeUndefined();
+  });
+});
+
+describe("structured reference roles on the submitted job", () => {
+  it("marks a user-named source as a user-chosen edit target", async () => {
+    const bytes = await sharp({ create: { width: 30, height: 40, channels: 3, background: "white" } }).png().toBuffer();
+    const source = `data:image/png;base64,${bytes.toString("base64")}`;
+    const f = fixture();
+    const result = await f.edit.execute({ title: "改色", prompt: "把主体改成蓝色",
+      sourceAssetIds: [assetId], sourceUsage: "edit" }, toolExecutionContext({
+      ...baseConfig, configurable: { ...baseConfig.configurable, user_attachment_map: { [assetId]: source } } }));
+    expect(result.status).toBe("processing");
+    expect(f.submit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      sourceReferences: [{ assetId, role: "edit_target", certain: true, source: "user" }],
+    }));
+    // The same data reaches the caller, so the receipt is not prose either.
+    expect(result.sourceReferences).toEqual([{ assetId, role: "edit_target", certain: true, source: "user" }]);
+  });
+
+  it("reports a user-named reference as undetermined instead of guessing style or content", async () => {
+    const bytes = await sharp({ create: { width: 30, height: 40, channels: 3, background: "white" } }).png().toBuffer();
+    const source = `data:image/png;base64,${bytes.toString("base64")}`;
+    const f = fixture();
+    const result = await f.edit.execute({ title: "同系列图", prompt: "保持视觉风格",
+      sourceAssetIds: [assetId], sourceUsage: "reference" }, toolExecutionContext({
+      ...baseConfig, configurable: { ...baseConfig.configurable, user_attachment_map: { [assetId]: source } } }));
+    expect(result.status).toBe("processing");
+    expect(f.submit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      sourceReferences: [{ assetId, role: "undetermined", certain: false, source: "user" }],
+    }));
+    expect(result.sourceReferences).toEqual([{ assetId, role: "undetermined", certain: false, source: "user" }]);
+  });
+
+  it("marks a server-grounded source and the reviewer's own verdict as inferred", async () => {
+    const bytes = await sharp({ create: { width: 20, height: 20, channels: 3, background: "green" } }).png().toBuffer();
+    const source = `data:image/png;base64,${bytes.toString("base64")}`;
+    const groundSources = vi.fn(async () => ({ decision: "bind" as const, usage: "reference" as const,
+      sourceAssetIds: [assetId], inputImages: [source], authorizationGranted: false as const }));
+    const f = fixture({ groundSources: groundSources as never });
+    const result = await f.generate.execute({ title: "Banner", prompt: "brand poster" }, toolExecutionContext(baseConfig));
+    expect(result.status).toBe("processing");
+    expect(f.submit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      sourceReferences: [{ assetId, role: "undetermined", certain: false, source: "inferred" }],
+    }));
+    // A grounded `edit` verdict is an edit target the request never stated.
+    const edits = fixture({ groundSources: (async () => ({ decision: "bind" as const, usage: "edit" as const,
+      sourceAssetIds: [assetId], inputImages: [source], authorizationGranted: false as const })) as never });
+    await edits.generate.execute({ title: "Banner", prompt: "modify it" }, toolExecutionContext(baseConfig));
+    expect(edits.submit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      sourceReferences: [{ assetId, role: "edit_target", certain: true, source: "inferred" }],
+    }));
+  });
+
+  it("marks each reference exactly once: user-chosen edit targets beside an inferred library addition", async () => {
+    const bytes = await sharp({ create: { width: 20, height: 20, channels: 3, background: "blue" } }).png().toBuffer();
+    const source = `data:image/png;base64,${bytes.toString("base64")}`;
+    const autoLibrarySources = vi.fn(async () => ({ sourceAssetIds: [objectId], inputImages: [source] }));
+    const f = fixture({ autoLibrarySources });
+    await expect(f.edit.execute({ title: "Restyle", prompt: "change to ocean style", model: "workspace:selected",
+      sourceAssetIds: [assetId], sourceUsage: "reference" }, toolExecutionContext({
+      ...baseConfig, configurable: { ...baseConfig.configurable, promo_library_auto_run_id: "run",
+        user_attachment_map: { [assetId]: source } } }))).resolves.toMatchObject({ status: "processing" });
+    const submitted = f.submit.mock.calls[0]![1] as { sourceReferences: Array<{ assetId: string }> };
+    expect(submitted.sourceReferences).toEqual([
+      { assetId, role: "undetermined", certain: false, source: "user" },
+      { assetId: objectId, role: "undetermined", certain: false, source: "inferred" },
+    ]);
+  });
+
+  it("carries no role field at all when the request has no references", async () => {
+    const f = fixture();
+    const result = await f.generate.execute({ title: "Poster", prompt: "an independent poster" },
+      toolExecutionContext(baseConfig));
+    expect(result.status).toBe("processing");
+    expect(f.submit).toHaveBeenCalledOnce();
+    // Not an empty list and not an empty object: the job claims no roles.
+    expect(f.submit.mock.calls[0]![1]).not.toHaveProperty("sourceReferences");
+    expect(result).not.toHaveProperty("sourceReferences");
+  });
+
+  it("keeps the role data out of the submission identity", async () => {
+    const bytes = await sharp({ create: { width: 30, height: 40, channels: 3, background: "white" } }).png().toBuffer();
+    const source = `data:image/png;base64,${bytes.toString("base64")}`;
+    const f = fixture();
+    const result = await f.edit.execute({ title: "改色", prompt: "把主体改成蓝色",
+      sourceAssetIds: [assetId], sourceUsage: "edit" }, toolExecutionContext({
+      ...baseConfig, configurable: { ...baseConfig.configurable, user_attachment_map: { [assetId]: source } } }));
+    expect(result.status).toBe("processing");
+    const submitted = f.submit.mock.calls[0]![1] as Record<string, unknown>;
+    const request = { ...submitted };
+    delete request.sourceReferences;
+    // The server hashes exactly this reference-free request on both sides, so
+    // carrying role data can never make an already-stored submission look like
+    // a different one (which would fork the durable identity and replay).
+    expect(mastraImageSubmissionKey("run", request as never)).toBe(mastraImageSubmissionKey("run", { ...request } as never));
+    expect(submitted.sourceReferences).toHaveLength(1);
+    expect(request).not.toHaveProperty("sourceReferences");
   });
 });

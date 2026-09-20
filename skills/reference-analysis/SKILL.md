@@ -3,7 +3,7 @@ name: reference-analysis
 description: 从实际参考图提取构图、色彩角色、字体层级和素材关系；只分析不生成，不凭 URL 编造细节。
 metadata:
   author: loomic
-  version: "2.1.0"
+  version: "2.1.1"
 ---
 
 # 参考图分析

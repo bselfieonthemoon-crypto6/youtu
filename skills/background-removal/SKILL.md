@@ -3,7 +3,7 @@ name: background-removal
 description: 将已有图片编辑为透明背景 PNG，或生成透明素材；区分图片透明处理与画板透明导出。
 metadata:
   author: loomic
-  version: "2.2.0"
+  version: "2.2.1"
 ---
 
 # 背景去除与透明素材

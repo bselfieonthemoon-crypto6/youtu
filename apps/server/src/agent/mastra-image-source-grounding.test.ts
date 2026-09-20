@@ -28,11 +28,16 @@ vi.mock("../security/safe-provider-fetch.js", () => ({
 import {
   buildMastraImageSourceCandidates,
   buildMastraImageSourceEffectiveBrief,
+  createIgnoredMastraImageSourceReference,
   createMastraExplicitImageSourceResolver,
   createMastraImageSourceGrounder,
   createMastraImageSourceMaterializer,
+  createMastraImageSourceReference,
   createMastraImageSourceReviewer,
+  isCertainMastraImageSourceRole,
   mastraImageSourceReviewSchema,
+  mastraImageSourceRoleFromUsage,
+  parseMastraImageSourceReferences,
   type MastraImageSourceCandidate,
   type MastraImageSourceReviewer,
 } from "./mastra-image-source-grounding.js";
@@ -411,5 +416,71 @@ describe("Mastra grounded source authorization", () => {
       ["created_by", context.userId], ["workspace_id", context.workspaceId], ["session_id", context.sessionId],
     ]));
     expect(resolveAttachment).not.toHaveBeenCalled();
+  });
+});
+
+describe("Mastra image source reference roles", () => {
+  it("maps the reviewer's edit verdict to edit_target and nothing else", () => {
+    expect(mastraImageSourceRoleFromUsage("edit")).toBe("edit_target");
+    expect(createMastraImageSourceReference({ assetId, usage: "edit", source: "inferred" }))
+      .toEqual({ assetId, role: "edit_target", certain: true, source: "inferred" });
+  });
+
+  it("never guesses style or content from a bare reference verdict", () => {
+    // The reviewer answers exactly one question — does the request require an
+    // existing image, and does it change that image or merely relate to it —
+    // and the tool's `sourceUsage` argument only says "reference". Neither
+    // carries a style-vs-content signal, so the honest role is undetermined;
+    // emitting "style_reference" or "content_reference" here would invent an
+    // answer the server never reached.
+    const role = mastraImageSourceRoleFromUsage("reference");
+    expect(role).toBe("undetermined");
+    expect(role).not.toBe("style_reference");
+    expect(role).not.toBe("content_reference");
+    expect(createMastraImageSourceReference({ assetId, usage: "reference", source: "user" }))
+      .toEqual({ assetId, role: "undetermined", certain: false, source: "user" });
+    expect(isCertainMastraImageSourceRole("undetermined")).toBe(false);
+    expect(isCertainMastraImageSourceRole("edit_target")).toBe(true);
+    expect(isCertainMastraImageSourceRole("style_reference")).toBe(true);
+    expect(isCertainMastraImageSourceRole("content_reference")).toBe(true);
+    expect(isCertainMastraImageSourceRole("ignored")).toBe(true);
+  });
+
+  it("keeps a user-stated role distinguishable from a server-inferred one", () => {
+    const user = createMastraImageSourceReference({ assetId, usage: "edit", source: "user" });
+    const inferred = createMastraImageSourceReference({ assetId, usage: "edit", source: "inferred" });
+    expect(user.role).toBe(inferred.role);
+    expect(user.source).toBe("user");
+    expect(inferred.source).toBe("inferred");
+    expect(user).not.toEqual(inferred);
+  });
+
+  it("marks a reference the request carried but the server did not use as ignored", () => {
+    expect(createIgnoredMastraImageSourceReference({ assetId, source: "user" }))
+      .toEqual({ assetId, role: "ignored", certain: true, source: "user" });
+  });
+
+  it("reports no references at all for a request that has none", () => {
+    // Absence and an empty list both mean "this job claims no reference roles";
+    // neither may become an empty object or an empty list on the job.
+    expect(parseMastraImageSourceReferences(undefined)).toBeUndefined();
+    expect(parseMastraImageSourceReferences(null)).toBeUndefined();
+    expect(parseMastraImageSourceReferences([])).toBeUndefined();
+  });
+
+  it("accepts only well-formed persisted roles and rejects corrupt ones", () => {
+    const references = [createMastraImageSourceReference({ assetId, usage: "edit", source: "user" })];
+    expect(parseMastraImageSourceReferences(references)).toEqual(references);
+    // `certain` is derived from `role`; a row that contradicts the derivation
+    // is corrupt data, not an alternative reading.
+    expect(parseMastraImageSourceReferences([{ assetId, role: "undetermined", certain: true, source: "user" }]))
+      .toBeUndefined();
+    expect(parseMastraImageSourceReferences([{ assetId, role: "edit_target", source: "user" }])).toBeUndefined();
+    expect(parseMastraImageSourceReferences([{ assetId, role: "edit_target", certain: true, source: "model" }]))
+      .toBeUndefined();
+    expect(parseMastraImageSourceReferences([{ assetId: "not-a-uuid", role: "edit_target", certain: true, source: "user" }]))
+      .toBeUndefined();
+    const duplicate = createMastraImageSourceReference({ assetId, usage: "edit", source: "user" });
+    expect(parseMastraImageSourceReferences([duplicate, duplicate])).toBeUndefined();
   });
 });

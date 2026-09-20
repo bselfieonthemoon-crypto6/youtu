@@ -3,7 +3,7 @@ name: product-visual
 description: 规划或生成商品主图、产品场景与卖点图片，保护真实产品外形、包装和标识；不编造功效或配件。
 metadata:
   author: loomic
-  version: "2.2.0"
+  version: "2.2.1"
 ---
 
 # 商品与产品视觉

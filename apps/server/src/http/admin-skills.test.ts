@@ -20,7 +20,7 @@ const preview: AdminSkillPreview = {
 
 const catalogEntry = {
   id: SKILL, slug: "logo-design", name: "Logo 与品牌标识", displayName: null, category: "design",
-  source: "system", version: "2.2.0", iconName: "shapes", outputKinds: ["raster-image"],
+  source: "system", version: "2.2.0", iconName: "shapes", outputKinds: ["generation_request"],
   enabledWorkspaces: 32, installCount: 32, previewCount: 1, publishedPreviewCount: 0, hasPublishedCover: false,
 };
 

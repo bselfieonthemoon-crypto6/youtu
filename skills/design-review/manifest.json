@@ -2,7 +2,7 @@
   "slug": "design-review",
   "name": "设计评审",
   "description": "对现有设计做有证据的版式、文字、品牌与用途评审；只点评不写入，简单改字不强制全面评审。",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "category": "design",
   "iconName": "palette",
   "license": null,
@@ -31,7 +31,7 @@
         "quality"
       ],
       "outputKinds": [
-        "design-review"
+        "guidance"
       ],
       "requiredTools": [],
       "optionalTools": [

@@ -26,7 +26,7 @@ describe("bundled raster skills match the Mastra image catalog", () => {
     const { manifest, content } = await packageFor(slug);
     const meta = manifest.metadata.loomic;
     expect(meta.execution).toBe("image");
-    expect(meta.outputKinds).toContain("raster-image");
+    expect(meta.outputKinds).toContain("generation_request");
     expect(meta.requiredTools).toEqual(["generate_image", "edit_image"]);
     expect(meta.optionalTools).not.toContain("confirm_image_generation");
     expect(meta.optionalTools).not.toContain("get_image_proposal");

@@ -16,6 +16,7 @@ import type {
   ToolBlock,
 } from "@loomic/shared";
 import type { AgentRunService, RoutedRunCreateRequest } from "../agent/runtime.js";
+import { appendImageRefusalCorrection } from "../agent/mastra-refusal-notice.js";
 import type { RetryableReadToolExecutor } from "../agent/tools/read-tool-registry.js";
 import type { DestructiveConfirmationService } from "../features/agent-actions/destructive-confirmation-service.js";
 import type { AgentRunMetadataService } from "../features/agent-runs/agent-run-service.js";
@@ -1310,6 +1311,35 @@ async function handleRunCommand(
           },
         );
         log.lap("assistant_message_persisted", { runId });
+        // A run whose image submission was refused before contact but whose
+        // closing text promises that it is under way just wrote a false last
+        // line. The refusal receipt is right here in this run's blocks, so the
+        // server — not the model — restores the truth: the correction is
+        // APPENDED after the message above (rewriting it in place would keep its
+        // original position, the trap `appendSettledNotice` documents) under a
+        // run-derived id, so a replay cannot append it twice.
+        try {
+          const corrected = await appendImageRefusalCorrection({
+            runId,
+            contentBlocks: assistantBlocks,
+            append: message =>
+              services.chatService!.createMessage(
+                authenticatedUser,
+                payload.sessionId,
+                message,
+              ),
+          });
+          if (corrected) log.lap("refusal_correction_appended", { runId });
+        } catch (correctionError) {
+          // Never fail the run's own persistence because the correction failed.
+          log.warn("refusal_correction_failed", {
+            runId,
+            error:
+              correctionError instanceof Error
+                ? correctionError.message
+                : String(correctionError),
+          });
+        }
       } catch (err) {
         log.warn("assistant_message_persist_failed", {
           runId,

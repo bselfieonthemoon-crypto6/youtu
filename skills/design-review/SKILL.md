@@ -3,7 +3,7 @@ name: design-review
 description: 对现有设计做有证据的版式、文字、品牌与用途评审；只点评不写入，简单改字不强制全面评审。
 metadata:
   author: loomic
-  version: "2.1.0"
+  version: "2.1.1"
 ---
 
 # 设计评审

@@ -96,13 +96,18 @@ describe("explicit skill usage evidence", () => {
     expect(await compose.execute({ deliverable: "Logo", stage: "design", primary: "disabled-logo", helpers: [] }, toolExecutionContext({})))
       .toMatchObject({ status: "conflict", code: "skill_not_enabled" });
   });
-  it("rejects a declared output mismatch without keyword routing", async () => {
+  it("rejects a declared output mismatch and names the kinds the skill accepts", async () => {
     const native = { ...entry, metadata: { loomic: { schemaVersion: 1, execution: "native", intents: ["anything"],
-      outputKinds: ["native-design"], requiredTools: [], optionalTools: [], models: [], limitations: [], examples: [], sources: [],
+      outputKinds: ["canvas_operation"], requiredTools: ["manipulate_canvas"], optionalTools: [], models: [], limitations: [], examples: [], sources: [],
       composition: { role: "domain", stages: ["design"] } } } };
     const [, use] = skillTools([native]);
-    expect(await use.execute({ name: native.name, deliverable: "Untitled", stage: "design", outputKind: "raster-image" }, toolExecutionContext({})))
-      .toMatchObject({ status: "conflict", code: "skill_output_kind_conflict", activated: false });
+    const refused = await use.execute({ name: native.name, deliverable: "Untitled", stage: "design", outputKind: "generation_request" }, toolExecutionContext({}));
+    expect(refused).toMatchObject({ status: "conflict", code: "skill_output_kind_conflict", activated: false,
+      acceptedOutputKinds: ["canvas_operation"] });
+    // The refusal is the model's only feedback, so it must quote the vocabulary
+    // this skill accepts instead of leaving the model to guess again.
+    expect((refused as { message: string }).message).toContain("canvas_operation");
+    expect((refused as { message: string }).message).toContain("generation_request");
   });
   it("keeps undeclared custom guides usable individually without guessing composition roles", async () => {
     const [list, use, compose] = skillTools([entry]);

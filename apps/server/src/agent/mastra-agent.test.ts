@@ -95,7 +95,7 @@ describe("Mastra real SDK stream bridge (synthetic transport, not provider E2E)"
     const toolkit = createMastraToolkit({ workspaceSkills: [{
       name: "nonstandard-image-size", path: "/workspace-skills/nonstandard-image-size/SKILL.md",
       description: "Approximate native size", content: "FULL CURRENT GUIDE", files: [], version: "1.1.0",
-      metadata: { loomic: { schemaVersion: 1, execution: "image", intents: ["sizing"], outputKinds: ["raster-image"],
+      metadata: { loomic: { schemaVersion: 1, execution: "image", intents: ["sizing"], outputKinds: ["generation_request"],
         requiredTools: [], optionalTools: [], models: [], limitations: [], examples: [], sources: [],
         composition: { role: "workflow", stages: ["design"] } } },
     }] });

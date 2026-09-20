@@ -3,7 +3,7 @@ name: social-carousel
 description: 规划或生成按阅读顺序排列的社交轮播图片，统一视觉身份并逐页核对文案；普通单张海报不扩成系列。
 metadata:
   author: loomic
-  version: "2.2.0"
+  version: "2.2.1"
 ---
 
 # 社交轮播图

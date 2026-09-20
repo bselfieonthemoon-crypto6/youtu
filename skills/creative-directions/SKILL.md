@@ -3,7 +3,7 @@ name: creative-directions
 description: 为开放式设计比较不同概念和视觉组织，解释取舍；已有方向或局部纠正不重新发散。
 metadata:
   author: loomic
-  version: "2.1.0"
+  version: "2.1.1"
 ---
 
 # 创意方向探索

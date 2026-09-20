@@ -1378,6 +1378,9 @@ function ConfirmationCard({
 
   return (
     <div
+      // Stable identity hook for browser acceptance probes: a transcript can hold many
+      // confirmation cards, so "the last card on screen" is not a deterministic target.
+      data-confirmation-id={confirmation.confirmationId}
       className={`rounded-xl border p-3 ${
         isImageGeneration || isDesignConfirmation
           ? "border-amber-300 bg-amber-50 text-amber-950"

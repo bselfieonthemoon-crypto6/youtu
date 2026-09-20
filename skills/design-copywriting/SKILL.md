@@ -3,7 +3,7 @@ name: design-copywriting
 description: 把用户提供的品牌和产品事实组织为标题、卖点与行动引导；排版任务不擅自改定稿。
 metadata:
   author: loomic
-  version: "2.1.0"
+  version: "2.1.1"
 ---
 
 # 设计文案

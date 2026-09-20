@@ -15,6 +15,8 @@ import type { WorkspaceModelCatalogService } from "../features/providers/workspa
 import type { AuthenticatedUser, UserSupabaseClient } from "../supabase/user.js";
 import type { ConnectionManager } from "../ws/connection-manager.js";
 import type { SubmitImageJobFn } from "./image-generation-contracts.js";
+import type { MastraImageSourceReference } from "./mastra-image-source-grounding.js";
+import { parseMastraImageSourceReferences } from "./mastra-image-source-grounding.js";
 import { imageSubmissionReceipt } from "../features/jobs/image-submission-receipt.js";
 import { generationIdentity } from "../features/jobs/generation-identity.js";
 import { mastraImageDefaultRunLimit, validateMastraImageExecution, validateMastraImageResolutionSupport } from "./mastra-image-execution-policy.js";
@@ -26,6 +28,13 @@ export type MastraImageDesignTargetInput = Omit<DesignJobTarget, "idempotency_ke
 export type MastraImageJobInput = Omit<Parameters<SubmitImageJobFn>[0],
   "proposalId" | "replayOnly" | "target" | "foregroundPolicy"> & {
   target?: MastraImageDesignTargetInput;
+  /**
+   * Server-owned role data for the references in `inputImages`, one entry per
+   * reference in the same order. It is NOT part of the submission key
+   * (`mastraImageSubmissionKey` hashes the request the submitter receives), so
+   * adding it can never make an already-stored submission unreplayable.
+   */
+  sourceReferences?: MastraImageSourceReference[];
 };
 export type MastraImageJobResult = Awaited<ReturnType<SubmitImageJobFn>>;
 
@@ -210,6 +219,12 @@ export function createMastraImageJobSubmitter(deps: MastraImageJobDependencies):
     signal.throwIfAborted();
 
     const input = structuredClone(rawInput);
+    // Structured reference roles are server-owned job data, not request-
+    // shaping input: they are split out BEFORE the submission key is derived so
+    // an already-stored submission keeps the exact same identity. A job with no
+    // references persists no field at all.
+    const sourceReferences = input.sourceReferences;
+    delete (input as { sourceReferences?: unknown }).sourceReferences;
     const executionViolation = validateMastraImageExecution(input, currentUserText);
     if (executionViolation) throw new MastraImagePreflightError(executionViolation.code, executionViolation.summary);
     const submissionKey = mastraImageSubmissionKey(context.runId, input);
@@ -262,6 +277,14 @@ export function createMastraImageJobSubmitter(deps: MastraImageJobDependencies):
       }
     })();
     const { quality, creditsCost } = preflight;
+    // Only a validated, complete role set for THIS submission's carriers becomes
+    // job data: a request with no references, or a set that does not match the
+    // submitted carriers one-for-one, leaves the payload without any role field
+    // rather than with roles that describe images the job does not carry.
+    const parsedSourceReferences = parseMastraImageSourceReferences(sourceReferences);
+    const persistedSourceReferences = parsedSourceReferences
+      && parsedSourceReferences.length === (input.inputImages?.length ?? 0)
+      ? parsedSourceReferences : undefined;
 
     const placeholderElementId = stablePlaceholderId(submissionKey);
     const requestedPlacement = input.placementX != null && input.placementY != null ? {
@@ -289,6 +312,9 @@ export function createMastraImageJobSubmitter(deps: MastraImageJobDependencies):
         ...(requestedPlacement ? { placement_x: requestedPlacement.x, placement_y: requestedPlacement.y,
           placement_width: requestedPlacement.width, placement_height: requestedPlacement.height } : {}),
         ...(input.inputImages ? { input_images: input.inputImages } : {}),
+        // Structured, per-reference role data for the submitted sources. Absent
+        // — never an empty object or list — when the request had no references.
+        ...(persistedSourceReferences ? { source_references: persistedSourceReferences } : {}),
       },
       });
     } catch (error) {
@@ -299,7 +325,10 @@ export function createMastraImageJobSubmitter(deps: MastraImageJobDependencies):
       throw error;
     }
     const { job, replayed } = creation;
-    const receipt = mastraImageJobReceipt(job);
+    // The durable payload is authoritative; this fallback only covers a create
+    // response that does not echo it back, so the immediate receipt still names
+    // each reference's role. A request with no references passes nothing.
+    const receipt = mastraImageJobReceipt(job, persistedSourceReferences);
 
     const existingTerminal = terminalResult(job);
     if (existingTerminal) return existingTerminal;

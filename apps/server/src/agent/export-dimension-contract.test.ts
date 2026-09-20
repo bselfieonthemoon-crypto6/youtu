@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import {
   CANVAS_FRAME_AUTHORITY,
+  ENCODED_BYTES_AUTHORITY,
+  EXPORT_DIMENSION_CARD_NOTE,
   EXPORT_SIZE_AUTHORITY,
   JOB_RECEIPT_SIZE_NOTE,
+  exportDimensionReceiptSchema,
   projectDesignExportDimensions,
   projectImageJobDimensions,
 } from "./export-dimension-contract.js";
@@ -85,5 +88,56 @@ describe("image job dimension contract", () => {
     const generation = projectImageJobDimensions({ requestedAspectRatio: "1:1", result: GENERATION_RESULT });
     expect(generation.sourcePixelWidth).toBe(880);
     expect(projectDesignExportDimensions(EXPORT_RESULT)!.width).not.toBe(generation.sourcePixelWidth);
+  });
+
+  it("names every delivery-card field the extreme-size requirement asks for", () => {
+    // 目标尺寸、实际导出尺寸、文件格式、是否包含透明通道 (+ match + deviation).
+    for (const field of ["targetSize", "actualExportSize", "format", "hasAlpha", "matches", "mismatches", "approximation"])
+      expect(EXPORT_DIMENSION_CARD_NOTE).toContain(field);
+    // The actual export size must be attributed to the encoded bytes, not to the
+    // canvas frame, the source pixels, or the scaled canvas.
+    expect(EXPORT_DIMENSION_CARD_NOTE).toContain("编码字节");
+    expect(ENCODED_BYTES_AUTHORITY).toContain("程序画布的目标尺寸");
+    expect(ENCODED_BYTES_AUTHORITY).toContain("不是导出像素的证据");
+    expect(ENCODED_BYTES_AUTHORITY).toContain("matches=false");
+  });
+
+  it("accepts a matching receipt and rejects one that hides the mismatch or the missing evidence", () => {
+    const matching = {
+      targetSize: { width: 320, height: 70 },
+      claimedSize: { width: 320, height: 70 },
+      actualExportSize: { width: 320, height: 70 },
+      format: "png",
+      hasAlpha: true,
+      alphaVerdict: "present",
+      matches: true,
+      mismatches: [],
+      approximation: { requestedRatio: "320:70", nativeRatio: "3:1", ratioDeviation: -0.34375 },
+      pixelVerification: {
+        source: "encoded_bytes", format: "png", actualSize: { width: 320, height: 70 },
+        alpha: { channel: true, verdict: "present", minAlpha: 0, realTransparency: true },
+        decodedSize: { width: 320, height: 70 }, headerSize: { width: 320, height: 70 },
+      },
+      authority: { target: "① user-requested frame, in pixels.", actual: ENCODED_BYTES_AUTHORITY },
+    };
+    expect(exportDimensionReceiptSchema.safeParse(matching).success).toBe(true);
+    // The "not yet verified" shape is legal, and it is the only shape in which a
+    // size field is null instead of a number read off the artifact.
+    expect(exportDimensionReceiptSchema.safeParse({ ...matching, actualExportSize: null,
+      format: null, hasAlpha: null, alphaVerdict: null, pixelVerification: null, matches: false,
+      mismatches: ["unverified"] }).success).toBe(true);
+    // The cross-field invariant (matches === actual size equals target) is
+    // enforced where the bytes are read, not by the structural schema: the
+    // schema accepts a mismatch receipt and the runtime refuses to emit `true`.
+    expect(exportDimensionReceiptSchema.safeParse({ ...matching, actualExportSize: { width: 640, height: 140 },
+      matches: false, mismatches: ["size"] }).success).toBe(true);
+    for (const bad of [
+      { ...matching, actualExportSize: { width: 0, height: 70 } },
+      { ...matching, format: "webp" },
+      { ...matching, alphaVerdict: "maybe" },
+      { ...matching, mismatches: ["almost"] },
+      { ...matching, extra: true },
+      { ...matching, pixelVerification: { ...matching.pixelVerification, source: "canvas_frame" } },
+    ]) expect(exportDimensionReceiptSchema.safeParse(bad).success).toBe(false);
   });
 });

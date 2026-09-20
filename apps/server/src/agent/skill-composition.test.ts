@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { readFile } from "node:fs/promises";
 import {
-  readSkillRuntimeMetadata, skillCompositionMetadataSchema,
+  readSkillRuntimeMetadata, skillCompositionMetadataSchema, SKILL_OUTPUT_KINDS,
   type SkillCompositionRole, type SkillCompositionStage,
 } from "@loomic/shared";
 import { composeWorkspaceSkills } from "./skill-composition.js";
@@ -23,7 +24,6 @@ const request = { deliverable: "One brand logo", stage: "design", primary: "logo
 const logo = entry("logo-design", "domain");
 const style = entry("gpt-image-2-style-library", "reference", ["design", "reference", "prompt"]);
 const prompt = entry("json-image-prompt", "prompt");
-
 describe("bounded composition of enabled method guides", () => {
   it("composes logo + style reference + one prompt compiler and loads every full versioned guide", () => {
     const result = composeWorkspaceSkills([logo, style, prompt], request);
@@ -95,14 +95,54 @@ describe("bounded composition of enabled method guides", () => {
     })).toMatchObject({ code: "prompt_stage_conflict" });
   });
 
+  it("lets one domain helper carry the method under a workflow primary, but never a second method lead", () => {
+    const series = entry("series-visual-design", "workflow", ["design", "prompt"], ["guidance", "generation_request", "prompt"]);
+    const campaign = entry("campaign-design", "domain", ["design", "prompt"], ["guidance", "generation_request", "prompt"]);
+    const product = entry("product-visual", "domain", ["design", "prompt"], ["guidance", "generation_request", "prompt"]);
+    const input = { deliverable: "Two-poster product series", stage: "design", outputKind: "generation_request" };
+    // A workflow primary organizes the steps; the professional method itself may
+    // sit in the one domain package it organizes.
+    const composed = composeWorkspaceSkills([series, campaign, prompt], { ...input, primary: series.name, helpers: [campaign.name, prompt.name] });
+    expect(composed).toMatchObject({ status: "composed",
+      primary: { name: series.name, role: "workflow" },
+      helpers: [{ name: campaign.name, role: "domain" }, { name: prompt.name, role: "prompt" }] });
+    // Still exactly one domain overall: a domain primary already leads, and a
+    // second domain package is the real competing-domain conflict.
+    const rasterLogo = entry("raster-logo", "domain", ["design", "prompt"], ["guidance", "generation_request"]);
+    expect(composeWorkspaceSkills([rasterLogo, campaign, prompt], { ...input, primary: rasterLogo.name, helpers: [campaign.name, prompt.name] }))
+      .toMatchObject({ status: "conflict", code: "competing_domain", names: [campaign.name] });
+    expect(composeWorkspaceSkills([series, campaign, product, prompt], { ...input, primary: series.name, helpers: [campaign.name, product.name, prompt.name] }))
+      .toMatchObject({ status: "conflict", code: "competing_domain", names: [product.name] });
+    expect(composeWorkspaceSkills([series, logo, prompt], { ...input, primary: series.name, helpers: [logo.name, prompt.name] }))
+      .toMatchObject({ status: "composed" });
+  });
+
+  it("names the output kinds a primary accepts when it refuses the requested one", () => {
+    const nativeOnly = entry("native-only", "domain", ["design"], ["canvas_operation"]);
+    const refused = composeWorkspaceSkills([nativeOnly], {
+      deliverable: "Launch artwork", stage: "design", primary: nativeOnly.name, outputKind: "raster-image",
+    });
+    expect(refused).toMatchObject({ status: "conflict", code: "primary_output_kind_conflict" });
+    // The refusal must be actionable without a second guess: it quotes the
+    // vocabulary this package actually declares.
+    expect((refused as { message: string }).message).toContain("canvas_operation");
+    expect((refused as { message: string }).message).toContain("raster-image");
+  });
+
   it("uses declared output metadata instead of keywords to reject a native-only primary for raster delivery", () => {
-    const nativeCanvas = entry("canvas-design", "domain", ["design", "prompt"], ["native-design"]);
-    const rasterCampaign = entry("campaign-design", "domain", ["design", "prompt"], ["native-design", "design-brief"]);
+    const nativeCanvas = entry("canvas-design", "domain", ["design", "prompt"], ["canvas_operation"]);
+    const rasterCampaign = entry("campaign-design", "domain", ["design", "prompt"], ["guidance", "generation_request", "prompt"]);
+    // The legacy deliverable word still resolves, and a package that declares
+    // `canvas_operation` alone can never lead a raster result.
     const input = { deliverable: "Launch artwork", stage: "design", outputKind: "raster-image", helpers: [] };
     expect(composeWorkspaceSkills([nativeCanvas], { ...input, primary: nativeCanvas.name }))
       .toMatchObject({ status: "conflict", code: "primary_output_kind_conflict" });
     expect(composeWorkspaceSkills([rasterCampaign], { ...input, primary: rasterCampaign.name }))
       .toMatchObject({ status: "composed", selection: { outputKind: "raster-image" } });
+    for (const kind of ["guidance", "generation_request"]) {
+      expect(composeWorkspaceSkills([rasterCampaign], { ...input, outputKind: kind, primary: rasterCampaign.name }))
+        .toMatchObject({ status: "composed", selection: { outputKind: kind } });
+    }
   });
 
   it("does not revive absent or disabled packages from an earlier run snapshot", () => {
@@ -169,5 +209,66 @@ describe("composition metadata compatibility", () => {
     expect(skillCompositionMetadataSchema.safeParse({ role: "reference", stages: [] }).success).toBe(false);
     expect(skillCompositionMetadataSchema.safeParse({ role: "reference", stages: ["execute"] }).success).toBe(false);
     expect(skillCompositionMetadataSchema.safeParse({ role: "reference", stages: ["design"], authority: "system" }).success).toBe(false);
+  });
+});
+
+/**
+ * The user-verification report for the multi-image series turn observed two
+ * `competing_domain` refusals before the model dropped `campaign-design` and
+ * `product-visual` and continued. The exact package pairing is therefore
+ * guarded against the bundled packages, not only against synthetic entries:
+ * a manifest declaration change that reintroduces the refusal fails here.
+ */
+describe("bundled packages compose the reported series turn", () => {
+  const skillRoot = new URL("../../../../skills/", import.meta.url);
+
+  async function bundled(slug: string): Promise<WorkspaceSkillEntry> {
+    const root = new URL(`${slug}/`, skillRoot);
+    const [manifestText, content] = await Promise.all([
+      readFile(new URL("manifest.json", root), "utf8"),
+      readFile(new URL("SKILL.md", root), "utf8"),
+    ]);
+    const manifest = JSON.parse(manifestText) as { name: string; description: string; version: string; metadata: unknown };
+    return {
+      name: slug, displayName: manifest.name, description: manifest.description,
+      version: manifest.version, metadata: manifest.metadata as Record<string, unknown>,
+      content, path: `/workspace-skills/${slug}/SKILL.md`, files: [],
+      readiness: { status: "ready", reasons: [], models: [] },
+    };
+  }
+
+  it("composes the exact series-visual-design + json-image-prompt pairing from the report", async () => {
+    const [series, prompt] = await Promise.all([bundled("series-visual-design"), bundled("json-image-prompt")]);
+    const result = composeWorkspaceSkills([series, prompt], {
+      deliverable: "青原保温壶夏日上新系列两张宣传图", stage: "design",
+      primary: "series-visual-design", helpers: ["json-image-prompt"], outputKind: "generation_request",
+    });
+    expect(result).toMatchObject({ status: "composed",
+      primary: { name: "series-visual-design", role: "workflow" },
+      helpers: [{ name: "json-image-prompt", role: "prompt" }] });
+  });
+
+  it("composes a domain method helper under the series workflow, and still refuses two domain methods", async () => {
+    const [series, campaign, product, prompt] = await Promise.all([
+      bundled("series-visual-design"), bundled("campaign-design"), bundled("product-visual"), bundled("json-image-prompt"),
+    ]);
+    const input = { deliverable: "青原保温壶夏日上新系列两张宣传图", stage: "design" as const, outputKind: "generation_request" };
+    expect(composeWorkspaceSkills([series, campaign, prompt], { ...input, primary: "series-visual-design", helpers: ["campaign-design", "json-image-prompt"] }))
+      .toMatchObject({ status: "composed",
+        primary: { name: "series-visual-design" },
+        helpers: [{ name: "campaign-design", role: "domain" }, { name: "json-image-prompt", role: "prompt" }] });
+    expect(composeWorkspaceSkills([series, campaign, product, prompt], {
+      ...input, primary: "series-visual-design", helpers: ["campaign-design", "product-visual", "json-image-prompt"],
+    })).toMatchObject({ status: "conflict", code: "competing_domain", names: ["product-visual"] });
+  });
+
+  it("declares one shared output-kind vocabulary across every bundled manifest", async () => {
+    const catalog = JSON.parse(await readFile(new URL("catalog.json", skillRoot), "utf8")) as { skills: string[] };
+    for (const slug of catalog.skills) {
+      const entry = await bundled(slug);
+      const kinds = readSkillRuntimeMetadata(entry.metadata)?.outputKinds ?? [];
+      expect(kinds.length, slug).toBeGreaterThan(0);
+      for (const kind of kinds) expect(SKILL_OUTPUT_KINDS, `${slug} declares ${kind}`).toContain(kind);
+    }
   });
 });

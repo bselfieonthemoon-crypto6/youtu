@@ -3,7 +3,7 @@ name: game-promo-visuals
 description: 把参考图的游戏活动视觉语言转换为新活动图片：有辨识度的角色、色彩、材质、灯光与文字设计，支持自定义尺寸与可选文案、Logo、角色和装饰元素。
 metadata:
   author: loomic
-  version: "2.2.0"
+  version: "2.2.1"
 ---
 
 # 游戏活动视觉 · 多尺寸生成

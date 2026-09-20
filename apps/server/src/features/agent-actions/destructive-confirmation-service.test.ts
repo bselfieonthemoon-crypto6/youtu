@@ -31,6 +31,36 @@ function canvas(version = 1): CanvasContent {
   } as CanvasContent;
 }
 
+/** The same objects, re-serialized: new version/nonce, identical content. */
+function reSerialized(version = 2, nonce = 999): CanvasContent {
+  const content = canvas(version);
+  for (const element of content.elements ?? []) {
+    (element as Record<string, unknown>).versionNonce = nonce;
+  }
+  return content;
+}
+
+/**
+ * A shape with no bound text: its `boundElements` is `null` in the proposal snapshot and
+ * reads back as `[]` after re-serialization — the exact drift the browser probe hit.
+ */
+function canvasWithUnboundShape(version = 1, nonce = 101): CanvasContent {
+  return {
+    elements: [
+      { id: "shape-1", type: "rectangle", version, versionNonce: nonce, isDeleted: false, boundElements: null },
+    ],
+    appState: {},
+    files: {},
+  } as CanvasContent;
+}
+
+/** A genuinely different object: same id and version, changed content. */
+function resized(version = 1): CanvasContent {
+  const content = canvas(version);
+  (content.elements[0] as Record<string, unknown>).width = 640;
+  return content;
+}
+
 describe("destructive confirmation service", () => {
   it("freezes a generic image action until the owner confirms", async () => {
     const execute = vi.fn(async () => ({ jobId: "job-1" }));
@@ -136,25 +166,90 @@ describe("destructive confirmation service", () => {
     })).rejects.toMatchObject({ code: "confirmation_consumed" });
   });
 
-  it("rejects a different user and target version drift", async () => {
+  it("rejects a different user", async () => {
+    const execute = vi.fn();
     const service = createDestructiveConfirmationService();
     const proposal = service.propose({
       userId: "owner",
       canvasId: "canvas-1",
       content: canvas(),
       operations: [{ action: "delete", element_id: "shape-1" }],
-      loadCanvas: async () => canvas(2),
-      execute: vi.fn(),
+      loadCanvas: async () => canvas(),
+      execute,
     });
 
     await expect(service.confirm({
       confirmationId: proposal.confirmationId,
       userId: "attacker",
     })).rejects.toMatchObject({ code: "confirmation_forbidden" });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // The browser's canvas session re-serializes elements it merges, which moves
+  // `version`/`versionNonce` without the object changing. Rejecting that was rejecting
+  // real user confirmations (the browser probe hit `confirmation_stale` on a card whose
+  // target was byte-identical), so version identity alone must not be the gate.
+  it("still confirms when only the target's version moved", async () => {
+    const execute = vi.fn(async () => ({ deleted: true }));
+    const service = createDestructiveConfirmationService();
+    const proposal = service.propose({
+      userId: "owner",
+      canvasId: "canvas-1",
+      content: canvas(),
+      operations: [{ action: "delete", element_id: "shape-1" }],
+      loadCanvas: async () => reSerialized(2, 999),
+      execute,
+    });
+
+    await expect(service.confirm({
+      confirmationId: proposal.confirmationId,
+      userId: "owner",
+    })).resolves.toEqual({ deleted: true });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  // Re-serialization also flips an empty collection between null/absent and [] (the
+  // browser probe hit exactly that: a seeded image's `boundElements` read back as []).
+  it("still confirms when shape churn is only null-versus-empty collection", async () => {
+    const execute = vi.fn(async () => ({ deleted: true }));
+    const service = createDestructiveConfirmationService();
+    const proposal = service.propose({
+      userId: "owner",
+      canvasId: "canvas-1",
+      content: canvasWithUnboundShape(1),
+      operations: [{ action: "delete", element_id: "shape-1" }],
+      loadCanvas: async () => {
+        const content = canvasWithUnboundShape(2, 999);
+        (content.elements[0] as Record<string, unknown>).boundElements = [];
+        return content;
+      },
+      execute,
+    });
+
+    await expect(service.confirm({
+      confirmationId: proposal.confirmationId,
+      userId: "owner",
+    })).resolves.toEqual({ deleted: true });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("still rejects a target whose version moved AND content changed", async () => {
+    const execute = vi.fn();
+    const service = createDestructiveConfirmationService();
+    const proposal = service.propose({
+      userId: "owner",
+      canvasId: "canvas-1",
+      content: canvas(),
+      operations: [{ action: "delete", element_id: "shape-1" }],
+      loadCanvas: async () => resized(2),
+      execute,
+    });
+
     await expect(service.confirm({
       confirmationId: proposal.confirmationId,
       userId: "owner",
     })).rejects.toMatchObject({ code: "confirmation_stale" });
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it("expires and cancels proposals without executing them", async () => {

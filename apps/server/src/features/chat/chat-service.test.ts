@@ -99,6 +99,61 @@ describe("ChatService write authorization", () => {
   });
 });
 
+describe("ChatService.createMessage identity", () => {
+  /**
+   * The mechanism every server-appended notice relies on (terminal image/video
+   * notices and the image-refusal correction): the row id is derived from the
+   * durable seed, and the primary key makes a replay settle on the existing row
+   * instead of appending the same outcome twice.
+   */
+  it("settles on the existing row when the same run-derived id is persisted twice", async () => {
+    const correctionId = "9c1f0b4a-8d2e-4f31-a7c0-5b6d9e0f1a2b";
+    const existing = {
+      id: correctionId,
+      role: "assistant",
+      content: "本轮没有提交任何生成任务，也没有扣费；未提交或扣费。",
+      tool_activities: null,
+      content_blocks: [{ type: "text", text: "本轮没有提交任何生成任务，也没有扣费；未提交或扣费。" }],
+      created_at: "2026-09-20T00:00:00Z",
+    };
+    const fixture = serviceWith(
+      { data: { id: "session-1" }, error: null },
+      { data: existing, error: null },
+      { error: null },
+      { data: { id: "session-1" }, error: null },
+      { data: null, error: { code: "23505", message: "duplicate key value violates unique constraint" } },
+      { data: existing, error: null },
+      { error: null },
+    );
+
+    const first = await fixture.service.createMessage(user, "session-1", {
+      id: correctionId, role: "assistant", content: existing.content,
+    });
+    const replay = await fixture.service.createMessage(user, "session-1", {
+      id: correctionId, role: "assistant", content: existing.content,
+    });
+
+    expect(first.id).toBe(correctionId);
+    // The replay is the same row, not a second correction.
+    expect(replay).toMatchObject({ id: correctionId, content: existing.content });
+    expect(replay.createdAt).toBe(existing.created_at);
+    // 2 session checks + 2 insert attempts + 1 duplicate lookup + 2 session touches.
+    expect(fixture.from).toHaveBeenCalledTimes(7);
+  });
+
+  it("still reports a duplicate id holding different content as a write failure", async () => {
+    const fixture = serviceWith(
+      { data: { id: "session-1" }, error: null },
+      { data: null, error: { code: "23505", message: "duplicate key value violates unique constraint" } },
+      { data: { id: "id-1", role: "assistant", content: "另一条消息" }, error: null },
+    );
+
+    await expect(fixture.service.createMessage(user, "session-1", {
+      id: "id-1", role: "assistant", content: "本轮没有提交任何生成任务。",
+    })).rejects.toMatchObject({ code: "chat_error", statusCode: 500 });
+  });
+});
+
 describe("ChatService.truncateFrom (edit and resend)", () => {
   it("removes the edited message and every later one, keeping earlier history", async () => {
     const fixture = serviceWith(

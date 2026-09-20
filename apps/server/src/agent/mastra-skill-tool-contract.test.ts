@@ -1,7 +1,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 
-import { SKILL_WHEN_TO_USE_MAX_CHARS, readSkillRuntimeMetadata } from "@loomic/shared";
+import { SKILL_OUTPUT_KINDS, SKILL_WHEN_TO_USE_MAX_CHARS, readSkillRuntimeMetadata } from "@loomic/shared";
 
 import { createPromptLibraryService } from "../features/prompt-library/prompt-library-service.js";
 import { createMastraImageTools } from "./mastra-image-tool.js";
@@ -148,6 +148,21 @@ describe("installed Skill manifests against the real Mastra tool surface", () =>
       expect(whenToUse.length, skill.slug).toBeLessThanOrEqual(SKILL_WHEN_TO_USE_MAX_CHARS);
       // Selection text describes a situation; it is not a copy of the description.
       expect(whenToUse, skill.slug).not.toBe(skill.description);
+    }
+  });
+
+  it("declares output kinds only from the one shared vocabulary", async () => {
+    const skills = await installedManifestSkills();
+    expect(skills).not.toHaveLength(0);
+    for (const skill of skills) {
+      const runtime = readSkillRuntimeMetadata(skill.metadata);
+      if (!runtime) throw new Error(`${skill.slug} metadata.loomic no longer validates`);
+      // The vocabulary is what `use_skill` / `compose_skills` accepts, so a
+      // package-specific word here would make the model's value unacceptable by
+      // construction — the exact mismatch this contract unifies.
+      expect(runtime.outputKinds.length, skill.slug).toBeGreaterThan(0);
+      for (const kind of runtime.outputKinds)
+        expect(SKILL_OUTPUT_KINDS, `${skill.slug} declares ${kind}`).toContain(kind);
     }
   });
 });

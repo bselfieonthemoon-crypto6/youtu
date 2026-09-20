@@ -427,26 +427,35 @@ export function createPostgrestWorkerHeartbeatProbe(options: {
 }
 
 /**
- * Agent-runtime probe: proves the runtime is CONFIGURED and LOADABLE, not merely
- * that the string says "mastra".
+ * Agent-runtime probe: judges the runtime by what is knowable at CHECK TIME —
+ * that it is properly CONFIGURED and constructible — never by whether a
+ * lazily-initialised instance already exists.
  *
- * Three zero-cost checks — no provider request is ever made, so health polling
- * can never spend credits:
- *   1. `LOOMIC_AGENT_RUNTIME` parses to `mastra` through the same resolver the
- *      server boot uses (a typo or the retired `legacy` value fails here);
- *   2. a default agent model reference is configured;
- *   3. the Mastra entry module loads, still exports `createMastraRunFactory`, and
- *      `@mastra/core`'s `Agent` class resolves.
+ * Why that distinction is the whole point: the Mastra runtime is built on first
+ * use, so a freshly booted process has no instance. A probe that failed on "not
+ * built yet" would answer 503 on a healthy server whose agent runs demonstrably
+ * succeed — the mirror image of the original `ok:true` lie, and still untruthful.
+ * `latencyMs: 0` next to `runtime_unavailable` was exactly that false alarm.
  *
- * Two deliberate limits, both about staying truthful:
- *   - The module load happens in `warmup()` (awaited by Fastify's `onReady`), not
- *     on the request path. Importing the runtime is expensive the first time, and
- *     a probe that takes seconds would break the startup polling it must serve.
- *   - The model BINDING is only constructed when the caller supplies a real
- *     provider endpoint (`bindingProbe`). The safe-provider-fetch wrapper refuses
- *     a synthetic URL, so validating against one would report `failed` for a
- *     perfectly good deployment — a health check that cries wolf is worse than
- *     none. Without a binding probe the component reports `binding unverified`.
+ * The probe therefore answers in two tiers:
+ *   1. CHEAP CONFIGURATION (runs on every check, always available):
+ *      `LOOMIC_AGENT_RUNTIME` parses to `mastra` through the same resolver the
+ *      server boot uses, and a default agent model reference is configured. Both
+ *      are pure decisions the code already makes, and both fail fast — a typo,
+ *      the retired `legacy` value, or no model is a genuine misconfiguration.
+ *   2. RUNTIME CONSTRUCTION (`warmup()`, awaited from Fastify's `onReady`):
+ *      the Mastra entry module loads, still exports `createMastraRunFactory`,
+ *      `@mastra/core`'s `Agent` class resolves, and the model binding constructs.
+ *      An EXPENSIVE first import belongs at startup, not on the polling path.
+ *      Once this has run, its verdict is authoritative — including a failure.
+ *      While it has not run yet, "not constructed yet" is reported as `ok` with
+ *      that wording, because an unbuilt lazy runtime is not a defect.
+ *
+ * No provider request is ever made, so health polling can never spend credits.
+ * The model BINDING is only constructed when the caller supplies a real provider
+ * endpoint (`bindingProbe`): the safe-provider-fetch wrapper refuses a synthetic
+ * URL, so validating against one would report `failed` for a perfectly good
+ * deployment — a health check that cries wolf is worse than none.
  *
  * What it deliberately does NOT do: call a provider, resolve a workspace
  * snapshot, or create a run. Those are per-turn paid/authorized operations.
@@ -480,14 +489,30 @@ export function createMastraRuntimeProbe(options: {
   let verdict: RuntimeProbeResult | undefined;
   let warmed: Promise<RuntimeProbeResult> | undefined;
 
-  async function load(): Promise<RuntimeProbeResult> {
+  /**
+   * Tier 1. Pure and synchronous, so it is available even before `warmup`, and
+   * cheap enough to run on every probe.
+   */
+  function configurationFailure(): RuntimeProbeResult | undefined {
     try {
       if (resolveAgentRuntimeMode() !== "mastra") {
         return { detail: "runtime agent_runtime_mode_invalid", reason: "agent_runtime_mode_invalid" };
       }
-      if (!options.agentModel) {
-        return { detail: "runtime agent_model_unconfigured", reason: "agent_model_unconfigured" };
-      }
+    } catch {
+      // The resolver throws for a retired or misspelled mode; that is a real
+      // misconfiguration, not a missing instance.
+      return { detail: "runtime agent_runtime_mode_invalid", reason: "agent_runtime_mode_invalid" };
+    }
+    if (!options.agentModel) {
+      return { detail: "runtime agent_model_unconfigured", reason: "agent_model_unconfigured" };
+    }
+    return undefined;
+  }
+
+  async function warmRuntime(): Promise<RuntimeProbeResult> {
+    const configured = configurationFailure();
+    if (configured) return configured;
+    try {
       const entry = await loadMastraEntry();
       if (
         typeof entry.createMastraRunFactory !== "function" ||
@@ -500,7 +525,7 @@ export function createMastraRuntimeProbe(options: {
           createModel({
             apiKey: options.bindingProbe.apiKey,
             baseUrl: options.bindingProbe.baseUrl,
-            upstreamModelId: options.agentModel,
+            upstreamModelId: options.agentModel!,
           });
         } catch {
           return { detail: "runtime model_binding_failed", reason: "model_binding_failed" };
@@ -509,21 +534,27 @@ export function createMastraRuntimeProbe(options: {
       }
       return { detail: "mastra configured (binding unverified)" };
     } catch {
+      // Reached only when the runtime module genuinely cannot be loaded.
       return { detail: "runtime runtime_unavailable", reason: "runtime_unavailable" };
     }
   }
 
   return {
     async warmup() {
-      warmed ??= load().then((result) => {
+      warmed ??= warmRuntime().then((result) => {
         verdict = result;
         return result;
       });
       return warmed;
     },
     async probeRuntime() {
-      // A probe that runs before warmup must not report healthy on no evidence.
-      return verdict ?? { detail: "runtime runtime_not_warmed", reason: "runtime_not_warmed" };
+      // A constructed runtime's verdict wins, including its failures.
+      if (verdict) return verdict;
+      const configured = configurationFailure();
+      if (configured) return configured;
+      // Configured and correct, but the lazy instance has not been constructed
+      // yet. That is a healthy boot state, not a failure.
+      return { detail: "mastra configured (lazy, not yet constructed)" };
     },
   };
 }

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import {
-  readSkillRuntimeMetadata, SKILL_COMPOSITION_STAGES,
+  readSkillRuntimeMetadata, SKILL_COMPOSITION_STAGES, SKILL_OUTPUT_KINDS,
   type SkillCompositionRole, type SkillCompositionStage, type SkillRuntimeMetadata,
 } from "@loomic/shared";
 import { hashSkillPackage, type WorkspaceSkillEntry } from "./workspace-skills.js";
@@ -12,7 +12,7 @@ export const composeSkillsSchema = z.object({
   stage: z.enum(SKILL_COMPOSITION_STAGES),
   /** The primary Skill's own declared output kind, not the turn's deliverable. */
   outputKind: z.string().trim().min(1).max(100).optional()
-    .describe("One of the primary skill's declared runtime.outputKinds from list_skills (its own output, for example raster-image or image-prompt) — never the deliverable you are producing for the user. A value the primary skill does not declare is refused."),
+    .describe(`One of the vocabulary (${SKILL_OUTPUT_KINDS.join(" / ")}) that the primary skill declares in its own runtime.outputKinds from list_skills — its own output, for example generation_request for a bitmap result or prompt for prompt-only work; never the deliverable you are producing for the user. A value the primary skill does not declare is refused, and the refusal names the kinds it does accept.`),
   primary: skillName,
   helpers: z.array(skillName).max(4).default([]),
 }).strict();
@@ -71,7 +71,15 @@ export function composeWorkspaceSkills(
   if (!parsed.success) return conflict("invalid_composition", "需要一个交付物名称、一个阶段、恰好一个主技能、最多四个辅助技能；不接受任何约束或批准字段。");
   const input = parsed.data;
   const names = [input.primary, ...input.helpers];
-  const selected = [];
+  /** The primary's declared role decides whether a helper may carry the one professional method. */
+  const primaryComposition = readSkillRuntimeMetadata(
+    entries.find(entry => entry.name === input.primary || entry.displayName === input.primary)?.metadata,
+  )?.composition;
+  const selected: Array<{
+    skill: WorkspaceSkillEntry;
+    composition: NonNullable<SkillRuntimeMetadata["composition"]>;
+    position: "primary" | "helper";
+  }> = [];
   const selectedNames: string[] = [];
   for (const [index, name] of names.entries()) {
     const matches = entries.filter(entry =>
@@ -93,9 +101,14 @@ export function composeWorkspaceSkills(
     if (index === 0 && !primaryRoles[input.stage].includes(composition.role))
       return conflict("primary_role_conflict", `${composition.role} 角色的技能包不能主导 ${input.stage} 阶段。请换一个匹配的主技能，把这个包只作为适用的辅助。`, [name]);
     if (index === 0 && input.outputKind && !skillSupportsDeliverable(metadata, input.outputKind))
-      return conflict("primary_output_kind_conflict", `此主技能没有声明 ${input.outputKind} 这类产出。请选一个声明产出与实际交付形式一致的领域技能包。`, [name]);
-    if (index > 0 && composition.role === "domain")
-      return conflict("competing_domain", "只有主技能可以主导专业领域。请分开组合不同交付物或阶段，不要并列两个领域主导。", [name]);
+      return conflict("primary_output_kind_conflict", `此主技能没有声明 ${input.outputKind} 这类产出；它接受 ${acceptedOutputKinds(metadata)}。请改传它声明的 outputKind，或换一个与实际交付形式匹配的领域技能包。`, [name]);
+    // A workflow primary organizes the steps; the professional method itself may
+    // sit in the domain package it organizes. That is exactly one method lead, so
+    // it composes. Only a domain primary (which already leads) or a *second*
+    // domain helper is a real competing-domain conflict.
+    if (index > 0 && composition.role === "domain" &&
+      (primaryComposition?.role === "domain" || selected.some(item => item.composition.role === "domain")))
+      return conflict("competing_domain", `只有主技能或唯一一个领域辅助技能可以主导专业领域；${skill.name} 是第二个领域主导。请只保留一个方法主导，把这个包改作其他角色或不组合。`, [name]);
     if (composition.role === "prompt" && input.stage !== "design" && input.stage !== "prompt")
       return conflict("prompt_stage_conflict", "提示词编译只属于 design 或 prompt 阶段；reference、review、delivery 阶段不要带上它。", [name]);
     selected.push({ skill, composition, position: index === 0 ? "primary" as const : "helper" as const });
@@ -105,7 +118,7 @@ export function composeWorkspaceSkills(
     return conflict("duplicate_skill", "每个技能只能出现一次；请去掉重复的显示名或 slug。", canonicalNames);
   const compilers = selected.filter(item => item.composition.role === "prompt");
   if (compilers.length > 1)
-    return conflict("multiple_prompt_compilers", "只能选一个提示词编译器；参考类辅助技能应为这个编译器提供素材，而不是各自写一份最终提示词。", compilers.map(item => item.skill.name));
+    return conflict("multiple_prompt_compilers", `只能选一个提示词编译器；${compilers.map(item => item.skill.name).join("、")} 都想编译最终提示词。参考类辅助技能应为这个编译器提供素材，而不是各自写一份最终提示词。`, compilers.map(item => item.skill.name));
   // Every composed guide comes back with its full body. There is no "already in
   // the instructions" case to elide any more: the runtime injects no guide text,
   // so the only way a body reaches the model is a tool result like this one.
@@ -137,10 +150,34 @@ export function composeWorkspaceSkills(
   };
 }
 
-/** A hybrid/guidance domain may lead the planning method for a downstream
- * raster result by declaring design-brief. Native-only packages cannot. */
+/** The one declared output-kind vocabulary, shared by manifests and the tool contract. */
+export function acceptedOutputKinds(metadata: SkillRuntimeMetadata): string {
+  return metadata.outputKinds.length ? metadata.outputKinds.join(" / ") : "（未声明任何 outputKind）";
+}
+
+/**
+ * Deliverable kinds that a caller may still hold from before the vocabulary was
+ * unified. They are only aliases for the check, never a second vocabulary a
+ * package may declare: `raster-image` is the raster deliverable behind
+ * `generation_request`, and `image-prompt` behind `prompt`.
+ */
+const LEGACY_DELIVERABLE_ALIASES: Record<string, string> = {
+  "raster-image": "generation_request",
+  "image-prompt": "prompt",
+};
+
+/**
+ * Whether a package may lead a deliverable of `outputKind`. A package accepts
+ * the kind it declares; `raster-image` / `image-prompt` still resolve to the
+ * raster and prompt kinds. A non-`native` package that declares `guidance` may
+ * also plan a downstream raster result, because guidance is exactly the
+ * declaration that says "this package leads a method whose result is produced
+ * elsewhere". A native-only package can never lead a raster result.
+ */
 export function skillSupportsDeliverable(metadata: SkillRuntimeMetadata, outputKind: string): boolean {
   if (metadata.outputKinds.includes(outputKind)) return true;
-  return outputKind === "raster-image" && metadata.outputKinds.includes("design-brief") &&
+  const canonical = LEGACY_DELIVERABLE_ALIASES[outputKind] ?? outputKind;
+  if (metadata.outputKinds.includes(canonical)) return true;
+  return canonical === "generation_request" && metadata.outputKinds.includes("guidance") &&
     metadata.execution !== "native";
 }

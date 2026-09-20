@@ -28,7 +28,7 @@ const fixtures = vi.hoisted(() => ({
   skills: [
     { name: "campaign-design", displayName: "活动海报与宣传图", description: "活动海报与推广封面",
       version: "2.2.0", content: "CAMPAIGN SKILL BODY", contentHash: "hash-campaign",
-      metadata: { loomic: { schemaVersion: 1, execution: "image", intents: ["campaign"], outputKinds: ["raster-image"],
+      metadata: { loomic: { schemaVersion: 1, execution: "image", intents: ["campaign"], outputKinds: ["generation_request"],
         requiredTools: [], optionalTools: [], models: [], limitations: [], examples: [], sources: [],
         routing: { keywords: ["活动", "促销", "海报", "宣传", "banner", "poster"], priority: 10 } } } },
   ],

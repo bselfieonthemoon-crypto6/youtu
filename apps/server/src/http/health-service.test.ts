@@ -515,15 +515,112 @@ describe("mastra runtime probe", () => {
     });
   });
 
-  it("does not report healthy on no evidence before startup warmed it", async () => {
+  it("does NOT fail while the lazy runtime has not been constructed yet", async () => {
+    // The production defect: a freshly booted process has no runtime instance, so
+    // health answered 503 on a server whose agent runs demonstrably work.
+    // `latencyMs: 0` next to `runtime_unavailable` was that false alarm.
+    const createModel = vi.fn(() => ({}));
+    const probe = createMastraRuntimeProbe({
+      agentModel: "apiyi:gemini-3.1-flash-lite",
+      createModel,
+      loadMastraEntry: vi.fn(async () => healthyEntry),
+    });
+
+    const bootVerdict = await probe.probeRuntime();
+    expect(bootVerdict.reason).toBeUndefined();
+    expect(bootVerdict.detail).toBe("mastra configured (lazy, not yet constructed)");
+    // Judging the boot state must not construct anything either.
+    expect(createModel).not.toHaveBeenCalled();
+  });
+
+  it("still reports ok once the runtime has been constructed", async () => {
+    const probe = createMastraRuntimeProbe({
+      agentModel: "apiyi:gemini-3.1-flash-lite",
+      createModel: vi.fn(() => ({})),
+      loadMastraEntry: vi.fn(async () => healthyEntry),
+    });
+    await probe.warmup();
+    await expect(probe.probeRuntime()).resolves.toEqual({
+      detail: "mastra configured (binding unverified)",
+    });
+  });
+
+  it("fails for a misspelled runtime mode even on a boot that never warmed", async () => {
+    // The cheap configuration tier must fail FAST: a typo is knowable
+    // immediately and must never be excused as "not built yet".
+    const previous = process.env.LOOMIC_AGENT_RUNTIME;
+    process.env.LOOMIC_AGENT_RUNTIME = "mastraa";
+    try {
+      const probe = createMastraRuntimeProbe({ agentModel: "apiyi:gemini-3.1-flash-lite" });
+      await expect(probe.probeRuntime()).resolves.toEqual({
+        detail: "runtime agent_runtime_mode_invalid",
+        reason: "agent_runtime_mode_invalid",
+      });
+    } finally {
+      if (previous === undefined) delete process.env.LOOMIC_AGENT_RUNTIME;
+      else process.env.LOOMIC_AGENT_RUNTIME = previous;
+    }
+  });
+
+  it("fails when the runtime entry module cannot be loaded", async () => {
     const probe = createMastraRuntimeProbe({
       agentModel: "gemini-3.1-flash-lite",
+      createModel: vi.fn(() => ({})),
+      loadMastraEntry: vi.fn(async () => {
+        throw new Error("Cannot find module @mastra/core");
+      }),
+    });
+    // Before the runtime is loaded, configuration is all that can be judged...
+    expect((await probe.probeRuntime()).reason).toBeUndefined();
+    // ...and once it IS loaded, a genuinely unavailable runtime is a real failure.
+    await probe.warmup();
+    await expect(probe.probeRuntime()).resolves.toEqual({
+      detail: "runtime runtime_unavailable",
+      reason: "runtime_unavailable",
+    });
+  });
+
+  it("fails when the entry module has lost its factory export", async () => {
+    const probe = createMastraRuntimeProbe({
+      agentModel: "gemini-3.1-flash-lite",
+      createModel: vi.fn(() => ({})),
+      loadMastraEntry: vi.fn(async () => ({ createMastraRunFactory: undefined, agentClass: class {} })),
+    });
+    await probe.warmup();
+    await expect(probe.probeRuntime()).resolves.toEqual({
+      detail: "runtime mastra_entry_incomplete",
+      reason: "mastra_entry_incomplete",
+    });
+  });
+
+  it("fails when no agent model is configured, even before any warmup", async () => {
+    const probe = createMastraRuntimeProbe({
       createModel: vi.fn(() => ({})),
       loadMastraEntry: vi.fn(async () => healthyEntry),
     });
     await expect(probe.probeRuntime()).resolves.toEqual({
-      detail: "runtime runtime_not_warmed",
-      reason: "runtime_not_warmed",
+      detail: "runtime agent_model_unconfigured",
+      reason: "agent_model_unconfigured",
+    });
+    await expect(probe.warmup()).resolves.toEqual({
+      detail: "runtime agent_model_unconfigured",
+      reason: "agent_model_unconfigured",
+    });
+  });
+
+  it("fails when the model binding cannot be constructed against a real endpoint", async () => {
+    const probe = createMastraRuntimeProbe({
+      agentModel: "gemini-3.1-flash-lite",
+      bindingProbe: { apiKey: "workspace-resolved", baseUrl: "https://api.example.com/v1" },
+      createModel: vi.fn(() => {
+        throw new Error("unsupported model");
+      }),
+      loadMastraEntry: vi.fn(async () => healthyEntry),
+    });
+    await probe.warmup();
+    await expect(probe.probeRuntime()).resolves.toEqual({
+      detail: "runtime model_binding_failed",
+      reason: "model_binding_failed",
     });
   });
 

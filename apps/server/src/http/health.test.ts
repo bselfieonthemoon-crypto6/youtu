@@ -12,7 +12,11 @@ import { describe, expect, it, vi } from "vitest";
 import { healthResponseSchema } from "@loomic/shared";
 
 import { registerHealthRoutes } from "./health.js";
-import { createHealthService, type HealthServiceDependencies } from "./health-service.js";
+import {
+  createHealthService,
+  createMastraRuntimeProbe,
+  type HealthServiceDependencies,
+} from "./health-service.js";
 
 const queues = ["image_generation_jobs"] as const;
 
@@ -115,6 +119,57 @@ describe("GET /api/health", () => {
       expect(payload.ok).toBe(true);
       expect(payload.components.worker.status).toBe("degraded");
       expect(payload.components.worker.detail).toContain("offline");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("answers 200 on a fresh boot whose lazy agent runtime is not constructed yet", async () => {
+    // The production defect: the runtime is built on first use, so a freshly
+    // booted API reported 503 for a server that demonstrably works. The route must
+    // judge configuration, not the existence of a lazily-created instance.
+    const runtimeProbe = createMastraRuntimeProbe({
+      agentModel: "apiyi:gemini-3.1-flash-lite",
+      createModel: vi.fn(() => ({})),
+      loadMastraEntry: vi.fn(async () => ({
+        createMastraRunFactory: () => undefined,
+        agentClass: class {},
+      })),
+    });
+    const app = await buildRoute(buildHealthService({ runtime: runtimeProbe }));
+    try {
+      const response = await app.inject({ method: "GET", url: "/api/health" });
+      expect(response.statusCode).toBe(200);
+      const payload = response.json();
+      expect(payload.ok).toBe(true);
+      expect(payload.components.agentRuntime).toMatchObject({
+        status: "ok",
+        detail: "mastra configured (lazy, not yet constructed)",
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("answers 503 when the agent runtime is genuinely unavailable", async () => {
+    const runtimeProbe = createMastraRuntimeProbe({
+      agentModel: "apiyi:gemini-3.1-flash-lite",
+      createModel: vi.fn(() => ({})),
+      loadMastraEntry: vi.fn(async () => {
+        throw new Error("Cannot find module @mastra/core");
+      }),
+    });
+    await runtimeProbe.warmup();
+    const app = await buildRoute(buildHealthService({ runtime: runtimeProbe }));
+    try {
+      const response = await app.inject({ method: "GET", url: "/api/health" });
+      expect(response.statusCode).toBe(503);
+      const payload = response.json();
+      expect(payload.ok).toBe(false);
+      expect(payload.components.agentRuntime).toMatchObject({
+        status: "failed",
+        detail: "runtime runtime_unavailable",
+      });
     } finally {
       await app.close();
     }

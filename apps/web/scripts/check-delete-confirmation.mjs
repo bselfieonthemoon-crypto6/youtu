@@ -13,12 +13,25 @@
 //                     image (the safety gate really gates).
 //   PHASE 2 EXECUTION a real click on that button removes the element from the
 //                     persisted canvas, the card settles to "已确认并删除", and the
-//                     assistant message carries no failure code.
+//                     server's own acknowledgement for the click reports success.
 //   PHASE 3 EXPIRY    an unconfirmed card is never applied by a background timer,
 //                     and after its TTL elapses the same card can no longer be
 //                     confirmed (the click must be rejected, not silently applied).
 //   PHASE 4 REFRESH   reloading after a confirmed deletion neither resurrects the
-//                     image nor duplicates the pending confirmation card.
+//                     image nor leaves a duplicate pending confirmation.
+//
+// ISOLATION (why this file no longer reuses one session for every phase):
+// a transcript accumulates one confirmation card per phase, and the browser renders
+// all of them. Selecting "the last card on screen" therefore let PHASE 2/3/4 confirm
+// a card left behind by an earlier phase — the observed "the click happened but the
+// element survived and the server still answered confirmation_required". Two rules
+// remove that entire class of false result:
+//   1. every phase runs against its OWN fixture (project + canvas + session), created
+//      for that phase, so no other phase's card exists in its DOM at all;
+//   2. a card is addressed by the `data-confirmation-id` marker on the card root, so a
+//      phase can only ever act on the confirmation it created.
+// The click's own server acknowledgement is recorded from the page's WebSocket, so a
+// phase reports what the server answered instead of inferring it from the transcript.
 //
 // SETUP uses the existing sim harness (isolated project + canvas + session, plus a
 // seeded image element). Only the confirmation itself is driven in a browser.
@@ -27,18 +40,20 @@
 //   node --env-file=../../.env.local ../../apps/web/scripts/check-delete-confirmation.mjs
 //
 // Flags:
-//   --canvas <id> --session <id>   reuse an existing isolated fixture
 //   --wait-expiry-seconds <n>     TTL wait for PHASE 3 (default 660)
 //   --skip-expiry-wait            do not wait out the TTL; record info only
-//   --quick                       phases 1-2 only (development smoke)
+//   --quick                       phases 1-2 + refresh only (development smoke)
+//   --reuse-fixture               one shared fixture for every phase (debug only; it
+//                                 reintroduces the accumulated-card ambiguity)
+//   --canvas <id> --session <id>  reuse an existing isolated fixture for every phase
 //   --out <path>                  evidence JSON (default artifacts/.../probe-*.json)
 //
-// Read-only outside its own isolated fixture: it seeds images on that fixture's
-// canvas and never touches any other project, canvas or session.
+// Read-only outside its own isolated fixtures: it seeds images on those fixtures'
+// canvases and never touches any other project, canvas or session.
 import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "@playwright/test";
@@ -59,6 +74,7 @@ const QA_OWNER = "541006fa-d2a1-4305-be55-b6263c27a1e3";
 const DELETE_TITLE = "需要确认危险操作";
 const CONFIRM_LABEL = "确认删除";
 const APPLIED_LABEL = "已确认并删除";
+const VERIFY_LOG = resolve(ARTIFACT_DIR, "probe-run.log");
 // A canvas deletion only becomes a proposal when the user's own wording asks for a
 // removal (hasExplicitCanvasDeleteIntent), so every phase sends a real one.
 const DELETE_PROMPT_SHAPE = "把画布上标题为「<title>」的那张图片删除掉";
@@ -76,6 +92,7 @@ const has = (name) => argv.includes(`--${name}`);
 const EXPIRY_WAIT_SECONDS = Number(flag("wait-expiry-seconds", 660));
 const QUICK = has("quick");
 const SKIP_EXPIRY_WAIT = has("skip-expiry-wait") || QUICK;
+const REUSE_FIXTURE = has("reuse-fixture") || (typeof flag("canvas") === "string" && typeof flag("session") === "string");
 
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
@@ -89,7 +106,11 @@ let failures = 0;
 const record = (phase, name, status, detail, data) => {
   rows.push({ phase, name, status, ...(detail ? { detail } : {}), ...(data === undefined ? {} : { data }) });
   const label = status.toUpperCase().padEnd(4);
-  console.log(`[${phase}] ${label} ${name}${detail ? ` — ${detail}` : ""}`);
+  const line = `[${phase}] ${label} ${name}${detail ? ` — ${detail}` : ""}`;
+  console.log(line);
+  // A long expiry wait invites a reader to assume the run is stuck; stream the log
+  // beside the JSON so the timeline survives even if the terminal is gone.
+  void appendFile(VERIFY_LOG, `${new Date().toISOString()} ${line}\n`).catch(() => undefined);
   if (status === "fail") failures += 1;
 };
 const pass = (phase, name, detail, data) => record(phase, name, "pass", detail, data);
@@ -113,6 +134,7 @@ async function saveEvidence(extra = {}) {
     api: API,
     prompt: DELETE_PROMPT_SHAPE,
     expiryWaitSeconds: EXPIRY_WAIT_SECONDS,
+    isolation: REUSE_FIXTURE ? "shared fixture (--reuse-fixture / --canvas)" : "one fresh fixture per phase",
     checks: rows,
     screenshots,
     counts: {
@@ -124,7 +146,7 @@ async function saveEvidence(extra = {}) {
     ...extra,
   };
   await mkdir(ARTIFACT_DIR, { recursive: true });
-  const path = resolve(ARTIFACT_DIR, `probe-${stamp}.json`);
+  const path = resolve(typeof flag("out") === "string" ? flag("out") : resolve(ARTIFACT_DIR, `probe-${stamp}.json`));
   await writeFile(path, `${JSON.stringify(evidence, null, 2)}\n`);
   console.log(`\nEVIDENCE ${path}`);
   console.log(`RESULT ${evidence.counts.passed} pass / ${evidence.counts.failed} fail / ${evidence.counts.info} info`);
@@ -174,26 +196,51 @@ function runHarness(mode, args) {
   }
 }
 
-async function ensureFixture() {
-  const existingCanvas = flag("canvas");
-  const existingSession = flag("session");
-  if (typeof existingCanvas === "string" && typeof existingSession === "string") {
-    info("setup", "reused fixture", `${existingCanvas} / ${existingSession}`);
-    return { canvasId: existingCanvas, sessionId: existingSession, projectId: null, created: false };
+const sharedFixturePath = resolve(ARTIFACT_DIR, "fixture.json");
+let sharedFixture = null;
+
+/**
+ * One fixture per phase. A fresh project + canvas + session means the phase's DOM can
+ * only ever contain the confirmation cards that phase created.
+ */
+async function fixtureFor(phase) {
+  if (REUSE_FIXTURE) {
+    const existingCanvas = flag("canvas");
+    const existingSession = flag("session");
+    if (typeof existingCanvas === "string" && typeof existingSession === "string") {
+      return { canvasId: existingCanvas, sessionId: existingSession, projectId: null, created: false, shared: true };
+    }
+    if (!sharedFixture) {
+      try {
+        sharedFixture = JSON.parse(await readFile(sharedFixturePath, "utf8"));
+      } catch {
+        runHarness("create", ["--name", "delete-confirmation-browser", "--out", "artifacts/delete-confirmation-browser/fixture.json"]);
+        sharedFixture = JSON.parse(await readFile(sharedFixturePath, "utf8"));
+      }
+      info("setup", "reused shared fixture", `canvas ${sharedFixture.canvasId} session ${sharedFixture.sessionId}`, {
+        projectId: sharedFixture.projectId,
+      });
+    }
+    return { ...sharedFixture, created: false, shared: true };
   }
-  const fixturePath = resolve(ARTIFACT_DIR, "fixture.json");
-  let fixture;
-  try {
-    fixture = JSON.parse(await readFile(fixturePath, "utf8"));
-  } catch {
-    runHarness("create", ["--name", "delete-confirmation-browser", "--out", "artifacts/delete-confirmation-browser/fixture.json"]);
-    fixture = JSON.parse(await readFile(fixturePath, "utf8"));
+  const path = resolve(ARTIFACT_DIR, "fixtures", `${phase}.json`);
+  // The local API is a long-lived dev process that may be restarting; a fixture
+  // creation that races it must not abort the whole campaign.
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      runHarness("create", ["--name", `delete-confirmation-${phase}`, "--out", path]);
+      break;
+    } catch (error) {
+      if (attempt >= 5) throw error;
+      info("setup", `${phase} fixture retry`, `attempt ${attempt}: ${String(error.message).split("\n")[0].slice(0, 160)}`);
+      await sleep(15_000);
+    }
   }
-  info("setup", "isolated fixture", `canvas ${fixture.canvasId} session ${fixture.sessionId}`, {
-    projectId: fixture.projectId,
-    fixturePath,
-  });
-  return { ...fixture, created: true };
+  const fixture = JSON.parse(await readFile(path, "utf8"));
+  info("setup", `${phase} fresh fixture`,
+    `canvas ${fixture.canvasId} session ${fixture.sessionId}`,
+    { projectId: fixture.projectId, fixturePath: path });
+  return { ...fixture, created: true, shared: false };
 }
 
 /**
@@ -255,10 +302,6 @@ async function canvasState(canvasId) {
   };
 }
 
-async function hasElement(canvasId, elementId) {
-  return (await canvasState(canvasId)).liveIds.includes(elementId);
-}
-
 /** Re-read the row until `match` holds, so a screenshot never races the database. */
 async function waitForCanvas(canvasId, match, timeoutMs, everyMs = 1000) {
   const deadline = Date.now() + timeoutMs;
@@ -296,24 +339,9 @@ async function findConfirmationBlocks(sessionId, confirmationId) {
     (confirmationId === undefined || block.output.confirmation.confirmationId === confirmationId));
 }
 
-/**
- * Every phase must act on the confirmation IT created, never on a card left behind by
- * an earlier turn — the transcript is append-only and the browser renders all of it.
- */
+/** Every phase acts on the confirmation IT created, never on a card left by another turn. */
 async function confirmedIdsBefore(sessionId) {
   return new Set((await findConfirmationBlocks(sessionId)).map(({ block }) => block.output.confirmation.confirmationId));
-}
-
-/** The canvas is what the card talks about, so compare its actual content, not a counter. */
-function signatureOf(state) {
-  return JSON.stringify({
-    revision: state.revision,
-    ids: state.liveIds,
-    files: Object.keys(state.content?.files ?? {}).sort(),
-  });
-}
-function resetCanvasTo(canvasId, content) {
-  return admin.from("canvases").update({ content }).eq("id", canvasId);
 }
 
 /* ------------------------------------------------------------------- browser */
@@ -322,12 +350,46 @@ async function openCanvasPage(browser, fixture, session) {
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 }, ignoreHTTPSErrors: true });
   const pageErrors = [];
   const consoleErrors = [];
+  const frames = [];
   page.on("pageerror", (error) => pageErrors.push(String(error.message).slice(0, 200)));
   page.on("console", (message) => {
     if (message.type() === "error") consoleErrors.push(message.text().slice(0, 200));
   });
+  await page.exposeFunction("__recordConfirmFrame", (entry) => {
+    frames.push(entry);
+  });
   await page.addInitScript((value) => {
     localStorage.setItem("sb-127-auth-token", JSON.stringify(value));
+    // Record the confirmation traffic the page itself sends and receives. The card's
+    // local state is not evidence of what the server answered; the ack is.
+    const Original = window.WebSocket;
+    window.WebSocket = new Proxy(Original, {
+      construct(target, args) {
+        const socket = new target(...args);
+        socket.addEventListener("message", (event) => {
+          try {
+            const parsed = JSON.parse(String(event.data));
+            if (parsed?.action === "agent.confirm_action") {
+              window.__recordConfirmFrame({ direction: "in", at: new Date().toISOString(), message: parsed });
+            }
+          } catch { /* not JSON */ }
+        });
+        const send = socket.send.bind(socket);
+        socket.send = (data) => {
+          try {
+            const parsed = JSON.parse(String(data));
+            if (parsed?.action === "agent.confirm_action") {
+              window.__recordConfirmFrame({
+                direction: "out", at: new Date().toISOString(),
+                message: { action: parsed.action, payload: parsed.payload },
+              });
+            }
+          } catch { /* ignore */ }
+          return send(data);
+        };
+        return socket;
+      },
+    });
   }, session);
   const target = `${BASE}/canvas?id=${fixture.canvasId}&session=${fixture.sessionId}`;
   for (let attempt = 1; ; attempt += 1) {
@@ -348,12 +410,12 @@ async function openCanvasPage(browser, fixture, session) {
     const body = await page.locator("body").innerText().catch(() => "");
     info("browser", "composer not rendered yet", `${page.url()} :: ${body.replace(/\s+/g, " ").slice(0, 400)}`);
   }
-  return { page, pageErrors, consoleErrors };
+  return { page, pageErrors, consoleErrors, frames };
 }
 
 async function waitForComposer(page) {
   const composer = page.getByRole("textbox", { name: "输入消息", exact: true });
-  await composer.waitFor({ state: "visible", timeout: 90_000 });
+  await composer.waitFor({ state: "visible", timeout: 120_000 });
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     if (await composer.isEnabled().catch(() => false)) return composer;
@@ -366,27 +428,30 @@ async function waitForComposer(page) {
 async function sendFromComposer(page, text) {
   const composer = await waitForComposer(page);
   await composer.fill(text);
-  await page.getByRole("button", { name: "发送消息", exact: true }).click({ timeout: 20_000 });
+  await page.getByRole("button", { name: "发送消息", exact: true }).click({ timeout: 30_000 });
 }
 
-// The card itself rarely exposes its confirmation id as text, so cards are matched
-// by the danger title (the innermost matching div is the card) and the id comes from
-// the transcript, which is the authoritative record of what the card was told.
-// `known` keeps the phase from latching onto a card left by an earlier turn.
+/**
+ * The confirmation id comes from the transcript, which is the authoritative record of
+ * what the card was told; `known` keeps the phase from latching onto an earlier turn.
+ * The card root is then addressed by `data-confirmation-id`, so the phase can only act
+ * on its own proposal even if the DOM also holds cards from other turns.
+ */
 async function waitForDeleteCard(page, sessionId, known = new Set(), timeoutMs = 150_000) {
   const deadline = Date.now() + timeoutMs;
-  const titles = () => page.getByText(DELETE_TITLE, { exact: true });
   for (;;) {
     const blocks = await findConfirmationBlocks(sessionId);
     const fresh = blocks.filter(({ block }) => !known.has(block.output.confirmation.confirmationId));
     const candidate = fresh[fresh.length - 1]?.block?.output?.confirmation;
     if (candidate?.confirmationId) {
-      await titles().last().waitFor({ state: "visible", timeout: 30_000 });
-      return { card: cardRoot(page), confirmation: candidate, block: fresh[fresh.length - 1].block };
+      const card = cardById(page, candidate.confirmationId);
+      await card.waitFor({ state: "visible", timeout: 60_000 });
+      return { card, confirmation: candidate, block: fresh[fresh.length - 1].block };
     }
     if (Date.now() >= deadline) {
       throw new Error(
-        `no NEW delete confirmation appeared (cards on screen: ${await titles().count()}, ` +
+        `no NEW delete confirmation appeared (delete cards on screen: ` +
+        `${await page.locator("[data-confirmation-id]").count()}, ` +
         `known ids: ${known.size}, transcript blocks: ${blocks.length})`,
       );
     }
@@ -394,19 +459,8 @@ async function waitForDeleteCard(page, sessionId, known = new Set(), timeoutMs =
   }
 }
 
-function cardRoot(page) {
-  // The innermost container that holds BOTH the card's title and its confirm button.
-  //
-  // Filtering on the title alone and taking `.last()` returned the title's OWN div,
-  // which does not contain the controls (they live in a sibling block), so every
-  // scoped button query resolved to ZERO elements while the page had clearly
-  // rendered them — the probe then reported the whole execution phase as a product
-  // failure. Adding the `has:` filter keeps the intent (scope to one card, so a card
-  // left pending by another phase cannot satisfy the query) without the false zero.
-  return page.locator("div")
-    .filter({ hasText: DELETE_TITLE })
-    .filter({ has: page.getByRole("button", { name: CONFIRM_LABEL, exact: true }) })
-    .last();
+function cardById(page, confirmationId) {
+  return page.locator(`[data-confirmation-id="${confirmationId}"]`);
 }
 
 async function waitForCardText(root, text, timeoutMs) {
@@ -419,11 +473,49 @@ async function waitForCardText(root, text, timeoutMs) {
   }
 }
 
+async function waitForCardState(root, predicate, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let content = await root.innerText().catch(() => "");
+  let confirmButtons = await root.getByRole("button", { name: CONFIRM_LABEL, exact: true }).count().catch(() => 0);
+  for (;;) {
+    if (predicate({ content, confirmButtons })) return { content, confirmButtons };
+    if (Date.now() >= deadline) return { content, confirmButtons };
+    await sleep(400);
+    content = await root.innerText().catch(() => "");
+    confirmButtons = await root.getByRole("button", { name: CONFIRM_LABEL, exact: true }).count().catch(() => 0);
+  }
+}
+
 function cardButtons(root) {
   return {
     confirm: root.getByRole("button", { name: CONFIRM_LABEL, exact: true }),
     cancel: root.getByRole("button", { name: "取消", exact: true }),
   };
+}
+
+/**
+ * Wait for the server's own answer to THIS click. The card marks itself applied on an
+ * immediate `accepted`/`applied` ack, so the second ack (the final outcome) is what
+ * separates "the delete really ran" from "the button looked like it worked".
+ */
+async function waitForConfirmAck(frames, confirmationId, timeoutMs = 90_000) {
+  const deadline = Date.now() + timeoutMs;
+  const mine = () => frames.filter((frame) => frame.message?.payload?.confirmationId === confirmationId);
+  for (;;) {
+    const entries = mine();
+    const sent = entries.find((frame) => frame.direction === "out");
+    const acks = entries.filter((frame) => frame.direction === "in").map((frame) => frame.message.payload);
+    const terminal = acks.find((payload) => payload.status && payload.status !== "accepted");
+    if (terminal) return { sentAt: sent?.at ?? null, acks, terminal };
+    if (sent && Date.now() >= deadline) return { sentAt: sent.at, acks, terminal: null };
+    if (Date.now() >= deadline) return { sentAt: sent?.at ?? null, acks, terminal: null };
+    await sleep(300);
+  }
+}
+
+function ackSummary(ack) {
+  if (!ack) return "no terminal acknowledgement";
+  return `status=${ack.status}${ack.code ? ` code=${ack.code}` : ""}${ack.message ? ` message=${ack.message}` : ""}`;
 }
 
 /* ------------------------------------------------------- the CLI-only question */
@@ -432,20 +524,21 @@ function cardButtons(root) {
 // `agent.confirm_action`. Two variants separate "the CLI never bound a canvas" from
 // "the confirmation id itself was stale".
 async function cliArtifactProbe(token, realConfirmationId) {
-  const { WebSocket } = await import("ws");
+  // `apps/web` has no `ws` package; Node 24 ships a browser-compatible global WebSocket,
+  // which is enough for an independent socket that only sends one command.
   const outcomes = {};
   const ask = async (label, confirmationId) => {
     const socket = new WebSocket(`${API.replace(/^http/, "ws")}/api/ws?token=${encodeURIComponent(token)}`);
     await new Promise((open, reject) => {
-      socket.once("open", open);
-      socket.once("error", reject);
+      socket.addEventListener("open", open, { once: true });
+      socket.addEventListener("error", reject, { once: true });
     });
     const requestId = randomUUID();
     const ack = await new Promise((done) => {
       const timer = setTimeout(() => done({ status: "no_ack_within_15s" }), 15_000);
-      socket.on("message", (raw) => {
+      socket.addEventListener("message", (event) => {
         let message;
-        try { message = JSON.parse(raw.toString()); } catch { return; }
+        try { message = JSON.parse(String(event.data)); } catch { return; }
         if (message.type === "command.ack" && message.action === "agent.confirm_action") {
           clearTimeout(timer);
           done(message.payload ?? {});
@@ -474,16 +567,17 @@ async function cliArtifactProbe(token, realConfirmationId) {
 
 const session = await login();
 process.env.__PROBE_TOKEN = session.access_token;
-const fixture = await ensureFixture();
-const evidence = { fixture: { canvasId: fixture.canvasId, sessionId: fixture.sessionId, projectId: fixture.projectId ?? null } };
-
 const browser = await chromium.launch({ headless: true });
+const evidence = { fixtures: {} };
+
 try {
-  /* ============================== PHASE 1 + 2: creation and execution ======== */
+  /* ============================== PHASE 1: creation gating =================== */
   {
     const phase = "phase1-creation";
     const title = "确认删除测试图";
+    const fixture = await fixtureFor("phase1");
     const seeded = await prepareCanvasWithOneImage(fixture.canvasId, "p1", title);
+    evidence.fixtures.phase1 = { canvasId: fixture.canvasId, sessionId: fixture.sessionId, projectId: fixture.projectId ?? null };
     const known = await confirmedIdsBefore(fixture.sessionId);
     evidence.phase1 = { seeded };
     const { page, pageErrors, consoleErrors } = await openCanvasPage(browser, fixture, session);
@@ -505,7 +599,6 @@ try {
       evidence.phase1.cardText = cardText;
       pass(phase, "confirmation card is rendered in the browser", `${DELETE_TITLE} + ${CONFIRM_LABEL}`);
       const stillThere = await canvasState(fixture.canvasId);
-      const before = { liveIds: stillThere.liveIds, revision: stillThere.revision, content: stillThere.content };
       await shot(page, "phase1-card-before-confirm");
       if (stillThere.liveIds.includes(seeded.elementId)) {
         pass(phase, "image is STILL on the canvas before any confirmation",
@@ -516,54 +609,90 @@ try {
       }
       if (pageErrors.length) info(phase, "page errors", pageErrors.slice(0, 3).join(" | "));
       if (consoleErrors.length) evidence.phase1.consoleErrors = consoleErrors.slice(0, 6);
+    } finally {
+      await page.close();
+    }
+  }
 
-      /* --------------------------- PHASE 2: a real click executes -------------- */
-      const phase2 = "phase2-execution";
-      const buttons = cardButtons(root);
-      const confirmButtonCount = await buttons.confirm.count();
-      evidence.phase2ButtonCount = confirmButtonCount;
-      if (confirmButtonCount !== 1) {
-        const debug = await page.evaluate(() => {
-          const hits = [...document.querySelectorAll("div")].filter((node) => node.innerText?.includes("需要确认危险操作"));
-          return hits.slice(0, 12).map((node) => ({
-            tag: node.tagName,
-            cls: node.className.slice(0, 60),
-            chars: node.innerText.length,
-            buttons: [...node.querySelectorAll("button")].map((button) => button.innerText.trim()),
-            head: node.innerText.slice(0, 160),
-          }));
-        });
-        evidence.phase2CardDebug = debug;
-        fail(phase2, "the card exposes exactly one 确认删除 button", `count=${confirmButtonCount}`);
+  /* ============================== PHASE 2: execution ========================= */
+  {
+    const phase = "phase2-execution";
+    const title = "确认删除执行图";
+    const fixture = await fixtureFor("phase2");
+    const seeded = await prepareCanvasWithOneImage(fixture.canvasId, "p2", title);
+    evidence.fixtures.phase2 = { canvasId: fixture.canvasId, sessionId: fixture.sessionId, projectId: fixture.projectId ?? null };
+    const known = await confirmedIdsBefore(fixture.sessionId);
+    evidence.phase2 = { seeded };
+    const { page, pageErrors, consoleErrors, frames } = await openCanvasPage(browser, fixture, session);
+    try {
+      await sendFromComposer(page, `把画布上标题为「${title}」的那张图片删除掉`);
+      const { card: root, confirmation } = await waitForDeleteCard(page, fixture.sessionId, known);
+      const confirmationId = confirmation.confirmationId;
+      evidence.phase2.confirmation = confirmation;
+      if ((confirmation.targets ?? []).some((target) => target.elementId === seeded.elementId)) {
+        pass(phase, "the proposal names the seeded image", `target elementId=${seeded.elementId}`);
+      } else {
+        fail(phase, "the proposal names the seeded image",
+          `targets: ${JSON.stringify((confirmation.targets ?? []).map((target) => target.elementId))}`);
       }
-      if (confirmButtonCount >= 1) await buttons.confirm.first().click({ timeout: 20_000 });
+      const cardCount = await cardById(page, confirmationId).count();
+      evidence.phase2.targetedCardCount = cardCount;
+      if (cardCount === 1) {
+        pass(phase, "the phase addresses exactly one card, by its own confirmation id",
+          `[data-confirmation-id="${confirmationId}"] matched 1 element`);
+      } else {
+        fail(phase, "the phase addresses exactly one card, by its own confirmation id", `matched ${cardCount}`);
+      }
+      const before = await canvasState(fixture.canvasId);
+      const confirmButtonCount = await cardButtons(root).confirm.count();
+      evidence.phase2.buttonCount = confirmButtonCount;
+      if (confirmButtonCount === 1) {
+        pass(phase, "the card exposes exactly one 确认删除 button", "count=1");
+      } else {
+        fail(phase, "the card exposes exactly one 确认删除 button", `count=${confirmButtonCount}`);
+      }
+      await cardButtons(root).confirm.first().click({ timeout: 30_000 });
+      const clickedAt = new Date().toISOString();
+      evidence.phase2.clickedAt = clickedAt;
+      const ack = await waitForConfirmAck(frames, confirmationId);
+      evidence.phase2.clickAck = ack;
       const settled = await waitForCardText(root, APPLIED_LABEL, 60_000);
-      evidence.phase2 = { settledText: settled, clickedAt: new Date().toISOString() };
+      evidence.phase2.settledText = settled;
       await shot(page, "phase2-card-applied");
       const after = await waitForCanvas(fixture.canvasId, (state) => !state.liveIds.includes(seeded.elementId), 30_000);
       evidence.phase2.canvasAfter = { revision: after.revision, liveIds: after.liveIds, elementCount: after.elementCount };
+
+      if (ack.terminal && (ack.terminal.status === "applied" || ack.terminal.status === "accepted")) {
+        pass(phase, "the server acknowledged the click as successful", ackSummary(ack.terminal));
+      } else {
+        fail(phase, "the server acknowledged the click as successful", ackSummary(ack.terminal));
+      }
       if (!after.liveIds.includes(seeded.elementId)) {
-        pass(phase2, "a real click deleted the element from the persisted canvas",
+        pass(phase, "a real click deleted the element from the persisted canvas",
           `element gone, ${after.elementCount} live element(s) remain, revision ${before.revision} -> ${after.revision}`);
       } else {
-        fail(phase2, "a real click deleted the element from the persisted canvas",
-          `element ${seeded.elementId} is still present after the click`);
+        fail(phase, "a real click deleted the element from the persisted canvas",
+          `element ${seeded.elementId} is still present after the click (${ackSummary(ack.terminal)})`);
       }
       if (settled.includes(APPLIED_LABEL)) {
-        pass(phase2, "card settled to the applied state", `card text contains 「${APPLIED_LABEL}」`);
+        pass(phase, "card settled to the applied state", `card text contains 「${APPLIED_LABEL}」`);
       } else {
-        fail(phase2, "card settled to the applied state", `card text: ${settled.replace(/\n/g, " / ").slice(0, 300)}`);
+        fail(phase, "card settled to the applied state", `card text: ${settled.replace(/\n/g, " / ").slice(0, 300)}`);
       }
-      const settledBlocks = await findConfirmationBlocks(fixture.sessionId, confirmation.confirmationId);
-      const failureCodes = settledBlocks
-        .map(({ block: current }) => current.output?.error ?? current.output?.code)
-        .filter(Boolean);
-      evidence.phase2.failureCodes = failureCodes;
-      if (failureCodes.length === 0) {
-        pass(phase2, "message state is consistent (no failure code on the confirmation block)");
+      // The card renders from the proposal block, whose output legitimately carries
+      // `error: "confirmation_required"` (that IS the proposal). Treating that string
+      // as a failure code made this check self-defeating; the click's own ack is the
+      // only honest evidence of what happened after the click.
+      const blockAfter = (await findConfirmationBlocks(fixture.sessionId, confirmationId))
+        .map(({ block: current }) => current.output ?? {});
+      evidence.phase2.blockAfter = blockAfter.map((output) => ({ status: output.status ?? null, error: output.error ?? null }));
+      if (settled.includes(APPLIED_LABEL) && ack.terminal?.status !== "failed") {
+        pass(phase, "message state is consistent (card applied and no failed click ack)");
       } else {
-        fail(phase2, "message state is consistent (no failure code on the confirmation block)", failureCodes.join(","));
+        fail(phase, "message state is consistent (card applied and no failed click ack)", ackSummary(ack.terminal));
       }
+      if (pageErrors.length) info(phase, "page errors", pageErrors.slice(0, 3).join(" | "));
+      if (consoleErrors.length) evidence.phase2.consoleErrors = consoleErrors.slice(0, 6);
     } finally {
       await page.close();
     }
@@ -574,9 +703,11 @@ try {
     const phase3 = "phase3-expiry";
     {
       const title = "过期测试图";
+      const fixture = await fixtureFor("phase3");
       const seeded = await prepareCanvasWithOneImage(fixture.canvasId, "p3", title);
+      evidence.fixtures.phase3 = { canvasId: fixture.canvasId, sessionId: fixture.sessionId, projectId: fixture.projectId ?? null };
       const known = await confirmedIdsBefore(fixture.sessionId);
-      const { page } = await openCanvasPage(browser, fixture, session);
+      const { page, frames } = await openCanvasPage(browser, fixture, session);
       try {
         await sendFromComposer(page, `把画布上标题为「${title}」的那张图片删除掉`);
         const { card: root, confirmation } = await waitForDeleteCard(page, fixture.sessionId, known);
@@ -604,60 +735,73 @@ try {
         }
 
         if (SKIP_EXPIRY_WAIT) {
-          info(phase3, "TTL wait skipped", `--skip-expiry-wait: server TTL is 10 minutes (destructive-confirmation-service.ts:266)`);
+          info(phase3, "TTL wait skipped", `--skip-expiry-wait: server TTL is 10 minutes (destructive-confirmation-service.ts)`);
         } else {
           const remaining = Date.parse(confirmation.expiresAt) - Date.now();
-          info(phase3, "waiting out the confirmation TTL", `${Math.max(0, Math.round(remaining / 1000))}s remaining of the 10-minute TTL`);
-          if (remaining > 0) await sleep(remaining + 15_000);
-          const atTtl = await canvasState(fixture.canvasId);
-          evidence.phase3.afterTtlWait = { liveIds: atTtl.liveIds, revision: atTtl.revision };
-          if (atTtl.liveIds.includes(seeded.elementId)) {
-            pass(phase3, "the TTL elapsed with the image untouched",
-              `element still present at TTL+15s, ${atTtl.elementCount} live element(s), revision ${atTtl.revision}`);
+          const budgetMs = EXPIRY_WAIT_SECONDS * 1000;
+          if (remaining > budgetMs) {
+            info(phase3, "TTL wait exceeds the configured budget",
+              `${Math.round(remaining / 1000)}s remaining but --wait-expiry-seconds=${EXPIRY_WAIT_SECONDS}; recording info only`);
+            evidence.phase3.ttlWaitSkipped = { remainingSeconds: Math.round(remaining / 1000), budgetSeconds: EXPIRY_WAIT_SECONDS };
           } else {
-            fail(phase3, "the TTL elapsed with the image untouched",
-              `element ${seeded.elementId} vanished while the card was never confirmed`);
-          }
-          const root = cardRoot(page);
-          await shot(page, "phase3-card-after-ttl");
-          const buttons = cardButtons(root);
-          if (await buttons.confirm.count()) {
-            await buttons.confirm.click({ timeout: 20_000 });
-            await waitForCardText(root, "失败", 5_000);
-            const cardAfterClick = await root.innerText();
-            evidence.phase3.cardAfterExpiredClick = cardAfterClick;
-            const rejected = !cardAfterClick.includes(APPLIED_LABEL);
-            if (rejected) {
-              pass(phase3, "an expired card can no longer be confirmed",
-                `card did not reach 「${APPLIED_LABEL}」; text: ${cardAfterClick.replace(/\n/g, " / ").slice(0, 240)}`);
+            info(phase3, "waiting out the confirmation TTL",
+              `${Math.max(0, Math.round(remaining / 1000))}s remaining of the 10-minute TTL`);
+            if (remaining > 0) await sleep(remaining + 15_000);
+            const atTtl = await canvasState(fixture.canvasId);
+            evidence.phase3.afterTtlWait = { liveIds: atTtl.liveIds, revision: atTtl.revision };
+            if (atTtl.liveIds.includes(seeded.elementId)) {
+              pass(phase3, "the TTL elapsed with the image untouched",
+                `element still present at TTL+15s, ${atTtl.elementCount} live element(s), revision ${atTtl.revision}`);
             } else {
-              fail(phase3, "an expired card can no longer be confirmed",
-                `card reported 「${APPLIED_LABEL}」 after the TTL`);
+              fail(phase3, "the TTL elapsed with the image untouched",
+                `element ${seeded.elementId} vanished while the card was never confirmed`);
             }
-            const codes = (await findConfirmationBlocks(fixture.sessionId, confirmationId))
-              .map(({ block: current }) => current.output?.error ?? current.output?.code)
-              .filter(Boolean);
-            evidence.phase3.expiredClickCodes = codes;
-            info(phase3, "expired-click server codes", codes.join(",") || "none recorded in the transcript");
-          } else {
-            fail(phase3, "an expired card can no longer be confirmed", "the confirm button was no longer rendered");
-          }
-          const finalState = await canvasState(fixture.canvasId);
-          if (finalState.liveIds.includes(seeded.elementId)) {
-            pass(phase3, "the rejected click did not delete anything", `element ${seeded.elementId} still present`);
-          } else {
-            fail(phase3, "the rejected click did not delete anything", `element ${seeded.elementId} is gone`);
-          }
-          // A rejected click must not be replayed by a background recovery tick either.
-          await sleep(60_000);
-          const afterRejection = await canvasState(fixture.canvasId);
-          evidence.phase3.afterRejectionWait = { liveIds: afterRejection.liveIds, revision: afterRejection.revision };
-          if (afterRejection.liveIds.includes(seeded.elementId)) {
-            pass(phase3, "nothing replay-deleted the element after the expired click",
-              `element still present 60s later (revision ${afterRejection.revision})`);
-          } else {
-            fail(phase3, "nothing replay-deleted the element after the expired click",
-              `element ${seeded.elementId} disappeared after the rejected click`);
+            await shot(page, "phase3-card-after-ttl");
+            const buttons = cardButtons(root);
+            if (await buttons.confirm.count()) {
+              await buttons.confirm.first().click({ timeout: 30_000 });
+              // The card only reports 「失败」 once the server answers; wait for that
+              // answer instead of asserting on an immediate screenshot.
+              const ack = await waitForConfirmAck(frames, confirmationId, 30_000);
+              const expired = await waitForCardState(
+                root,
+                ({ content, confirmButtons }) => /失败|已取消/.test(content) || confirmButtons === 0,
+                20_000,
+              );
+              evidence.phase3.expiredClickAck = ack;
+              evidence.phase3.cardAfterExpiredClick = expired.content;
+              evidence.phase3.confirmButtonsAfterExpiredClick = expired.confirmButtons;
+              const rejected = !expired.content.includes(APPLIED_LABEL)
+                && (!ack.terminal || ack.terminal.status === "failed");
+              if (rejected) {
+                pass(phase3, "an expired card can no longer be confirmed",
+                  `${ackSummary(ack.terminal)}; card did not reach 「${APPLIED_LABEL}」: ` +
+                  `${expired.content.replace(/\n/g, " / ").slice(0, 200)}`);
+              } else {
+                fail(phase3, "an expired card can no longer be confirmed",
+                  `card reported 「${APPLIED_LABEL}」 after the TTL (${ackSummary(ack.terminal)})`);
+              }
+              info(phase3, "expired-click server codes", ackSummary(ack.terminal));
+            } else {
+              fail(phase3, "an expired card can no longer be confirmed", "the confirm button was no longer rendered");
+            }
+            const finalState = await canvasState(fixture.canvasId);
+            if (finalState.liveIds.includes(seeded.elementId)) {
+              pass(phase3, "the rejected click did not delete anything", `element ${seeded.elementId} still present`);
+            } else {
+              fail(phase3, "the rejected click did not delete anything", `element ${seeded.elementId} is gone`);
+            }
+            // A rejected click must not be replayed by a background recovery tick either.
+            await sleep(60_000);
+            const afterRejection = await canvasState(fixture.canvasId);
+            evidence.phase3.afterRejectionWait = { liveIds: afterRejection.liveIds, revision: afterRejection.revision };
+            if (afterRejection.liveIds.includes(seeded.elementId)) {
+              pass(phase3, "nothing replay-deleted the element after the expired click",
+                `element still present 60s later (revision ${afterRejection.revision})`);
+            } else {
+              fail(phase3, "nothing replay-deleted the element after the expired click",
+                `element ${seeded.elementId} disappeared after the rejected click`);
+            }
           }
         }
       } finally {
@@ -669,96 +813,126 @@ try {
     {
       const phase4 = "phase4-refresh";
       const title = "刷新测试图";
+      const fixture = await fixtureFor("phase4");
       const seeded = await prepareCanvasWithOneImage(fixture.canvasId, "p4", title);
+      evidence.fixtures.phase4 = { canvasId: fixture.canvasId, sessionId: fixture.sessionId, projectId: fixture.projectId ?? null };
       const known = await confirmedIdsBefore(fixture.sessionId);
-      const { page } = await openCanvasPage(browser, fixture, session);
+      const { page, frames } = await openCanvasPage(browser, fixture, session);
       try {
         await sendFromComposer(page, `把画布上标题为「${title}」的那张图片删除掉`);
         const { card: root, confirmation } = await waitForDeleteCard(page, fixture.sessionId, known);
+        const confirmationId = confirmation.confirmationId;
         if (!(confirmation.targets ?? []).some((target) => target.elementId === seeded.elementId)) {
           fail(phase4, "the proposal names the seeded image",
             `targets: ${JSON.stringify((confirmation.targets ?? []).map((target) => target.elementId))}`);
         }
-        await cardButtons(root).confirm.click({ timeout: 20_000 });
-        await waitForCardText(root, APPLIED_LABEL, 60_000);
+        await cardButtons(root).confirm.first().click({ timeout: 30_000 });
+        const ack = await waitForConfirmAck(frames, confirmationId);
+        const settled = await waitForCardText(root, APPLIED_LABEL, 60_000);
         const afterClick = await waitForCanvas(fixture.canvasId, (state) => !state.liveIds.includes(seeded.elementId), 30_000);
-        const signatureAfterClick = signatureOf(afterClick);
+        const signatureAfterClick = JSON.stringify({
+          revision: afterClick.revision,
+          ids: afterClick.liveIds,
+          files: Object.keys(afterClick.content?.files ?? {}).sort(),
+        });
         evidence.phase4 = {
           seeded,
           confirmation,
+          clickAck: ack,
+          settledText: settled,
           afterClick: { liveIds: afterClick.liveIds, revision: afterClick.revision, signature: signatureAfterClick },
         };
-        const storageFlag = await page.evaluate(
-          (id) => localStorage.getItem(`loomic:handled-confirmation:${id}`),
-          confirmation.confirmationId,
-        );
-        evidence.phase4.handledStorageFlag = storageFlag;
-        // Count only the cards whose target label matches this phase's seeded title, so
-        // an older card left pending by another phase cannot skew the duplicate check.
-        const cardsForThisTarget = () => page.getByText(title, { exact: true }).count();
-        const cardCountBefore = await cardsForThisTarget();
-        evidence.phase4.cardCountBeforeReload = cardCountBefore;
+        if (afterClick.liveIds.includes(seeded.elementId)) {
+          // Everything below would be meaningless: the reload check only says something
+          // when the delete actually happened first.
+          fail(phase4, "the delete succeeded before the reload test", `${ackSummary(ack.terminal)}`);
+          info(phase4, "reload checks skipped", "the element was still present before the reload");
+        } else {
+          pass(phase4, "the delete succeeded before the reload test",
+            `element gone, revision ${afterClick.revision}, ${ackSummary(ack.terminal)}`);
+          const storageFlag = await page.evaluate(
+            (id) => localStorage.getItem(`loomic:handled-confirmation:${id}`),
+            confirmationId,
+          );
+          evidence.phase4.handledStorageFlag = storageFlag;
+          // Count only the cards this phase created (its own session holds no others).
+          const cardsForThisTarget = () => page.getByText(title, { exact: true }).count();
+          const cardCountBefore = await cardsForThisTarget();
+          evidence.phase4.cardCountBeforeReload = cardCountBefore;
 
-        await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
-        await waitForComposer(page);
-        await sleep(6000);
-        await shot(page, "phase4-after-reload");
-        const afterReload = await canvasState(fixture.canvasId);
-        evidence.phase4.afterReload = {
-          liveIds: afterReload.liveIds,
-          revision: afterReload.revision,
-          elementCount: afterReload.elementCount,
-          signature: signatureOf(afterReload),
-        };
-        if (!afterReload.liveIds.includes(seeded.elementId)) {
-          pass(phase4, "reload did not resurrect the deleted image",
-            `element ${seeded.elementId} still absent (revision ${afterClick.revision} -> ${afterReload.revision})`);
-        } else {
-          fail(phase4, "reload did not resurrect the deleted image", `element ${seeded.elementId} is back on the canvas`);
-        }
-        if (signatureOf(afterReload) === signatureAfterClick) {
-          pass(phase4, "the persisted canvas is byte-identical across the reload",
-            `revision ${afterReload.revision}, ${afterReload.elementCount} live element(s)`);
-        } else {
-          info(phase4, "the persisted canvas changed across the reload",
-            `before=${signatureAfterClick.slice(0, 160)} after=${signatureOf(afterReload).slice(0, 160)}`);
-        }
-        const cardCountAfter = await cardsForThisTarget();
-        evidence.phase4.cardCountAfterReload = cardCountAfter;
-        if (cardCountAfter <= cardCountBefore) {
-          pass(phase4, "reload did not duplicate the confirmation",
-            `${cardCountAfter} card(s) carrying 「${title}」 after reload (was ${cardCountBefore})`);
-        } else {
-          fail(phase4, "reload did not duplicate the confirmation",
-            `${cardCountAfter} cards after reload vs ${cardCountBefore} before`);
-        }
-        // A card that still offers 确认删除 after the action was applied would be the
-        // "confirmation comes back on refresh" regression; record it plainly.
-        const buttonsAfter = cardButtons(cardRoot(page));
-        const confirmButtonsAfter = await buttonsAfter.confirm.count();
-        evidence.phase4.confirmButtonsAfterReload = confirmButtonsAfter;
-        if (confirmButtonsAfter === 0) {
-          pass(phase4, "confirmed card does not reappear as a pending action after reload",
-            "no 确认删除 button rendered");
-        } else {
-          info(phase4, "confirmed card reappears as a pending action after reload",
-            `${confirmButtonsAfter} 确认删除 button(s) rendered; the deletion itself did not re-run`);
+          await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
+          await waitForComposer(page);
+          await sleep(8000);
+          await shot(page, "phase4-after-reload");
+          const afterReload = await canvasState(fixture.canvasId);
+          const signatureAfterReload = JSON.stringify({
+            revision: afterReload.revision,
+            ids: afterReload.liveIds,
+            files: Object.keys(afterReload.content?.files ?? {}).sort(),
+          });
+          evidence.phase4.afterReload = {
+            liveIds: afterReload.liveIds,
+            revision: afterReload.revision,
+            elementCount: afterReload.elementCount,
+            signature: signatureAfterReload,
+          };
+          if (!afterReload.liveIds.includes(seeded.elementId)) {
+            pass(phase4, "reload did not resurrect the deleted image",
+              `element ${seeded.elementId} still absent (revision ${afterClick.revision} -> ${afterReload.revision})`);
+          } else {
+            fail(phase4, "reload did not resurrect the deleted image", `element ${seeded.elementId} is back on the canvas`);
+          }
+          if (signatureAfterReload === signatureAfterClick) {
+            pass(phase4, "the persisted canvas is byte-identical across the reload",
+              `revision ${afterReload.revision}, ${afterReload.elementCount} live element(s)`);
+          } else {
+            info(phase4, "the persisted canvas changed across the reload",
+              `before=${signatureAfterClick.slice(0, 160)} after=${signatureAfterReload.slice(0, 160)}`);
+          }
+          const cardCountAfter = await cardsForThisTarget();
+          evidence.phase4.cardCountAfterReload = cardCountAfter;
+          if (cardCountAfter <= cardCountBefore) {
+            pass(phase4, "reload did not duplicate the confirmation",
+              `${cardCountAfter} card(s) carrying 「${title}」 after reload (was ${cardCountBefore})`);
+          } else {
+            fail(phase4, "reload did not duplicate the confirmation",
+              `${cardCountAfter} cards after reload vs ${cardCountBefore} before`);
+          }
+          // A card that still offers 确认删除 after the action was applied would be the
+          // "confirmation comes back on refresh" regression; record it plainly.
+          const reloadedCard = cardById(page, confirmationId);
+          const reloadedVisible = await reloadedCard.count();
+          const confirmButtonsAfter = reloadedVisible
+            ? await cardButtons(reloadedCard).confirm.count()
+            : 0;
+          evidence.phase4.confirmButtonsAfterReload = confirmButtonsAfter;
+          if (confirmButtonsAfter === 0) {
+            pass(phase4, "confirmed card does not reappear as a pending action after reload",
+              reloadedVisible
+                ? "the same card is rendered without a 确认删除 button"
+                : "the confirmed card is not rendered at all");
+          } else {
+            fail(phase4, "confirmed card does not reappear as a pending action after reload",
+              `${confirmButtonsAfter} 确认删除 button(s) rendered on [data-confirmation-id="${confirmationId}"]`);
+          }
         }
       } finally {
         await page.close();
       }
     }
   } else {
-    info("quick", "phases 3-4 skipped", "--quick");
+    info("quick", "phase 3 skipped", "--quick");
   }
 
   /* ==================== the CLI-only question, answered with a browser ====== */
   {
     const phase = "cli-artifact";
     const title = "命令行对照图";
+    const fixture = await fixtureFor("cliArtifact");
     const seeded = await prepareCanvasWithOneImage(fixture.canvasId, "cli", title);
+    evidence.fixtures.cliArtifact = { canvasId: fixture.canvasId, sessionId: fixture.sessionId, projectId: fixture.projectId ?? null };
     const known = await confirmedIdsBefore(fixture.sessionId);
-    const { page } = await openCanvasPage(browser, fixture, session);
+    const { page, frames } = await openCanvasPage(browser, fixture, session);
     try {
       await sendFromComposer(page, `把画布上标题为「${title}」的那张图片删除掉`);
       const { card: root, confirmation } = await waitForDeleteCard(page, fixture.sessionId, known);
@@ -771,18 +945,19 @@ try {
       info(phase, "independent CLI socket, unknown id", JSON.stringify(probe.bogus));
       info(phase, "independent CLI socket, real pending id", JSON.stringify(probe.real));
       // The browser's own click still works on the same proposal.
-      await cardButtons(root).confirm.click({ timeout: 20_000 });
+      await cardButtons(root).confirm.first().click({ timeout: 30_000 });
+      const ack = await waitForConfirmAck(frames, confirmation.confirmationId);
       const text = await waitForCardText(root, APPLIED_LABEL, 60_000);
       const after = await waitForCanvas(fixture.canvasId, (state) => !state.liveIds.includes(seeded.elementId), 30_000);
       evidence.cliArtifact.browserClickText = text;
+      evidence.cliArtifact.browserClickAck = ack;
       if (text.includes(APPLIED_LABEL) && !after.liveIds.includes(seeded.elementId)) {
         pass(phase, "the same confirmation executes from a real browser click",
-          `element ${seeded.elementId} deleted by the browser after the CLI socket failed`);
+          `element ${seeded.elementId} deleted by the browser after the CLI socket failed (${ackSummary(ack.terminal)})`);
       } else {
         fail(phase, "the same confirmation executes from a real browser click",
-          `card: ${text.replace(/\n/g, " / ").slice(0, 200)}`);
-      }
-    } finally {
+          `card: ${text.replace(/\n/g, " / ").slice(0, 200)}; ${ackSummary(ack.terminal)}`);
+      }    } finally {
       await page.close();
     }
   }

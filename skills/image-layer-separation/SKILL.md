@@ -3,7 +3,7 @@ name: image-layer-separation
 description: 区分原生设计图层编辑与扁平图片分层，为拆分背景、主体、文字等提供当前可执行路径；不将 RGBA 位图拆解冒充原始 PSD 或可编辑字体。
 metadata:
   author: loomic
-  version: "2.2.0"
+  version: "2.2.1"
 ---
 
 # 图片分层与原生图层

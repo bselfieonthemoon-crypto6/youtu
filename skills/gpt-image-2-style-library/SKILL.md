@@ -3,7 +3,7 @@ name: gpt-image-2-style-library
 description: 为开放设计需求或用户要求优化的生图提示，跨现有图文库检索并筛选构图、风格和场景参考；配合专业设计 Skill，不改写原样执行的节点提示或单纯改字任务。
 metadata:
   author: loomic
-  version: "1.0.1"
+  version: "1.0.2"
 ---
 
 # 图文提示词风格参考

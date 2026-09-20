@@ -3,7 +3,7 @@ name: campaign-design
 description: 规划或生成活动海报、推广封面与广告图片，组织准确文案和主视觉；已有定稿小改不重新策划。
 metadata:
   author: loomic
-  version: "2.2.0"
+  version: "2.2.1"
 ---
 
 # 活动海报与宣传图
