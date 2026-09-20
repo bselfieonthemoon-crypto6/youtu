@@ -40,7 +40,7 @@
 | # | 清单项 | 状态 | 代码事实 |
 | --- | --- | --- | --- |
 | 1 | Skills 输出协议统一 | ❌ | `use_skill` 要求传入该技能**自己声明的** `runtime.outputKinds`，模型传错即 `skill_output_kind_conflict`（`workspace-skill-tools.ts:48`）。本轮证据显示它**可恢复**（同 run 稍后加载成功），所以不是阻塞项，但多技能组合时输出协议确实不统一（清单建议统一为 guidance/prompt/copy/generation_request/canvas_operation）。 |
-| 2 | 费用与账务核对 | ❌ | `imageSubmissionReceipt()` 在缺 `credits_cost` 时**直接省略** `creditsCost`，没有"费用数据暂不可用"的显式标记；本轮真实成功 job 的 `creditsCost` 为空且无账务流水行。缺：job ↔ 流水 ↔ 余额 三方核对，以及不可用时的明确文案。 |
+| 2 | 费用与账务核对 | 🟡 | **用户侧已修**（`a1f0571`）：`tool-block-view.tsx` 的成本回执在字段不全时**直接 `return null`**，卡片上干脆没有费用行——而"没有费用行"会被用户读成"这次免费"。现在不完整回执明确显示**"费用数据暂不可用"**（不编数字、不给计价依据），只有"从未有过回执"的结果（预检失败/取消/退款）才什么都不显示；4 条新测试覆盖 queued/processing/succeeded/finished。**管理端对账本来就有**：`admin_workspace_billing(p_actor_user_id, p_workspace_id, p_tx_limit)` 返回 `mismatchedJobs`（把 `credits_cost` 与额度流水实际扣费/退款逐条比对），管理页展示最近 20 条"为空表示当前对得上"；已在本机库核实 `admin_workspace_billing` / `admin_set_workspace_plan` / `admin_adjust_credits` 三个函数都存在。**仍缺**：回执本身没有显式 `costStatus`，其它消费方（状态工具/模型）仍只能靠"字段缺失"推断；这是小项，排在正在改 `mastra-image-status-tools.ts` 的工作流落地后做，避免同文件互踩。 |
 | 3 | 错误分类 | 🟡 | 已有 `providerFailureDescription`（按 error code 给中文原因）、`canvasFailureLabel`（按 code 区分渠道过载/拒绝/额度/凭据/尺寸校验）、`sanitizeErrorForClient`；缺**统一分类实体**（用户输入 / 路由 / DB-API / 供应商 / 取消 / 测试入口）与"不一律显示生成失败"的收口。 |
 | 4 | 自动回归用例（11 条流程） | 🟡 | 已有仿真 harness（`apps/server/scripts/agent-sim-tools.mjs`）+ 结构检查 8 类违规定义 + 本轮新增的 19 条单测；缺清单列的 11 条流程的**固定回归集**（只讨论不生图 / 只给提示词 / 明确生成 / 生成后改口 / 多图系列 / 透明背景 / 多参考图消歧 / 运行中取消 / 删除确认 / 非标准尺寸 / 新话题不继承）。 |
 | 5 | 执行过程可观测性（每轮执行摘要） | ❌ | 未做：用户意图 / 匹配 Skill / 使用工具 / 创建任务数 / 最终交付资产 的每轮摘要。 |
