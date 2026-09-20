@@ -28,8 +28,12 @@ export default function WorkspaceLayout({
     return <LoadingScreen />;
   }
 
+  // An unauthenticated visitor is being redirected to /login. Showing nothing here
+  // makes the app look frozen for as long as the redirect takes - a blank screen with
+  // no feedback is indistinguishable from "my click did nothing", so keep the loading
+  // screen up until the router actually leaves.
   if (!user) {
-    return null;
+    return <LoadingScreen />;
   }
 
   return (

@@ -48,6 +48,7 @@ export default function SettingsPage() {
     email: string;
     avatarUrl: string | null;
   } | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [pageLoading, setPageLoading] = useState(true);
 
   // Ref pattern: prevent token refresh from cascading through dependency arrays
@@ -61,6 +62,7 @@ export default function SettingsPage() {
     const token = getToken();
     if (!token) return;
     setPageLoading(true);
+    setLoadError(null);
 
     try {
       const viewer = await fetchViewer(token);
@@ -74,6 +76,11 @@ export default function SettingsPage() {
         // Workspace layout handles auth redirect
         return;
       }
+      // Never leave the page blank: a failed load has to look like a failed load, with
+      // a way to try again.
+      setLoadError(
+        err instanceof Error ? err.message : "无法加载个人资料，请稍后重试。",
+      );
     } finally {
       setPageLoading(false);
     }
@@ -107,48 +114,63 @@ export default function SettingsPage() {
     return <SettingsSkeleton />;
   }
 
-  if (!profile) return null;
-
   return (
     <div className="px-4 py-6 sm:px-6 md:p-8">
       <h1 className="mb-4 text-base font-semibold sm:mb-6 sm:text-lg">
         Settings
       </h1>
 
-      {/* Tab bar -- scrollable on small screens, 44px min touch target */}
-      <div className="mb-6 overflow-x-auto sm:mb-8">
-        <div className="inline-flex gap-1 rounded-lg bg-muted p-1">
-          {tabs.map((tab) => (
-            <button
-              key={tab.id}
-              type="button"
-              onClick={() => setActiveTab(tab.id)}
-              className={`min-h-[44px] whitespace-nowrap rounded-md px-4 py-1.5 text-sm transition-colors sm:min-h-0 sm:px-3 ${
-                activeTab === tab.id
-                  ? "bg-card font-medium text-foreground shadow-sm"
-                  : "text-muted-foreground hover:text-foreground"
-              }`}
-            >
-              {tab.label}
-            </button>
-          ))}
+      {!profile ? (
+        <div className="max-w-xl">
+          <p className="text-sm text-destructive" data-testid="settings-load-error">
+            {loadError ?? "无法加载个人资料，请稍后重试。"}
+          </p>
+          <button
+            type="button"
+            onClick={() => void loadData()}
+            className="mt-4 rounded-md border border-border px-3 py-1.5 text-sm"
+          >
+            重试
+          </button>
         </div>
-      </div>
+      ) : (
+        <>
+          {/* Tab bar -- scrollable on small screens, 44px min touch target */}
+          <div className="mb-6 overflow-x-auto sm:mb-8">
+            <div className="inline-flex gap-1 rounded-lg bg-muted p-1">
+              {tabs.map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`min-h-[44px] whitespace-nowrap rounded-md px-4 py-1.5 text-sm transition-colors sm:min-h-0 sm:px-3 ${
+                    activeTab === tab.id
+                      ? "bg-card font-medium text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+          </div>
 
-      <div className="max-w-xl">
-        {activeTab === "profile" ? (
-          <ProfileSection
-            displayName={profile.displayName}
-            email={profile.email}
-            avatarUrl={profile.avatarUrl}
-            onSave={handleProfileSave}
-          />
-        ) : activeTab === "usage" ? (
-          <CreditUsageHistory />
-        ) : (
-          <BillingSection />
-        )}
-      </div>
+          <div className="max-w-xl">
+            {activeTab === "profile" ? (
+              <ProfileSection
+                displayName={profile.displayName}
+                email={profile.email}
+                avatarUrl={profile.avatarUrl}
+                onSave={handleProfileSave}
+              />
+            ) : activeTab === "usage" ? (
+              <CreditUsageHistory />
+            ) : (
+              <BillingSection />
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }

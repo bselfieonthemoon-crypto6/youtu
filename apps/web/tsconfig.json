@@ -106,6 +106,7 @@
     ".next-production-semantic-layers/types/**/*.ts",
     ".next-production-skills/types/**/*.ts",
     ".next-production-split-placeholder/types/**/*.ts",
+    ".next-production-structured-clarification/types/**/*.ts",
     ".next-production-text-stream/types/**/*.ts",
     ".next-production-textreplace-size/types/**/*.ts",
     ".next-production-textreplace/types/**/*.ts",
@@ -122,7 +123,7 @@
     "src/**/*.tsx",
     "test/**/*.ts",
     "test/**/*.tsx",
-    ".next-production-structured-clarification/types/**/*.ts"
+    ".next-probe/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"

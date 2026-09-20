@@ -93,6 +93,21 @@ describe("settings tabs", () => {
     );
   });
 
+  it("shows a retryable error instead of a blank page when the profile cannot load", async () => {
+    // A blank render is indistinguishable from "my click did nothing", so a failed
+    // load has to say so and offer a retry.
+    fetchViewerMock.mockRejectedValueOnce(new Error("权限服务暂时不可用"));
+    render(<SettingsPage />);
+
+    expect(await screen.findByTestId("settings-load-error")).toHaveTextContent("权限服务暂时不可用");
+    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Billing" })).not.toBeInTheDocument();
+
+    fetchViewerMock.mockResolvedValue(viewer("owner"));
+    await userEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(await screen.findByRole("heading", { name: "Profile" })).toBeInTheDocument();
+  });
+
   it("reads no provider catalogue, provider configs or workspace settings", async () => {
     // The page owns none of that configuration any more, so it must not ask for it.
     render(<SettingsPage />);
