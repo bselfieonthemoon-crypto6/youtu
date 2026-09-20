@@ -1,10 +1,12 @@
 import {
   type DeleteDesignCatalogEntryRequest,
   type DesignCatalogMutationResponse,
+  type DesignCatalogPreviewUrlResponse,
   type DesignResourceScope,
   type RestoreDesignCatalogEntryRequest,
   type SetDesignCatalogStatusRequest,
   designCatalogMutationResponseSchema,
+  designCatalogPreviewUrlResponseSchema,
 } from "@loomic/shared";
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
@@ -53,6 +55,16 @@ export type DesignCatalogAdminService = {
     entity_id: string;
     references: Array<Record<string, unknown>>;
   }>;
+  /**
+   * Sign a thumbnail for one catalog entry. Only the collections that actually
+   * carry an asset (resource, template) are supported; the caller must be able to
+   * see the row through their own client, so this never widens what they can read.
+   */
+  previewUrl(
+    user: AuthenticatedUser,
+    entityKind: DesignCatalogEntityKind,
+    entityId: string,
+  ): Promise<DesignCatalogPreviewUrlResponse>;
   setStatus(
     user: AuthenticatedUser,
     input: SetDesignCatalogStatusRequest,
@@ -132,6 +144,100 @@ export function createDesignCatalogAdminService(options: {
         );
       }
       return { entity_kind: entityKind, entity_id: entityId, references };
+    },
+    async previewUrl(user, entityKind, entityId) {
+      // Only these two collections carry an asset of their own. Everything else
+      // (presets, fonts, categories, tags) has either no preview or its own route.
+      if (entityKind !== "resource" && entityKind !== "template") {
+        throw new DesignResourceServiceError(
+          "resource_invalid",
+          "This catalog collection has no preview image.",
+          400,
+        );
+      }
+      // Visibility first, through the caller's own client: signing must never show
+      // an asset from a row the caller cannot read. Templates have no content asset
+      // of their own - only resources do - so the selected columns differ.
+      const visible = await dynamicFrom(
+        options.createUserClient(user.accessToken),
+        entityTable(entityKind),
+      )
+        .select(
+          entityKind === "resource"
+            ? "id,asset_object_id,preview_asset_object_id"
+            : "id,preview_asset_object_id",
+        )
+        .eq("id", entityId)
+        .maybeSingle();
+      if (visible.error) throw mutationError(visible.error);
+      const row = visible.data as
+        | { asset_object_id?: unknown; preview_asset_object_id?: unknown }
+        | null;
+      if (!row) {
+        throw new DesignResourceServiceError(
+          "resource_not_found",
+          "Catalog item not found.",
+          404,
+        );
+      }
+
+      const previewId =
+        typeof row.preview_asset_object_id === "string"
+          ? row.preview_asset_object_id
+          : null;
+      const assetObjectId =
+        previewId ??
+        (typeof row.asset_object_id === "string" ? row.asset_object_id : null);
+      if (!assetObjectId) {
+        throw new DesignResourceServiceError(
+          "resource_not_found",
+          "Catalog item has no image.",
+          404,
+        );
+      }
+
+      const asset = await dynamicFrom(options.getAdminClient(), "asset_objects")
+        .select("bucket,object_path,mime_type")
+        .eq("id", assetObjectId)
+        .maybeSingle();
+      if (asset.error) throw mutationError(asset.error);
+      const assetRow = asset.data as
+        | { bucket?: unknown; object_path?: unknown; mime_type?: unknown }
+        | null;
+
+      // A failed signature is reported as null, not as an error: the console shows
+      // a placeholder, which is more useful than a broken thumbnail.
+      let url: string | null = null;
+      if (assetRow?.bucket && assetRow.object_path) {
+        const signed = await (
+          options.getAdminClient() as unknown as {
+            storage: {
+              from: (bucket: string) => {
+                createSignedUrl: (
+                  path: string,
+                  expiresIn: number,
+                ) => Promise<{ data?: { signedUrl?: string } | null }>;
+              };
+            };
+          }
+        ).storage
+          .from(String(assetRow.bucket))
+          .createSignedUrl(String(assetRow.object_path), 900);
+        url =
+          typeof signed.data?.signedUrl === "string"
+            ? signed.data.signedUrl
+            : null;
+      }
+
+      return designCatalogPreviewUrlResponseSchema.parse({
+        entity_kind: entityKind,
+        entity_id: entityId,
+        uses_preview: previewId !== null,
+        asset_object_id: assetObjectId,
+        mime_type:
+          typeof assetRow?.mime_type === "string" ? assetRow.mime_type : null,
+        url,
+      });
     },
     async setStatus(user, input) {
       const { data, error } = await callRpc(

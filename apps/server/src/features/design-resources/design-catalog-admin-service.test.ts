@@ -85,3 +85,153 @@ describe("design catalog admin service", () => {
     );
   });
 });
+
+describe("design catalog preview url", () => {
+  const resourceId = "33333333-3333-4333-8333-333333333333";
+  const previewAssetId = "44444444-4444-4444-8444-444444444444";
+  const contentAssetId = "55555555-5555-4555-8555-555555555555";
+
+  function fakeClients(options: {
+    row?: unknown;
+    rowError?: unknown;
+    asset?: unknown;
+    signedUrl?: string | null;
+    onSelect?: (columns: string) => void;
+  }) {
+    const createSignedUrl = vi.fn(async () => ({
+      data: options.signedUrl === undefined ? { signedUrl: "https://signed.example/thumb" } : (options.signedUrl === null ? null : { signedUrl: options.signedUrl }),
+    }));
+    const from = vi.fn((table: string) => {
+      if (table === "design_resources" || table === "design_templates") {
+        const visible: any = {
+          select: (columns: string) => {
+            options.onSelect?.(columns);
+            return visible;
+          },
+          eq: () => visible,
+          maybeSingle: async () => ({
+            data: options.row === undefined ? { id: resourceId, asset_object_id: contentAssetId, preview_asset_object_id: previewAssetId } : options.row,
+            error: options.rowError ?? null,
+          }),
+        };
+        return visible;
+      }
+      const asset: any = {
+        select: () => asset,
+        eq: () => asset,
+        maybeSingle: async () => ({
+          data: options.asset === undefined
+            ? { bucket: "workspace-assets", object_path: "w/1/thumb.png", mime_type: "image/png" }
+            : options.asset,
+          error: null,
+        }),
+      };
+      return asset;
+    });
+    return {
+      createUserClient: () => ({ from }) as never,
+      getAdminClient: () => ({ from, storage: { from: () => ({ createSignedUrl }) } }) as never,
+      createSignedUrl,
+    };
+  }
+
+  it("signs the explicit preview asset and reports that it did", async () => {
+    const clients = fakeClients({});
+    const service = createDesignCatalogAdminService({
+      createUserClient: clients.createUserClient,
+      getAdminClient: clients.getAdminClient,
+    });
+    await expect(
+      service.previewUrl(user as never, "resource", resourceId),
+    ).resolves.toEqual({
+      entity_kind: "resource",
+      entity_id: resourceId,
+      uses_preview: true,
+      asset_object_id: previewAssetId,
+      mime_type: "image/png",
+      url: "https://signed.example/thumb",
+    });
+    expect(clients.createSignedUrl).toHaveBeenCalledWith("w/1/thumb.png", 900);
+  });
+
+  it("falls back to the content asset when there is no preview", async () => {
+    const clients = fakeClients({
+      row: { id: resourceId, asset_object_id: contentAssetId, preview_asset_object_id: null },
+    });
+    const service = createDesignCatalogAdminService({
+      createUserClient: clients.createUserClient,
+      getAdminClient: clients.getAdminClient,
+    });
+    await expect(
+      service.previewUrl(user as never, "template", resourceId),
+    ).resolves.toMatchObject({
+      uses_preview: false,
+      asset_object_id: contentAssetId,
+    });
+  });
+
+  it("never asks templates for a content asset column they do not have", async () => {
+    // `design_templates` has no `asset_object_id`; selecting it makes PostgREST
+    // reject the whole query, which surfaced as a 500 before this was split.
+    const selected: string[] = [];
+    const clients = fakeClients({
+      row: { id: resourceId, preview_asset_object_id: previewAssetId },
+      onSelect: (columns) => selected.push(columns),
+    });
+    const service = createDesignCatalogAdminService({
+      createUserClient: clients.createUserClient,
+      getAdminClient: clients.getAdminClient,
+    });
+    await expect(
+      service.previewUrl(user as never, "template", resourceId),
+    ).resolves.toMatchObject({ uses_preview: true, asset_object_id: previewAssetId });
+    expect(selected).toEqual(["id,preview_asset_object_id"]);
+  });
+
+  it("returns a null url instead of a broken thumbnail when signing fails", async () => {
+    const clients = fakeClients({ signedUrl: null });
+    const service = createDesignCatalogAdminService({
+      createUserClient: clients.createUserClient,
+      getAdminClient: clients.getAdminClient,
+    });
+    await expect(
+      service.previewUrl(user as never, "resource", resourceId),
+    ).resolves.toMatchObject({ url: null });
+  });
+
+  it("hides a row the caller cannot see, and refuses collections without an image", async () => {
+    const invisible = fakeClients({ row: null });
+    const hidden = createDesignCatalogAdminService({
+      createUserClient: invisible.createUserClient,
+      getAdminClient: invisible.getAdminClient,
+    });
+    await expect(
+      hidden.previewUrl(user as never, "resource", resourceId),
+    ).rejects.toMatchObject({ statusCode: 404 });
+    expect(invisible.createSignedUrl).not.toHaveBeenCalled();
+
+    const clients = fakeClients({});
+    const service = createDesignCatalogAdminService({
+      createUserClient: clients.createUserClient,
+      getAdminClient: clients.getAdminClient,
+    });
+    for (const kind of ["text_preset", "font_family", "font_face", "category", "tag"] as const) {
+      await expect(
+        service.previewUrl(user as never, kind, resourceId),
+      ).rejects.toMatchObject({ statusCode: 400 });
+    }
+    // The refusal happens before any database access.
+    expect(clients.createSignedUrl).not.toHaveBeenCalled();
+  });
+
+  it("reports a row with no image at all rather than signing nothing", async () => {
+    const clients = fakeClients({ row: { id: resourceId, asset_object_id: null, preview_asset_object_id: null } });
+    const service = createDesignCatalogAdminService({
+      createUserClient: clients.createUserClient,
+      getAdminClient: clients.getAdminClient,
+    });
+    await expect(
+      service.previewUrl(user as never, "resource", resourceId),
+    ).rejects.toMatchObject({ statusCode: 404 });
+  });
+});

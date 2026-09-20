@@ -175,6 +175,27 @@ export async function registerDesignCatalogAdminRoutes(
       }
     },
   );
+  app.get<{ Params: { collection: string; entityId: string } }>(
+    "/api/admin/design-catalog/:collection/:entityId/preview-url",
+    async (request, reply) => {
+      try {
+        const user = await options.auth.authenticate(request);
+        if (!user) return unauthorized(reply);
+        const config = collectionConfig(request.params.collection);
+        return reply
+          .code(200)
+          .send(
+            await options.service.previewUrl(
+              user,
+              config.kind,
+              request.params.entityId,
+            ),
+          );
+      } catch (error) {
+        return sendError(error, reply);
+      }
+    },
+  );
   app.post("/api/admin/design-catalog/status", async (request, reply) =>
     run(request, reply, options, "status"),
   );

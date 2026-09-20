@@ -44,6 +44,7 @@ import {
   createDesignTextPresetRequestSchema,
   deleteDesignCatalogEntryRequestSchema,
   designCatalogMutationResponseSchema,
+designCatalogPreviewUrlResponseSchema,
   designFontFaceDtoSchema,
   designFontFamilyDtoSchema,
   designImportItemDtoSchema,
@@ -206,6 +207,17 @@ export type DesignResourceApiClient = {
     request?: CatalogPageRequest,
     signal?: AbortSignal,
   ): Promise<DesignCatalogPage<DesignTemplateDto>>;
+  /**
+   * A short-lived signed thumbnail URL for one catalog entry. The list rows carry
+   * the preview asset id, but the bytes come from an endpoint that needs the bearer
+   * token, which an `<img src>` cannot send - so the server signs instead.
+   */
+  getAdminCatalogPreviewUrl(
+    accessToken: string,
+    collection: string,
+    entityId: string,
+    signal?: AbortSignal,
+  ): Promise<{ url: string | null; uses_preview: boolean }>;
   createAdminTemplateFromDesign(
     accessToken: string,
     request: {
@@ -623,6 +635,19 @@ export function createDesignResourceApiClient(
           path: `/api/admin/design-catalog/templates${toQuery(parsed)}`,
         },
         (value) => parsePage(value, designTemplateDtoSchema),
+      );
+    },
+    getAdminCatalogPreviewUrl(accessToken, collection, entityId, signal?: AbortSignal) {
+      return requestJson(
+        {
+          accessToken,
+          signal,
+          path: `/api/admin/design-catalog/${encodeURIComponent(collection)}/${encodeURIComponent(entityId)}/preview-url`,
+        },
+        (value) => {
+          const parsed = designCatalogPreviewUrlResponseSchema.parse(value);
+          return { url: parsed.url, uses_preview: parsed.uses_preview };
+        },
       );
     },
     createAdminTemplateFromDesign(accessToken, input) {

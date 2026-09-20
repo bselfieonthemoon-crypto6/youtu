@@ -56,6 +56,7 @@ const api = vi.hoisted(() => ({
   setAdminCatalogStatus: vi.fn(),
   setAdminCatalogDeleted: vi.fn(),
   getAdminReferences: vi.fn(),
+  getAdminCatalogPreviewUrl: vi.fn(),
   createImport: vi.fn(),
   createImportPackage: vi.fn(),
   createDirectoryImport: vi.fn(),
@@ -111,6 +112,10 @@ describe("DesignResourceAdminSection", () => {
       resource_id: resourceId,
       design_references: [],
     });
+    api.getAdminCatalogPreviewUrl.mockResolvedValue({
+      url: "https://signed.example/thumb",
+      uses_preview: true,
+    });
     api.createImport.mockResolvedValue({
       import_job_id: "44444444-4444-4444-8444-444444444444",
       status: "queued",
@@ -130,6 +135,105 @@ describe("DesignResourceAdminSection", () => {
       asset: { id: "55555555-5555-4555-8555-555555555555" },
     });
     vi.spyOn(window, "confirm").mockReturnValue(true);
+  });
+
+  it("shows a signed thumbnail per row and a placeholder when signing fails", async () => {
+    api.listAdminResources.mockResolvedValue({
+      items: [
+        resource,
+        { ...resource, id: "99999999-9999-4999-8999-999999999999", name: "无缩略图素材" },
+      ],
+      next_cursor: null,
+    });
+    api.getAdminCatalogPreviewUrl.mockImplementation(
+      async (_token: string, _collection: string, id: string) =>
+        id === resourceId
+          ? { url: "https://signed.example/thumb", uses_preview: true }
+          : { url: null, uses_preview: false },
+    );
+    render(
+      <DesignResourceAdminSection
+        accessToken="token"
+        workspaceId={workspaceId}
+      />,
+    );
+    await screen.findByText("封面素材");
+
+    const thumbnails = await screen.findAllByTestId("catalog-preview");
+    expect(thumbnails).toHaveLength(1);
+    expect(thumbnails[0]).toHaveAttribute("src", "https://signed.example/thumb");
+    // The row whose signature failed shows a dash rather than a broken image.
+    expect(screen.getAllByTestId("catalog-preview-placeholder")).toHaveLength(1);
+    expect(api.getAdminCatalogPreviewUrl).toHaveBeenCalledWith(
+      "token",
+      "resources",
+      resourceId,
+    );
+  });
+
+  it("applies a batch status change row by row and reports the outcome", async () => {
+    api.listAdminResources.mockResolvedValue({
+      items: [
+        resource,
+        { ...resource, id: "99999999-9999-4999-8999-999999999999", name: "第二张" },
+      ],
+      next_cursor: null,
+    });
+    api.setAdminCatalogStatus.mockImplementation(
+      async (_token: string, input: { entity_id: string }) => {
+        if (input.entity_id !== resourceId) throw new Error("revision conflict");
+        return {
+          entity_kind: "resource",
+          entity_id: input.entity_id,
+          revision: 2,
+          status: "published",
+          replayed: false,
+        };
+      },
+    );
+    render(
+      <DesignResourceAdminSection
+        accessToken="token"
+        workspaceId={workspaceId}
+      />,
+    );
+    await screen.findByText("封面素材");
+
+    // The select-all box appears once the page's thumbnails have been fetched.
+    fireEvent.click(await screen.findByLabelText("全选"));
+    fireEvent.click(screen.getByRole("button", { name: "批量上架" }));
+
+    await waitFor(() =>
+      expect(api.setAdminCatalogStatus).toHaveBeenCalledTimes(2),
+    );
+    expect(api.setAdminCatalogStatus).toHaveBeenCalledWith(
+      "token",
+      expect.objectContaining({
+        entity_kind: "resource",
+        entity_id: resourceId,
+        expected_revision: 1,
+        status: "published",
+      }),
+    );
+    // One failure does not stop the other row, and the summary says so.
+    expect(await screen.findByText(/成功 1 条，失败 1 条/)).toBeInTheDocument();
+  });
+
+  it("keeps bulk controls off the collections that have no thumbnail", async () => {
+    render(
+      <DesignResourceAdminSection
+        accessToken="token"
+        workspaceId={workspaceId}
+      />,
+    );
+    await screen.findByText("封面素材");
+    expect(screen.getByRole("button", { name: "批量上架" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "标签" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "批量上架" })).toBeNull(),
+    );
+    expect(api.getAdminCatalogPreviewUrl).toHaveBeenCalledTimes(1);
   });
 
   it("uploads a real resource record and runs the review/delete/restore/reference APIs", async () => {

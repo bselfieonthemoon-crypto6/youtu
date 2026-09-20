@@ -238,6 +238,69 @@ describe("design catalog admin routes", () => {
       ).statusCode,
     ).toBe(200);
   });
+
+  it("serves a signed thumbnail url per collection and keeps its refusals", async () => {
+    const app = Fastify();
+    apps.push(app);
+    const auth = {
+      authenticate: vi.fn(async () => ({ id: "user", accessToken: "token" })),
+    };
+    const resourceId = "44444444-4444-4444-8444-444444444444";
+    const service = {
+      previewUrl: vi.fn(async (_user: unknown, kind: string, id: string) => ({
+        entity_kind: kind,
+        entity_id: id,
+        uses_preview: true,
+        asset_object_id: "55555555-5555-4555-8555-555555555555",
+        mime_type: "image/png",
+        url: "https://signed.example/thumb",
+      })),
+    };
+    await registerDesignCatalogAdminRoutes(app, {
+      auth: auth as never,
+      service: service as never,
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/admin/design-catalog/resources/${resourceId}/preview-url`,
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json()).toMatchObject({
+      entity_kind: "resource",
+      uses_preview: true,
+      url: "https://signed.example/thumb",
+    });
+    expect(service.previewUrl).toHaveBeenCalledWith(
+      expect.anything(),
+      "resource",
+      resourceId,
+    );
+
+    // Templates map to their own entity kind, so the collection segment is not
+    // decoration: it decides which table is read.
+    await app.inject({
+      method: "GET",
+      url: `/api/admin/design-catalog/templates/${resourceId}/preview-url`,
+    });
+    expect(service.previewUrl).toHaveBeenLastCalledWith(
+      expect.anything(),
+      "template",
+      resourceId,
+    );
+
+    // An unknown collection never reaches the service (the collection map answers
+    // 400, the same as it does for every other catalog route).
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/admin/design-catalog/nonsense/${resourceId}/preview-url`,
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(service.previewUrl).toHaveBeenCalledTimes(2);
+  });
 });
 
 function multipartBody(file: Buffer) {

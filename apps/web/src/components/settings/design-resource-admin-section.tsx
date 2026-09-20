@@ -98,6 +98,24 @@ export function DesignResourceAdminSection({
   const [variableEditor, setVariableEditor] =
     useState<DesignTemplateDetailDto | null>(null);
   const [variableError, setVariableError] = useState<string | null>(null);
+  // Thumbnails arrive as short-lived signed URLs, fetched once per page of rows.
+  const [previewUrls, setPreviewUrls] = useState<Record<string, string | null>>(
+    {},
+  );
+  const [selected, setSelected] = useState<Record<string, boolean>>({});
+  // Only the two collections that own an asset have a thumbnail or a bulk switch.
+  const supportsPreview = tab === "resources" || tab === "templates";
+  const selectedRows = rows.filter((row) => selected[row.id]);
+  const selectedCount = selectedRows.length;
+
+  const setRowSelected = (row: Row, checked: boolean) =>
+    setSelected((current) => ({ ...current, [row.id]: checked }));
+  const setAllSelected = (checked: boolean) =>
+    setSelected(
+      checked
+        ? Object.fromEntries(rows.map((row) => [row.id, true]))
+        : {},
+    );
 
   const loadFilters = useCallback(async () => {
     try {
@@ -256,6 +274,43 @@ export function DesignResourceAdminSection({
     return () => window.clearInterval(timer);
   }, [imports, load, tab]);
 
+  // Switching collection invalidates both the selection and the old thumbnails.
+  useEffect(() => {
+    setSelected({});
+    setPreviewUrls({});
+  }, [tab]);
+
+  useEffect(() => {
+    if (!supportsPreview || rows.length === 0) {
+      setPreviewUrls({});
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const next: Record<string, string | null> = {};
+      await Promise.all(
+        rows.map(async (row) => {
+          try {
+            const preview = await client.getAdminCatalogPreviewUrl(
+              accessToken,
+              tab,
+              row.id,
+            );
+            next[row.id] = preview.url;
+          } catch {
+            // A row without a usable thumbnail shows a placeholder; it must never
+            // break the table.
+            next[row.id] = null;
+          }
+        }),
+      );
+      if (!cancelled) setPreviewUrls(next);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [accessToken, client, rows, supportsPreview, tab]);
+
   const run = async (key: string, action: () => Promise<void>) => {
     setBusy(key);
     setError(null);
@@ -303,6 +358,48 @@ export function DesignResourceAdminSection({
         deleted,
       );
       setNotice(deleted ? "已删除。" : "已恢复。");
+      await load();
+    });
+
+  /**
+   * Bulk publish/unpublish is a loop over the existing per-row endpoint, not a new
+   * batch semantic: each row keeps its own CAS revision and its own failure reason,
+   * and the result is summarised instead of stopping at the first error.
+   */
+  const batchStatus = (next: Status) =>
+    run("batch", async () => {
+      const chosen = rows.filter((row) => selected[row.id]);
+      if (chosen.length === 0) return;
+      if (
+        !window.confirm(
+          `确认将选中的 ${chosen.length} 条变更为${statusLabel(next)}？`,
+        )
+      )
+        return;
+      let ok = 0;
+      const failed: string[] = [];
+      for (const row of chosen) {
+        try {
+          await client.setAdminCatalogStatus(accessToken, {
+            request_id: crypto.randomUUID(),
+            entity_kind: entityKind(row),
+            entity_id: row.id,
+            expected_revision: row.revision,
+            status: next,
+          });
+          ok += 1;
+        } catch (cause) {
+          failed.push(
+            `${rowName(row)}：${cause instanceof Error ? cause.message : "失败"}`,
+          );
+        }
+      }
+      setSelected({});
+      setNotice(
+        failed.length === 0
+          ? `批量完成：${ok} 条已变更为${statusLabel(next)}。`
+          : `批量完成：成功 ${ok} 条，失败 ${failed.length} 条（${failed.slice(0, 3).join("；")}${failed.length > 3 ? " 等" : ""}）。`,
+      );
       await load();
     });
 
@@ -506,17 +603,51 @@ export function DesignResourceAdminSection({
           }
         />
       ) : (
-        <CatalogTable
-          rows={rows}
-          fontFaces={fontFaces}
-          busy={busy}
-          onStatus={mutateStatus}
-          onDelete={mutateDeleted}
-          onRename={rename}
-          onReferences={showReferences}
-          onToggleFontEmbed={toggleFontEmbed}
-          onVariables={showTemplateVariables}
-        />
+        <>
+          {supportsPreview && (
+            <div className="mt-4 flex flex-wrap items-center gap-2 rounded-xl border p-3">
+              <span className="text-sm text-muted-foreground">
+                已选 {selectedCount} / {rows.length} 条
+              </span>
+              <SmallButton
+                disabled={busy === "batch" || selectedCount === 0}
+                onClick={() => batchStatus("published")}
+              >
+                批量上架
+              </SmallButton>
+              <SmallButton
+                disabled={busy === "batch" || selectedCount === 0}
+                onClick={() => batchStatus("draft")}
+              >
+                批量下架
+              </SmallButton>
+              <SmallButton
+                disabled={selectedCount === 0}
+                onClick={() => setSelected({})}
+              >
+                清空选择
+              </SmallButton>
+              <span className="text-xs text-muted-foreground">
+                批量操作逐条调用既有接口；任一条失败不影响其他条，结果会汇总提示。
+              </span>
+            </div>
+          )}
+          <CatalogTable
+            rows={rows}
+            fontFaces={fontFaces}
+            busy={busy}
+            previewUrls={supportsPreview ? previewUrls : {}}
+            selected={supportsPreview ? selected : {}}
+            onSelect={setRowSelected}
+            onSelectAll={setAllSelected}
+            onStatus={mutateStatus}
+            onDelete={mutateDeleted}
+            onRename={rename}
+            onReferences={showReferences}
+            onToggleFontEmbed={toggleFontEmbed}
+            onVariables={showTemplateVariables}
+          />
+        </>
       )}
       {loading && (
         <p className="mt-3 text-sm text-muted-foreground">正在加载…</p>
@@ -697,6 +828,10 @@ function CatalogTable({
   rows,
   fontFaces,
   busy,
+  previewUrls,
+  selected,
+  onSelect,
+  onSelectAll,
   onStatus,
   onDelete,
   onRename,
@@ -707,6 +842,10 @@ function CatalogTable({
   rows: Row[];
   fontFaces: DesignFontFaceDto[];
   busy: string | null;
+  previewUrls: Record<string, string | null>;
+  selected: Record<string, boolean>;
+  onSelect: (row: Row, checked: boolean) => void;
+  onSelectAll: (checked: boolean) => void;
   onStatus: (row: Row, status: Status) => void;
   onDelete: (row: Row, deleted: boolean) => void;
   onRename: (row: Row) => void;
@@ -722,11 +861,24 @@ function CatalogTable({
         ...fontFaces.filter((face) => face.family_id === row.id),
       );
   }
+  const selectable = Object.keys(previewUrls).length > 0 || Object.keys(selected).length > 0;
+  const allSelected = selectable && rows.length > 0 && rows.every((row) => selected[row.id]);
   return (
     <div className="mt-4 overflow-x-auto rounded-xl border">
       <table className="w-full min-w-[760px] text-left text-sm">
         <thead className="bg-muted/60 text-xs text-muted-foreground">
           <tr>
+            {selectable && (
+              <th className="w-10 px-3 py-2">
+                <input
+                  type="checkbox"
+                  aria-label="全选"
+                  checked={allSelected}
+                  onChange={(event) => onSelectAll(event.target.checked)}
+                />
+              </th>
+            )}
+            <th className="px-3 py-2">预览</th>
             <th className="px-3 py-2">名称</th>
             <th className="px-3 py-2">范围</th>
             <th className="px-3 py-2">类型/详情</th>
@@ -735,8 +887,38 @@ function CatalogTable({
           </tr>
         </thead>
         <tbody>
-          {displayRows.map((row) => (
+          {displayRows.map((row) => {
+            const previewUrl = previewUrls[row.id];
+            const hasPreviewCell = selectable && !isFontFace(row);
+            return (
             <tr key={row.id} className="border-t align-top">
+              {hasPreviewCell && (
+                <td className="px-3 py-3">
+                  <input
+                    type="checkbox"
+                    aria-label={`选择 ${rowName(row)}`}
+                    checked={Boolean(selected[row.id])}
+                    onChange={(event) => onSelect(row, event.target.checked)}
+                  />
+                </td>
+              )}
+              <td className="px-3 py-3">
+                {previewUrl ? (
+                  <img
+                    src={previewUrl}
+                    alt={`${rowName(row)} 预览图`}
+                    data-testid="catalog-preview"
+                    className="h-12 w-12 rounded border object-cover"
+                  />
+                ) : (
+                  <span
+                    className="text-xs text-muted-foreground"
+                    data-testid="catalog-preview-placeholder"
+                  >
+                    —
+                  </span>
+                )}
+              </td>
               <td className="max-w-64 px-3 py-3 font-medium">
                 {rowName(row)}
                 {isFontFace(row) && (
@@ -803,11 +985,12 @@ function CatalogTable({
                 </div>
               </td>
             </tr>
-          ))}
+            );
+          })}
           {displayRows.length === 0 && (
             <tr>
               <td
-                colSpan={5}
+                colSpan={7}
                 className="px-3 py-8 text-center text-muted-foreground"
               >
                 暂无数据

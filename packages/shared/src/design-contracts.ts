@@ -2359,6 +2359,30 @@ export type SetDesignCatalogStatusRequest = z.infer<
   typeof setDesignCatalogStatusRequestSchema
 >;
 
+/**
+ * A short-lived signed URL for a catalog entry's thumbnail.
+ *
+ * The list DTO already carries `preview_asset_object_id`, but the bytes are served
+ * by an endpoint that needs an Authorization header, and an `<img src>` cannot send
+ * one. Signing stays server-side for the same reason the skill previews do it:
+ * the storage bucket has no policy for authenticated readers.
+ *
+ * `uses_preview` says whether the explicit preview asset was signed or the content
+ * asset was used as a fallback, and `url` is null when signing failed - the console
+ * shows a placeholder rather than a broken image.
+ */
+export const designCatalogPreviewUrlResponseSchema = z.object({
+  entity_kind: designCatalogEntityKindSchema,
+  entity_id: designUuidSchema,
+  uses_preview: z.boolean(),
+  asset_object_id: designUuidSchema,
+  mime_type: z.string().nullable(),
+  url: z.string().nullable(),
+});
+export type DesignCatalogPreviewUrlResponse = z.infer<
+  typeof designCatalogPreviewUrlResponseSchema
+>;
+
 export const deleteDesignCatalogEntryRequestSchema = z
   .object({
     request_id: designUuidSchema,
