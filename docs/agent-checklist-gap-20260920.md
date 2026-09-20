@@ -101,6 +101,41 @@
 
 7. **删除确认浏览器验收**（阶段二 #5）— 本轮 E 工作流在做（创建/过期/执行/刷新四阶段 + 判定 CLI 的 `not_found` 是否只存在于 CLI）。
 
+## 回归结论（第二批，2026-09-20 集成后）
+
+集成提交 `5f86ece`（+ `63ebe87` 清理误入的临时脚本），工作区 0 改动。门禁：shared 构建 ✅；
+server typecheck 12/12 批（production 根 249）✅；server 测试 **273 文件 / 2269 测试全通过**（原 268 / 2181）。
+
+**新健康检查线上实测**（替换掉原常量 `{ok:true}`）：
+`HTTP 200 ok=true`，五项组件全 `ok` —— database `write+read ok` 20ms（**真写入**探针）、agentRuntime 3ms、
+queue `4 queues empty` 34ms、storage `bucket reachable` 25ms、worker `1 online (…0a0884ec)` 6ms；
+`private.loomic_worker_heartbeats` 实时更新（实测 `last_seen=08:56:26`）。
+
+**技能选型信号已真正生效**：生成器校验器修好 → `--write` 重新生成 → `--check` 恢复通过 →
+应用目录迁移后 `whenToUse` **15/15 落库**，版本未倒退、356 条安装状态行未变。
+
+**11 条流程固定回归集首跑**（`apps/server/scripts/agent-regression-flows.mjs`，默认零成本）：
+**PASS 4 / FAIL 1 / SKIP 6**。
+
+| 流程 | 结果 | 观测 |
+| --- | --- | --- |
+| 只讨论不生图 | PASS 7/7 | jobs=0 tools=0 |
+| 只给提示词 | PASS 6/6 | jobs=0 tools=2 |
+| 多参考图消歧 | PASS 11/11 | jobs=0 |
+| 非标准尺寸（讨论） | PASS 6/6 | jobs=0 |
+| 新话题不继承旧约束 | **FAIL 9/10** | 见下（**检查器假阳性**） |
+| 明确生成 / 生成后改口 / 多图系列 / 透明背景 / 运行中取消 | SKIP | `--paid` 门控，默认不花钱 |
+| 删除确认 | SKIP | 交给浏览器探测，不重复实现 |
+
+**那条 FAIL 不是产品缺陷，而是断言设计失真**（已留证据
+`artifacts/agent-regression-20260920/flows/new-topic-no-inheritance`）：断言用"禁用词是否出现"做代理，
+而回复开头正是"**前一轮设定已作废**：青原保温壶、哑光绿、夏日上新、3:2 全部不带入本任务"——
+禁用词出现在**声明作废的句子里**。同轮的路由断言 `routing_not_series_continuation`
+是 PASS 的，`new_topic_reply_is_about_new_subject` 也 PASS。**诚实的修法**是让断言区分
+"被引用以作废"与"被当作本轮设定使用"（例如先剔除含 作废/不带入/不沿用/全新起点 的分句再查禁用词），
+而不是把禁用词表删掉——这属于检查器修正，尚未实施。
+
+
 ## 总体判断（与用户一致）
 
 主链路可用，不需要推倒重做。真正该收紧的是**状态准确、路由安全、资产绑定、尺寸可信、多图完成度**这五件基础事。
