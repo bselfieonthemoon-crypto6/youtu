@@ -55,6 +55,16 @@
  * 删除确认 is declared here with `runner: "browser"` and its real probe path,
  * and is always reported as SKIPPED: a CLI cannot impersonate a browser tab, so
  * a second probe would be a duplicate, not a regression case.
+ *
+ * Prose-assertion contract (added 2026-09-20 after the false-FAIL incident in
+ * `new-topic-no-inheritance`): an expectation that reads natural language must
+ * never FAIL because a reply *quotes, denies or voids* what it mentions. Every
+ * such assertion here is clause/scope aware, states its rule in a comment with
+ * the incident as the reason, and is listed in PROSE_PROXY_AUDIT below as `fixed`
+ * or `flagged` (assertions that read report/state/check JSON are structural and
+ * out of scope). The assertions themselves are pinned by a native node:test suite
+ * that lives beside this file:
+ *   node --test apps/server/scripts/agent-regression-flows.assertions.test.mjs
  */
 import { spawn } from "node:child_process";
 import { access, mkdir, open, readFile, writeFile } from "node:fs/promises";
@@ -165,12 +175,35 @@ function replyPresent(turn, minChars, code = "reply_present", description = "本
   return decide(turn.reply.trim().length >= minChars, code, description,
     { replySource: turn.replySource, replyChars: turn.reply.trim().length, minChars, excerpt: turn.reply.trim().slice(0, 240) });
 }
+/**
+ * "回复不得声称已经生成/交付了图片" — clause-scoped, fixed in the same pass as the
+ * old-topic rule because it is the same class of proxy: the first version matched
+ * /已(?:经)?(?:生成|出图|交付|…)/ anywhere in the reply, so a sentence that
+ * explicitly DENIES delivery ("本轮不会生成图片，也没有已生成的结果") read as a
+ * claim — the reply was punished for quoting the very thing it refused. A claim
+ * now requires the matched verb to sit in a clause whose immediate neighbourhood
+ * carries no negation (不/没/未/别/勿/无/尚未/不会/不能/无法/还没…), so the denial
+ * clause is exempt while a real claim in a neighbouring clause still fails.
+ */
+const GENERATION_CLAIM = /(?:已(?:经)?(?:生成|出图|交付|完成生成)|生成完成|图片已生成|已完成生成)/;
+const CLAIM_NEGATION = /(?:不|没|未|别|勿|无|尚未|不会|不能|无法|不必|无需|还没|否认|毋需)/;
+function generationClaimClause(reply) {
+  for (const sentence of String(reply).split(SENTENCE_SPLIT)) {
+    const match = GENERATION_CLAIM.exec(sentence);
+    if (!match) continue;
+    const [from, to] = clauseBounds(sentence, match.index, match.index + match[0].length);
+    const clause = sentence.slice(from, to);
+    const neighbourhood = clause.slice(Math.max(0, match.index - from - 8), match.index - from);
+    if (CLAIM_NEGATION.test(neighbourhood)) continue;
+    return clause.trim().slice(0, 160);
+  }
+  return null;
+}
 function noGenerationClaim(turn, description = "回复不得声称已经生成/交付了图片") {
-  const CLAIM = /(?:已(?:经)?(?:生成|出图|交付|完成生成)|生成完成|图片已生成|已完成生成)/;
   if (turn?.replyAuthority === "none") return undecided("no_generation_claim", description, { reason: "没有可见回复可判定" });
-  const match = turn.reply.match(CLAIM);
-  if (match) return fail("no_generation_claim", description, { matched: match[0], excerpt: turn.reply.slice(0, 240) });
-  return pass("no_generation_claim", description, { matched: null, replySource: turn.replySource });
+  const claim = generationClaimClause(turn.reply);
+  if (claim) return fail("no_generation_claim", description, { claimClause: claim, excerpt: turn.reply.slice(0, 240) });
+  return pass("no_generation_claim", description, { claimClause: null, replySource: turn.replySource });
 }
 function noCanvasDelivery(turn, description = "本轮画布不得新增图片元素") {
   const canvas = turn?.report?.canvas;
@@ -218,6 +251,20 @@ function harnessStepsOk(ctx) {
       failed: failedSteps.map(step => ({ step: step.step, exitCode: step.exitCode, log: step.log })) });
 }
 
+/* --------------------------------------------------------------------------- *
+ * Prose assertions.                                                            *
+ * Everything below reads natural-language reply text, so each rule has to say  *
+ * how it decides — and what it refuses to decide — or it becomes a proxy that  *
+ * a reply can satisfy, or break, merely by quoting the words in question.      *
+ * --------------------------------------------------------------------------- */
+
+/** Sentence cut shared by every prose assertion (no trim: indexes stay valid). */
+const SENTENCE_SPLIT = /(?<=[。；！？!?;\n])/;
+/** Clause cut inside one sentence. Brackets/quotes are deliberately NOT
+ * delimiters: a copy label may wrap its value (文案「夏日上新」) and the label has
+ * to stay visible to the assignment test. */
+const CLAUSE_DELIMITER = /[，、；：,;:]/;
+
 /**
  * "非标准尺寸" expectation: the discussion must not claim an exact 320×70 output.
  *
@@ -226,13 +273,20 @@ function harnessStepsOk(ctx) {
  * delivery verb (已生成/已交付/生成完成/…) or a precision-delivery verb pair
  * (输出/产出/生成 + 精确/正好), and contains no negation, approximation or
  * conditional marker. Questions are never claims.
+ *
+ * FLAGGED (see PROSE_PROXY_AUDIT): the suppression marker is SENTENCE scoped, so
+ * a negation in one clause can excuse a real claim in another clause of the same
+ * sentence — the mirror image of the quoted-token defect. It has not produced a
+ * false FAIL (the direction that hides regressions in noise is the opposite one:
+ * a false PASS), and tightening it would change the live baseline of a flow this
+ * pass does not own, so it is left as-is and recorded instead.
  */
 const PIXEL_SIZE = /320\s*[×xX*]\s*70/;
 const DELIVERY_COMPLETION = /(?:已(?:经)?(?:生成|交付|导出|完成|产出|给出|输出|提交|做好|得到|获得)|生成完成|提交完成|交付完成|输出完成|已完成|做好了)/;
 const DELIVERY_PRECISE = /(?:输出|产出|生成|交付|得到|获得|保证|确保)[^。；！？\n]{0,12}(?:精确|精准|正好|恰好)/;
 const NON_CLAIM_MARKER = /(?:无法|不能|不会|不可|不要|不用|未能|没有|尚未|未|并非|不是|不保证|不承诺|不声称|不精确|近似|差不多|接近|如果|若|假如|裁切|裁剪|缩放|自己再|你自己)/;
 function exactPixelClaimSentence(reply) {
-  for (const raw of String(reply).split(/(?<=[。；！？!?;\n])/)) {
+  for (const raw of String(reply).split(SENTENCE_SPLIT)) {
     const sentence = raw.trim();
     if (!sentence || /[？?]/.test(sentence)) continue;
     if (!PIXEL_SIZE.test(sentence)) continue;
@@ -253,33 +307,214 @@ function noExactPixelClaim(turn) {
 }
 
 /**
- * "新话题不继承旧约束": SENTENCE-SCOPED inheritance detection.
+ * "新话题不继承旧约束": CLAUSE-SCOPED inheritance detection with application evidence.
  *
- * The literal form of this expectation ("the new reply must not contain the old
- * topic's tokens at all") was measured on 2026-09-20 and came back FAIL for a
- * reply whose only mention was the sentence "新任务已切换到宠物友好书店，之前的
- * 青原保温壶品牌、产品、文案和 3:2 尺寸全部作废，不沿用。" — that is a disavowal,
- * not reuse, and every other line of the reply was new-topic content. Treating a
- * meta-statement as inheritance would report a correct behaviour as a defect, so
- * the honest machine-checkable form is: an old token counts as INHERITANCE only
- * when it appears in a sentence that carries no discard marker (作废/不沿用/…).
- * A token re-used later in the plan is still caught, because sentence scoping
- * does not let one disavowal sentence cover the rest of the reply.
+ * INCIDENT (the reason this rule exists). The first version of this expectation
+ * was a raw substring scan over the whole reply:
+ *     OLD_TOPIC_TOKENS.filter(token => second.reply.includes(token))
+ * It reported FAIL on four consecutive full runs on 2026-09-20
+ * (report-2026-09-20T08-36-18, 08-59-00, 09-34-55, 12-09-35), every time because
+ * the old-topic words appeared inside the sentence that VOIDS them, e.g.
+ *   「这是一个全新任务，之前青原保温壶的品牌、产品、文案和 3:2 尺寸全部作废，不沿用。」
+ *   「**前一轮设定已作废**：青原保温壶、哑光绿、夏日上新、3:2 全部不带入本任务。」
+ * The product behaviour was correct — the same turn's routing_not_series_continuation
+ * and new_topic_reply_is_about_new_subject passed — so the CHECK was the defect.
+ * A wrong FAIL is worse than no check: it trains people to ignore the suite and it
+ * buries real regressions in noise.
+ *
+ * RULE. A forbidden token counts as inheritance only when BOTH hold:
+ *   1. it is not voided (see voidCover below), and
+ *   2. it carries application evidence (see applicationEvidence below), i.e. the
+ *      sentence presents it as THIS turn's active setting.
+ * Void scope (computed inside one sentence; a void in one sentence never covers
+ * another sentence):
+ *   - VOID_BACKWARD (作废/无效/不作数/清空/重置/…): Chinese puts the object before
+ *     the predicate, so it voids the tokens before it in the sentence; it voids the
+ *     tokens after it only when it introduces a list with a colon (已作废：A、B).
+ *   - VOID_NEGATED_USE (不再沿用/不使用/不带入/不继承/…) and VOID_FORWARD
+ *     (放弃/弃用/忘掉/删除/…): the object may sit on either side, so they void the
+ *     tokens before them in the sentence and the tokens after them in their own
+ *     clause.
+ *   - VOID_CONTRAST (相比/不同于/不是/并非/无关/…): voids the tokens in its clause.
+ * Void scope beats application evidence, because a discarded enumeration may
+ * legitimately name the settings it throws away: 「之前的品牌青原保温壶、主色哑光绿
+ * 全部作废」 is not reuse.
+ * Application evidence (inside the token's own clause only): a setting noun assigns
+ * the token (品牌青原 / 主色是哑光绿 / 文案「夏日上新」), the token is named as a
+ * setting (哑光绿作为主色), or a negation-guarded application verb carries it
+ * (沿用/继续用/保持/改用/… — so 不沿用 can never read as 沿用).
+ * A token that is neither voided nor applied is NOT a pass: prose alone cannot tell
+ * a passing comparison from a silent carry-over, so it is reported as `unverified`
+ * (ok: null) for a human to read — never as PASS and never as FAIL.
+ * The forbidden-token list is deliberately NOT weakened: one applied token fails
+ * the expectation (self-tested in agent-regression-flows.assertions.test.mjs).
+ *
+ * KNOWN LIMITS (deliberate, so nobody mistakes them for coverage):
+ *   - Application evidence is clause-local (a setting noun or verb within ~4 chars
+ *     of the token). A carry-over whose verb sits in the final clause of a 、-list
+ *     ("青原保温壶的品牌、产品、文案全部沿用") is reported unverified, not failed:
+ *     widening evidence to sentence scope would also judge "青原保温壶项目已收尾，
+ *     书店沿用夜间暖光" as inheritance — a false FAIL, the exact defect fixed here.
+ *   - A reply can reuse the old setting without naming any forbidden token
+ *     ("沿用之前的品牌"); a token-based check cannot see that and does not claim to.
  */
 const OLD_TOPIC_TOKENS = ["青原", "保温壶", "夏日上新", "哑光绿"];
-const DISAVOWAL_MARKER = /(?:作废|不沿用|不要沿用|不继承|不再使用|放弃|弃用|无效|不作数|清空|重置|无关|脱离|切换到|转向|忘掉)/;
+
+/** Bare discard predicates: their object normally PRECEDES them in Chinese. */
+const VOID_BACKWARD = /(?:作废|无效|不作数|已废弃|废弃|全部不要|清空|重置|清除)/;
+/** Negated-use forms: the object may precede or follow ("不再沿用 X" / "X 不再沿用"). */
+const VOID_NEGATED_USE = /(?:不再沿用|不再使用|不再采用|不再保留|不再继续|不沿用|不使用|不采用|不保留|不继续|不继承|不带入|不要沿用|不要用|别沿用|勿沿用|无需沿用|不用沿用)/;
+/** Directives whose object FOLLOWS them ("放弃旧方案"). */
+const VOID_FORWARD = /(?:放弃|弃用|停用|忘掉|忘记|删除|移除|去掉|脱离|另起|重新开始|重来)/;
+/** Contrast markers: the token is being compared with, or separated from, the new task.
+ * Deliberately limited to contrast/negation of the token itself: 全新 and 另一个 were
+ * removed because they can sit in the SAME clause as an applied token
+ * ("全新方案沿用青原保温壶"), and void scope would then swallow a real inheritance. */
+const VOID_CONTRAST = /(?:不同于|区别于|无关|不相关|没有任何关系|相比|对比|不是|并非)/;
+
+/** Setting nouns that can assign a value to the current turn. */
+const SETTING_NOUN = "(?:品牌名|品牌色|品牌|产品名|产品|主色调|主色|配色|色调|色系|颜色|文案|主题|系列|尺寸|比例|风格|视觉|画面|素材|字体)";
+/** Only these may sit between a setting noun and its value (品牌 青原 / 主色是哑光绿). */
+const ASSIGN_GAP = "(?:是|为|用|定|做|选|按|照|沿用|采用|保持|保留|继续|：|:|、|\\s|\\*)*";
+const ASSIGNMENT_BEFORE = new RegExp(`${SETTING_NOUN}(?:名|色)?${ASSIGN_GAP}$`);
+const ASSIGNMENT_AFTER = /^(?:[^，。；：、\n]{0,3})?(?:作为|为|是|定为|设为|用作|做|成为)(?:品牌名|品牌|主色调|主色|配色|色调|色系|文案|主题|系列|尺寸|比例|风格)/;
+/** Application verbs; the lookbehind is what keeps 不沿用 / 不再用 / 弃用 from reading as use. */
+const APPLY_VERB = "(?:沿用|延用|继续|保持|保留|采用|使用|改用|改为|改成|切换到|转向|统一|一致|照旧|照常|同上|仍然|仍|依然|依旧|还是|不变|固定为|定为|设为|作为|按|照|用)";
+const NOT_NEGATED = "(?<!不再|不|没|未|别|勿|弃|停|免|无需)";
+const APPLICATION_BEFORE = new RegExp(`${NOT_NEGATED}${APPLY_VERB}[^，。；：、\\n]{0,4}$`);
+const APPLICATION_AFTER = new RegExp(`^[^，。；：、\\n]{0,2}${NOT_NEGATED}${APPLY_VERB}`);
+
+/** Clause bounds around one token occurrence, inside one sentence. */
+function clauseBounds(sentence, start, end) {
+  let from = 0;
+  for (let index = start - 1; index >= 0; index--) if (CLAUSE_DELIMITER.test(sentence[index])) { from = index + 1; break; }
+  let to = sentence.length;
+  for (let index = end; index < sentence.length; index++) if (CLAUSE_DELIMITER.test(sentence[index])) { to = index; break; }
+  return [from, to];
+}
+function sameClause(sentence, first, second) {
+  return !CLAUSE_DELIMITER.test(sentence.slice(Math.min(first, second), Math.max(first, second)));
+}
+/** Why (if at all) this sentence voids the token at `index`; `null` means "not voided". */
+function voidCover(sentence, index, length) {
+  const end = index + length;
+  const backward = VOID_BACKWARD.exec(sentence);
+  if (backward) {
+    if (index < backward.index) return `void-before:${backward[0]}`;
+    const after = sentence.slice(backward.index + backward[0].length);
+    if (end > backward.index + backward[0].length && /^[\s*]*[:：]/.test(after)) return `void-colon-list:${backward[0]}`;
+  }
+  for (const marker of [VOID_NEGATED_USE, VOID_FORWARD]) {
+    const match = marker.exec(sentence);
+    if (!match) continue;
+    const markerEnd = match.index + match[0].length;
+    if (index < match.index) return `void-object-of:${match[0]}`;
+    if (end > markerEnd && sameClause(sentence, match.index, index)) return `void-after:${match[0]}`;
+  }
+  const contrast = VOID_CONTRAST.exec(sentence);
+  if (contrast && sameClause(sentence, contrast.index, index)) return `void-contrast:${contrast[0]}`;
+  return null;
+}
+/** Why (if at all) this token is presented as the current turn's setting. */
+function applicationEvidence(clause, offset, token) {
+  const before = clause.slice(0, offset);
+  const after = clause.slice(offset + token.length);
+  const assignment = ASSIGNMENT_BEFORE.exec(before);
+  if (assignment) return `setting-assigns:${assignment[0]}`;
+  const named = ASSIGNMENT_AFTER.exec(after);
+  if (named) return `named-as-setting:${named[0]}`;
+  const verbBefore = APPLICATION_BEFORE.exec(before);
+  if (verbBefore) return `apply-verb-before:${verbBefore[0]}`;
+  const verbAfter = APPLICATION_AFTER.exec(after);
+  if (verbAfter) return `apply-verb-after:${verbAfter[0]}`;
+  return null;
+}
+const evidenceRecord = (token, sentence, extra) => ({ token, sentence: sentence.trim().slice(0, 160), ...extra });
+/**
+ * Classify every old-topic token occurrence in `reply`.
+ * reused     -> presented as this turn's setting            (inheritance)
+ * disavowed  -> quoted only to be voided/refused/contrasted  (innocent)
+ * unclear    -> mentioned with no void and no application    (unverifiable)
+ */
 function oldConstraintUse(reply, tokens = OLD_TOPIC_TOKENS) {
   const reused = [];
   const disavowed = [];
-  for (const raw of String(reply).split(/(?<=[。；！？!?;\n])/)) {
-    const sentence = raw.trim();
-    if (!sentence) continue;
-    const hits = tokens.filter(token => sentence.includes(token));
-    if (!hits.length) continue;
-    (DISAVOWAL_MARKER.test(sentence) ? disavowed : reused).push({ tokens: hits, sentence });
+  const unclear = [];
+  for (const sentence of String(reply).split(SENTENCE_SPLIT)) {
+    if (!sentence.trim()) continue;
+    for (const token of tokens) {
+      for (let index = sentence.indexOf(token); index >= 0; index = sentence.indexOf(token, index + token.length)) {
+        const [from, to] = clauseBounds(sentence, index, index + token.length);
+        const cover = voidCover(sentence, index, token.length);
+        const evidence = cover ? null : applicationEvidence(sentence.slice(from, to), index - from, token);
+        if (cover) disavowed.push(evidenceRecord(token, sentence, { voidedBy: cover }));
+        else if (evidence) reused.push(evidenceRecord(token, sentence, { evidence }));
+        else unclear.push(evidenceRecord(token, sentence, { reason: "既未被作废/对比，也没有被当作本轮设定使用" }));
+      }
+    }
   }
-  return { reused, disavowed };
+  return { reused, disavowed, unclear };
 }
+/** The flow's expectation, with a decidable PASS / FAIL and an honest UNVERIFIED. */
+function newTopicExcludesOldConstraints(turn) {
+  const description = "第 2 轮回复不得把第 1 轮的品牌/产品/文案/尺寸当作本轮生效设定（引用后作废/不沿用不算复用）";
+  if (turn?.replyAuthority !== "full") {
+    return undecided("new_topic_excludes_old_constraints", "回复不可读，无法判定是否复用旧约束",
+      { replySource: turn?.replySource ?? "none" });
+  }
+  const { reused, disavowed, unclear } = oldConstraintUse(turn.reply);
+  const observed = {
+    appliedTokens: reused.map(record => record.token),
+    appliedEvidence: reused.map(record => `${record.token}<-${record.evidence}`),
+    voidedTokens: disavowed.map(record => record.token),
+    undecidedTokens: unclear.map(record => record.token),
+    forbidden: OLD_TOPIC_TOKENS,
+    excerpt: turn.reply.trim().slice(0, 240),
+  };
+  if (reused.length) {
+    return fail("new_topic_excludes_old_constraints", description,
+      { ...observed, appliedSentences: reused.map(record => record.sentence) });
+  }
+  if (unclear.length) {
+    return undecided("new_topic_excludes_old_constraints", description,
+      { ...observed, reason: "旧话题特征词既未被作废、也没有被当作本轮设定使用：文字层面无法判定，交人复核",
+        undecidedSentences: unclear.map(record => record.sentence) });
+  }
+  return pass("new_topic_excludes_old_constraints", description, observed);
+}
+
+/* --------------------------------------------------------------------------- *
+ * PROSE_PROXY_AUDIT — every expectation in this file that judges natural        *
+ * language rather than a structured report field, with its disposition and why. *
+ * Audit performed 2026-09-20 after the `new-topic-no-inheritance` false FAIL.   *
+ * Dispositions:                                                                 *
+ *   fixed      — rule rewritten in this pass (scope/negation aware, self-tested)*
+ *   flagged    — known proxy kept as-is; its weakness is stated here. It can    *
+ *                only produce a false PASS (a real regression slipping through),*
+ *                never a false FAIL, and it has produced neither so far.        *
+ * Anything reading turn-report/state/check JSON (runStatus, jobs, tools,        *
+ * routing, canvas, attachments, harness steps) is structural and out of scope.  *
+ * --------------------------------------------------------------------------- */
+const PROSE_PROXY_AUDIT = [
+  { code: "new_topic_excludes_old_constraints", where: "new-topic-no-inheritance", disposition: "fixed",
+    note: "raw substring scan over the reply -> void-cover + application-evidence rule; incident 2026-09-20 (4 false FAILs)" },
+  { code: "no_generation_claim", where: "discussion-only / prompt-only", disposition: "fixed",
+    note: "claim regex read a denial clause (没有已生成/不会生成) as a claim -> clause-scoped negation guard" },
+  { code: "no_exact_pixel_claim", where: "nonstandard-size-discussion", disposition: "flagged",
+    note: "sentence-scoped NON_CLAIM_MARKER: a negation in one clause excuses a claim in another (false PASS direction)" },
+  { code: "reply_is_prompt_text", where: "prompt-only", disposition: "flagged",
+    note: "/提示词|prompt/ + length can be satisfied by quoting the word; only asserts delivery form is text" },
+  { code: "clarification_instead_of_job", where: "multi-reference-disambiguation", disposition: "flagged",
+    note: "/请明确|需要你|澄清|哪一张/ over prose is satisfiable by a negated sentence; the structural image-tool refusal path is unaffected" },
+  { code: "discusses_size", where: "nonstandard-size-discussion", disposition: "flagged",
+    note: "/320|70|尺寸|比例|像素/ can be satisfied by mentioning the size in order to refuse it" },
+  { code: "new_topic_reply_is_about_new_subject", where: "new-topic-no-inheritance", disposition: "flagged",
+    note: "/书店|宠物|猫/ can be satisfied by a negated mention; positive-content proxy only" },
+  { code: "routing_background_removal", where: "transparent-background", disposition: "flagged",
+    note: "mentionsRemoval fallback regexes routing summary prose; the structural signal is primarySkill" },
+  { code: "reply_present", where: "discussion-only / prompt-only", disposition: "flagged",
+    note: "length-only presence check: cannot be satisfied or broken by quoting, but it does not prove the reply is on the requested subject" },
+];
 
 /* ====================================================================== flows */
 
@@ -395,29 +630,27 @@ const FLOWS = [
     name: "新话题不继承旧约束",
     paid: false,
     setup: "none",
-    summary: "第 1 轮给出品牌/产品/文案约束，第 2 轮换全新话题：新话题回复不得复用旧约束，路由不得判为系列延续。",
-    declared: ["两轮 run 都 completed", "两轮 jobs = 0", "第 2 轮回复不含旧话题特征词（青原/保温壶/夏日上新/哑光绿）", "第 2 轮回复必须谈新话题（书店/宠物/猫）", "第 2 轮路由不是 series_continuation"],
+    summary: "第 1 轮给出品牌/产品/文案约束，第 2 轮换全新话题：新话题回复不得把旧约束当作本轮生效设定，路由不得判为系列延续。",
+    declared: ["两轮 run 都 completed", "两轮 jobs = 0", "第 2 轮回复不把旧话题特征词（青原/保温壶/夏日上新/哑光绿）当作本轮生效设定（引用后作废/不沿用不算复用）", "第 2 轮回复必须谈新话题（书店/宠物/猫）", "第 2 轮路由不是 series_continuation"],
     turns: [
       { prompt: "我要做青原保温壶的夏日上新系列视觉，品牌主色是哑光绿，文案固定为“夏日上新”，尺寸按 3:2。先给我一份两张图的文字规划，现在不要生成图片，也不要提交任务。" },
       { prompt: "换一个全新的任务：请为一家宠物友好书店设计周五晚间活动视觉，主题“猫咪陪你读到打烊”。之前的品牌、产品、文案和尺寸设定全部作废，不要沿用，也不要生成图片或提交任务，先只确认新方向。" },
     ],
-    notVerified: ["生成之后 session_design_context.series 的不继承（讨论轮不写入设计回执，mastra-runtime.ts:857 只在真实设计写入时替换系列），这里验证的是对话层面的不继承：回复文本与路由"],
+    notVerified: ["生成之后 session_design_context.series 的不继承（讨论轮不写入设计回执，mastra-runtime.ts:857 只在真实设计写入时替换系列），这里验证的是对话层面的不继承：回复文本与路由",
+      "旧特征词「既未被作废、也没有被当作本轮设定使用」的中性提及记为 unverified 而不是失败：仅凭文字无法区分“顺带比较”和“悄悄沿用”，交人复核（应用动词落在列举句末的写法，如「…、…全部沿用」，同样记为 unverified）"],
     decide: ({ turns }) => {
       const [first, second] = turns;
-      const OLD_TOPIC_TOKENS = ["青原", "保温壶", "夏日上新", "哑光绿"];
-      const reused = OLD_TOPIC_TOKENS.filter(token => second.reply.includes(token));
       const talksAboutNewTopic = /(书店|宠物|猫)/.test(second.reply);
       const routingB = routingOf(second);
       const seriesContinuation = routingB.filter(item => item.intent === "series_continuation");
-      const newTopicText = second.replyAuthority === "full"
-        ? [decide(reused.length === 0, "new_topic_excludes_old_constraints",
-            "第 2 轮回复不得复用第 1 轮的品牌/产品/文案约束词",
-            { reusedTokens: reused, forbidden: OLD_TOPIC_TOKENS, excerpt: second.reply.trim().slice(0, 240) }),
-          decide(talksAboutNewTopic, "new_topic_reply_is_about_new_subject",
+      const newTopicText = [
+        newTopicExcludesOldConstraints(second),
+        second.replyAuthority === "full"
+          ? decide(talksAboutNewTopic, "new_topic_reply_is_about_new_subject",
             "第 2 轮回复必须谈新话题（出现 书店/宠物/猫）",
-            { talksAboutNewTopic, excerpt: second.reply.trim().slice(0, 240) })]
-        : [undecided("new_topic_excludes_old_constraints", "回复不可读，无法判定是否复用旧约束", { replySource: second.replySource }),
-          undecided("new_topic_reply_is_about_new_subject", "回复不可读，无法判定是否谈新话题", { replySource: second.replySource })];
+            { talksAboutNewTopic, excerpt: second.reply.trim().slice(0, 240) })
+          : undecided("new_topic_reply_is_about_new_subject", "回复不可读，无法判定是否谈新话题", { replySource: second.replySource }),
+      ];
       return [runCompleted(first), runCompleted(second),
         noJobs(first, "第 1 轮规划：必须 0 个任务"), noJobs(second, "第 2 轮新话题讨论：必须 0 个任务"),
         noImageToolCall(first), noImageToolCall(second),
@@ -974,6 +1207,18 @@ function writeMarkdown(results, meta) {
     lines.push(`| \`${result.id}\` | ${result.name} | ${result.paid ? "paid" : "free"} | **${STATUS_LABEL[result.status]}** | ${expectationSummary(result)} | ${observed} |`);
   }
   lines.push("");
+  lines.push("## 散文代理断言审计（不随运行变化）");
+  lines.push("");
+  lines.push("本套件中所有“读自然语言而不是读结构化字段”的期望，及其处置（fixed＝本轮已按语义范围重写并自测；flagged＝保留原样并记录已知弱点）：");
+  lines.push("");
+  lines.push("| 期望 | 流程 | 处置 | 说明 |");
+  lines.push("|---|---|---|---|");
+  for (const entry of PROSE_PROXY_AUDIT) {
+    lines.push(`| \`${entry.code}\` | \`${entry.where}\` | ${entry.disposition === "fixed" ? "**fixed**" : "flagged"} | ${inline(entry.note)} |`);
+  }
+  lines.push("");
+  lines.push("自测：`node --test apps/server/scripts/agent-regression-flows.assertions.test.mjs`");
+  lines.push("");
   for (const result of results) {
     lines.push(`## ${result.name}（\`${result.id}\`）— ${STATUS_LABEL[result.status]}`);
     lines.push("");
@@ -1161,4 +1406,27 @@ async function main() {
   return exitCode;
 }
 
-process.exitCode = await main();
+/* ---------------------------------------------------------------- test surface */
+
+/**
+ * Exported only so the sibling node:test suite can drive the prose assertions
+ * directly:
+ *   node --test apps/server/scripts/agent-regression-flows.assertions.test.mjs
+ * Nothing else should import this module (it is a CLI; see IS_ENTRY below).
+ */
+export {
+  OLD_TOPIC_TOKENS, PROSE_PROXY_AUDIT, generationClaimClause, newTopicExcludesOldConstraints,
+  noGenerationClaim, oldConstraintUse,
+};
+
+/**
+ * Run the suite only when this file IS the entry point. The prose assertions are
+ * pinned by a sibling node:test file, and importing this module from a test must
+ * not reach for the API, the env file or the artifacts directory.
+ */
+const SELF_PATH = fileURLToPath(import.meta.url);
+const samePath = (left, right) => process.platform === "win32"
+  ? left.toLowerCase() === right.toLowerCase()
+  : left === right;
+const IS_ENTRY = process.argv[1] !== undefined && samePath(resolve(process.argv[1]), SELF_PATH);
+if (IS_ENTRY) process.exitCode = await main();

@@ -88,6 +88,95 @@ describe("JobService terminal state guards", () => {
   });
 });
 
+describe("JobService cancel settlement", () => {
+  function canceledRow(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "job-1", workspace_id: "workspace-1", project_id: null, canvas_id: "canvas-1",
+      target_kind: "canvas", design_id: null, session_id: "session-1", thread_id: null,
+      queue_name: "image_generation_jobs", job_type: "image_generation", status: "canceled",
+      payload: {}, result: null, error_code: null, error_message: null, attempt_count: 1,
+      max_attempts: 3, credits_transaction_id: null, created_by: "user-1",
+      created_at: "2026-09-20T00:00:00.000Z", updated_at: "2026-09-20T00:00:01.000Z",
+      started_at: null, completed_at: null, failed_at: null,
+      canceled_at: "2026-09-20T00:00:01.000Z",
+      ...overrides,
+    };
+  }
+
+  function cancelService(input: {
+    row?: unknown;
+    error?: unknown;
+    settle?: (jobId: string) => Promise<unknown>;
+  }) {
+    const { query, calls } = createAdminQuery({
+      data: input.row === undefined ? canceledRow() : input.row,
+      error: input.error ?? null,
+    });
+    const service = createJobService({
+      createUserClient: () => ({ from: vi.fn(() => query) }) as never,
+      getAdminClient: () => ({ from: vi.fn(() => query) }) as never,
+      pgmq: {} as never,
+      ...(input.settle ? { settleTerminalJob: input.settle } : {}),
+    });
+    return { service, calls };
+  }
+
+  const user = { id: "user-1", accessToken: "token" } as never;
+
+  // Wiring the settlement into the HTTP cancel route alone left the agent's own
+  // `cancel_image_job` tool — the path the 2026-09-20 paid run exercised — with a
+  // canvas placeholder still reading "generating" after the job row read
+  // `canceled`. The cancel transition is the one place every transport meets.
+  it("settles the job it just canceled, before answering the caller", async () => {
+    // Snapshot the query log at settlement time: the cancel transition must
+    // already be issued, and the settle must happen before the caller is answered
+    // with `canceled` (the agent tool relays that status to the user).
+    let callsAtSettle = -1;
+    const { query, calls } = createAdminQuery({ data: canceledRow(), error: null });
+    const settle = vi.fn(async () => {
+      callsAtSettle = calls.length;
+      return true;
+    });
+    const service = createJobService({
+      createUserClient: () => ({ from: vi.fn(() => query) }) as never,
+      getAdminClient: () => ({ from: vi.fn(() => query) }) as never,
+      pgmq: {} as never,
+      settleTerminalJob: settle,
+    });
+
+    await expect(service.cancelJob(user, "job-1")).resolves.toMatchObject({ status: "canceled" });
+
+    expect(settle).toHaveBeenCalledExactlyOnceWith("job-1");
+    expect(calls.slice(0, callsAtSettle)).toContainEqual(["in:status", ["queued", "running"]]);
+    expect(calls.slice(0, callsAtSettle)).toContainEqual(["eq:id", "job-1"]);
+  });
+
+  it("never settles a job whose cancellation lost the state transition", async () => {
+    const settle = vi.fn(async () => true);
+    const { service } = cancelService({ row: null, settle });
+
+    await expect(service.cancelJob(user, "job-1")).rejects.toMatchObject({
+      code: "job_not_found",
+    });
+
+    expect(settle).not.toHaveBeenCalled();
+  });
+
+  it("keeps the cancellation when the settlement itself fails", async () => {
+    const settle = vi.fn(async () => {
+      throw new Error("canvas temporarily unavailable");
+    });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { service } = cancelService({ settle });
+
+    await expect(service.cancelJob(user, "job-1")).resolves.toMatchObject({ status: "canceled" });
+
+    expect(settle).toHaveBeenCalledWith("job-1");
+    expect(consoleError).toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
+});
+
 describe("JobService attempt recording", () => {
   it.each([
     ["an RPC error", { data: null, error: { message: "database unavailable" } }],

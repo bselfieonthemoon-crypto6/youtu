@@ -250,6 +250,20 @@ export function createJobService(options: {
   getAdminClient: () => AdminSupabaseClient;
   pgmq: PgmqClient;
   providerSnapshotService?: ProviderSnapshotService;
+  /**
+   * Settle the user-visible surface (canvas placeholder and chat card) of a job
+   * that just became terminal. Injected by the composition root, so this service
+   * keeps no canvas knowledge.
+   *
+   * Settlement belongs to the CANCEL TRANSITION, not to one transport: the
+   * user-facing cancel route, the platform console and the agent's own
+   * `cancel_image_job` tool all funnel through `cancelWithClient`, and a job
+   * canceled while it is still `queued` is never claimed by a worker. Wiring the
+   * settlement into the HTTP route alone left the agent tool path — the one a
+   * simulated user actually hit — showing "生成中" on the canvas while the job row
+   * already read `canceled`.
+   */
+  settleTerminalJob?: (jobId: string) => Promise<unknown>;
 }): JobService {
   function mapJobRow(row: Record<string, unknown>): BackgroundJob {
     return {
@@ -283,6 +297,25 @@ export function createJobService(options: {
   const SELECT_COLS =
     "id, workspace_id, project_id, canvas_id, target_kind, design_id, session_id, thread_id, queue_name, job_type, status, payload, result, error_code, error_message, attempt_count, max_attempts, credits_transaction_id, created_by, created_at, updated_at, started_at, completed_at, failed_at, canceled_at";
 
+  // Best-effort settlement of an already-durable cancellation. Every write behind
+  // this hook is keyed by the job id and idempotent through
+  // `canvas_terminal_finalized_at` / `chat_terminal_finalized_at`, so a late worker
+  // settle, a recovery scan, or a second cancel re-runs it without double-applying
+  // or overwriting a placeholder that already settled (or one the user deleted).
+  // A settlement failure must never turn a successful cancel into a failed
+  // request: the cancellation itself is what the user asked for.
+  async function settleCanceledJob(jobId: string) {
+    if (!options.settleTerminalJob) return;
+    try {
+      await options.settleTerminalJob(jobId);
+    } catch (error) {
+      console.error(
+        `[job-service] Terminal settlement deferred for canceled job ${jobId}:`,
+        error,
+      );
+    }
+  }
+
   // Both authorization paths share the existing conditional state transition.
   // Refunds remain the responsibility of the existing worker/accounting flow.
   async function cancelWithClient(client: any, jobId: string, scope?: ConversationImageJobScope) {
@@ -293,7 +326,14 @@ export function createJobService(options: {
     const { data: job, error } = await query.select(SELECT_COLS).maybeSingle();
     if (error) throw new JobServiceError("job_cancel_failed", "Failed to cancel job.", 500);
     if (!job) throw new JobServiceError("job_not_found", "Job not found or already completed.", 404);
-    return mapJobRow(job as Record<string, unknown>);
+    const canceled = mapJobRow(job as Record<string, unknown>);
+    // Before returning, because the caller reports this status to the user (the
+    // agent's `cancel_image_job` tool answers with it) and the canvas must agree
+    // with that answer. Nothing else settles a job canceled while `queued`, and a
+    // job canceled during its provider call would keep its placeholder
+    // "generating" until that paid call returned.
+    await settleCanceledJob(canceled.id);
+    return canceled;
   }
 
   return {

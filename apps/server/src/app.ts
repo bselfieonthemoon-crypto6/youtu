@@ -404,6 +404,38 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const pgmq = env.supabaseDbUrl
     ? createPgmqClient(env.supabaseDbUrl)
     : undefined;
+  // Terminal settlement is a property of the CANCEL, not of the transport that
+  // carried it. Every cancel entry point — the user-facing route, the platform
+  // console and the agent's own `cancel_image_job` tool — funnels through the job
+  // service, and a job canceled while it is still `queued` is never claimed by a
+  // worker. The 2026-09-20 paid run showed the consequence of wiring only the
+  // routes: the CLI/HTTP cancel had already settled its placeholder when the
+  // checker read the canvas ~2s later, while the same cancel issued through the
+  // agent tool still read `generating` ~3s later and stayed that way for the whole
+  // paid provider call
+  // (artifacts/agent-regression-20260920/flows/generate-then-withdraw).
+  //
+  // Defined before the service because the service invokes it on every cancel, and
+  // passed to the routes as well so their existing immediate settlement is the
+  // same function rather than a second implementation. Every write behind it is
+  // keyed by the job id and idempotent through `canvas_terminal_finalized_at` /
+  // `chat_terminal_finalized_at`, so a double call is a no-op.
+  const settleTerminalJob = async (jobId: string) => {
+    const admin = getAdminClient();
+    const { data } = await admin
+      .from("background_jobs")
+      .select(
+        "id, workspace_id, canvas_id, target_kind, design_id, session_id, job_type, status, payload, result, error_code, error_message",
+      )
+      .eq("id", jobId)
+      .maybeSingle();
+    if (!data) return false;
+    const row = data as unknown as FinalizableJob;
+    if (row.job_type === "video_generation") {
+      return finalizeTerminalVideoJobPlaceholder(admin, row);
+    }
+    return finalizeTerminalImageJobPlaceholder(admin, row);
+  };
   const jobService =
     options.jobService ??
     (pgmq
@@ -412,6 +444,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           getAdminClient,
           pgmq,
           providerSnapshotService,
+          settleTerminalJob,
         })
       : undefined);
   const creditService =
@@ -766,19 +799,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     ...(tierGuard ? { tierGuard } : {}),
   });
   void registerCreditRoutes(app, { auth, creditService, viewerService });
-  // The worker settles a terminal job only while it is processing it; a job
-  // canceled while queued would otherwise leave "生成中" on screen until the
-  // throttled recovery scan ran (measured: 132-145s). Both the user-facing cancel
-  // route and the console's cancel share this hook.
-  const settleTerminalJob = async (jobId: string) => {
-    const row = await jobService!.getJobAdmin(jobId) as FinalizableJob | null;
-    if (!row) return false;
-    const admin = getAdminClient();
-    if (row.job_type === "video_generation") {
-      return finalizeTerminalVideoJobPlaceholder(admin, row);
-    }
-    return finalizeTerminalImageJobPlaceholder(admin, row);
-  };
+  // `settleTerminalJob` is defined above, next to the job service that now invokes
+  // it on every cancel; the routes below share that one implementation.
   if (jobService) {
     void registerNodeImageSubmissionRoutes(app, {
       auth,
