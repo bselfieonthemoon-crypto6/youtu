@@ -71,6 +71,11 @@ import { useToast } from "./toast";
 import { ErrorBoundary } from "./error-boundary";
 import { SessionSelector } from "./session-selector";
 import { RunHistoryPanel } from "./chat/run-history-panel";
+import {
+  markConfirmationOutcome,
+  markConfirmationSubmitted,
+  wasConfirmationSubmitted,
+} from "./chat/confirmation-memory";
 import type { ToolConfirmationKind } from "./chat/tool-block-view";
 import {
   ClarificationDialog,
@@ -107,32 +112,6 @@ type ChatSidebarProps = {
   activeDesignId?: string;
   beforeDesignSend?: () => Promise<void>;
 };
-
-const HANDLED_CONFIRMATION_STORAGE_PREFIX = "loomic:handled-confirmation:";
-
-function wasConfirmationHandled(confirmationId: string): boolean {
-  try {
-    return (
-      window.localStorage.getItem(
-        `${HANDLED_CONFIRMATION_STORAGE_PREFIX}${confirmationId}`,
-      ) === "1"
-    );
-  } catch {
-    return false;
-  }
-}
-
-function markConfirmationHandled(confirmationId: string): void {
-  try {
-    window.localStorage.setItem(
-      `${HANDLED_CONFIRMATION_STORAGE_PREFIX}${confirmationId}`,
-      "1",
-    );
-  } catch {
-    // The in-memory message guard still prevents the dialog from reopening
-    // when storage is unavailable (for example, in a restricted browser).
-  }
-}
 
 export function ChatSidebar({
   activeDesignId,
@@ -565,6 +544,13 @@ export function ChatSidebar({
       confirmationId: string,
       decision: "confirm" | "cancel",
       confirmationKind: ToolConfirmationKind = "delete",
+      /**
+       * Called for a terminal acknowledgement that arrives AFTER the click was already
+       * acknowledged as `accepted`. The card needs it: the accepted claim only means the
+       * server started the action, so the later `failed` answer is the one that says the
+       * deletion did not happen.
+       */
+      onTerminalAck?: (ack: { status: string; message?: string }) => void,
     ) => {
       // During the initial session load React state can already contain the
       // visible session while the ref observed by this callback is one render
@@ -573,14 +559,15 @@ export function ChatSidebar({
       const confirmationSessionId =
         activeSessionIdRef.current ?? activeSessionId;
       return new Promise<{ status: string; message?: string }>((resolve) => {
-        const timeout = window.setTimeout(
-          () =>
-            resolve({
-              status: "failed",
-              message: "确认请求超时，请重新发起。",
-            }),
-          10_000,
-        );
+        let answered = false;
+        const timeout = window.setTimeout(() => {
+          if (answered) return;
+          answered = true;
+          resolve({
+            status: "failed",
+            message: "确认请求超时，请重新发起。",
+          });
+        }, 10_000);
         ws.confirmAction(confirmationId, decision, (ack) => {
           window.clearTimeout(timeout);
           const payload = ack.payload as {
@@ -588,6 +575,10 @@ export function ChatSidebar({
             message?: unknown;
             result?: unknown;
           };
+          const status =
+            typeof payload.status === "string" ? payload.status : "failed";
+          const message =
+            typeof payload.message === "string" ? payload.message : undefined;
           const result =
             payload.result &&
             typeof payload.result === "object" &&
@@ -599,7 +590,20 @@ export function ChatSidebar({
             payload.status === "applied" ||
             payload.status === "canceled"
           ) {
-            markConfirmationHandled(confirmationId);
+            markConfirmationSubmitted(confirmationId);
+          }
+          // Record the terminal answer too: a reloaded card is rendered from the
+          // persisted transcript, and only this record lets it report what happened
+          // instead of offering the same destructive button again.
+          if (
+            status === "applied" ||
+            status === "failed" ||
+            status === "canceled"
+          ) {
+            markConfirmationOutcome(confirmationId, {
+              status,
+              ...(message ? { message } : {}),
+            });
           }
           if (
             decision === "confirm" &&
@@ -794,13 +798,17 @@ export function ChatSidebar({
                 );
               });
           }
-          resolve({
-            status:
-              typeof payload.status === "string" ? payload.status : "failed",
-            ...(typeof payload.message === "string"
-              ? { message: payload.message }
-              : {}),
-          });
+          // The server may answer one click twice: first `accepted` (the action is
+          // claimed and running), then the outcome. The claim resolves the promise so
+          // the card can render progress immediately; everything after it is handed to
+          // the card's terminal handler, because otherwise the failure of an accepted
+          // click would never reach the user at all.
+          if (answered) {
+            onTerminalAck?.({ status, ...(message ? { message } : {}) });
+            return;
+          }
+          answered = true;
+          resolve({ status, ...(message ? { message } : {}) });
         });
       });
     },
@@ -1457,7 +1465,7 @@ export function ChatSidebar({
     if (questions.length === 0 && !confirmation) return;
     if (
       confirmation?.confirmationId &&
-      wasConfirmationHandled(confirmation.confirmationId)
+      wasConfirmationSubmitted(confirmation.confirmationId)
     ) {
       handledClarificationMessageIdsRef.current.add(lastMessage.id);
       return;

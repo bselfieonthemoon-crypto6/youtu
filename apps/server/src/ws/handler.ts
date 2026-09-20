@@ -734,6 +734,13 @@ async function handleConfirmedAction(
         })
         .catch((error) => {
           console.error("[confirmation] Async image generation failed:", error);
+          // The click was already acknowledged as `accepted`, so this terminal answer is
+          // the only thing that can tell the card the action did NOT happen. It must
+          // therefore carry a user-readable reason instead of the raw internal message.
+          const confirmationCode =
+            error && typeof error === "object" && "code" in error
+              ? String((error as { code: unknown }).code)
+              : null;
           void connectionManager.sendToAuthorized(connectionId, {
             type: "command.ack",
             action: "agent.confirm_action",
@@ -742,9 +749,13 @@ async function handleConfirmedAction(
               status: "failed",
               code: "confirmation_execution_failed",
               message:
-                error instanceof Error
-                  ? error.message
-                  : "图片生成失败，请重试。",
+                confirmationCode === "confirmation_stale"
+                  ? "画布内容在确认后已发生变化，本次操作未执行。请重新发起。"
+                  : confirmationCode === "confirmation_expired"
+                    ? "确认已过期，本次操作未执行。请重新发起。"
+                    : error instanceof Error
+                      ? sanitizeErrorForClient(error)
+                      : "图片生成失败，请重试。",
             },
           });
         });

@@ -18,11 +18,20 @@ export type DestructiveTarget = {
   label: string;
   version: number;
   versionNonce: number | null;
+  /**
+   * The version-independent content shape this element had when the proposal was
+   * created. It travels with the target — through the proposal, the frozen `execute`
+   * closure and the CAS writer — so every gate compares against the same snapshot
+   * without a side table that a caller could fail to populate.
+   */
+  contentShape: Record<string, unknown>;
   cascade: Array<{
     elementId: string;
     type: string;
     version: number;
     versionNonce: number | null;
+    /** Content shape of the cascaded element at proposal time. */
+    contentShape: Record<string, unknown>;
   }>;
 };
 
@@ -148,9 +157,17 @@ function activeElements(content: CanvasContent): CanvasElement[] {
 
 /**
  * Fields that decide which object a delete confirmation is about and what it would
- * remove. Deliberately excludes `version`, `versionNonce`, `updated` and `index`: those
+ * remove: identity, geometry, appearance, text, bindings and grouping.
+ *
+ * Deliberately excludes `version`, `versionNonce`, `updated`, `index` and `seed`: those
  * move whenever any writer (the browser's canvas session, an autosave, Excalidraw's
  * restore) re-serializes an element, without the object becoming a different object.
+ * Measured on a real browser click (artifacts/delete-confirmation-browser, 2026-09-20):
+ * the canvas write that lands while a card is pending moved `version` 1 -> 2,
+ * `versionNonce` 1 -> 2106926071, `updated`, added `index: "a0"` and normalized
+ * `boundElements: null` -> `[]` — every one of the fields below stayed byte-identical.
+ * None of the excluded fields can change which element is deleted or what it contains,
+ * so accepting a difference in them cannot delete an object the user did not see.
  */
 const TARGET_FINGERPRINT_FIELDS = [
   "type",
@@ -171,6 +188,14 @@ const TARGET_FINGERPRINT_FIELDS = [
   "text",
   "containerId",
   "frameId",
+  "link",
+  "strokeColor",
+  "backgroundColor",
+  "fillStyle",
+  "strokeWidth",
+  "strokeStyle",
+  "roughness",
+  "roundness",
 ] as const;
 
 /**
@@ -186,10 +211,10 @@ function normalizeFingerprintValue(field: string, value: unknown): unknown {
   return value ?? null;
 }
 
-/** Stable content fingerprint of one element, independent of its version counter. */
-function fingerprintOf(element: Record<string, unknown>): string {
+/** Stable fingerprint of a canonical, version-independent element shape. */
+function fingerprintOfShape(shape: Record<string, unknown>): string {
   return createHash("sha256")
-    .update(JSON.stringify(canonicalize(fingerprintShape(element))))
+    .update(JSON.stringify(canonicalize(shape)))
     .digest("hex");
 }
 
@@ -203,63 +228,81 @@ function fingerprintShape(element: Record<string, unknown>): Record<string, unkn
 }
 
 /**
- * A version move alone is not a content change. Accept the confirmation when every
- * target still exists and is content-identical to the snapshot the user saw, even
- * though its version/nonce moved; fail closed on ANY content difference.
+ * What counts as "the target changed", and why the accepted differences are safe.
+ *
+ * A confirmation authorizes deleting exactly the objects the user saw. Each target
+ * therefore carries the version-independent content shape of every element the delete
+ * would remove: the named element, plus every bound-text element the delete cascades
+ * into. A click is STALE — fail closed — when any of those elements is no longer an
+ * active element of the canvas, or when any field of `TARGET_FINGERPRINT_FIELDS`
+ * differs from the snapshot (identity, geometry, appearance, text, bindings, grouping),
+ * or when the fingerprint on record cannot be compared at all.
+ *
+ * The only accepted differences are `version`, `versionNonce`, `updated`, `index`,
+ * `seed`, and empty-collection shape churn (`null`/absent vs `[]` in `groupIds` /
+ * `boundElements`). They are counters, timestamps, paint order and canvas-session
+ * serialization artifacts: none of them names, locates, styles, labels or binds an
+ * object, so a difference in them cannot make the delete hit a different object or
+ * remove content the user did not see. A moved, resized, restyled, relabelled,
+ * regrouped, unbound, replaced or deleted target differs in at least one hashed field
+ * and is still refused; a proposal replayed against another scene is refused by the
+ * service's canvasId check before this guard is reached.
  */
 export function assertDestructiveTargetsContentUnchanged(
   content: CanvasContent,
   targets: DestructiveTarget[],
-  expectedShapes: Map<string, Record<string, unknown>>,
-  fingerprintOfElement: (element: Record<string, unknown>) => string = fingerprintOf,
 ): void {
   const byId = new Map(
     activeElements(content).map((element) => [element.id, element]),
   );
   for (const target of targets) {
-    const current = byId.get(target.elementId);
-    const expectedShape = expectedShapes.get(target.elementId);
-    if (!current || !expectedShape) {
-      throw new DestructiveConfirmationError(
-        "confirmation_stale",
-        `Delete target ${target.elementId} changed after confirmation was requested.`,
-      );
+    assertElementShapeUnchanged(byId, target.elementId, target.contentShape);
+    for (const child of target.cascade) {
+      assertElementShapeUnchanged(byId, child.elementId, child.contentShape);
     }
-    const currentShape = fingerprintShape(current);
-    if (
-      fingerprintOfElement(current) ===
-      createHash("sha256").update(JSON.stringify(canonicalize(expectedShape))).digest("hex")
-    ) {
-      continue;
-    }
-    // Name the exact fields behind a rejected confirmation: "the target changed" is
-    // not actionable on its own, and this branch only runs on a version drift.
-    const differingFields = TARGET_FINGERPRINT_FIELDS.filter(
-      (field) =>
-        JSON.stringify(currentShape[field]) !== JSON.stringify(expectedShape[field]),
-    );
-    console.info("[confirmation] rejected a drifted delete target", {
-      elementId: target.elementId,
-      differingFields,
-      expected: JSON.stringify(canonicalize(expectedShape)),
-      current: JSON.stringify(canonicalize(currentShape)),
-    });
+  }
+}
+
+function assertElementShapeUnchanged(
+  byId: Map<string, CanvasElement>,
+  elementId: string,
+  expectedShape: Record<string, unknown>,
+): void {
+  const current = byId.get(elementId);
+  if (!current || !expectedShape) {
     throw new DestructiveConfirmationError(
       "confirmation_stale",
-      `Delete target ${target.elementId} changed after confirmation was requested.`,
+      `Delete target ${elementId} changed after confirmation was requested.`,
     );
   }
+  const currentShape = fingerprintShape(current);
+  if (fingerprintOfShape(currentShape) === fingerprintOfShape(expectedShape)) return;
+  // Name the exact fields behind a rejected confirmation: "the target changed" is
+  // not actionable on its own, and this branch only runs on a version drift.
+  const differingFields = TARGET_FINGERPRINT_FIELDS.filter(
+    (field) =>
+      JSON.stringify(currentShape[field]) !== JSON.stringify(expectedShape[field]),
+  );
+  console.info("[confirmation] rejected a drifted delete target", {
+    elementId,
+    differingFields,
+    expected: JSON.stringify(canonicalize(expectedShape)),
+    current: JSON.stringify(canonicalize(currentShape)),
+  });
+  throw new DestructiveConfirmationError(
+    "confirmation_stale",
+    `Delete target ${elementId} changed after confirmation was requested.`,
+  );
 }
 
 /**
  * The one gate a destructive confirmation must pass, for both the confirmation service
  * and the CAS writer that performs the delete. Version identity is checked first; if
- * only the version counter moved, the content shape decides.
+ * only the version counter moved, the content shape carried by the target decides.
  */
 export function assertDestructiveTargetsStillCurrent(
   content: CanvasContent,
   targets: DestructiveTarget[],
-  expectedShapes?: Map<string, Record<string, unknown>>,
 ): void {
   try {
     assertDestructiveTargetsUnchanged(content, targets);
@@ -268,9 +311,8 @@ export function assertDestructiveTargetsStillCurrent(
     if (!(error instanceof DestructiveConfirmationError) || error.code !== "confirmation_stale") {
       throw error;
     }
-    if (!expectedShapes) throw error;
   }
-  assertDestructiveTargetsContentUnchanged(content, targets, expectedShapes);
+  assertDestructiveTargetsContentUnchanged(content, targets);
 }
 
 function snapshotTargets(
@@ -317,6 +359,7 @@ function snapshotTargets(
         type: String(item.type ?? "unknown"),
         version: versionOf(item),
         versionNonce: nonceOf(item),
+        contentShape: fingerprintShape(item),
       }));
     return {
       elementId,
@@ -324,29 +367,10 @@ function snapshotTargets(
       label: labelOf(element),
       version: versionOf(element),
       versionNonce: nonceOf(element),
+      contentShape: fingerprintShape(element),
       cascade,
     };
   });
-}
-
-/**
- * Canonical, version-independent shape of every delete target at proposal time, keyed by
- * element id. This is the snapshot the content comparison uses when the version counter
- * has moved.
- */
-function snapshotTargetShapes(
-  content: CanvasContent,
-  targets: DestructiveTarget[],
-): Map<string, Record<string, unknown>> {
-  const byId = new Map(
-    activeElements(content).map((element) => [element.id, element]),
-  );
-  const shapes = new Map<string, Record<string, unknown>>();
-  for (const target of targets) {
-    const element = byId.get(target.elementId);
-    if (element) shapes.set(target.elementId, fingerprintShape(element));
-  }
-  return shapes;
 }
 
 export function assertDestructiveTargetsUnchanged(
@@ -414,16 +438,6 @@ export function createDestructiveConfirmationService(options?: {
   const now = options?.now ?? Date.now;
   const proposals = new Map<string, StoredProposal>();
   const actionProposals = new Map<string, StoredActionProposal>();
-  /**
-   * Canonical content shapes keyed by the exact target objects handed to the proposal's
-   * `execute` closure. Keeping them out of `DestructiveProposal` leaves the action's
-   * declared shape unchanged while still letting the CAS writer apply the same
-   * version-drift rule as this service.
-   */
-  const targetShapesByProposal = new WeakMap<
-    DestructiveTarget[],
-    Map<string, Record<string, unknown>>
-  >();
 
   const completeDurableAction = async (action: DurableActionConfirmation) => {
     if (action.completionDone) return;
@@ -629,19 +643,14 @@ export function createDestructiveConfirmationService(options?: {
 
     /**
      * Snapshot the delete targets of `operations` before any proposal exists, so the
-     * caller can hold on to the exact target objects (and their content shapes) that the
-     * proposal's `execute` closure will later receive.
+     * caller can hold on to the exact target objects — including the content shapes that
+     * travel with them into the proposal's `execute` closure and the CAS writer.
      */
     targetsSnapshot(
       content: CanvasContent,
       operations: FrozenCanvasOperation[],
     ): DestructiveTarget[] {
       return snapshotTargets(content, structuredClone(operations));
-    },
-
-    /** Content shapes for targets returned by `targetsSnapshot`. */
-    targetShapesFor(targets: DestructiveTarget[]): Map<string, Record<string, unknown>> | undefined {
-      return targetShapesByProposal.get(targets);
     },
 
     propose(input: {
@@ -659,17 +668,9 @@ export function createDestructiveConfirmationService(options?: {
     }): DestructiveProposal {
       const frozenOperations = structuredClone(input.operations);
       const confirmationId = randomUUID();
+      // Each target carries the content shape it had at proposal time, so the gate does
+      // not depend on any caller remembering to thread a side table along.
       const targets = input.targets ?? snapshotTargets(input.content, frozenOperations);
-      // Element `version` alone is not a stable authorization basis: the browser's
-      // canvas session rewrites persisted elements with a bumped version when it merges
-      // a server refresh (observed in the canvas write audit as a client PUT that moved
-      // `version` 1 -> 2 with a new nonce and no semantic change), which made a real user
-      // confirmation fail a strict version compare. The content shape keeps the
-      // guarantee ("the object the user saw is unchanged") without depending on it.
-      targetShapesByProposal.set(
-        targets,
-        snapshotTargetShapes(input.content, targets),
-      );
       const proposal: StoredProposal = {
         confirmationId,
         userId: input.userId,
@@ -873,10 +874,10 @@ export function createDestructiveConfirmationService(options?: {
       try {
         const content = await proposal.loadCanvas();
         // The version counter can legitimately move while the user decides (the
-        // browser's canvas session re-serializes elements it merges), so the actual
-        // content decides whether this click is still about the object the user saw.
-        const expectedShapes = targetShapesByProposal.get(proposal.targets);
-        assertDestructiveTargetsStillCurrent(content, proposal.targets, expectedShapes);
+        // browser's canvas session re-serializes elements it merges), so the content
+        // shape snapshotted on the target decides whether this click is still about
+        // the object the user saw.
+        assertDestructiveTargetsStillCurrent(content, proposal.targets);
         const result = await proposal.execute(
           structuredClone(proposal.operations),
           proposal.targets,

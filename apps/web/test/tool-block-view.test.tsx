@@ -2,6 +2,7 @@
 
 import "@testing-library/jest-dom/vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -207,11 +208,196 @@ describe("ToolBlockView", () => {
 
     expect(screen.getByText("需要确认危险操作")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "确认删除" }));
-    expect(onConfirmAction).toHaveBeenCalledWith("confirm-1", "confirm");
+    expect(onConfirmAction).toHaveBeenCalledWith(
+      "confirm-1",
+      "confirm",
+      "delete",
+      expect.any(Function),
+    );
     expect(await screen.findByText("已确认并删除")).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "确认删除" }),
     ).not.toBeInTheDocument();
+  });
+
+  // A real browser run showed the card rendering 「已确认并删除」 while the server's own
+  // final answer for that click was a failure and the element was still on the canvas:
+  // the server answers `accepted` first (the action is claimed) and only later reports
+  // the outcome, and the card treated the claim as the result.
+  it("does not show a failed delete as applied when the terminal ack fails", async () => {
+    let terminalAck: ((ack: { status: string; message?: string }) => void) | undefined;
+    const onConfirmAction = vi.fn(
+      async (
+        _confirmationId: string,
+        _decision: string,
+        _kind?: unknown,
+        onTerminalAck?: (ack: { status: string; message?: string }) => void,
+      ) => {
+        terminalAck = onTerminalAck;
+        return { status: "accepted" };
+      },
+    );
+    render(
+      <ToolBlockView
+        block={{
+          type: "tool",
+          toolCallId: "tool-confirm-failed-ack",
+          toolName: "manipulate_canvas",
+          status: "completed",
+          output: {
+            error: "confirmation_required",
+            confirmation: {
+              confirmationId: "confirm-failed-ack",
+              targets: ["旧图片 1"],
+            },
+          },
+        }}
+        onConfirmAction={onConfirmAction}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "确认删除" }));
+
+    // A claim is not an outcome: it must not read as a completed deletion.
+    expect(await screen.findByText("已确认，正在删除…")).toBeInTheDocument();
+    expect(screen.queryByText("已确认并删除")).not.toBeInTheDocument();
+
+    act(() => {
+      terminalAck?.({
+        status: "failed",
+        message: "画布内容在确认后已发生变化，本次操作未执行。请重新发起。",
+      });
+    });
+
+    expect(
+      await screen.findByText(
+        "画布内容在确认后已发生变化，本次操作未执行。请重新发起。",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("已确认并删除")).not.toBeInTheDocument();
+    // A failed execution cannot be retried through the same consumed proposal.
+    expect(
+      screen.queryByRole("button", { name: "确认删除" }),
+    ).not.toBeInTheDocument();
+  });
+
+  // The transcript still holds the proposal after a reload, so without a memory of what
+  // this browser already sent, the card re-offered the destructive button for an action
+  // the server had already consumed (measured: 1 确认删除 button after the reload).
+  it("does not re-offer the button for a confirmation this browser already sent", async () => {
+    window.localStorage.setItem(
+      "loomic:confirmation-outcome:confirm-already-applied",
+      JSON.stringify({ status: "applied" }),
+    );
+    window.localStorage.setItem(
+      "loomic:handled-confirmation:confirm-already-applied",
+      "1",
+    );
+    render(
+      <ToolBlockView
+        block={{
+          type: "tool",
+          toolCallId: "tool-confirm-reload",
+          toolName: "manipulate_canvas",
+          status: "completed",
+          output: {
+            error: "confirmation_required",
+            confirmation: {
+              confirmationId: "confirm-already-applied",
+              targets: ["旧图片 1"],
+            },
+          },
+        }}
+        onConfirmAction={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("已确认并删除")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "确认删除" }),
+    ).not.toBeInTheDocument();
+    window.localStorage.clear();
+  });
+
+  it("does not re-offer the button when the recorded outcome was a failure", async () => {
+    window.localStorage.setItem(
+      "loomic:confirmation-outcome:confirm-already-failed",
+      JSON.stringify({
+        status: "failed",
+        message: "画布内容在确认后已发生变化，本次操作未执行。请重新发起。",
+      }),
+    );
+    render(
+      <ToolBlockView
+        block={{
+          type: "tool",
+          toolCallId: "tool-confirm-reload-failed",
+          toolName: "manipulate_canvas",
+          status: "completed",
+          output: {
+            error: "confirmation_required",
+            confirmation: {
+              confirmationId: "confirm-already-failed",
+              targets: ["旧图片 1"],
+            },
+          },
+        }}
+        onConfirmAction={vi.fn()}
+      />,
+    );
+
+    expect(
+      await screen.findByText(
+        "画布内容在确认后已发生变化，本次操作未执行。请重新发起。",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("已确认并删除")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "确认删除" }),
+    ).not.toBeInTheDocument();
+    window.localStorage.clear();
+  });
+
+  it("settles to applied when the terminal ack after an accepted claim succeeds", async () => {
+    let terminalAck: ((ack: { status: string; message?: string }) => void) | undefined;
+    const onConfirmAction = vi.fn(
+      async (
+        _confirmationId: string,
+        _decision: string,
+        _kind?: unknown,
+        onTerminalAck?: (ack: { status: string; message?: string }) => void,
+      ) => {
+        terminalAck = onTerminalAck;
+        return { status: "accepted" };
+      },
+    );
+    render(
+      <ToolBlockView
+        block={{
+          type: "tool",
+          toolCallId: "tool-confirm-applied-ack",
+          toolName: "manipulate_canvas",
+          status: "completed",
+          output: {
+            error: "confirmation_required",
+            confirmation: {
+              confirmationId: "confirm-applied-ack",
+              targets: ["旧图片 1"],
+            },
+          },
+        }}
+        onConfirmAction={onConfirmAction}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "确认删除" }));
+    expect(await screen.findByText("已确认，正在删除…")).toBeInTheDocument();
+
+    act(() => {
+      terminalAck?.({ status: "applied" });
+    });
+
+    expect(await screen.findByText("已确认并删除")).toBeInTheDocument();
   });
 
   it("treats an accepted background confirmation as submitted", async () => {
@@ -559,6 +745,7 @@ describe("ToolBlockView", () => {
       confirmationId,
       "confirm",
       "design_template_apply",
+      expect.any(Function),
     );
     expect(
       await screen.findByText("已确认，正在应用设计更改"),

@@ -6,6 +6,10 @@ import { createPortal } from "react-dom";
 
 import type { BackgroundJob, ImageArtifact, ToolBlock } from "@loomic/shared";
 import { readGenerationJobElementId } from "../../hooks/use-job-fallback-polling";
+import {
+  readConfirmationOutcome,
+  wasConfirmationSubmitted,
+} from "./confirmation-memory";
 import { useGenerationCanvasPresence } from "./generation-canvas-presence";
 import type { RestoreJobToCanvasResponse } from "../../lib/server-api";
 import { ChatImage } from "./image-lightbox";
@@ -155,6 +159,8 @@ export const ToolBlockView = React.memo(function ToolBlockView({
     confirmationId: string,
     decision: "confirm" | "cancel",
     kind?: ConfirmationDetails["kind"],
+    /** Terminal answer of a click the server already acknowledged as `accepted`. */
+    onTerminalAck?: (ack: { status: string; message?: string }) => void,
   ) => Promise<{ status: string; message?: string }> | undefined;
   onWaitGeneration?: (jobId: string) => Promise<BackgroundJob>;
   onRestoreGeneration?: (jobId: string) => Promise<RestoreJobToCanvasResponse>;
@@ -1345,10 +1351,16 @@ function ConfirmationCard({
     confirmationId: string,
     decision: "confirm" | "cancel",
     kind?: ConfirmationDetails["kind"],
+    /**
+     * The server's final answer for a click it already acknowledged as `accepted`.
+     * A claim is not an outcome: a destructive action that fails after being claimed
+     * must still be able to say so on the card.
+     */
+    onTerminalAck?: (ack: { status: string; message?: string }) => void,
   ) => Promise<{ status: string; message?: string }> | undefined;
 }) {
   const [confirmationStatus, setConfirmationStatus] = useState<
-    "pending" | "submitting" | "applied" | "canceled" | "failed"
+    "pending" | "submitting" | "working" | "applied" | "canceled" | "failed" | "handled"
   >("pending");
   const [failureMessage, setFailureMessage] = useState<string | null>(null);
   const isImageGeneration = confirmation.kind === "image_generation";
@@ -1356,20 +1368,60 @@ function ConfirmationCard({
     confirmation.kind === "design_mutation" ||
     confirmation.kind === "design_template_apply";
 
+  // The transcript is server state: after a reload it still holds the original proposal,
+  // so without this the card would offer 「确认删除」 again for an action the server has
+  // already consumed. `handled` is the honest state when this browser knows the click was
+  // sent but never saw the outcome.
+  const [memoryChecked, setMemoryChecked] = useState(false);
+  useEffect(() => {
+    const outcome = readConfirmationOutcome(confirmation.confirmationId);
+    if (outcome?.status === "failed") {
+      setConfirmationStatus("failed");
+      setFailureMessage(outcome.message ?? "操作未执行，请重新发起。 ");
+    } else if (outcome?.status === "applied") {
+      setConfirmationStatus("applied");
+    } else if (outcome?.status === "canceled") {
+      setConfirmationStatus("canceled");
+    } else if (wasConfirmationSubmitted(confirmation.confirmationId)) {
+      setConfirmationStatus("handled");
+    }
+    setMemoryChecked(true);
+  }, [confirmation.confirmationId]);
+
   const submitDecision = async (decision: "confirm" | "cancel") => {
     if (!onConfirmAction || confirmationStatus !== "pending") return;
     setConfirmationStatus("submitting");
-    const result = await (isDesignConfirmation
-      ? onConfirmAction(
-          confirmation.confirmationId,
-          decision,
-          confirmation.kind,
-        )
-      : onConfirmAction(confirmation.confirmationId, decision));
+    // The server answers a confirmed action up to twice: `accepted` (the action is
+    // claimed and running) and then the outcome. A claim is NOT proof the action
+    // happened — a real browser run showed the card rendering 「已确认并删除」 while the
+    // server's final answer was a failure and the element was still on the canvas. So
+    // an accepted claim renders as in-progress, and the terminal answer may still
+    // correct the card afterwards.
+    let settled = false;
+    const applyTerminalAck = (ack: { status: string; message?: string }) => {
+      if (ack.status === "failed") {
+        setConfirmationStatus("failed");
+        setFailureMessage(ack.message ?? "操作未执行，请重新发起。 ");
+        return;
+      }
+      if (ack.status === "canceled") setConfirmationStatus("canceled");
+      else if (ack.status === "applied") setConfirmationStatus("applied");
+    };
+    const result = await onConfirmAction(
+      confirmation.confirmationId,
+      decision,
+      confirmation.kind,
+      (ack) => {
+        // The awaited result below already carries the first answer; only a LATER
+        // terminal answer has to be applied here.
+        if (settled) applyTerminalAck(ack);
+      },
+    );
+    settled = true;
     const status = result?.status;
-    if (status === "accepted" || status === "applied") {
-      setConfirmationStatus("applied");
-    } else if (status === "canceled") setConfirmationStatus("canceled");
+    if (status === "accepted") setConfirmationStatus("working");
+    else if (status === "applied") setConfirmationStatus("applied");
+    else if (status === "canceled") setConfirmationStatus("canceled");
     else {
       setConfirmationStatus("failed");
       setFailureMessage(result?.message ?? "操作未执行，请重新发起。 ");
@@ -1427,7 +1479,23 @@ function ConfirmationCard({
           ))}
         </div>
       ) : null}
-      {confirmationStatus === "applied" ? (
+      {confirmationStatus === "handled" ? (
+        // This browser already sent a decision and never saw the outcome (for example a
+        // reload while the action was still running). Say only that much.
+        <p className="mt-3 text-xs font-medium text-muted-foreground">
+          已确认，操作结果请以画布为准
+        </p>
+      ) : confirmationStatus === "working" ? (
+        // A claimed action is not a completed one. Saying 「已确认并删除」 for a claim is
+        // the exact inconsistency a failed click produced (card applied, canvas intact).
+        <p className="mt-3 text-xs font-medium text-amber-700">
+          {isImageGeneration
+            ? "已确认，图片生成任务已提交"
+            : isDesignConfirmation
+              ? "已确认，正在应用设计更改"
+              : "已确认，正在删除…"}
+        </p>
+      ) : confirmationStatus === "applied" ? (
         <p className="mt-3 text-xs font-medium text-emerald-700">
           {isImageGeneration
             ? "已确认，图片生成任务已提交"
@@ -1448,7 +1516,8 @@ function ConfirmationCard({
           {failureMessage}
         </p>
       ) : null}
-      {(confirmationStatus === "pending" ||
+      {memoryChecked &&
+        (confirmationStatus === "pending" ||
         confirmationStatus === "submitting") && (
         <div className="mt-3 flex justify-end gap-2">
           <button

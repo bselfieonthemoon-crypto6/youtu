@@ -53,6 +53,8 @@ type ChatMessageProps = {
     confirmationId: string,
     decision: "confirm" | "cancel",
     kind?: ToolConfirmationKind,
+    /** Terminal answer of a click the server already acknowledged as `accepted`. */
+    onTerminalAck?: (ack: { status: string; message?: string }) => void,
   ) => Promise<{ status: string; message?: string }> | undefined;
   onWaitGeneration?: (jobId: string) => Promise<BackgroundJob>;
   onRestoreGeneration?: (jobId: string) => Promise<RestoreJobToCanvasResponse>;
@@ -387,6 +389,8 @@ const AssistantMessage = React.memo(function AssistantMessage({
     confirmationId: string,
     decision: "confirm" | "cancel",
     kind?: ToolConfirmationKind,
+    /** Terminal answer of a click the server already acknowledged as `accepted`. */
+    onTerminalAck?: (ack: { status: string; message?: string }) => void,
   ) => Promise<{ status: string; message?: string }> | undefined;
   onWaitGeneration?: (jobId: string) => Promise<BackgroundJob>;
   onRestoreGeneration?: (jobId: string) => Promise<RestoreJobToCanvasResponse>;

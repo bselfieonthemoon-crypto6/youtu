@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { CanvasContent } from "@loomic/shared";
 import {
+  assertDestructiveTargetsStillCurrent,
+  assertDestructiveTargetsUnchanged,
   createDestructiveConfirmationService,
   DestructiveConfirmationError,
 } from "./destructive-confirmation-service.js";
@@ -59,6 +61,14 @@ function resized(version = 1): CanvasContent {
   const content = canvas(version);
   (content.elements[0] as Record<string, unknown>).width = 640;
   return content;
+}
+
+/** Snapshotted delete targets, exactly as `manipulate_canvas` produces them. */
+function deleteTargets(content: CanvasContent) {
+  const service = createDestructiveConfirmationService();
+  return service.targetsSnapshot(content, [
+    { action: "delete", element_id: "shape-1" },
+  ]);
 }
 
 describe("destructive confirmation service", () => {
@@ -250,6 +260,68 @@ describe("destructive confirmation service", () => {
       userId: "owner",
     })).rejects.toMatchObject({ code: "confirmation_stale" });
     expect(execute).not.toHaveBeenCalled();
+  });
+
+  // THE REGRESSION. The CAS writer that performs the delete revalidates outside the
+  // service, and it used to receive the content shapes through a side table that
+  // `manipulate_canvas` read BEFORE `propose` populated it. It therefore fell back to a
+  // strict version compare and refused every real browser click with
+  // `confirmation_stale` while the element stayed on the canvas. The snapshot now
+  // travels on the target itself, so this call needs nothing else.
+  it("accepts a version-only re-serialization using only the snapshot on the target", () => {
+    const targets = deleteTargets(canvas());
+
+    expect(() =>
+      assertDestructiveTargetsUnchanged(reSerialized(2, 999), targets)
+    ).toThrow(DestructiveConfirmationError);
+    expect(() =>
+      assertDestructiveTargetsStillCurrent(reSerialized(2, 999), targets)
+    ).not.toThrow();
+  });
+
+  it.each([
+    ["geometry (x)", (element: Record<string, unknown>) => { element.x = 40; }],
+    ["size (width)", (element: Record<string, unknown>) => { element.width = 640; }],
+    ["rotation", (element: Record<string, unknown>) => { element.angle = 45; }],
+    ["text", (element: Record<string, unknown>) => { element.text = "Edited label"; }],
+    ["opacity", (element: Record<string, unknown>) => { element.opacity = 40; }],
+    ["stroke colour", (element: Record<string, unknown>) => { element.strokeColor = "#ff0000"; }],
+    ["fill style", (element: Record<string, unknown>) => { element.fillStyle = "hachure"; }],
+    ["label data", (element: Record<string, unknown>) => {
+      element.customData = { title: "Different object" };
+    }],
+    ["grouping", (element: Record<string, unknown>) => { element.groupIds = ["group-1"]; }],
+    ["locked", (element: Record<string, unknown>) => { element.locked = true; }],
+  ])("still rejects a %s change even when the version moved", (_label, change) => {
+    const content = reSerialized(2, 999);
+    change(content.elements[0] as Record<string, unknown>);
+
+    expect(() =>
+      assertDestructiveTargetsStillCurrent(content, deleteTargets(canvas()))
+    ).toThrow(DestructiveConfirmationError);
+  });
+
+  it("still rejects a cascaded bound-text element whose content was edited", () => {
+    const drifted = reSerialized(2, 999);
+    const boundText = (drifted.elements ?? []).find(
+      (element) => element.id === "text-1",
+    ) as Record<string, unknown>;
+    boundText.text = "Edited label";
+
+    expect(() =>
+      assertDestructiveTargetsStillCurrent(drifted, deleteTargets(canvas()))
+    ).toThrow(DestructiveConfirmationError);
+  });
+
+  it("still rejects a target that vanished from the canvas", () => {
+    const gone = reSerialized(2, 999);
+    gone.elements = (gone.elements ?? []).filter(
+      (element) => element.id !== "shape-1",
+    );
+
+    expect(() =>
+      assertDestructiveTargetsStillCurrent(gone, deleteTargets(canvas()))
+    ).toThrow(DestructiveConfirmationError);
   });
 
   it("expires and cancels proposals without executing them", async () => {
