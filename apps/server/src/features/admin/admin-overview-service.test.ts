@@ -120,11 +120,15 @@ function baseTables(): Tables {
         last_test_status: "succeeded", last_test_error_code: null, updated_at: iso(3) },
       { id: "cfg-2", workspace_id: workspace(2).id, display_name: "渠道 B", enabled: false,
         last_test_status: "failed", last_test_error_code: "http_401", updated_at: iso(2) },
+      // The platform-wide default channel has no owning workspace.
+      { id: "cfg-platform", workspace_id: null, display_name: "平台默认", enabled: true,
+        last_test_status: "succeeded", last_test_error_code: null, updated_at: iso(4) },
     ],
     workspace_provider_models: [
       { id: "m1", provider_config_id: "cfg-1", modality: "image", enabled: true },
       { id: "m2", provider_config_id: "cfg-1", modality: "text", enabled: true },
       { id: "m3", provider_config_id: "cfg-2", modality: "image", enabled: false },
+      { id: "m4", provider_config_id: "cfg-platform", modality: "video", enabled: true },
     ],
     skills: [
       { id: "s1", category: "design" },
@@ -260,11 +264,15 @@ describe("admin overview service", () => {
   it("summarizes provider and skill catalogs without counting rows twice", async () => {
     const result = await service(baseTables()).overview();
     expect(result.providers).toMatchObject({
-      configCount: 2, disabledConfigCount: 1, failingTestCount: 1,
-      modelCount: 3, disabledModelCount: 1, modelsByModality: { image: 2, text: 1 }, truncated: false,
+      configCount: 3, disabledConfigCount: 1, failingTestCount: 1,
+      modelCount: 4, disabledModelCount: 1, modelsByModality: { image: 2, text: 1, video: 1 }, truncated: false,
     });
     expect(result.providers.items.find(item => item.id === "cfg-1")).toMatchObject({ workspaceName: "workspace-1", modelCount: 2 });
     expect(result.providers.items.find(item => item.id === "cfg-2")).toMatchObject({ modelCount: 1, enabled: false, lastTestErrorCode: "http_401" });
+    // The platform channel carries no workspace id and is labelled, not "unknown".
+    expect(result.providers.items.find(item => item.id === "cfg-platform")).toMatchObject({
+      workspaceId: null, workspaceName: "平台默认（所有工作区）", modelCount: 1, enabled: true,
+    });
     expect(result.skills).toEqual({ total: 3, byCategory: { design: 2, generation: 0, code: 0, data: 0, writing: 0, custom: 1 },
       installs: 3, enabledInstalls: 2, truncated: false });
   });

@@ -20,11 +20,12 @@ import { AdminStorageSection } from "@/components/admin/admin-storage-section";
 import { useViewerAccess } from "@/hooks/use-viewer-access";
 import { useAuth } from "@/lib/auth-context";
 
-type AdminTab = "overview" | "access" | "directory" | "billing" | "skills" | "jobs" | "channels" | "content" | "storage" | "users" | "providers" | "resources";
+type AdminTab = "overview" | "platform-providers" | "access" | "directory" | "billing" | "skills" | "jobs" | "channels" | "content" | "storage" | "users" | "providers" | "resources";
 
 /** Tabs that only an active platform admin may open. */
 const PLATFORM_TABS: ReadonlyArray<readonly [AdminTab, string]> = [
   ["overview", "平台总览"],
+  ["platform-providers", "平台模型与渠道"],
   ["jobs", "任务"],
   ["channels", "渠道健康"],
   ["content", "首页内容"],
@@ -38,7 +39,7 @@ const PLATFORM_TABS: ReadonlyArray<readonly [AdminTab, string]> = [
 /** Tabs a workspace owner/admin legitimately owns. */
 const WORKSPACE_TABS: ReadonlyArray<readonly [AdminTab, string]> = [
   ["users", "本工作区成员"],
-  ["providers", "模型与渠道"],
+  ["providers", "工作区模型覆盖"],
   ["resources", "设计资源"],
 ];
 
@@ -144,9 +145,13 @@ export default function AdminPage() {
           </button>
         ))}
       </div>
-      <div className={effectiveTab === "users" || effectiveTab === "resources" || effectiveTab === "providers" ? "max-w-3xl" : "w-full"}>
+      <div className={effectiveTab === "users" || effectiveTab === "resources" || effectiveTab === "providers" || effectiveTab === "platform-providers" ? "max-w-3xl" : "w-full"}>
         {effectiveTab === "overview" && platformAdmin ? (
           <AdminOverviewSection accessToken={accessToken} />
+        ) : effectiveTab === "platform-providers" && platformAdmin ? (
+          // The platform default is deliberately workspace-free: it applies to every
+          // workspace, so there is nothing here to pick or scope.
+          <ProviderSettingsSection accessToken={accessToken} scope="platform" />
         ) : effectiveTab === "access" && platformAdmin ? (
           <div className="space-y-5">
             <AdminAccessSection accessToken={accessToken} />

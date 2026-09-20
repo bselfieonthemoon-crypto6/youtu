@@ -3494,7 +3494,7 @@ export type Database = {
           revision: number;
           updated_at: string;
           updated_by: string | null;
-          workspace_id: string;
+          workspace_id: string | null;
         };
         Insert: {
           adapter?: string;
@@ -3512,7 +3512,7 @@ export type Database = {
           revision?: number;
           updated_at?: string;
           updated_by?: string | null;
-          workspace_id: string;
+          workspace_id?: string | null;
         };
         Update: {
           adapter?: string;
@@ -3530,7 +3530,7 @@ export type Database = {
           revision?: number;
           updated_at?: string;
           updated_by?: string | null;
-          workspace_id?: string;
+          workspace_id?: string | null;
         };
         Relationships: [
           {

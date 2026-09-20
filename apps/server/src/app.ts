@@ -201,6 +201,7 @@ import { registerPaymentStatusRoute } from "./http/payments-status.js";
 import { registerProjectRoutes } from "./http/projects.js";
 import { registerPromptLibraryRoutes } from "./http/prompt-library.js";
 import { registerProviderConfigRoutes } from "./http/provider-configs.js";
+import { registerAdminProviderConfigRoutes } from "./http/admin-provider-configs.js";
 import { registerRunRoutes } from "./http/runs.js";
 import { createAgentTargetScopeService } from "./features/agent-tasks/agent-target-scope-service.js";
 import { registerSettingsRoutes } from "./http/settings.js";
@@ -841,6 +842,14 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   void registerAdminOverviewRoutes(app, {
     auth,
     adminOverviewService: createAdminOverviewService({ getAdminClient }),
+  });
+  // Platform-wide provider channels: the model set every workspace falls back to
+  // when it has no usable configuration of its own. Administered once, from the
+  // console, without picking a workspace; the service checks platform-admin
+  // rights and the database RPCs re-check the actor inside the write transaction.
+  void registerAdminProviderConfigRoutes(app, {
+    auth,
+    providerConfigService,
   });
   // Platform-admin access management and the audit trail. The writes go through
   // database functions that re-check the actor and write the audit row in the same

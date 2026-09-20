@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { modelContextProfileSchema } from "@loomic/shared";
 
+import { isActivePlatformAdmin } from "../admin/platform-admin.js";
 import {
   createSafeProviderFetch,
   normalizePublicProviderBaseUrl,
@@ -51,6 +52,21 @@ export class ProviderConfigServiceError extends Error {
   }
 }
 
+/**
+ * `null` is the platform scope: the one channel set every workspace resolves to
+ * while it has no usable configuration of its own. It is managed from the
+ * platform console and is authorized by an active platform-admin check instead
+ * of workspace membership, exactly like the other admin write paths.
+ */
+export type ProviderConfigScope = string | null;
+
+/** Restrict a query to one scope: an owning workspace, or the platform default. */
+function inScope(query: any, workspaceId: ProviderConfigScope) {
+  return workspaceId === null
+    ? query.is("workspace_id", null)
+    : query.eq("workspace_id", workspaceId);
+}
+
 export function createProviderConfigService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
   getAdminClient: () => AdminSupabaseClient;
@@ -67,7 +83,17 @@ export function createProviderConfigService(options: {
     ...(options.resolveProviderHost ? { resolve: options.resolveProviderHost } : {}),
   });
 
-  async function requireManager(user: AuthenticatedUser, workspaceId: string) {
+  async function requireManager(user: AuthenticatedUser, workspaceId: ProviderConfigScope) {
+    if (workspaceId === null) {
+      if (!(await isActivePlatformAdmin(options.getAdminClient(), user.id))) {
+        throw new ProviderConfigServiceError(
+          "provider_forbidden",
+          "Platform administrator access is required.",
+          403,
+        );
+      }
+      return;
+    }
     const { data, error } = await options
       .createUserClient(user.accessToken)
       .from("workspace_members")
@@ -84,12 +110,12 @@ export function createProviderConfigService(options: {
     }
   }
 
-  async function listAuthorized(workspaceId: string) {
+  async function listAuthorized(workspaceId: ProviderConfigScope) {
     const admin = options.getAdminClient();
-    const configsResult = await (admin.from("workspace_provider_configs") as any)
-      .select(CONFIG_COLUMNS)
-      .eq("workspace_id", workspaceId)
-      .order("created_at", { ascending: true });
+    const configsResult = await inScope(
+      (admin.from("workspace_provider_configs") as any).select(CONFIG_COLUMNS),
+      workspaceId,
+    ).order("created_at", { ascending: true });
     if (configsResult.error) throw persistenceError();
     const configs = (configsResult.data ?? []) as Record<string, unknown>[];
     if (configs.length === 0) return [];
@@ -100,12 +126,12 @@ export function createProviderConfigService(options: {
     return mapViews(configs, (modelsResult.data ?? []) as Record<string, unknown>[]);
   }
 
-  async function findConfig(workspaceId: string, configId: string) {
-    const { data, error } = await (options
-      .getAdminClient()
-      .from("workspace_provider_configs") as any)
-      .select(CONFIG_COLUMNS)
-      .eq("workspace_id", workspaceId)
+  async function findConfig(workspaceId: ProviderConfigScope, configId: string) {
+    const { data, error } = await inScope(
+      (options.getAdminClient().from("workspace_provider_configs") as any)
+        .select(CONFIG_COLUMNS),
+      workspaceId,
+    )
       .eq("id", configId)
       .maybeSingle();
     if (error) throw persistenceError();
@@ -120,12 +146,31 @@ export function createProviderConfigService(options: {
   }
 
   async function audit(
-    workspaceId: string,
+    workspaceId: ProviderConfigScope,
     configId: string,
     actorId: string,
     action: "created" | "updated" | "key_rotated" | "test_succeeded" | "test_failed",
     safeDetails: Record<string, unknown> = {},
   ) {
+    // A platform channel has no owning workspace, so its trail is the platform
+    // audit log rather than the workspace-scoped one (whose workspace_id is NOT
+    // NULL). updated/key_rotated/deleted are written by the database RPCs in the
+    // same transaction as the change; created and test results are written here.
+    if (workspaceId === null) {
+      // `admin_audit_events` is newer than the hand-maintained Database type map
+      // (same reason http/skills.ts has its own loose view).
+      const { error } = await (options.getAdminClient() as any)
+        .from("admin_audit_events")
+        .insert({
+          actor_user_id: actorId,
+          action: `provider_config.${action}`,
+          target_kind: "provider_config",
+          target_id: configId,
+          after: safeDetails,
+        });
+      if (error) throw persistenceError();
+      return;
+    }
     const { error } = await (options
       .getAdminClient()
       .from("workspace_provider_audit_events") as any)
@@ -159,7 +204,7 @@ export function createProviderConfigService(options: {
         const { error } = await (admin.from("workspace_provider_configs") as any)
           .insert({
             id: configId,
-            workspace_id: workspaceId,
+            ...(workspaceId === null ? {} : { workspace_id: workspaceId }),
             adapter: "openai_compatible",
             display_name: input.displayName,
             base_url: input.baseUrl,
@@ -266,15 +311,15 @@ export function createProviderConfigService(options: {
       const errorCode = await testConnection(providerFetch(baseUrl), baseUrl, apiKey);
       const ok = errorCode === undefined;
       const admin = options.getAdminClient();
-      const { error } = await (admin.from("workspace_provider_configs") as any)
-        .update({
+      const { error } = await inScope(
+        (admin.from("workspace_provider_configs") as any).update({
           last_tested_at: testedAt,
           last_test_status: ok ? "succeeded" : "failed",
           last_test_error_code: errorCode ?? null,
           updated_by: user.id,
-        })
-        .eq("id", configId)
-        .eq("workspace_id", workspaceId);
+        }),
+        workspaceId,
+      ).eq("id", configId);
       if (error) throw persistenceError();
       await audit(
         workspaceId,

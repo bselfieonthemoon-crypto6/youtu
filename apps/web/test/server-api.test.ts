@@ -5,6 +5,7 @@ import {
   createProject,
   createProviderConfig,
   deleteProviderConfig,
+  discoverDraftProviderModels,
   discoverProviderModels,
   createRun,
   fetchAgentRunDetail,
@@ -475,6 +476,42 @@ describe("authenticated server API", () => {
       "http://localhost:3001/api/workspace/provider-configs/provider%2Fone",
       { method: "DELETE", headers: { Authorization: "Bearer token_abc" } },
     );
+  });
+
+  it("moves every provider call to the platform admin endpoints for the platform scope", async () => {
+    const provider = makeProviderConfig();
+    mockFetch
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ configs: [] }) })
+      .mockResolvedValueOnce({ ok: true, status: 201, json: async () => ({ config: provider }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ config: provider }) })
+      .mockResolvedValueOnce({ ok: true, status: 204 })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ ok: true, testedAt: "2026-09-01T01:00:00.000Z" }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ models: [] }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ models: [] }) });
+
+    await fetchProviderConfigs("token_abc", "platform");
+    await createProviderConfig("token_abc", {
+      displayName: "Gateway",
+      baseUrl: "https://api.example.com/v1",
+      apiKey: "write-only-key",
+      models: [],
+    }, "platform");
+    await updateProviderConfig("token_abc", provider.id, { displayName: "Renamed" }, "platform");
+    await deleteProviderConfig("token_abc", provider.id, "platform");
+    await testProviderConnection("token_abc", provider.id, "platform");
+    await discoverDraftProviderModels("token_abc", { baseUrl: provider.baseUrl }, "platform");
+    await discoverProviderModels("token_abc", provider.id, "platform");
+
+    const urls = mockFetch.mock.calls.map((call) => String(call[0]));
+    expect(urls).toEqual([
+      "http://localhost:3001/api/admin/provider-configs",
+      "http://localhost:3001/api/admin/provider-configs",
+      `http://localhost:3001/api/admin/provider-configs/${provider.id}`,
+      `http://localhost:3001/api/admin/provider-configs/${provider.id}`,
+      `http://localhost:3001/api/admin/provider-configs/${provider.id}/test`,
+      "http://localhost:3001/api/admin/provider-configs/discover-models",
+      `http://localhost:3001/api/admin/provider-configs/${provider.id}/discover-models`,
+    ]);
   });
 });
 

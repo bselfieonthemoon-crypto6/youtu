@@ -7,7 +7,7 @@ import {
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { AuthenticatedUser } from "../../supabase/user.js";
 
-const CONFIG_COLUMNS = "id, display_name";
+const CONFIG_COLUMNS = "id, display_name, revision";
 const MODEL_COLUMNS =
   "catalog_key, provider_config_id, upstream_model_id, display_name, modality, capabilities";
 
@@ -51,20 +51,66 @@ export type ResolvedWorkspaceModel = {
   capabilities: WorkspaceCatalogModel["capabilities"];
 };
 
+/**
+ * The provider rows a workspace resolves to.
+ *
+ * `kind` is `workspace` while the workspace has its own enabled, connection-tested
+ * configuration, and `platform` (workspace_id IS NULL) otherwise. The database
+ * enforces the same rule in public.loomic_provider_config_in_scope; keeping the
+ * two in step is what lets a brand-new workspace chat and generate immediately
+ * while an already-configured workspace is untouched.
+ */
+type ProviderScope = {
+  kind: "workspace" | "platform";
+  configIds: string[];
+  revisions: Map<string, number>;
+  providerNames: Map<string, string>;
+};
+
 export function createWorkspaceModelCatalogService(options: {
   getAdminClient: () => AdminSupabaseClient;
 }): WorkspaceModelCatalogService {
+  /** Configs the workspace may resolve models through: its own, else the platform's. */
+  async function resolveEffectiveScope(
+    admin: AdminSupabaseClient,
+    workspaceId: string,
+  ): Promise<ProviderScope> {
+    const own = await usableConfigs(admin, (query) => query.eq("workspace_id", workspaceId));
+    if (own.length > 0) return toScope("workspace", own);
+    const platform = await usableConfigs(admin, (query) => query.is("workspace_id", null));
+    return toScope("platform", platform);
+  }
+
+  /**
+   * Any config the workspace may already own, including a disabled or untested
+   * one: an alias a client already holds must resolve to the identity it was
+   * published under even after that channel was switched off. Platform rows are
+   * the fallback for a workspace that owns none.
+   */
+  async function resolveAliasScope(
+    admin: AdminSupabaseClient,
+    workspaceId: string,
+  ): Promise<ProviderScope> {
+    const own = await readConfigs(admin, (query) => query.eq("workspace_id", workspaceId));
+    if (own.length > 0) return toScope("workspace", own);
+    const platform = await readConfigs(admin, (query) => query.is("workspace_id", null));
+    return toScope("platform", platform);
+  }
+
   return {
     async resolveCompatibleImageFallback(user, workspaceId, publicId) {
       const catalogKey = parsePublicCatalogKey(publicId);
       if (!catalogKey) return null;
       const admin = options.getAdminClient();
       await assertWorkspaceMembership(admin, user.id, workspaceId);
+
+      const aliasScope = await resolveAliasScope(admin, workspaceId);
+      if (aliasScope.configIds.length === 0) return null;
       const requestedResult = await (admin.from("workspace_provider_models") as any)
-        .select("catalog_key,provider_config_id,upstream_model_id,modality,capabilities,workspace_provider_configs!inner(workspace_id,revision)")
+        .select(MODEL_COLUMNS)
         .eq("catalog_key", catalogKey)
         .eq("modality", "image")
-        .eq("workspace_provider_configs.workspace_id", workspaceId)
+        .in("provider_config_id", aliasScope.configIds)
         .maybeSingle();
       if (requestedResult.error) throw new WorkspaceModelCatalogError();
       if (!requestedResult.data) return null;
@@ -74,49 +120,38 @@ export function createWorkspaceModelCatalogService(options: {
       );
       if (!capabilities.includes("image_generation")) return null;
       const upstreamModelId = String(requested.upstream_model_id);
+
+      const effectiveScope = await resolveEffectiveScope(admin, workspaceId);
+      if (effectiveScope.configIds.length === 0) return null;
       const candidateResult = await (admin.from("workspace_provider_models") as any)
-        .select("catalog_key,workspace_provider_configs!inner(workspace_id,enabled,last_test_status)")
+        .select("catalog_key,provider_config_id")
         .eq("upstream_model_id", upstreamModelId)
         .eq("modality", "image")
         .eq("enabled", true)
         // This column is JSONB, not a PostgreSQL text array. PostgREST's
         // array overload emits {image_generation}, which is invalid JSON.
         .contains("capabilities", JSON.stringify(["image_generation"]))
-        .eq("workspace_provider_configs.workspace_id", workspaceId)
-        .eq("workspace_provider_configs.enabled", true)
-        .eq("workspace_provider_configs.last_test_status", "succeeded")
+        .in("provider_config_id", effectiveScope.configIds)
         .limit(1);
       if (candidateResult.error) throw new WorkspaceModelCatalogError();
       if (!Array.isArray(candidateResult.data) || candidateResult.data.length === 0) return null;
-      const config = requested.workspace_provider_configs as Record<string, unknown>;
       return {
         upstreamModelId,
         catalogKey: String(requested.catalog_key),
         providerConfigId: String(requested.provider_config_id),
-        revision: Number(config.revision),
+        revision: aliasScope.revisions.get(String(requested.provider_config_id)) ?? 0,
         capabilities,
       };
     },
     async listPublished(user, workspaceId) {
       const admin = options.getAdminClient();
       await assertWorkspaceMembership(admin, user.id, workspaceId);
-      const configsResult = await (admin.from("workspace_provider_configs") as any)
-        .select(CONFIG_COLUMNS)
-        .eq("workspace_id", workspaceId)
-        .eq("enabled", true)
-        .eq("last_test_status", "succeeded")
-        .order("created_at", { ascending: true });
-      if (configsResult.error) throw new WorkspaceModelCatalogError();
-
-      const configs = (configsResult.data ?? []) as Array<Record<string, unknown>>;
-      if (configs.length === 0) return [];
-      const providerNames = new Map(
-        configs.map((row) => [String(row.id), String(row.display_name)]),
-      );
+      const scope = await resolveEffectiveScope(admin, workspaceId);
+      if (scope.configIds.length === 0) return [];
 
       const modelsResult = await (admin.from("workspace_provider_models") as any)
         .select(MODEL_COLUMNS)
-        .in("provider_config_id", [...providerNames.keys()])
+        .in("provider_config_id", scope.configIds)
         .eq("enabled", true)
         .order("created_at", { ascending: true });
       if (modelsResult.error) throw new WorkspaceModelCatalogError();
@@ -125,7 +160,7 @@ export function createWorkspaceModelCatalogService(options: {
           model: workspaceCatalogModelSchema.parse({
             id: `workspace:${String(row.catalog_key)}`,
             displayName: row.display_name,
-            providerDisplayName: providerNames.get(String(row.provider_config_id)),
+            providerDisplayName: scope.providerNames.get(String(row.provider_config_id)),
             modality: row.modality,
             capabilities: row.capabilities ?? [],
             source: "workspace",
@@ -139,29 +174,61 @@ export function createWorkspaceModelCatalogService(options: {
       if (!catalogKey) return null;
       const admin = options.getAdminClient();
       await assertWorkspaceMembership(admin, user.id, workspaceId);
+      const scope = await resolveEffectiveScope(admin, workspaceId);
+      if (scope.configIds.length === 0) return null;
       const result = await (admin.from("workspace_provider_models") as any)
-        .select("catalog_key, provider_config_id, upstream_model_id, modality, capabilities, workspace_provider_configs!inner(workspace_id, enabled, last_test_status, revision)")
+        .select(MODEL_COLUMNS)
         .eq("catalog_key", catalogKey)
         .eq("modality", modality)
         .eq("enabled", true)
-        .eq("workspace_provider_configs.workspace_id", workspaceId)
-        .eq("workspace_provider_configs.enabled", true)
-        .eq("workspace_provider_configs.last_test_status", "succeeded")
+        .in("provider_config_id", scope.configIds)
         .maybeSingle();
       if (result.error) throw new WorkspaceModelCatalogError();
       if (!result.data) return null;
       const row = result.data as Record<string, unknown>;
-      const config = row.workspace_provider_configs as Record<string, unknown>;
       return {
         upstreamModelId: String(row.upstream_model_id),
         catalogKey: String(row.catalog_key),
         providerConfigId: String(row.provider_config_id),
-        revision: Number(config.revision),
+        revision: scope.revisions.get(String(row.provider_config_id)) ?? 0,
         capabilities: workspaceCatalogModelSchema.shape.capabilities.parse(
           row.capabilities ?? [],
         ),
       };
     },
+  };
+}
+
+/** Published catalogue eligibility: enabled and connection-tested. */
+function usableConfigs(
+  admin: AdminSupabaseClient,
+  scope: (query: any) => any,
+): Promise<Array<Record<string, unknown>>> {
+  return readConfigs(admin, (query) =>
+    scope(query).eq("enabled", true).eq("last_test_status", "succeeded"),
+  );
+}
+
+async function readConfigs(
+  admin: AdminSupabaseClient,
+  scope: (query: any) => any,
+): Promise<Array<Record<string, unknown>>> {
+  const result = await scope(
+    (admin.from("workspace_provider_configs") as any).select(CONFIG_COLUMNS),
+  ).order("created_at", { ascending: true });
+  if (result.error) throw new WorkspaceModelCatalogError();
+  return (result.data ?? []) as Array<Record<string, unknown>>;
+}
+
+function toScope(
+  kind: ProviderScope["kind"],
+  rows: Array<Record<string, unknown>>,
+): ProviderScope {
+  return {
+    kind,
+    configIds: rows.map((row) => String(row.id)),
+    revisions: new Map(rows.map((row) => [String(row.id), Number(row.revision)])),
+    providerNames: new Map(rows.map((row) => [String(row.id), String(row.display_name)])),
   };
 }
 

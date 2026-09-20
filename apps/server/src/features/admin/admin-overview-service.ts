@@ -240,7 +240,14 @@ export function createAdminOverviewService(options: {
     const transactionWorkspaceIds = (transactionRows.data ?? []).map(row => row.workspace_id);
     const missingTransactionNames = transactionWorkspaceIds.filter(id => !failureNames.has(id));
     const transactionNames = await workspaceNames(missingTransactionNames);
-    const providerNames = await workspaceNames((providerList.data ?? []).map(row => row.workspace_id));
+    // A platform-scoped channel (workspace_id IS NULL) belongs to the whole
+    // install, so it must not be sent to the workspace-name lookup: an empty id
+    // in an `in` filter makes PostgREST reject the whole query.
+    const providerNames = await workspaceNames(
+      (providerList.data ?? [])
+        .map(row => row.workspace_id)
+        .filter((id): id is string => typeof id === "string"),
+    );
 
     const recentFailures: AdminOverviewJobFailure[] = (failureRows.data ?? []).map(row => ({
       id: row.id,
@@ -269,7 +276,9 @@ export function createAdminOverviewService(options: {
     const providerItems: AdminOverviewProvider[] = (providerList.data ?? []).map(row => ({
       id: row.id,
       workspaceId: row.workspace_id,
-      workspaceName: providerNames.get(row.workspace_id) ?? "未知工作区",
+      workspaceName: typeof row.workspace_id === "string"
+        ? providerNames.get(row.workspace_id) ?? "未知工作区"
+        : "平台默认（所有工作区）",
       displayName: row.display_name,
       enabled: row.enabled === true,
       modelCount: modelsPerConfig[row.id] ?? 0,

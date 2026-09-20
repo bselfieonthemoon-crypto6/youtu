@@ -75,39 +75,40 @@ export type ProviderConnectionTestResult = {
 };
 
 export type ProviderConfigService = {
+  /** `workspaceId === null` addresses the platform-wide default channel. */
   list(
     user: AuthenticatedUser,
-    workspaceId: string,
+    workspaceId: string | null,
   ): Promise<WorkspaceProviderConfigView[]>;
   create(
     user: AuthenticatedUser,
-    workspaceId: string,
+    workspaceId: string | null,
     input: CreateProviderConfigInput,
   ): Promise<WorkspaceProviderConfigView>;
   update(
     user: AuthenticatedUser,
-    workspaceId: string,
+    workspaceId: string | null,
     configId: string,
     input: UpdateProviderConfigInput,
   ): Promise<WorkspaceProviderConfigView>;
   delete(
     user: AuthenticatedUser,
-    workspaceId: string,
+    workspaceId: string | null,
     configId: string,
   ): Promise<void>;
   test(
     user: AuthenticatedUser,
-    workspaceId: string,
+    workspaceId: string | null,
     configId: string,
   ): Promise<ProviderConnectionTestResult>;
   discoverModels(
     user: AuthenticatedUser,
-    workspaceId: string,
+    workspaceId: string | null,
     configId: string,
   ): Promise<ProviderModelInput[]>;
   discoverDraftModels(
     user: AuthenticatedUser,
-    workspaceId: string,
+    workspaceId: string | null,
     input: DiscoverProviderModelsDraftInput,
   ): Promise<ProviderModelInput[]>;
 };

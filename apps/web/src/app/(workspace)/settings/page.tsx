@@ -16,7 +16,7 @@ import { ApiAuthError, fetchViewer, updateProfile } from "@/lib/server-api";
  * There is deliberately no "Agent" (default model) or "供应商" (model provider) tab
  * here: both are configured on the platform side, and letting a workspace pick its own
  * default model or manage its own channels duplicated that. The provider console still
- * lives in the admin page (`/admin → 模型与渠道`), which owns those endpoints - the APIs
+ * lives in the admin page (`/admin → 工作区模型覆盖`), which owns those endpoints - the APIs
  * themselves are unchanged.
  *
  * A deep link to a tab that no longer exists (`?tab=agent`, `?tab=providers`) falls

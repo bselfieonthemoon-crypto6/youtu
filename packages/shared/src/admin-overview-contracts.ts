@@ -45,7 +45,9 @@ const adminJobFailureViewSchema = z.object({
 
 const adminProviderViewSchema = z.object({
   id: z.string().min(1),
-  workspaceId: workspaceIdSchema,
+  /** Null for the platform-wide default channel, which belongs to no workspace. */
+  workspaceId: workspaceIdSchema.nullable(),
+  /** Display name of the owning workspace, or the platform default's label. */
   workspaceName: z.string().min(1),
   displayName: z.string().min(1),
   enabled: z.boolean(),

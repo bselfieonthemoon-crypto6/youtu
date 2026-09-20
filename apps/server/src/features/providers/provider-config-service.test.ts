@@ -484,3 +484,87 @@ describe("provider config security", () => {
     });
   });
 });
+
+/**
+ * The platform scope (`workspaceId === null`) is the channel set every workspace
+ * falls back to. It is authorized by platform-admin rights, never by workspace
+ * membership, and the write RPCs carry a NULL workspace id.
+ */
+function platformAdminFor(options: { activeAdmin?: boolean } = {}) {
+  const configs = {
+    select: vi.fn(() => configs),
+    eq: vi.fn(() => configs),
+    is: vi.fn(() => configs),
+    in: vi.fn(() => configs),
+    order: vi.fn(() => Promise.resolve({ data: [configRow], error: null })),
+    maybeSingle: vi.fn(async () => ({ data: configRow, error: null })),
+    then: (resolve: (value: unknown) => unknown) =>
+      Promise.resolve({ data: [configRow], error: null }).then(resolve),
+  };
+  const from = vi.fn((table: string) => {
+    if (table === "platform_admins") {
+      const q: any = {
+        select: vi.fn(() => q),
+        eq: vi.fn(() => q),
+        is: vi.fn(() => q),
+        maybeSingle: vi.fn(async () => ({
+          data: options.activeAdmin === false ? null : { user_id: "user-1" },
+          error: null,
+        })),
+      };
+      return q;
+    }
+    return configs;
+  });
+  const rpc = vi.fn(async (name: string) => ({
+    data: name === "loomic_provider_config_delete" ? true
+      : name === "loomic_provider_config_update" ? "updated"
+      : null,
+    error: null,
+  }));
+  return { client: { from, rpc } as unknown as AdminSupabaseClient, from, rpc, configs };
+}
+
+describe("platform provider config scope", () => {
+  it("refuses a caller who is not an active platform admin, without a user client", async () => {
+    const admin = platformAdminFor({ activeAdmin: false });
+    const createUserClient = vi.fn();
+    const service = createProviderConfigService({
+      createUserClient,
+      getAdminClient: () => admin.client,
+    });
+    await expect(service.list(user, null)).rejects.toMatchObject({
+      code: "provider_forbidden",
+      statusCode: 403,
+    });
+    expect(createUserClient).not.toHaveBeenCalled();
+  });
+
+  it("reads and writes the NULL-workspace scope for an active platform admin", async () => {
+    const admin = platformAdminFor();
+    const createUserClient = vi.fn();
+    const service = createProviderConfigService({
+      createUserClient,
+      getAdminClient: () => admin.client,
+    });
+
+    await expect(service.list(user, null)).resolves.toHaveLength(1);
+    expect(admin.configs.is).toHaveBeenCalledWith("workspace_id", null);
+    expect(admin.configs.eq).not.toHaveBeenCalledWith("workspace_id", expect.anything());
+    expect(createUserClient).not.toHaveBeenCalled();
+
+    await expect(service.update(user, null, "config-1", { enabled: false }))
+      .resolves.toMatchObject({ id: "config-1" });
+    expect(admin.rpc).toHaveBeenCalledWith(
+      "loomic_provider_config_update",
+      expect.objectContaining({ p_workspace_id: null, p_provider_config_id: "config-1" }),
+    );
+
+    await expect(service.delete(user, null, "config-1")).resolves.toBeUndefined();
+    expect(admin.rpc).toHaveBeenCalledWith("loomic_provider_config_delete", {
+      p_workspace_id: null,
+      p_provider_config_id: "config-1",
+      p_actor_user_id: "user-1",
+    });
+  });
+});

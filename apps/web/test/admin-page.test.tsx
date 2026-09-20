@@ -25,7 +25,11 @@ vi.mock("../src/components/settings/workspace-members-section", () => ({
   WorkspaceMembersSection: () => <div>成员面板</div>,
 }));
 vi.mock("../src/components/settings/provider-settings-section", () => ({
-  ProviderSettingsSection: () => <div>供应商面板</div>,
+  // The real section is covered in its own test file. Here it only has to make the
+  // scope the page handed it visible, because that scope decides the API endpoint.
+  ProviderSettingsSection: ({ scope = "workspace" }: { scope?: string }) => (
+    <div data-testid={`provider-settings-${scope}`}>供应商面板</div>
+  ),
 }));
 vi.mock("../src/components/admin/default-model-section", () => ({
   DefaultModelSection: ({ accessToken }: { accessToken: string }) => (
@@ -93,7 +97,11 @@ describe("admin page", () => {
     fetchAdminAccessMock.mockReset().mockResolvedValue({ platformAdmin: false });
     authState.session = { access_token: "token" };
   });
-  afterEach(() => cleanup());
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
 
   it("blocks ordinary workspace members, and offers them no console at all", async () => {
     fetchViewerMock.mockResolvedValue(viewer("member"));
@@ -106,7 +114,7 @@ describe("admin page", () => {
     expect(screen.queryByRole("button", { name: "权限与审计" })).not.toBeInTheDocument();
     // ...and not the workspace console either.
     expect(screen.queryByRole("button", { name: "本工作区成员" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "模型与渠道" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "工作区模型覆盖" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "设计资源" })).not.toBeInTheDocument();
   });
 
@@ -174,12 +182,71 @@ describe("admin page", () => {
     render(<AdminPage />);
     expect(await screen.findByText("成员面板")).toBeInTheDocument();
     await userEvent.click(
-      screen.getByRole("button", { name: "模型与渠道" }),
+      screen.getByRole("button", { name: "工作区模型覆盖" }),
     );
     expect(screen.getByText("供应商面板")).toBeInTheDocument();
+    // The workspace tab is the optional override, never the platform default.
+    expect(screen.getByTestId("provider-settings-workspace")).toBeInTheDocument();
+    expect(screen.queryByTestId("provider-settings-platform")).not.toBeInTheDocument();
     // The default model is drawn from those channels, so it lives in the same tab.
     expect(screen.getByText("默认模型面板:token")).toBeInTheDocument();
   });
+
+  it("gives a platform admin a workspace-free platform channel tab", async () => {
+    fetchViewerMock.mockResolvedValue(viewer("owner"));
+    fetchAdminAccessMock.mockResolvedValue({ platformAdmin: true });
+    render(<AdminPage />);
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "平台模型与渠道" }),
+    );
+
+    // The platform default applies to every workspace, so it renders without a
+    // workspace id and without the workspace-only default-model control.
+    expect(screen.getByTestId("provider-settings-platform")).toBeInTheDocument();
+    expect(screen.queryByTestId("provider-settings-workspace")).not.toBeInTheDocument();
+    expect(screen.queryByText("默认模型面板:token")).not.toBeInTheDocument();
+    expect(screen.getByText("供应商面板")).toBeInTheDocument();
+  });
+
+  it("sends platform provider requests to the platform admin endpoint", async () => {
+    // The page hands the section the platform scope, and that scope is what moves the
+    // request off the workspace routes, so both halves of that chain are asserted here.
+    const { fetchProviderConfigs } = await vi.importActual<
+      typeof import("../src/lib/server-api")
+    >("../src/lib/server-api");
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ configs: [] }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubEnv("NEXT_PUBLIC_SERVER_BASE_URL", "http://localhost:3001");
+
+    await fetchProviderConfigs("token", "platform");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:3001/api/admin/provider-configs",
+      { headers: { Authorization: "Bearer token" } },
+    );
+  });
+
+  it.each(["owner", "admin"] as const)(
+    "gives a workspace %s the optional override tab instead of the platform default",
+    async (role) => {
+      fetchViewerMock.mockResolvedValue(viewer(role));
+      fetchAdminAccessMock.mockResolvedValue({ platformAdmin: false });
+      render(<AdminPage />);
+
+      // The per-workspace override control stays available...
+      expect(
+        await screen.findByRole("button", { name: "工作区模型覆盖" }),
+      ).toBeInTheDocument();
+      // ...but the platform-wide default is not theirs to configure.
+      expect(screen.queryByRole("button", { name: "平台模型与渠道" })).not.toBeInTheDocument();
+      expect(screen.queryByTestId("provider-settings-platform")).not.toBeInTheDocument();
+    },
+  );
 
   it("shows the viewer error and retries instead of reporting missing permission", async () => {
     fetchViewerMock

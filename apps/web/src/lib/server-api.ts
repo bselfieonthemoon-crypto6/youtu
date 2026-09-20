@@ -776,12 +776,27 @@ export async function suggestLayerElements(
   };
 }
 
-// --- Workspace provider configurations (admin only) ---
+// --- Provider configurations (workspace admin, or platform admin for the default) ---
+
+/**
+ * The platform scope manages the one default every workspace inherits; the workspace
+ * scope is the optional per-workspace override. The request and response shapes are
+ * identical, so only the path prefix and the server-side authorization differ.
+ */
+export type ProviderConfigScope = "workspace" | "platform";
+
+function providerConfigsPath(scope: ProviderConfigScope): string {
+  return scope === "platform"
+    ? "/api/admin/provider-configs"
+    : "/api/workspace/provider-configs";
+}
+
 export async function fetchProviderConfigs(
   accessToken: string,
+  scope: ProviderConfigScope = "workspace",
 ): Promise<ProviderConfigListResponse> {
   const response = await fetch(
-    `${getServerBaseUrl()}/api/workspace/provider-configs`,
+    `${getServerBaseUrl()}${providerConfigsPath(scope)}`,
     { headers: authHeaders(accessToken) },
   );
   if (!response.ok) return handleErrorResponse(response);
@@ -791,9 +806,10 @@ export async function fetchProviderConfigs(
 export async function createProviderConfig(
   accessToken: string,
   data: ProviderConfigCreateRequest,
+  scope: ProviderConfigScope = "workspace",
 ): Promise<ProviderConfigResponse> {
   const response = await fetch(
-    `${getServerBaseUrl()}/api/workspace/provider-configs`,
+    `${getServerBaseUrl()}${providerConfigsPath(scope)}`,
     {
       method: "POST",
       headers: authJsonHeaders(accessToken),
@@ -808,9 +824,10 @@ export async function updateProviderConfig(
   accessToken: string,
   providerId: string,
   data: ProviderConfigUpdateRequest,
+  scope: ProviderConfigScope = "workspace",
 ): Promise<ProviderConfigResponse> {
   const response = await fetch(
-    `${getServerBaseUrl()}/api/workspace/provider-configs/${encodeURIComponent(providerId)}`,
+    `${getServerBaseUrl()}${providerConfigsPath(scope)}/${encodeURIComponent(providerId)}`,
     {
       method: "PUT",
       headers: authJsonHeaders(accessToken),
@@ -824,9 +841,10 @@ export async function updateProviderConfig(
 export async function deleteProviderConfig(
   accessToken: string,
   providerId: string,
+  scope: ProviderConfigScope = "workspace",
 ): Promise<void> {
   const response = await fetch(
-    `${getServerBaseUrl()}/api/workspace/provider-configs/${encodeURIComponent(providerId)}`,
+    `${getServerBaseUrl()}${providerConfigsPath(scope)}/${encodeURIComponent(providerId)}`,
     { method: "DELETE", headers: authHeaders(accessToken) },
   );
   if (!response.ok) return handleErrorResponse(response);
@@ -835,9 +853,10 @@ export async function deleteProviderConfig(
 export async function testProviderConnection(
   accessToken: string,
   providerId: string,
+  scope: ProviderConfigScope = "workspace",
 ): Promise<ProviderConnectionTestResponse> {
   const response = await fetch(
-    `${getServerBaseUrl()}/api/workspace/provider-configs/${encodeURIComponent(providerId)}/test`,
+    `${getServerBaseUrl()}${providerConfigsPath(scope)}/${encodeURIComponent(providerId)}/test`,
     { method: "POST", headers: authHeaders(accessToken) },
   );
   if (!response.ok) return handleErrorResponse(response);
@@ -847,8 +866,9 @@ export async function testProviderConnection(
 export async function discoverDraftProviderModels(
   accessToken: string,
   input: { baseUrl: string; apiKey?: string; configId?: string },
+  scope: ProviderConfigScope = "workspace",
 ): Promise<ProviderModelDiscoveryResponse> {
-  const response = await fetch(`${getServerBaseUrl()}/api/workspace/provider-configs/discover-models`, {
+  const response = await fetch(`${getServerBaseUrl()}${providerConfigsPath(scope)}/discover-models`, {
     method: "POST", headers: authJsonHeaders(accessToken), body: JSON.stringify(input),
   });
   if (!response.ok) return handleErrorResponse(response);
@@ -858,9 +878,10 @@ export async function discoverDraftProviderModels(
 export async function discoverProviderModels(
   accessToken: string,
   providerId: string,
+  scope: ProviderConfigScope = "workspace",
 ): Promise<ProviderModelDiscoveryResponse> {
   const response = await fetch(
-    `${getServerBaseUrl()}/api/workspace/provider-configs/${encodeURIComponent(providerId)}/discover-models`,
+    `${getServerBaseUrl()}${providerConfigsPath(scope)}/${encodeURIComponent(providerId)}/discover-models`,
     { method: "POST", headers: authHeaders(accessToken) },
   );
   if (!response.ok) return handleErrorResponse(response);

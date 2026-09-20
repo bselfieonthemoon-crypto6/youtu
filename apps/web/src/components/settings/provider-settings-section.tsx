@@ -10,6 +10,7 @@ import type {
 } from "@loomic/shared";
 import { useCallback, useEffect, useState } from "react";
 
+import type { ProviderConfigScope } from "../../lib/server-api";
 import {
   createProviderConfig,
   deleteProviderConfig,
@@ -53,7 +54,14 @@ function changeModelModality(model: ProviderModelInput, modality: ProviderModelI
   return { ...model, modality, capabilities: capabilitiesForModality(modality), contextProfile: null };
 }
 
-export function ProviderSettingsSection({ accessToken }: { accessToken: string }) {
+export function ProviderSettingsSection({
+  accessToken,
+  scope = "workspace",
+}: {
+  accessToken: string;
+  scope?: ProviderConfigScope;
+}) {
+  const isPlatform = scope === "platform";
   const [configs, setConfigs] = useState<WorkspaceProviderConfig[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -68,14 +76,14 @@ export function ProviderSettingsSection({ accessToken }: { accessToken: string }
     setLoading(true);
     setError(null);
     try {
-      const response = await fetchProviderConfigs(accessToken);
+      const response = await fetchProviderConfigs(accessToken, scope);
       setConfigs(response.configs);
     } catch (caught) {
       setError(providerErrorMessage(caught, "供应商配置加载失败，请稍后重试。"));
     } finally {
       setLoading(false);
     }
-  }, [accessToken]);
+  }, [accessToken, scope]);
 
   useEffect(() => void load(), [load]);
 
@@ -83,7 +91,7 @@ export function ProviderSettingsSection({ accessToken }: { accessToken: string }
     setTestingId(config.id);
     setTestFeedback((current) => ({ ...current, [config.id]: { ok: true, text: "正在测试连接…" } }));
     try {
-      const result = await testProviderConnection(accessToken, config.id);
+      const result = await testProviderConnection(accessToken, config.id, scope);
       setTestFeedback((current) => ({ ...current, [config.id]: { ok: true, text: "连接成功" } }));
       setConfigs((current) => current.map((item) => item.id === config.id
         ? { ...item, lastTestStatus: "succeeded", lastTestedAt: result.testedAt }
@@ -105,7 +113,7 @@ export function ProviderSettingsSection({ accessToken }: { accessToken: string }
     setDeletingId(config.id);
     setDeleteFeedback((current) => ({ ...current, [config.id]: "" }));
     try {
-      await deleteProviderConfig(accessToken, config.id);
+      await deleteProviderConfig(accessToken, config.id, scope);
       setConfigs((current) => current.filter((item) => item.id !== config.id));
       setConfirmDeleteId(null);
     } catch (caught) {
@@ -122,6 +130,7 @@ export function ProviderSettingsSection({ accessToken }: { accessToken: string }
     return (
       <ProviderForm
         accessToken={accessToken}
+        scope={scope}
         initial={editing === "new" ? null : editing}
         onCancel={() => {
           setEditing(null);
@@ -141,11 +150,22 @@ export function ProviderSettingsSection({ accessToken }: { accessToken: string }
   }
 
   return (
-    <section aria-labelledby="provider-settings-heading">
+    <section
+      aria-labelledby="provider-settings-heading"
+      data-testid={`provider-settings-${scope}`}
+    >
       <div className="mb-5 flex items-start justify-between gap-3">
         <div>
-          <h2 id="provider-settings-heading" className="text-lg font-semibold">模型供应商</h2>
-          <p className="mt-1 text-sm text-muted-foreground">管理工作区的 OpenAI 兼容接口。密钥只写入，不会再次显示。</p>
+          <h2 id="provider-settings-heading" className="text-lg font-semibold">
+            {isPlatform ? "平台模型与渠道" : "工作区模型渠道（可选覆盖）"}
+          </h2>
+          {/* The platform default only avoids per-workspace configuration if the copy
+              says so - including for a workspace that does not exist yet. */}
+          <p className="mt-1 text-sm text-muted-foreground">
+            {isPlatform
+              ? "平台级默认渠道：所有工作区（包括之后新建的账号）都会自动使用它，不必逐个工作区配置。工作区仍可用自己的渠道覆盖这一默认值。"
+              : "只有本工作区至少有一个已启用且连接测试通过的自有渠道时，才会使用这里的渠道；否则自动回退到平台默认渠道。"}
+          </p>
         </div>
         <button type="button" onClick={() => setEditing("new")} className="shrink-0 rounded-md bg-foreground px-3 py-2 text-xs font-medium text-background hover:opacity-90">
           新增供应商
@@ -190,7 +210,11 @@ export function ProviderSettingsSection({ accessToken }: { accessToken: string }
                 </div>
                 {confirmDeleteId === config.id && (
                   <div role="alertdialog" aria-label={`确认删除 ${config.displayName}`} className="mt-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3">
-                    <p className="text-xs text-foreground">确定删除“{config.displayName}”吗？此操作会移除该工作区供应商配置，无法撤销。</p>
+                    <p className="text-xs text-foreground">
+                      {isPlatform
+                        ? `确定删除“${config.displayName}”吗？此操作会移除所有工作区的平台渠道，无法撤销。`
+                        : `确定删除“${config.displayName}”吗？此操作会移除该工作区供应商配置，无法撤销。`}
+                    </p>
                     <div className="mt-2 flex gap-2">
                       <button type="button" disabled={deletingId === config.id} onClick={() => void handleDelete(config)} className="rounded-md bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground disabled:opacity-50">
                         {deletingId === config.id ? "删除中…" : "确认删除"}
@@ -211,11 +235,13 @@ export function ProviderSettingsSection({ accessToken }: { accessToken: string }
 
 function ProviderForm({
   accessToken,
+  scope,
   initial,
   onCancel,
   onSaved,
 }: {
   accessToken: string;
+  scope: ProviderConfigScope;
   initial: WorkspaceProviderConfig | null;
   onCancel: () => void;
   onSaved: (config: WorkspaceProviderConfig) => void;
@@ -324,7 +350,7 @@ function ProviderForm({
     // Draft discovery is intentionally write-free. Verify the saved connection
     // before publishing its models, without trusting client-side preview state.
     try {
-      const tested = await testProviderConnection(accessToken, config.id);
+      const tested = await testProviderConnection(accessToken, config.id, scope);
       onSaved({ ...config, lastTestStatus: "succeeded", lastTestedAt: tested.testedAt });
     } catch (caught) {
       setFeedback(`供应商与模型已保存，但连接验证未通过。${providerErrorMessage(caught, "请返回列表重新测试连接。")}`);
@@ -357,7 +383,7 @@ function ProviderForm({
           apiKey: apiKey.trim(),
           enabled,
           models: cleanModels,
-        } satisfies ProviderConfigCreateRequest);
+        } satisfies ProviderConfigCreateRequest, scope);
         await finishSave(created.config);
         return;
       }
@@ -367,7 +393,7 @@ function ProviderForm({
             enabled,
             models: cleanModels,
             ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
-          });
+          }, scope);
       await finishSave(response.config);
     } catch (caught) {
       setApiKey("");
@@ -388,7 +414,7 @@ function ProviderForm({
         baseUrl: normalizedUrl,
         ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
         ...(savedConfig ? { configId: savedConfig.id } : {}),
-      });
+      }, scope);
       openDiscoveryPicker(response.models);
       setFeedback(`试拉取成功，已获取 ${response.models.length} 个模型。连接和模型尚未保存。`);
     } catch (caught) {

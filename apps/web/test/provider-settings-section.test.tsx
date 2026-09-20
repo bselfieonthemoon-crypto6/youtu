@@ -62,6 +62,8 @@ describe("ProviderSettingsSection", () => {
   it("shows only the masked key hint and never prefills the secret", async () => {
     render(<ProviderSettingsSection accessToken="token" />);
     expect(await screen.findByText(/已配置 ••••6d97/)).toBeInTheDocument();
+    // Omitting the scope keeps the optional per-workspace override.
+    expect(screen.getByTestId("provider-settings-workspace")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "编辑" }));
     const keyInput = screen.getByLabelText("API Key") as HTMLInputElement;
     expect(keyInput.value).toBe("");
@@ -107,6 +109,7 @@ describe("ProviderSettingsSection", () => {
         apiKey: "sk-secret-value",
         models: [expect.objectContaining({ upstreamModelId: "model-one" })],
       }),
+      "workspace",
     ));
     expect(discoverMock).not.toHaveBeenCalled();
   }, 10_000);
@@ -148,7 +151,7 @@ describe("ProviderSettingsSection", () => {
     expect(screen.getByLabelText("模型 2 ID")).toBeEnabled();
     expect(updateMock).not.toHaveBeenCalled();
     expect(testMock).not.toHaveBeenCalled();
-    expect(discoverMock).toHaveBeenCalledWith("token", { configId: config.id, baseUrl: config.baseUrl });
+    expect(discoverMock).toHaveBeenCalledWith("token", { configId: config.id, baseUrl: config.baseUrl }, "workspace");
   });
 
   it("discovers with unsaved connection credentials without persisting them", async () => {
@@ -159,7 +162,7 @@ describe("ProviderSettingsSection", () => {
     await userEvent.click(screen.getByRole("button", { name: "拉取模型" }));
     expect(await screen.findByRole("dialog")).toBeInTheDocument();
     expect(testMock).not.toHaveBeenCalled();
-    expect(discoverMock).toHaveBeenCalledWith("token", { configId: config.id, baseUrl: config.baseUrl, apiKey: "new-secret-value" });
+    expect(discoverMock).toHaveBeenCalledWith("token", { configId: config.id, baseUrl: config.baseUrl, apiKey: "new-secret-value" }, "workspace");
     expect(updateMock).not.toHaveBeenCalled();
     expect(createMock).not.toHaveBeenCalled();
   });
@@ -173,7 +176,7 @@ describe("ProviderSettingsSection", () => {
     await userEvent.type(screen.getByLabelText("API Key"), "unsaved-test-key");
     await userEvent.click(screen.getByRole("button", { name: "拉取模型" }));
     expect(await screen.findByRole("dialog")).toBeInTheDocument();
-    expect(discoverMock).toHaveBeenCalledWith("token", { baseUrl: "https://toapis.cn/v1", apiKey: "unsaved-test-key" });
+    expect(discoverMock).toHaveBeenCalledWith("token", { baseUrl: "https://toapis.cn/v1", apiKey: "unsaved-test-key" }, "workspace");
     expect(createMock).not.toHaveBeenCalled();
     expect(updateMock).not.toHaveBeenCalled();
     await userEvent.keyboard("{Escape}");
@@ -231,7 +234,7 @@ describe("ProviderSettingsSection", () => {
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "删除" }));
     await userEvent.click(screen.getByRole("button", { name: "确认删除" }));
-    await waitFor(() => expect(deleteMock).toHaveBeenCalledWith("token", config.id));
+    await waitFor(() => expect(deleteMock).toHaveBeenCalledWith("token", config.id, "workspace"));
     expect(screen.queryByText("API 易")).not.toBeInTheDocument();
   });
 
@@ -243,5 +246,29 @@ describe("ProviderSettingsSection", () => {
     await userEvent.click(screen.getByRole("button", { name: "确认删除" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("删除失败");
     expect(screen.getByText("API 易")).toBeInTheDocument();
+  });
+
+  it("configures the platform default, and says so, when the scope is platform", async () => {
+    render(<ProviderSettingsSection accessToken="token" scope="platform" />);
+
+    expect(await screen.findByText(/包括之后新建的账号/)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "平台模型与渠道" })).toBeInTheDocument();
+    expect(screen.getByTestId("provider-settings-platform")).toBeInTheDocument();
+    // Every call carries the scope, because that is what selects the platform routes.
+    expect(fetchMock).toHaveBeenCalledWith("token", "platform");
+
+    await userEvent.click(screen.getByRole("button", { name: "测试连接" }));
+    await waitFor(() => expect(testMock).toHaveBeenCalledWith("token", config.id, "platform"));
+
+    await userEvent.click(screen.getByRole("button", { name: "编辑" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存模型" }));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("token", config.id, expect.anything(), "platform"));
+
+    // Saving lands back on the platform list, where deletion is scoped the same way
+    // and the confirmation says it affects every workspace.
+    await userEvent.click(await screen.findByRole("button", { name: "删除" }));
+    expect(screen.getByRole("alertdialog", { name: "确认删除 API 易" })).toHaveTextContent("所有工作区");
+    await userEvent.click(screen.getByRole("button", { name: "确认删除" }));
+    await waitFor(() => expect(deleteMock).toHaveBeenCalledWith("token", config.id, "platform"));
   });
 });

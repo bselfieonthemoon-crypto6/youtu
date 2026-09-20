@@ -198,7 +198,7 @@ function parseConfigId(params: unknown) {
   return providerConfigIdSchema.parse(id);
 }
 
-function toServiceCreateInput(payload: ProviderConfigCreateRequest) {
+export function toServiceCreateInput(payload: ProviderConfigCreateRequest) {
   return {
     displayName: payload.displayName,
     baseUrl: payload.baseUrl,
@@ -208,7 +208,7 @@ function toServiceCreateInput(payload: ProviderConfigCreateRequest) {
   };
 }
 
-function toServiceUpdateInput(payload: ProviderConfigUpdateRequest) {
+export function toServiceUpdateInput(payload: ProviderConfigUpdateRequest) {
   return {
     ...(payload.displayName !== undefined
       ? { displayName: payload.displayName }
@@ -220,7 +220,7 @@ function toServiceUpdateInput(payload: ProviderConfigUpdateRequest) {
   };
 }
 
-function toServiceDraftDiscoveryInput(payload: ProviderModelDiscoveryDraftRequest) {
+export function toServiceDraftDiscoveryInput(payload: ProviderModelDiscoveryDraftRequest) {
   return {
     baseUrl: payload.baseUrl,
     ...(payload.apiKey !== undefined ? { apiKey: payload.apiKey } : {}),
@@ -244,7 +244,7 @@ function toServiceModel(model: {
   };
 }
 
-function toApiConfig(view: WorkspaceProviderConfigView): WorkspaceProviderConfig {
+export function toApiConfig(view: WorkspaceProviderConfigView): WorkspaceProviderConfig {
   return {
     id: view.id,
     adapter: "openai_compatible",
@@ -279,7 +279,7 @@ function sendUnauthenticated(reply: FastifyReply) {
   );
 }
 
-function sendProviderError(
+export function sendProviderError(
   error: unknown,
   reply: FastifyReply,
   explicitEmptyApiKey = false,
@@ -313,14 +313,14 @@ function sendProviderError(
   );
 }
 
-function isExplicitEmptyApiKey(body: unknown) {
+export function isExplicitEmptyApiKey(body: unknown) {
   if (typeof body !== "object" || body === null || Array.isArray(body)) return false;
   if (!Object.prototype.hasOwnProperty.call(body, "apiKey")) return false;
   return typeof (body as { apiKey?: unknown }).apiKey === "string" &&
     (body as { apiKey: string }).apiKey.trim().length === 0;
 }
 
-function connectionErrorMessage(code: string) {
+export function connectionErrorMessage(code: string) {
   switch (code) {
     case "provider_connection_timeout":
       return "Provider connection test timed out.";
