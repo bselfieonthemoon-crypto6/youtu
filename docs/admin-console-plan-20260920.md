@@ -162,6 +162,40 @@
 **建议**：`/admin → 存储`：占用统计（按工作区/桶/类型）、孤儿资产列表（含"为什么判定为孤儿"）、
 待删队列、清理操作（软删→GC，二次确认 + 审计）。
 
+### B6c 现状复核（2026-09-20，B6b 完成后动手前核对）
+
+**清理路径已经存在，而且是完整的**，所以这一批**不应该新写删除逻辑**：
+
+| 现有函数 | 作用 |
+| --- | --- |
+| `loomic_asset_has_live_references(p_asset_id)` | 判断素材是否还有活引用——**唯一可信的"是不是孤儿"判据** |
+| `loomic_orphan_asset_claim(p_asset_id)` | 领取一个孤儿（返回 bucket/object_path），内部会复查引用 |
+| `loomic_orphan_asset_finalize(p_asset_id)` | 对象删掉后收尾（删除 `asset_objects` 行） |
+| `loomic_asset_gc_prepare_delete` / `loomic_asset_gc_claim` / `loomic_asset_gc_finalize` | 另一条更细的 GC 流程（`gc_eligible_at` / `gc_claim_token` / `gc_claimed_at`），带领取令牌 |
+| `loomic_asset_is_usable(p_asset_object_id, p_workspace_id)` | 读取侧的可用性判定 |
+| `cancel_asset_gc_on_reference` | 引用出现时取消 GC |
+| `loomic_jsonb_has_asset_reference` | jsonb 字段里的引用（如画布文档）也算引用 |
+
+**关键认识**：`asset_references`（当前 319 行 / 316 个素材）**不是唯一的引用来源**——
+`design_resources.asset_object_id`、`skill_previews.asset_object_id`、`design_templates.preview_asset_object_id`、
+画布文档 jsonb 等都指向 `asset_objects`。所以"孤儿"**必须**问 `loomic_asset_has_live_references`，
+自己在 SQL 里 `LEFT JOIN asset_references` 判断会误删——这也正是 B4a 删除技能图片时只删记录、
+把存储对象留给回收流程的原因。
+
+当前副本规模（用于设计分页与默认窗口）：`workspace-assets` 5731 个对象 / 1370 MB，
+`project-assets` 4 个（全部 `deletion_pending_at`），`gc_eligible_at` 非空的 3 个，已领取 0 个。
+
+**B6c 的建议做法**：
+1. **只读**（本批主要价值）：`admin_asset_overview`（按桶/scope/工作区聚合对象数、字节数、
+   待删与待 GC 计数）、`admin_asset_orphans`（用 `loomic_asset_has_live_references` 判定，
+   每条给出**判定理由**：无 `asset_references`、且无其它列引用、`deletion_pending_at` 是否已置）、
+   `admin_asset_large_objects`（大文件排行）、`admin_asset_pending_queue`（待删/待 GC）。
+2. **清理**（写）：只提供"把选中的孤儿交给**既有** `loomic_orphan_asset_claim` → 删对象 →
+   `loomic_orphan_asset_finalize`"，并在同一个事务外记录审计；**不提供**任何绕过引用检查的删除。
+   每条都要行内原因 + 确认（沿用平台后台约定）。
+3. 界面：`/admin → 存储`：占用卡片（桶/工作区/类型）、孤儿表（带判定理由）、大文件排行、待删队列，
+   清理动作只出现在孤儿表上。
+
 ---
 
 ## 八、Agent 运行时
