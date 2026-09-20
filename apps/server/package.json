@@ -52,6 +52,8 @@
     "test": "vitest run",
     "test:authz-parity": "node --import tsx ./scripts/run-mastra-image-authorization-parity.mjs",
     "eval:behavior": "node --env-file=../../artifacts/local-replica-20260907/app.env --import tsx ./scripts/eval-agent-behavior.ts",
+    "bootstrap:platform-admin": "node --env-file=../../.env.local --import tsx ./scripts/bootstrap-platform-admin.ts",
+    "check:postgrest-schema": "node --env-file=../../.env.local ./scripts/check-postgrest-schema-cache.mjs",
     "test:supervisor": "node --test scripts/worker-supervisor.test.mjs",
     "typecheck": "node ./scripts/typecheck-batched.mjs",
     "typecheck:full": "tsc -p tsconfig.json --noEmit"
