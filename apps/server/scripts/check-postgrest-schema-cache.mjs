@@ -39,6 +39,15 @@ const ADMIN_FUNCTIONS = [
   "admin_channel_directory",
   "admin_channel_detail",
   "admin_channel_failure_rates",
+  "admin_home_content_overview",
+  "admin_home_content_list",
+  "admin_upsert_home_discovery_case",
+  "admin_upsert_home_example_example",
+  "admin_upsert_home_category",
+  "admin_set_home_content_active",
+  "admin_reorder_home_content",
+  "admin_reorder_home_categories",
+  "admin_delete_home_content",
 ];
 
 const expected = process.argv.slice(2).filter(argument => !argument.startsWith("--"));

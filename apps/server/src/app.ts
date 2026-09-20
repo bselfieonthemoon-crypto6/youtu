@@ -166,6 +166,7 @@ import { registerAdminBillingRoutes } from "./http/admin-billing.js";
 import { registerAdminSkillRoutes } from "./http/admin-skills.js";
 import { registerAdminJobRoutes } from "./http/admin-jobs.js";
 import { registerAdminChannelRoutes } from "./http/admin-channels.js";
+import { registerAdminHomeContentRoutes } from "./http/admin-home-content.js";
 import { createAdminOverviewService } from "./features/admin/admin-overview-service.js";
 import { createAdminAccessService } from "./features/admin/admin-access-service.js";
 import { createAdminUserService } from "./features/admin/admin-user-service.js";
@@ -173,6 +174,7 @@ import { createAdminBillingService } from "./features/admin/admin-billing-servic
 import { createAdminSkillService } from "./features/admin/admin-skill-service.js";
 import { createAdminJobService } from "./features/admin/admin-job-service.js";
 import { createAdminChannelService } from "./features/admin/admin-channel-service.js";
+import { createAdminHomeContentService } from "./features/admin/admin-home-content-service.js";
 import {
   finalizeTerminalImageJobPlaceholder,
   finalizeTerminalVideoJobPlaceholder,
@@ -814,6 +816,14 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   void registerAdminChannelRoutes(app, {
     auth,
     adminChannelService: createAdminChannelService({ getAdminClient }),
+  });
+  // Home content: the discovery and examples libraries, which until now only ever
+  // changed through migrations and import scripts. Publish state is the RLS switch
+  // the home page already reads; ordering travels through dedicated reorder calls
+  // because the tables carry a unique index on (category_key, sort_order).
+  void registerAdminHomeContentRoutes(app, {
+    auth,
+    adminHomeContentService: createAdminHomeContentService({ getAdminClient }),
   });
 
   // Payment routes — only registered when Lemon Squeezy is configured

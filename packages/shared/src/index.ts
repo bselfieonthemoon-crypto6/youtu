@@ -32,3 +32,4 @@ export * from "./admin-billing-contracts.js";
 export * from "./admin-skill-contracts.js";
 export * from "./admin-job-contracts.js";
 export * from "./admin-channel-contracts.js";
+export * from "./admin-home-content-contracts.js";

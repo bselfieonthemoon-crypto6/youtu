@@ -56,6 +56,15 @@ import type {
   AdminChannelListResponse,
   AdminChannelDetailResponse,
   AdminChannelFailureRatesResponse,
+  AdminHomeContentOverviewResponse,
+  AdminHomeContentListResponse,
+  AdminHomeCategoryUpsertRequest,
+  AdminHomeContentToggleRequest,
+  AdminHomeContentReorderRequest,
+  AdminHomeCategoryReorderRequest,
+  AdminHomeContentDeleteRequest,
+  AdminHomeDiscoveryCaseUpsertRequest,
+  AdminHomeExampleUpsertRequest,
 } from "@loomic/shared";
 import {
   canvasGetResponseSchema,
@@ -1569,4 +1578,109 @@ export async function fetchAdminChannelFailureRates(
   });
   if (!response.ok) return handleErrorResponse(response);
   return (await response.json()) as AdminChannelFailureRatesResponse;
+}
+
+/** Home content: both libraries, their categories, and the audited writes. */
+export async function fetchAdminHomeContentOverview(accessToken: string): Promise<AdminHomeContentOverviewResponse> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/home-content/overview`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminHomeContentOverviewResponse;
+}
+
+export async function fetchAdminHomeContentItems(
+  accessToken: string,
+  filters: { kind: "discovery_case" | "example_example"; categoryKey?: string; active?: boolean; query?: string; limit?: number; offset?: number },
+): Promise<AdminHomeContentListResponse> {
+  const query = new URLSearchParams({ kind: filters.kind });
+  for (const [key, value] of Object.entries(filters)) {
+    // `kind` is written first, and `active: false` is a real filter, so only
+    // undefined and "" are skipped.
+    if (key === "kind" || value === undefined || value === "") continue;
+    query.set(key, String(value));
+  }
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/home-content/items?${query.toString()}`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminHomeContentListResponse;
+}
+
+/** Every home content write carries a reason; the server stores it in the audit row. */
+export async function upsertAdminHomeDiscoveryCase(
+  accessToken: string,
+  input: AdminHomeDiscoveryCaseUpsertRequest,
+): Promise<{ id: string; created: boolean; sortOrder: number }> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/home-content/discovery-cases`, {
+    method: "POST", headers: authJsonHeaders(accessToken), body: JSON.stringify(input),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as { id: string; created: boolean; sortOrder: number };
+}
+
+export async function upsertAdminHomeExample(
+  accessToken: string,
+  input: AdminHomeExampleUpsertRequest,
+): Promise<{ id: string; created: boolean; sortOrder: number }> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/home-content/examples`, {
+    method: "POST", headers: authJsonHeaders(accessToken), body: JSON.stringify(input),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as { id: string; created: boolean; sortOrder: number };
+}
+
+export async function upsertAdminHomeCategory(
+  accessToken: string,
+  input: AdminHomeCategoryUpsertRequest,
+): Promise<{ key: string; kind: string; created: boolean; sortOrder: number }> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/home-content/categories`, {
+    method: "POST", headers: authJsonHeaders(accessToken), body: JSON.stringify(input),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as { key: string; kind: string; created: boolean; sortOrder: number };
+}
+
+export async function setAdminHomeContentActive(
+  accessToken: string,
+  input: AdminHomeContentToggleRequest,
+): Promise<{ hiddenItems: number; wasActive: boolean }> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/home-content/active`, {
+    method: "POST", headers: authJsonHeaders(accessToken), body: JSON.stringify(input),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  const body = (await response.json()) as { hiddenItems: number; wasActive: boolean };
+  return { hiddenItems: body.hiddenItems, wasActive: body.wasActive };
+}
+
+export async function reorderAdminHomeContent(
+  accessToken: string,
+  input: AdminHomeContentReorderRequest,
+): Promise<{ ordered: number }> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/home-content/reorder`, {
+    method: "POST", headers: authJsonHeaders(accessToken), body: JSON.stringify(input),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as { ordered: number };
+}
+
+export async function reorderAdminHomeCategories(
+  accessToken: string,
+  input: AdminHomeCategoryReorderRequest,
+): Promise<{ ordered: number }> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/home-content/category-order`, {
+    method: "POST", headers: authJsonHeaders(accessToken), body: JSON.stringify(input),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as { ordered: number };
+}
+
+export async function deleteAdminHomeContent(
+  accessToken: string,
+  input: AdminHomeContentDeleteRequest,
+): Promise<void> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/home-content/delete`, {
+    method: "POST", headers: authJsonHeaders(accessToken), body: JSON.stringify(input),
+  });
+  if (!response.ok) return handleErrorResponse(response);
 }

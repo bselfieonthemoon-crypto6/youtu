@@ -76,6 +76,12 @@ export const adminWriteErrorCodeSchema = z.enum([
   "admin_job_already_terminal",
   "admin_job_not_terminal",
   "admin_channel_not_found",
+  "admin_content_not_found",
+  "admin_category_not_found",
+  "admin_unknown_kind",
+  "admin_invalid_content",
+  "admin_invalid_order",
+  "admin_unsupported_target",
 ]);
 
 export const adminWriteErrorResponseSchema = z.object({
