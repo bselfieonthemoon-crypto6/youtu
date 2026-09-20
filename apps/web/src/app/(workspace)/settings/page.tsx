@@ -3,49 +3,50 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 
-import { AgentSection } from "@/components/agent-section";
 import { BillingSection } from "@/components/billing-section";
 import { CreditUsageHistory } from "@/components/credits/credit-usage-history";
 import { ProfileSection } from "@/components/profile-section";
-import { ProviderSettingsSection } from "@/components/settings/provider-settings-section";
 import { SettingsSkeleton } from "@/components/skeletons/settings-skeleton";
 import { useAuth } from "@/lib/auth-context";
-import {
-  ApiAuthError,
-  fetchModels,
-  fetchViewer,
-  fetchWorkspaceSettings,
-  updateProfile,
-  updateWorkspaceSettings,
-} from "@/lib/server-api";
+import { ApiAuthError, fetchViewer, updateProfile } from "@/lib/server-api";
 
-type SettingsTab = "profile" | "agent" | "providers" | "billing" | "usage";
+/**
+ * Workspace settings for the signed-in user.
+ *
+ * There is deliberately no "Agent" (default model) or "供应商" (model provider) tab
+ * here: both are configured on the platform side, and letting a workspace pick its own
+ * default model or manage its own channels duplicated that. The provider console still
+ * lives in the platform admin page (`/admin → 第三方模型供应商`), which owns those
+ * endpoints - the APIs themselves are unchanged.
+ *
+ * A deep link to a tab that no longer exists (`?tab=agent`, `?tab=providers`) falls
+ * back to Profile rather than rendering an empty panel, so old bookmarks and links
+ * keep working.
+ */
 
-const baseTabs: Array<{ id: SettingsTab; label: string }> = [
+type SettingsTab = "profile" | "billing" | "usage";
+
+const tabs: Array<{ id: SettingsTab; label: string }> = [
   { id: "profile", label: "Profile" },
-  { id: "agent", label: "Agent" },
   { id: "billing", label: "Billing" },
   { id: "usage", label: "Usage" },
 ];
+
+const isSettingsTab = (value: string | null): value is SettingsTab =>
+  tabs.some((tab) => tab.id === value);
 
 export default function SettingsPage() {
   const { session } = useAuth();
   const searchParams = useSearchParams();
 
-  const initialTab = (searchParams.get("tab") as SettingsTab) ?? "profile";
-  const [activeTab, setActiveTab] = useState<SettingsTab>(
-    [...baseTabs.map((tab) => tab.id), "providers"].includes(initialTab)
-      ? initialTab
-      : "profile",
-  );
-  const [workspaceRole, setWorkspaceRole] = useState<
-    "owner" | "admin" | "member" | null
-  >(null);
+  const [activeTab, setActiveTab] = useState<SettingsTab>(() => {
+    const requested = searchParams.get("tab");
+    return isSettingsTab(requested) ? requested : "profile";
+  });
   const [profile, setProfile] = useState<{
     displayName: string;
     email: string;
   } | null>(null);
-  const [defaultModel, setDefaultModel] = useState<string>("apiyi:gemini-3.1-flash-lite");
   const [pageLoading, setPageLoading] = useState(true);
 
   // Ref pattern: prevent token refresh from cascading through dependency arrays
@@ -61,24 +62,11 @@ export default function SettingsPage() {
     setPageLoading(true);
 
     try {
-      const [viewer, settings] = await Promise.all([
-        fetchViewer(token),
-        fetchWorkspaceSettings(token),
-      ]);
-
+      const viewer = await fetchViewer(token);
       setProfile({
         displayName: viewer.profile.displayName,
         email: viewer.profile.email,
       });
-      setWorkspaceRole(viewer.membership.role);
-      if (
-        initialTab === "providers" &&
-        viewer.membership.role !== "owner" &&
-        viewer.membership.role !== "admin"
-      ) {
-        setActiveTab("profile");
-      }
-      setDefaultModel(settings.settings.defaultModel);
     } catch (err) {
       if (err instanceof ApiAuthError) {
         // Workspace layout handles auth redirect
@@ -87,7 +75,7 @@ export default function SettingsPage() {
     } finally {
       setPageLoading(false);
     }
-  }, [getToken, initialTab]);
+  }, [getToken]);
 
   useEffect(() => {
     if (hasInitialized.current) return;
@@ -109,35 +97,11 @@ export default function SettingsPage() {
     [getToken],
   );
 
-  const handleAgentSave = useCallback(
-    async (model: string) => {
-      const token = getToken();
-      if (!token) throw new Error("Login required");
-      const result = await updateWorkspaceSettings(token, {
-        defaultModel: model,
-      });
-      if (token !== getToken()) throw new Error("Session changed");
-      setDefaultModel(result.settings.defaultModel);
-    },
-    [getToken],
-  );
-
-  const stableFetchModels = useCallback(() => fetchModels(getToken()), [getToken]);
   if (pageLoading) {
     return <SettingsSkeleton />;
   }
 
   if (!profile) return null;
-
-  const canManageProviders =
-    workspaceRole === "owner" || workspaceRole === "admin";
-  const tabs = canManageProviders
-    ? [
-        ...baseTabs.slice(0, 2),
-        { id: "providers" as const, label: "供应商" },
-        ...baseTabs.slice(2),
-      ]
-    : baseTabs;
 
   return (
     <div className="px-4 py-6 sm:px-6 md:p-8">
@@ -172,15 +136,6 @@ export default function SettingsPage() {
             email={profile.email}
             onSave={handleProfileSave}
           />
-        ) : activeTab === "agent" ? (
-          <AgentSection
-            defaultModel={defaultModel}
-            onSave={handleAgentSave}
-            fetchModels={stableFetchModels}
-            canManage={canManageProviders}
-          />
-        ) : activeTab === "providers" && canManageProviders ? (
-          <ProviderSettingsSection accessToken={getToken() ?? ""} />
         ) : activeTab === "usage" ? (
           <CreditUsageHistory />
         ) : (

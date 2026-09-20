@@ -86,13 +86,12 @@ test("reviews persisted expert cards, collaboration settings and unconfigured la
       await expect(card).toContainText("当前需求第 1 版");
       cardsVerified = true;
     }
-    await page.goto("/settings?tab=agent");
-    const settings = page.getByRole("region", { name: "专业 Agent 协作设置" });
-    await expect(settings).toBeVisible({ timeout: 60_000 });
-    await expect(settings.getByLabel("参考分析模型")).toBeEnabled();
-    await expect(settings.getByRole("button", { name: "保存协作配置" })).toBeDisabled();
-    await settings.scrollIntoViewIfNeeded();
-    await page.screenshot({ path: info.outputPath("collaboration-settings-read-only.png"), fullPage: true });
+    // Agent defaults and provider management no longer exist in the user settings page
+    // (both are platform-configured), so the read-only check visits the remaining tabs
+    // and still proves that opening settings mutates nothing.
+    await page.goto("/settings");
+    await expect(page.getByRole("heading", { name: "Profile", exact: true })).toBeVisible({ timeout: 60_000 });
+    await page.screenshot({ path: info.outputPath("settings-read-only.png"), fullPage: true });
     const afterSettingsResponse = await request.get(`${api}/api/workspace/settings`, { headers });
     expect(await afterSettingsResponse.json()).toEqual(beforeSettings);
     expect(agentRunRequests).toEqual([]);
