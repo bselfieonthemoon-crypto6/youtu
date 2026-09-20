@@ -67,6 +67,11 @@ export const adminWriteErrorCodeSchema = z.enum([
   "admin_invalid_role",
   "admin_insufficient_balance",
   "admin_invalid_amount",
+  "admin_skill_not_found",
+  "admin_preview_not_found",
+  "admin_invalid_asset",
+  "admin_invalid_file",
+  "admin_invalid_order",
 ]);
 
 export const adminWriteErrorResponseSchema = z.object({

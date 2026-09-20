@@ -163,10 +163,12 @@ import { registerAdminOverviewRoutes } from "./http/admin-overview.js";
 import { registerAdminAccessRoutes } from "./http/admin-access.js";
 import { registerAdminUserRoutes } from "./http/admin-users.js";
 import { registerAdminBillingRoutes } from "./http/admin-billing.js";
+import { registerAdminSkillRoutes } from "./http/admin-skills.js";
 import { createAdminOverviewService } from "./features/admin/admin-overview-service.js";
 import { createAdminAccessService } from "./features/admin/admin-access-service.js";
 import { createAdminUserService } from "./features/admin/admin-user-service.js";
 import { createAdminBillingService } from "./features/admin/admin-billing-service.js";
+import { createAdminSkillService } from "./features/admin/admin-skill-service.js";
 import {
   finalizeTerminalImageJobPlaceholder,
   finalizeTerminalVideoJobPlaceholder,
@@ -785,6 +787,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   void registerAdminBillingRoutes(app, {
     auth,
     adminBillingService: createAdminBillingService({ getAdminClient }),
+  });
+  // Skill images for the platform catalog, plus the customer-facing published
+  // read. Uploads land in the existing platform-assets bucket; the published read
+  // is served through the server because that bucket has no authenticated policy.
+  void registerAdminSkillRoutes(app, {
+    auth,
+    adminSkillService: createAdminSkillService({ getAdminClient }),
   });
 
   // Payment routes — only registered when Lemon Squeezy is configured

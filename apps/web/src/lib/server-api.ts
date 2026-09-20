@@ -47,6 +47,9 @@ import type {
   AdminWorkspaceDirectoryResponse,
   AdminAssignableRole,
   AdminWorkspaceBillingResponse,
+  AdminSkillCatalogResponse,
+  AdminSkillPreviewListResponse,
+  PublishedSkillPreviewsResponse,
 } from "@loomic/shared";
 import {
   canvasGetResponseSchema,
@@ -1358,4 +1361,104 @@ export async function adminAdjustWorkspaceCredits(
     body: JSON.stringify(input),
   });
   if (!response.ok) return handleErrorResponse(response);
+}
+
+export async function fetchAdminSkillCatalog(
+  accessToken: string,
+  options: { query?: string; limit?: number } = {},
+): Promise<AdminSkillCatalogResponse> {
+  const search = new URLSearchParams();
+  if (options.query) search.set("query", options.query);
+  if (options.limit !== undefined) search.set("limit", String(options.limit));
+  const suffix = search.toString() ? `?${search.toString()}` : "";
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/skills${suffix}`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminSkillCatalogResponse;
+}
+
+export async function fetchAdminSkillPreviews(
+  accessToken: string,
+  skillId: string,
+): Promise<AdminSkillPreviewListResponse> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/skills/${skillId}/previews`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminSkillPreviewListResponse;
+}
+
+/** Multipart: the file, its role, an optional caption and the mandatory reason. */
+export async function uploadAdminSkillPreview(
+  accessToken: string,
+  skillId: string,
+  input: { file: File; role: "cover" | "example"; caption: string; reason: string },
+): Promise<void> {
+  const form = new FormData();
+  form.append("file", input.file, input.file.name);
+  form.append("role", input.role);
+  if (input.caption.trim()) form.append("caption", input.caption.trim());
+  form.append("reason", input.reason.trim());
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/skills/${skillId}/previews`, {
+    method: "POST",
+    headers: authHeaders(accessToken),
+    body: form,
+  });
+  if (!response.ok) return handleErrorResponse(response);
+}
+
+export async function publishAdminSkillPreview(
+  accessToken: string,
+  skillId: string,
+  previewId: string,
+  reason: string,
+  action: "publish" | "unpublish" = "publish",
+): Promise<void> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/skills/${skillId}/previews/${previewId}/${action}`, {
+    method: "POST",
+    headers: authJsonHeaders(accessToken),
+    body: JSON.stringify({ reason: reason.trim() }),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+}
+
+export async function deleteAdminSkillPreview(
+  accessToken: string,
+  skillId: string,
+  previewId: string,
+  reason: string,
+): Promise<void> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/skills/${skillId}/previews/${previewId}`, {
+    method: "DELETE",
+    headers: authJsonHeaders(accessToken),
+    body: JSON.stringify({ reason: reason.trim() }),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+}
+
+export async function reorderAdminSkillPreviews(
+  accessToken: string,
+  skillId: string,
+  orderedPreviewIds: string[],
+  reason: string,
+): Promise<void> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/skills/${skillId}/previews/order`, {
+    method: "POST",
+    headers: authJsonHeaders(accessToken),
+    body: JSON.stringify({ orderedPreviewIds, reason: reason.trim() }),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+}
+
+/** Published previews only; available to any signed-in user. */
+export async function fetchPublishedSkillPreviews(
+  accessToken: string,
+  slug: string,
+): Promise<PublishedSkillPreviewsResponse> {
+  const response = await fetch(`${getServerBaseUrl()}/api/skills/${encodeURIComponent(slug)}/previews`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as PublishedSkillPreviewsResponse;
 }
