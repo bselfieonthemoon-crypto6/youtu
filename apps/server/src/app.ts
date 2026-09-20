@@ -187,6 +187,7 @@ import { createNodeImageSubmissionService } from "./features/jobs/node-image-sub
 import { registerModelRoutes } from "./http/models.js";
 import { registerPaymentWebhookRoute } from "./http/payments-webhook.js";
 import { registerPaymentRoutes } from "./http/payments.js";
+import { registerPaymentStatusRoute } from "./http/payments-status.js";
 import { registerProjectRoutes } from "./http/projects.js";
 import { registerPromptLibraryRoutes } from "./http/prompt-library.js";
 import { registerProviderConfigRoutes } from "./http/provider-configs.js";
@@ -833,6 +834,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   void registerAdminStorageRoutes(app, {
     auth,
     adminStorageService: createAdminStorageService({ getAdminClient }),
+  });
+
+  // Always registered, even without a payment provider: the billing page needs to be
+  // able to say "payments are switched off here" instead of showing a load failure.
+  void registerPaymentStatusRoute(app, {
+    auth,
+    provider: paymentService ? "lemon_squeezy" : null,
   });
 
   // Payment routes — only registered when Lemon Squeezy is configured

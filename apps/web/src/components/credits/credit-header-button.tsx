@@ -9,6 +9,7 @@ import Link from "next/link";
 
 import { useAuth } from "@/lib/auth-context";
 import { useCredits } from "@/hooks/use-credits";
+import { useViewerProfile } from "@/hooks/use-viewer-profile";
 
 // ── Plan badge color map ─────────────────────────────────────
 
@@ -24,6 +25,7 @@ const PLAN_COLORS: Record<string, string> = {
 
 export function CreditHeaderButton() {
   const { user } = useAuth();
+  const profile = useViewerProfile();
   const { balance, plan, dailyClaimed, limits, loading, claimDaily } =
     useCredits();
 
@@ -80,10 +82,12 @@ export function CreditHeaderButton() {
 
   const isFree = plan === "free";
   const canClaim = isFree && !dailyClaimed;
-  const avatarUrl = user?.user_metadata?.avatar_url as string | undefined;
+  const avatarUrl =
+    profile?.avatarUrl ?? (user?.user_metadata?.avatar_url as string | undefined);
   const displayName =
-    (user?.user_metadata?.full_name as string | undefined) ??
-    user?.email?.split("@")[0] ??
+    profile?.displayName ||
+    (user?.user_metadata?.full_name as string | undefined) ||
+    user?.email?.split("@")[0] ||
     "User";
 
   if (loading) {

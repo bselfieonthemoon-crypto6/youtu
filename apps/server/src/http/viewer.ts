@@ -94,6 +94,61 @@ export async function registerViewerRoutes(
     }
   });
 
+  // A lean read of just the signed-in profile. `/api/viewer` bootstraps the workspace
+  // and auto-claims daily credits, which the header must not trigger on every page
+  // just to render a name and an avatar.
+  app.get("/api/viewer/profile", async (request, reply) => {
+    try {
+      const user = await options.auth.authenticate(request);
+      if (!user) {
+        return reply.code(401).send(
+          unauthenticatedErrorResponseSchema.parse({
+            error: {
+              code: "unauthorized",
+              message: "Missing or invalid bearer token.",
+            },
+          }),
+        );
+      }
+
+      const client = options.createUserClient(user.accessToken);
+      const { data, error } = await client
+        .from("profiles")
+        .select("id, email, display_name, avatar_url")
+        .eq("id", user.id)
+        .maybeSingle();
+
+      if (error || !data) {
+        return reply.code(500).send(
+          applicationErrorResponseSchema.parse({
+            error: {
+              code: "application_error",
+              message: "Unable to read profile.",
+            },
+          }),
+        );
+      }
+
+      return reply.code(200).send(
+        profileUpdateResponseSchema.parse({
+          profile: {
+            id: data.id,
+            email: data.email ?? "",
+            displayName: data.display_name ?? "",
+            avatarUrl: data.avatar_url ?? null,
+          },
+        }),
+      );
+    } catch (error) {
+      return sendApplicationError(
+        error,
+        reply,
+        "application_error",
+        "Internal server error.",
+      );
+    }
+  });
+
   app.patch("/api/viewer/profile", async (request, reply) => {
     try {
       const user = await options.auth.authenticate(request);
@@ -111,9 +166,13 @@ export async function registerViewerRoutes(
 
       const payload = profileUpdateRequestSchema.parse(request.body);
       const client = options.createUserClient(user.accessToken);
+      // `avatarUrl` absent means "leave it as it is"; explicit null clears it.
       const { data, error } = await client
         .from("profiles")
-        .update({ display_name: payload.displayName })
+        .update({
+          display_name: payload.displayName,
+          ...("avatarUrl" in payload ? { avatar_url: payload.avatarUrl ?? null } : {}),
+        })
         .eq("id", user.id)
         .select("id, email, display_name, avatar_url")
         .single();

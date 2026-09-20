@@ -195,6 +195,10 @@ export const canvasDetailSchema = z.object({
 
 export const profileUpdateRequestSchema = z.object({
   displayName: z.string().trim().min(1).max(100),
+  // Absent leaves the current avatar alone; null clears it. Only an absolute URL is
+  // accepted: uploaded images live in a private bucket behind short-lived signed URLs,
+  // so a stored value has to be a link that keeps working on its own.
+  avatarUrl: z.string().trim().url().max(500).nullable().optional(),
 });
 
 export const workspaceSettingsSchema = z.object({

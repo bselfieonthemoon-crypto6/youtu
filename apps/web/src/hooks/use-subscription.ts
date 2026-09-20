@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "@/lib/auth-context";
 import {
+  getPaymentsStatus,
   getSubscription,
   cancelSubscription as apiCancelSubscription,
   changePlan as apiChangePlan,
@@ -14,6 +15,8 @@ interface UseSubscriptionReturn {
   subscription: SubscriptionStatus | null;
   loading: boolean;
   error: string | null;
+  /** False when this installation has no payment provider configured. */
+  paymentsEnabled: boolean | null;
   refresh: () => Promise<void>;
   cancel: () => Promise<void>;
   changePlan: (plan: string, billingPeriod: string) => Promise<void>;
@@ -29,11 +32,22 @@ export function useSubscription(): UseSubscriptionReturn {
   );
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [paymentsEnabled, setPaymentsEnabled] = useState<boolean | null>(null);
 
   const refresh = useCallback(async () => {
     const token = accessTokenRef.current;
     if (!token) return;
     try {
+      // Ask whether payments exist before asking for a subscription: without a payment
+      // provider the subscription route is not registered at all, and the 404 would
+      // read as a failure rather than as "this install does not take payments".
+      const status = await getPaymentsStatus(token);
+      setPaymentsEnabled(status.enabled);
+      if (!status.enabled) {
+        setSubscription(null);
+        setError(null);
+        return;
+      }
       const result = await getSubscription(token);
       setSubscription(result);
       setError(null);
@@ -71,5 +85,5 @@ export function useSubscription(): UseSubscriptionReturn {
     [refresh],
   );
 
-  return { subscription, loading, error, refresh, cancel, changePlan };
+  return { subscription, loading, error, paymentsEnabled, refresh, cancel, changePlan };
 }

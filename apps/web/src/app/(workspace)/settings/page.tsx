@@ -46,6 +46,7 @@ export default function SettingsPage() {
   const [profile, setProfile] = useState<{
     displayName: string;
     email: string;
+    avatarUrl: string | null;
   } | null>(null);
   const [pageLoading, setPageLoading] = useState(true);
 
@@ -66,6 +67,7 @@ export default function SettingsPage() {
       setProfile({
         displayName: viewer.profile.displayName,
         email: viewer.profile.email,
+        avatarUrl: viewer.profile.avatarUrl ?? null,
       });
     } catch (err) {
       if (err instanceof ApiAuthError) {
@@ -85,13 +87,17 @@ export default function SettingsPage() {
   }, [session?.access_token, loadData]);
 
   const handleProfileSave = useCallback(
-    async (displayName: string) => {
+    async (input: { displayName: string; avatarUrl: string | null }) => {
       const token = getToken();
       if (!token) return;
-      const result = await updateProfile(token, { displayName });
+      const result = await updateProfile(token, {
+        displayName: input.displayName,
+        avatarUrl: input.avatarUrl,
+      });
       setProfile({
         displayName: result.profile.displayName,
         email: result.profile.email,
+        avatarUrl: result.profile.avatarUrl ?? null,
       });
     },
     [getToken],
@@ -134,6 +140,7 @@ export default function SettingsPage() {
           <ProfileSection
             displayName={profile.displayName}
             email={profile.email}
+            avatarUrl={profile.avatarUrl}
             onSave={handleProfileSave}
           />
         ) : activeTab === "usage" ? (

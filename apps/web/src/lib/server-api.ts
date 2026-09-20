@@ -181,6 +181,20 @@ export async function fetchViewer(
   return (await response.json()) as ViewerResponse;
 }
 
+/**
+ * Just the signed-in profile. `/api/viewer` bootstraps the workspace and auto-claims
+ * daily credits, so the header uses this instead of triggering that on every page.
+ */
+export async function fetchProfile(
+  accessToken: string,
+): Promise<ProfileUpdateResponse> {
+  const response = await fetch(`${getServerBaseUrl()}/api/viewer/profile`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as ProfileUpdateResponse;
+}
+
 export async function fetchProjects(
   accessToken: string,
 ): Promise<ProjectListResponse> {
@@ -309,7 +323,7 @@ export async function uploadThumbnail(
 
 export async function updateProfile(
   accessToken: string,
-  data: { displayName: string },
+  data: { displayName: string; avatarUrl?: string | null },
 ): Promise<ProfileUpdateResponse> {
   const response = await fetch(`${getServerBaseUrl()}/api/viewer/profile`, {
     method: "PATCH",

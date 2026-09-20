@@ -41,6 +41,23 @@ async function handleErrorResponse(response: Response): Promise<never> {
 
 // ── Payment APIs ─────────────────────────────────────────────
 
+export type PaymentsStatus = { enabled: boolean; provider: string | null };
+
+/**
+ * Whether this installation can take payments at all. Registered even when no payment
+ * provider is configured, so the billing page can distinguish "switched off" from
+ * "broken" instead of showing a retry that can never succeed.
+ */
+export async function getPaymentsStatus(
+  accessToken: string,
+): Promise<PaymentsStatus> {
+  const response = await fetch(`${getServerBaseUrl()}/api/payments/status`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as PaymentsStatus;
+}
+
 export async function createCheckout(
   accessToken: string,
   plan: string,

@@ -15,7 +15,8 @@ import { useSubscription } from "@/hooks/use-subscription";
 import { Button } from "@/components/ui/button";
 
 export function BillingSection() {
-  const { subscription, loading, error, cancel } = useSubscription();
+  const { subscription, loading, error, paymentsEnabled, refresh, cancel } =
+    useSubscription();
   const [cancelConfirmOpen, setCancelConfirmOpen] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
@@ -47,7 +48,47 @@ export function BillingSection() {
   if (error) {
     return (
       <div className="rounded-lg border border-destructive/20 bg-destructive/10 p-4 text-sm text-destructive">
-        Failed to load subscription info. Please try again later.
+        <p data-testid="billing-error">无法读取订阅信息：{error}</p>
+        <button
+          type="button"
+          onClick={() => void refresh()}
+          className="mt-3 rounded-md border border-destructive/30 px-3 py-1.5 text-xs"
+        >
+          重试
+        </button>
+      </div>
+    );
+  }
+
+  // No payment provider on this installation: this is a configuration state, not a
+  // failure, so the page explains how plans are actually managed instead of offering
+  // a retry that could never help.
+  if (paymentsEnabled === false) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <h2 className="text-base font-semibold">Billing</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Manage your subscription and billing details.
+          </p>
+        </div>
+        <div
+          data-testid="billing-payments-disabled"
+          className="rounded-lg border border-border bg-muted/40 p-4 text-sm"
+        >
+          <p className="font-medium">本部署未启用在线支付</p>
+          <p className="mt-1 text-muted-foreground">
+            这套安装没有配置支付渠道，因此没有可管理的订阅。套餐与额度由平台管理员在
+            <Link href="/admin" className="mx-1 underline">
+              管理后台
+            </Link>
+            调整；想查看额度流水可以打开
+            <Link href="/settings?tab=usage" className="mx-1 underline">
+              Usage
+            </Link>
+            。
+          </p>
+        </div>
       </div>
     );
   }
