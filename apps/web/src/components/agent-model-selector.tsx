@@ -3,6 +3,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useAgentModel } from "@/hooks/use-agent-model";
+import { useModelList } from "@/hooks/use-model-list";
 import { fetchModels } from "@/lib/server-api";
 
 type ModelOption = { id: string; name: string; provider: string };
@@ -38,19 +39,34 @@ export function AgentModelSelector({
 }: { compact?: boolean; accessToken?: string | undefined } = {}) {
   const { model, setModel } = useAgentModel();
   const [open, setOpen] = useState(false);
-  const [models, setModels] = useState<ModelOption[]>([]);
   const btnRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
 
-  // Fetch available models
+  // Fetch available models. Keyed by the access token: switching accounts re-derives the
+  // list for the new identity instead of reusing the previous one's.
+  const {
+    status,
+    models,
+    error,
+    reload,
+    emptyMessage,
+  } = useModelList<ModelOption>({
+    enabled: true,
+    identity: accessToken,
+    kind: "text",
+    load: async () => (await fetchModels(accessToken)).models,
+  });
+
+  // A model picked under a different identity (or one that was unpublished since) must
+  // not stay selected. Only clear it once the list actually loaded - a failed load must
+  // not silently rewrite the user's preference.
+  const modelRef = useRef(model);
+  modelRef.current = model;
   useEffect(() => {
-    fetchModels(accessToken)
-      .then((data) => {
-        setModels(data.models);
-        if (model && !data.models.some((item) => item.id === model)) setModel(null);
-      })
-      .catch(() => {});
-  }, [accessToken, model, setModel]);
+    if (status !== "ready") return;
+    const selected = modelRef.current;
+    if (selected && !models.some((item) => item.id === selected)) setModel(null);
+  }, [status, models, setModel]);
 
   // Close on outside click
   useEffect(() => {
@@ -175,6 +191,34 @@ export function AgentModelSelector({
                 </svg>
               )}
             </button>
+            {/* The three states an empty-looking list can be in. Without these, a
+                workspace with no published models and a list that never loaded both
+                rendered as a picker with nothing but "Auto" in it. */}
+            {status === "loading" ? (
+              <p className="px-2 py-2 text-[11px] leading-relaxed text-muted-foreground">
+                正在加载可用模型…
+              </p>
+            ) : status === "error" ? (
+              <div className="px-2 py-2" data-testid="agent-model-load-error">
+                <p className="text-[11px] leading-relaxed text-destructive">
+                  {error}
+                </p>
+                <button
+                  type="button"
+                  onClick={reload}
+                  className="mt-2 rounded-md border-[0.5px] border-border px-2 py-1 text-[11px] text-foreground hover:bg-muted"
+                >
+                  重试
+                </button>
+              </div>
+            ) : models.length === 0 ? (
+              <p
+                className="px-2 py-2 text-[11px] leading-relaxed text-muted-foreground"
+                data-testid="agent-model-empty"
+              >
+                {emptyMessage}
+              </p>
+            ) : null}
             {/* Group by provider */}
             {providers.map((provider) => {
               const providerModels = models.filter(

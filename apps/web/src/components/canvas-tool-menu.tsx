@@ -1271,9 +1271,19 @@ export function CanvasToolMenu({
         operation === "split-layers" ||
         operation === "erase-transparent" ||
         operation === "smart-erase";
-      const availableModels = usesFixedOperationModel
-        ? []
-        : (await fetchImageModels(accessToken)).models;
+      let availableModels: Awaited<ReturnType<typeof fetchImageModels>>["models"];
+      if (usesFixedOperationModel) {
+        availableModels = [];
+      } else {
+        try {
+          availableModels = (await fetchImageModels(accessToken)).models;
+        } catch {
+          // A list that failed to load must not look like a workspace with nothing
+          // published: the two need different actions from the user.
+          showError("图片模型列表加载失败，请稍后重试。");
+          return;
+        }
+      }
       const preferredModel = imageModelPreference.models[0];
       const model = usesFixedOperationModel
         ? (options?.layerBackend === "semantic" ? options.model : imageToolOperationModel(operation))

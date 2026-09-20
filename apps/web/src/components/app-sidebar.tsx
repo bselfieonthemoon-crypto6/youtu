@@ -7,6 +7,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { LoomicLogo } from "@/components/icons/loomic-logo";
 import { CreditBalance } from "@/components/credits/credit-balance";
 import { useAuth } from "@/lib/auth-context";
+import { useViewerAccess } from "@/hooks/use-viewer-access";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -47,13 +48,38 @@ const TOP_NAV_ITEMS: NavItem[] = [
     viewBox: 24,
     icon: "M15.39 4.39a1 1 0 0 0 1.68-.474 2.5 2.5 0 1 1 3.014 3.015 1 1 0 0 0-.474 1.68l1.683 1.682a2.414 2.414 0 0 1 0 3.414L19.61 15.39a1 1 0 0 1-1.68-.474 2.5 2.5 0 1 0-3.014 3.015 1 1 0 0 1 .474 1.68l-1.683 1.682a2.414 2.414 0 0 1-3.414 0L8.61 19.61a1 1 0 0 0-1.68.474 2.5 2.5 0 1 1-3.014-3.015 1 1 0 0 0 .474-1.68l-1.683-1.682a2.414 2.414 0 0 1 0-3.414L4.39 8.61a1 1 0 0 1 1.68.474 2.5 2.5 0 1 0 3.014-3.015 1 1 0 0 1-.474-1.68l1.683-1.682a2.414 2.414 0 0 1 3.414 0z",
   },
-  {
-    href: "/admin",
-    label: "管理后台",
-    viewBox: 24,
-    icon: "M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5s-3 1.34-3 3 1.34 3 3 3m-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5 5 6.34 5 8s1.34 3 3 3m0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5C15 14.17 10.33 13 8 13m8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5",
-  },
 ];
+
+// The administration entry is NOT part of the unconditional nav. It was, and that is
+// exactly why an ordinary workspace member still saw a 管理后台 door: the item was a
+// static array member rendered for every signed-in user, with no role probe at all.
+// It is now derived per identity, and it is absent until the server answers for the
+// identity that is signed in right now (fail closed, so a probe that is still running
+// or that failed never reveals the entry).
+const ADMIN_NAV_ITEM: NavItem = {
+  href: "/admin",
+  label: "管理后台",
+  viewBox: 24,
+  icon: "M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5s-3 1.34-3 3 1.34 3 3 3m-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5 5 6.34 5 8s1.34 3 3 3m0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5C15 14.17 10.33 13 8 13m8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5",
+};
+
+/**
+ * The one administration entry, labelled for what this identity will actually get.
+ *
+ * - platform admin → the platform console (「管理后台」)
+ * - workspace owner/admin → the workspace console only (「工作区管理」); the platform
+ *   tabs are not theirs, so the entry must not promise them
+ * - everyone else → no entry at all
+ */
+export function administrationNavItem(access: {
+  platformAdmin: boolean;
+  canAdministerWorkspace: boolean;
+}): NavItem | null {
+  if (access.platformAdmin) return ADMIN_NAV_ITEM;
+  if (access.canAdministerWorkspace)
+    return { ...ADMIN_NAV_ITEM, label: "工作区管理" };
+  return null;
+}
 
 const SETTINGS_ITEM: NavItem = {
   href: "/settings",
@@ -114,7 +140,7 @@ function NavButton({
 // Each item has min 48px touch target for comfortable tapping.
 // ---------------------------------------------------------------------------
 
-function MobileBottomBar() {
+function MobileBottomBar({ navItems }: { navItems: NavItem[] }) {
   const pathname = usePathname();
 
   const isActive = (href: string) =>
@@ -126,7 +152,7 @@ function MobileBottomBar() {
       role="navigation"
       aria-label="Main navigation"
     >
-      {TOP_NAV_ITEMS.map((item) => {
+      {navItems.map((item) => {
         const active = isActive(item.href);
         const vb = `0 0 ${item.viewBox} ${item.viewBox}`;
         return (
@@ -189,9 +215,15 @@ export function AppSidebar() {
   const pathname = usePathname();
   const router = useRouter();
   const { signOut } = useAuth();
+  const access = useViewerAccess();
 
   const isActive = (href: string) =>
     pathname === href || pathname.startsWith(`${href}/`);
+
+  // Recomputed per identity: the entry appears only once the server has answered for
+  // whoever is signed in now, and disappears on an account switch.
+  const adminItem = administrationNavItem(access);
+  const navItems = adminItem ? [...TOP_NAV_ITEMS, adminItem] : TOP_NAV_ITEMS;
 
   const handleSignOut = async () => {
     await signOut();
@@ -218,7 +250,7 @@ export function AppSidebar() {
         </Link>
 
         {/* Top nav items */}
-        {TOP_NAV_ITEMS.map((item) => (
+        {navItems.map((item) => (
           <NavButton
             key={item.href}
             item={item}
@@ -261,7 +293,7 @@ export function AppSidebar() {
       </aside>
 
       {/* Mobile bottom navigation bar */}
-      <MobileBottomBar />
+      <MobileBottomBar navItems={navItems} />
     </>
   );
 }

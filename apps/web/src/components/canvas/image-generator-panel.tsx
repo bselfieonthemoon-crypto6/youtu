@@ -70,6 +70,9 @@ export function ImageGeneratorPanel({
   );
   const [error, setError] = useState<string | null>(data.errorMessage ?? null);
   const [models, setModels] = useState<ImageModelInfo[]>([]);
+  // An empty model list has two different causes; the dropdown must not show the same
+  // blank panel for both.
+  const [modelsFailedToLoad, setModelsFailedToLoad] = useState(false);
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   const [showRatioDropdown, setShowRatioDropdown] = useState(false);
   const [showQualityDropdown, setShowQualityDropdown] = useState(false);
@@ -104,6 +107,7 @@ export function ImageGeneratorPanel({
       .then((r) => {
         if (cancelled) return;
         setModels(r.models);
+        setModelsFailedToLoad(false);
         // Read at response time: the user may have changed models while this
         // request was pending. React can replay setState updater functions
         // during render, so canvas writes must never live inside an updater.
@@ -132,6 +136,7 @@ export function ImageGeneratorPanel({
       })
       .catch((err) => {
         console.warn("[image-gen] Failed to fetch models:", err);
+        if (!cancelled) setModelsFailedToLoad(true);
       });
     return () => {
       cancelled = true;
@@ -374,6 +379,16 @@ export function ImageGeneratorPanel({
             </button>
             {showModelDropdown && (
               <div className="absolute bottom-full left-0 z-50 mb-1 max-h-[280px] w-[260px] overflow-y-auto rounded-xl border-[0.5px] border-border bg-card py-1 shadow-card">
+                {models.length === 0 && (
+                  <p
+                    className="px-3 py-2 text-[11px] leading-relaxed text-muted-foreground"
+                    data-testid="image-generator-model-empty"
+                  >
+                    {modelsFailedToLoad
+                      ? "图片模型列表加载失败，请稍后重试。"
+                      : "当前工作区还没有可用的图片模型，请管理员在后台配置并发布模型。"}
+                  </p>
+                )}
                 {models.map((m) => (
                   <button
                     key={m.id}

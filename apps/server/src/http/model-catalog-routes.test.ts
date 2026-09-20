@@ -76,6 +76,66 @@ describe("workspace model catalog routes", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json().models).toEqual([]);
   });
+
+  // "Nothing is published in this workspace" and "the catalog could not be read" need
+  // different actions from the user, so they must not be the same response. The picker
+  // rendered both as an empty control with no explanation.
+  it("reports an unreadable catalog as a failure, not as an empty workspace catalog", async () => {
+    const catalog = {
+      listPublished: vi.fn(async () => { throw new Error("relation does not exist"); }),
+      resolvePublishedModel: vi.fn(),
+    };
+    const app = Fastify(); apps.push(app);
+    await registerModelRoutes(app, { apiYiApiKey: "env-key" } as never, {
+      auth: { authenticate: async () => user } as never,
+      viewerService: { ensureViewer: async () => ({ workspace: { id: "workspace-current" } }) } as never,
+      workspaceModelCatalogService: catalog as never,
+    });
+    await registerImageModelRoutes(app, {
+      auth: { authenticate: async () => user } as never,
+      viewerService: { ensureViewer: async () => ({ workspace: { id: "workspace-current" } }) } as never,
+      creditService: { getBalance: async () => ({ plan: "pro" }) } as never,
+      workspaceModelCatalogService: catalog as never,
+    });
+
+    for (const url of ["/api/models", "/api/image-models"]) {
+      const response = await app.inject({ method: "GET", url, headers: { authorization: "Bearer token" } });
+      expect(response.statusCode).toBe(503);
+      // No empty catalog is claimed, and no internal detail leaks.
+      expect(response.json()).not.toHaveProperty("models");
+      expect(response.body).not.toContain("relation does not exist");
+    }
+  });
+
+  it("reports an unreadable workspace bootstrap as a failure too", async () => {
+    const app = Fastify(); apps.push(app);
+    await registerModelRoutes(app, { apiYiApiKey: "env-key" } as never, {
+      auth: { authenticate: async () => user } as never,
+      viewerService: { ensureViewer: async () => { throw new Error("kaboom"); } } as never,
+      workspaceModelCatalogService: { listPublished: vi.fn(async () => []), resolvePublishedModel: vi.fn() } as never,
+    });
+
+    const response = await app.inject({ method: "GET", url: "/api/models", headers: { authorization: "Bearer token" } });
+    expect(response.statusCode).toBe(503);
+    expect(response.body).not.toContain("kaboom");
+  });
+
+  // An anonymous visitor is not signed in, so an empty list is a fact about the request,
+  // not a failure - this must keep returning 200.
+  it("still answers an unauthenticated catalog read with an empty list", async () => {
+    const catalog = { listPublished: vi.fn(async () => catalogEntries), resolvePublishedModel: vi.fn() };
+    const app = Fastify(); apps.push(app);
+    await registerModelRoutes(app, { apiYiApiKey: "env-key" } as never, {
+      auth: { authenticate: async () => null } as never,
+      viewerService: { ensureViewer: vi.fn() } as never,
+      workspaceModelCatalogService: catalog as never,
+    });
+
+    const response = await app.inject({ method: "GET", url: "/api/models" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().models).toEqual([]);
+    expect(catalog.listPublished).not.toHaveBeenCalled();
+  });
 });
 
 function entry(catalogKey: string, modality: "text" | "image" | "video", displayName: string, upstreamModelId: string, capabilities: Array<"text" | "image_generation" | "video_generation">) {

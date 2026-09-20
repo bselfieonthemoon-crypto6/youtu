@@ -5,6 +5,7 @@ import type { CreditService } from "../features/credits/credit-service.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { WorkspaceModelCatalogService } from "../features/providers/index.js";
+import { modelCatalogUnavailable } from "./models.js";
 
 export async function registerImageModelRoutes(
   app: FastifyInstance,
@@ -16,18 +17,28 @@ export async function registerImageModelRoutes(
   },
 ) {
   app.get("/api/image-models", async (request, reply) => {
-    let workspaceModels: Awaited<ReturnType<WorkspaceModelCatalogService["listPublished"]>> = [];
+    // An anonymous or invalid session legitimately has no workspace catalog.
+    let user: Awaited<ReturnType<RequestAuthenticator["authenticate"]>> = null;
     try {
-      const user = await options.auth.authenticate(request);
-      if (user) {
+      user = await options.auth.authenticate(request);
+    } catch {
+      user = null;
+    }
+
+    let workspaceModels: Awaited<ReturnType<WorkspaceModelCatalogService["listPublished"]>> = [];
+    if (user) {
+      // The identity is known, so an empty list would be a claim about this workspace.
+      // A catalog that cannot be read must not be reported as "nothing configured".
+      try {
         const viewer = await options.viewerService.ensureViewer(user);
         workspaceModels = options.workspaceModelCatalogService
           ? await options.workspaceModelCatalogService.listPublished(user, viewer.workspace.id)
           : [];
+      } catch {
+        return modelCatalogUnavailable(reply);
       }
-    } catch {
-      // Auth failure is non-fatal — no workspace catalog is returned.
     }
+
     const annotated = [] as Array<Record<string, unknown>>;
     for (const entry of workspaceModels) {
       if (entry.model.modality !== "image") continue;

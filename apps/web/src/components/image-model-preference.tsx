@@ -7,6 +7,7 @@ import { Lock, Zap } from "lucide-react";
 import type { ImageModelInfo } from "../lib/server-api";
 import type { VideoModelInfo } from "../lib/server-api";
 import { fetchImageModels, fetchVideoModels } from "../lib/server-api";
+import { useModelList } from "../hooks/use-model-list";
 import { useImageModelPreference } from "../hooks/use-image-model-preference";
 import { useVideoModelPreference } from "../hooks/use-video-model-preference";
 
@@ -22,40 +23,63 @@ export function ImageModelPreferencePopover({
   accessToken?: string | undefined;
 }) {
   const { preference, setPreference, setMode, toggleModel } = useImageModelPreference();
-  const [models, setModels] = useState<ImageModelInfo[]>([]);
   const [activeTab, setActiveTab] = useState<"image" | "video">("image");
   const videoPreference = useVideoModelPreference();
-  const [videoModels, setVideoModels] = useState<VideoModelInfo[]>([]);
   const popoverRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ top: number; left: number; above: boolean } | null>(null);
 
+  // Both lists are re-derived for the identity signed in now, and only while the
+  // popover is open. A failed load and an empty workspace are kept apart: one is a
+  // retryable failure, the other needs an administrator to publish a model.
+  const imageList = useModelList<ImageModelInfo>({
+    enabled: open,
+    identity: accessToken,
+    kind: "image",
+    load: async () => (await fetchImageModels(accessToken)).models,
+  });
+  const videoList = useModelList<VideoModelInfo>({
+    enabled: open,
+    identity: accessToken,
+    kind: "video",
+    load: async () => (await fetchVideoModels(accessToken)).models,
+  });
+
+  // A model that is no longer published (or that belonged to another account's
+  // workspace) must not stay selected.
+  const setPreferenceRef = useRef(setPreference);
+  setPreferenceRef.current = setPreference;
+  const preferenceRef = useRef(preference);
+  preferenceRef.current = preference;
   useEffect(() => {
-    if (!open) return;
-    fetchImageModels(accessToken)
-      .then((data) => {
-        setModels(data.models);
-        const available = new Set(data.models.map((model) => model.id));
-        const selected = preference.models.filter((model) => available.has(model));
-        if (selected.length !== preference.models.length) {
-          setPreference({
-            ...preference,
-            mode: selected.length > 0 ? preference.mode : "auto",
-            models: selected,
-          });
-        }
-      })
-      .catch(() => {});
-    fetchVideoModels(accessToken)
-      .then((data) => {
-        setVideoModels(data.models);
-        const available = new Set(data.models.map((model) => model.id));
-        const selected = videoPreference.preference.models.filter((model) => available.has(model));
-        if (selected.length !== videoPreference.preference.models.length) {
-          videoPreference.setPreference({ mode: selected.length > 0 ? videoPreference.preference.mode : "auto", models: selected });
-        }
-      })
-      .catch(() => {});
-  }, [open, accessToken]);
+    if (imageList.status !== "ready") return;
+    const available = new Set(imageList.models.map((model) => model.id));
+    const current = preferenceRef.current;
+    const selected = current.models.filter((model) => available.has(model));
+    if (selected.length !== current.models.length) {
+      setPreferenceRef.current({
+        ...current,
+        mode: selected.length > 0 ? current.mode : "auto",
+        models: selected,
+      });
+    }
+  }, [imageList.status, imageList.models]);
+
+  const setVideoPreferenceRef = useRef(videoPreference.setPreference);
+  setVideoPreferenceRef.current = videoPreference.setPreference;
+  const videoPreferenceRef = useRef(videoPreference.preference);
+  videoPreferenceRef.current = videoPreference.preference;
+  useEffect(() => {
+    if (videoList.status !== "ready") return;
+    const available = new Set(videoList.models.map((model) => model.id));
+    const current = videoPreferenceRef.current;
+    const selected = current.models.filter((model) => available.has(model));
+    if (selected.length !== current.models.length) {
+      setVideoPreferenceRef.current({
+        mode: selected.length > 0 ? current.mode : "auto",
+        models: selected,
+      });
+    }
+  }, [videoList.status, videoList.models]);
 
   // Calculate position — auto-detect direction based on available space
   useLayoutEffect(() => {
@@ -100,7 +124,7 @@ export function ImageModelPreferencePopover({
   }, [open, onClose]);
 
   const currentPreference = activeTab === "image" ? preference : videoPreference.preference;
-  const currentModels = activeTab === "image" ? models : videoModels;
+  const currentList = activeTab === "image" ? imageList : videoList;
   const currentSetMode = activeTab === "image" ? setMode : videoPreference.setMode;
   const currentToggleModel = activeTab === "image" ? toggleModel : videoPreference.toggleModel;
 
@@ -171,7 +195,7 @@ export function ImageModelPreferencePopover({
 
         {/* Model list */}
         <div className="scrollbar-hidden max-h-[300px] space-y-0.5 overflow-y-auto px-1">
-          {currentModels.map((m) => {
+          {currentList.models.map((m) => {
             const selected = currentPreference.models.includes(m.id);
             return (
               <button
@@ -225,6 +249,34 @@ export function ImageModelPreferencePopover({
               </button>
             );
           })}
+
+          {/* An empty list is never shown bare: either nothing is published here, or
+              the list failed to load. Those need different actions from the user. */}
+          {currentList.status === "loading" ? (
+            <p className="px-2 py-3 text-[11px] leading-relaxed text-muted-foreground">
+              正在加载可用模型…
+            </p>
+          ) : currentList.status === "error" ? (
+            <div className="px-2 py-3" data-testid="image-model-load-error">
+              <p className="text-[11px] leading-relaxed text-destructive">
+                {currentList.error}
+              </p>
+              <button
+                type="button"
+                onClick={currentList.reload}
+                className="mt-2 rounded-md border-[0.5px] border-border px-2 py-1 text-[11px] text-foreground hover:bg-muted"
+              >
+                重试
+              </button>
+            </div>
+          ) : currentList.models.length === 0 ? (
+            <p
+              className="px-2 py-3 text-[11px] leading-relaxed text-muted-foreground"
+              data-testid="image-model-empty"
+            >
+              {currentList.emptyMessage}
+            </p>
+          ) : null}
         </div>
       </div>
     </div>,

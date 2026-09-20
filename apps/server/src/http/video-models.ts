@@ -5,6 +5,7 @@ import type { ViewerService } from "../features/bootstrap/ensure-user-foundation
 import type { CreditService } from "../features/credits/credit-service.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
 import type { WorkspaceModelCatalogService } from "../features/providers/index.js";
+import { modelCatalogUnavailable } from "./models.js";
 
 export async function registerVideoModelRoutes(
   app: FastifyInstance,
@@ -16,18 +17,27 @@ export async function registerVideoModelRoutes(
   },
 ) {
   app.get("/api/video-models", async (request, reply) => {
-    let workspaceModels: Awaited<ReturnType<WorkspaceModelCatalogService["listPublished"]>> = [];
+    // An anonymous or invalid session legitimately has no workspace catalog.
+    let user: Awaited<ReturnType<RequestAuthenticator["authenticate"]>> = null;
     try {
-      const user = await options.auth.authenticate(request);
-      if (user) {
+      user = await options.auth.authenticate(request);
+    } catch {
+      user = null;
+    }
+
+    let workspaceModels: Awaited<ReturnType<WorkspaceModelCatalogService["listPublished"]>> = [];
+    if (user) {
+      // Same rule as the image catalog: a failed read is not an empty catalog.
+      try {
         const viewer = await options.viewerService.ensureViewer(user);
         workspaceModels = options.workspaceModelCatalogService
           ? await options.workspaceModelCatalogService.listPublished(user, viewer.workspace.id)
           : [];
+      } catch {
+        return modelCatalogUnavailable(reply);
       }
-    } catch {
-      // Auth failure is non-fatal — no workspace catalog is returned.
     }
+
     const annotated = [] as Array<Record<string, unknown>>;
     for (const entry of workspaceModels) {
       if (entry.model.modality !== "video") continue;
