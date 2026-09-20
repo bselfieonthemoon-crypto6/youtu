@@ -45,6 +45,9 @@ const API = process.env.LOOMIC_LIVE_API ?? "http://127.0.0.1:3002";
 const DEFAULT_OWNER = "541006fa-d2a1-4305-be55-b6263c27a1e3";
 const RUN_TERMINAL = new Set(["completed", "failed", "canceled"]);
 const JOB_TERMINAL = new Set(["succeeded", "failed", "canceled", "dead_letter"]);
+/** How long a turn report waits for the assistant message to be persisted after a
+ * terminal run event. Bounded so a genuinely answerless turn still reports. */
+const ASSISTANT_MESSAGE_WAIT_MS = 12_000;
 const MAX_TEXT = 24_000;
 
 const argv = process.argv.slice(2);
@@ -452,10 +455,25 @@ async function runTurn() {
   }
   socket.close();
   // The transcript is the authority: read it back instead of trusting deltas.
-  const messages = await api("GET", `/api/sessions/${settings.sessionId}/messages`);
-  report.assistantMessages = (messages.messages ?? []).filter(message => message.role === "assistant")
-    .filter(message => !message.createdAt || Date.parse(message.createdAt) >= Date.parse(startedAt))
-    .map(messageView);
+  //
+  // It is also written by the server AFTER `run.completed` reaches this socket, so
+  // an immediate read raced that write and reported an EMPTY assistant list for
+  // turns whose state was already correct: a campaign persona saw "assistantMessages
+  // empty" on one turn, re-read `state`, and found the answer persisted. Polling a
+  // bounded while removes the race and records how long it actually took, so a
+  // future report can tell "no answer" apart from "answered a moment later".
+  const pollStartedAt = Date.now();
+  const waitUntil = report.runStatus ? pollStartedAt + ASSISTANT_MESSAGE_WAIT_MS : pollStartedAt;
+  let assistantMessages = [];
+  for (;;) {
+    const messages = await api("GET", `/api/sessions/${settings.sessionId}/messages`);
+    assistantMessages = (messages.messages ?? []).filter(message => message.role === "assistant")
+      .filter(message => !message.createdAt || Date.parse(message.createdAt) >= Date.parse(startedAt));
+    if (assistantMessages.length || has("no-wait") || Date.now() >= waitUntil) break;
+    await new Promise(resolveWait => setTimeout(resolveWait, 400));
+  }
+  report.assistantMessages = assistantMessages.map(messageView);
+  report.assistantMessageWaitMs = Date.now() - pollStartedAt;
   report.jobs = await sessionJobs(settings);
   report.workspaceCredits = (await api("GET", "/api/viewer")).credits?.balance ?? null;
   report.canvas = await canvasSummary(settings);
