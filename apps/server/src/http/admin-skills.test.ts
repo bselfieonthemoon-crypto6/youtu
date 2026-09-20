@@ -35,6 +35,9 @@ function service(overrides: Partial<AdminSkillService> = {}): AdminSkillService 
     reorderPreviews: vi.fn(async () => undefined),
     listPublishedPreviews: vi.fn(async () => ({ previews: [{
       id: PREVIEW, role: "cover" as const, caption: "封面", imageUrl: "https://signed.test/cover.png" }] })),
+    listPublishedPreviewGroups: vi.fn(async (slugs: readonly string[]) => ({ groups: slugs.map(slug => ({
+      slug, cover: { id: PREVIEW, role: "cover" as const, caption: "封面", imageUrl: "https://signed.test/cover.png" },
+      examples: [] })) })),
     ...overrides,
   };
 }
@@ -86,6 +89,7 @@ describe("admin skill routes", () => {
       ["DELETE", `/api/admin/skills/${SKILL}/previews/${PREVIEW}`, { reason: "删除" }],
       ["POST", `/api/admin/skills/${SKILL}/previews/order`, { orderedPreviewIds: [PREVIEW], reason: "排序" }],
       ["GET", "/api/skills/logo-design/previews", undefined],
+      ["GET", "/api/skill-previews?slugs=logo-design", undefined],
     ] as const;
     for (const [method, url, payload] of routes) {
       const response = await app.inject({ method, url, ...(payload ? { payload } : {}) });
@@ -209,6 +213,25 @@ describe("admin skill routes", () => {
     expect(adminSkillService.listPublishedPreviews).toHaveBeenCalledWith("logo-design");
 
     expect((await app.inject({ method: "GET", url: "/api/skills/not a slug!/previews" })).statusCode).toBe(400);
+  });
+
+  it("serves a bounded batch of published previews for a page of cards", async () => {
+    const adminSkillService = service();
+    const app = await makeApp(adminSkillService);
+    const ok = await app.inject({ method: "GET", url: "/api/skill-previews?slugs=logo-design,json-image-prompt" });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json().groups.map((group: { slug: string }) => group.slug))
+      .toEqual(["logo-design", "json-image-prompt"]);
+    expect(adminSkillService.listPublishedPreviewGroups)
+      .toHaveBeenCalledWith(["logo-design", "json-image-prompt"]);
+
+    // An empty or oversized list is the caller's mistake, not a 500.
+    for (const url of ["/api/skill-previews", "/api/skill-previews?slugs=",
+      `/api/skill-previews?slugs=${Array.from({ length: 51 }, (_, index) => `s-${index}`).join(",")}`]) {
+      const response = await app.inject({ method: "GET", url });
+      expect(response.statusCode, url).toBe(400);
+      expect(response.json(), url).toMatchObject({ error: { code: "admin_invalid_request" } });
+    }
   });
 
   it("maps a service refusal to its status and never leaks the raw message", async () => {

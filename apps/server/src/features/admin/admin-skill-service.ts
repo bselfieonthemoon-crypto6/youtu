@@ -5,8 +5,12 @@ import type {
   AdminSkillPreview,
   AdminSkillPreviewListResponse,
   AdminWriteErrorCode,
+  PublishedSkillPreview,
+  PublishedSkillPreviewBatchResponse,
   PublishedSkillPreviewsResponse,
 } from "@loomic/shared";
+
+import { PUBLISHED_SKILL_PREVIEW_SLUG_LIMIT } from "@loomic/shared";
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import { isActivePlatformAdmin } from "./platform-admin.js";
@@ -28,6 +32,7 @@ import { isActivePlatformAdmin } from "./platform-admin.js";
 const MAX_PREVIEW_BYTES = 5 * 1024 * 1024;
 const SIGNED_URL_EXPIRY_SECONDS = 900;
 const CATALOG_LIMIT_MAX = 200;
+const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/i;
 export const SKILL_PREVIEW_MIME_TYPES = ["image/png", "image/jpeg", "image/webp"] as const;
 
 const EXTENSIONS: Record<string, string> = {
@@ -59,6 +64,8 @@ export type AdminSkillService = {
   deletePreview(actorUserId: string, input: { previewId: string; reason: string }): Promise<void>;
   reorderPreviews(actorUserId: string, input: { skillId: string; orderedPreviewIds: string[]; reason: string }): Promise<void>;
   listPublishedPreviews(skillSlug: string): Promise<PublishedSkillPreviewsResponse>;
+  /** Batch read for a list of skills, so a page of cards is one request. */
+  listPublishedPreviewGroups(slugs: readonly string[]): Promise<PublishedSkillPreviewBatchResponse>;
 };
 
 type LooseAdmin = {
@@ -260,33 +267,69 @@ export function createAdminSkillService(options: {
     },
 
     async listPublishedPreviews(skillSlug) {
-      const client = loose(admin());
-      const { data: skill, error: skillError } = await client.from("skills")
-        .select("id").eq("slug", skillSlug).maybeSingle();
-      if (skillError) throw new AdminSkillError("admin_write_failed", "技能图片加载失败，请稍后重试。", 500);
-      if (!skill) return { previews: [] };
+      const groups = await publishedGroups([skillSlug]);
+      const group = groups[0];
+      return { previews: group ? [ ...(group.cover ? [group.cover] : []), ...group.examples ] : [] };
+    },
 
-      const { data: rows, error } = await client.from("skill_previews")
-        .select("id,role,caption,sort_order,asset_object_id")
-        .eq("skill_id", String(skill.id)).eq("status", "published")
-        .order("role", { ascending: true }).order("sort_order", { ascending: true });
-      if (error) throw new AdminSkillError("admin_write_failed", "技能图片加载失败，请稍后重试。", 500);
-
-      const previews: PublishedSkillPreviewsResponse["previews"] = [];
-      for (const row of (rows ?? []) as Array<Record<string, unknown>>) {
-        const { data: asset } = await client.from("asset_objects")
-          .select("bucket,object_path").eq("id", String(row.asset_object_id)).maybeSingle();
-        if (!asset) continue;
-        const url = await signedUrl(String(asset.bucket), String(asset.object_path));
-        if (!url) continue;
-        previews.push({
-          id: String(row.id),
-          role: row.role === "cover" ? "cover" : "example",
-          caption: typeof row.caption === "string" ? row.caption : null,
-          imageUrl: url,
-        });
-      }
-      return { previews };
+    async listPublishedPreviewGroups(slugs) {
+      // A page asks for one batch: dedupe, drop anything that cannot be a slug and
+      // bound the list so the query and the payload stay predictable.
+      const unique = [...new Set(slugs.map(slug => slug.trim()).filter(slug => SLUG_PATTERN.test(slug)))]
+        .slice(0, PUBLISHED_SKILL_PREVIEW_SLUG_LIMIT);
+      if (!unique.length) return { groups: [] };
+      return { groups: await publishedGroups(unique) };
     },
   };
+
+  /**
+   * Published images for a bounded set of slugs, in one pass over the three
+   * tables. Only `published` rows are returned, and a row whose image cannot be
+   * signed is skipped rather than rendered broken.
+   */
+  async function publishedGroups(slugs: readonly string[]): Promise<PublishedSkillPreviewBatchResponse["groups"]> {
+    const client = loose(admin());
+    const { data: skills, error: skillError } = await client.from("skills")
+      .select("id,slug").in("slug", [...slugs]);
+    if (skillError) throw new AdminSkillError("admin_write_failed", "技能图片加载失败，请稍后重试。", 500);
+    const skillRows = (skills ?? []) as Array<{ id: string; slug: string }>;
+    if (!skillRows.length) return [];
+
+    const slugById = new Map(skillRows.map(row => [String(row.id), String(row.slug)]));
+    const { data: rows, error } = await client.from("skill_previews")
+      .select("id,skill_id,role,caption,sort_order,asset_object_id")
+      .in("skill_id", [...slugById.keys()]).eq("status", "published")
+      .order("sort_order", { ascending: true });
+    if (error) throw new AdminSkillError("admin_write_failed", "技能图片加载失败，请稍后重试。", 500);
+    const previewRows = (rows ?? []) as Array<Record<string, unknown>>;
+    if (!previewRows.length) return [];
+
+    const { data: assets, error: assetError } = await client.from("asset_objects")
+      .select("id,bucket,object_path").in("id", previewRows.map(row => String(row.asset_object_id)));
+    if (assetError) throw new AdminSkillError("admin_write_failed", "技能图片加载失败，请稍后重试。", 500);
+    const assetById = new Map(((assets ?? []) as Array<Record<string, unknown>>)
+      .map(row => [String(row.id), row]));
+
+    const grouped = new Map<string, { cover: PublishedSkillPreview | null; examples: PublishedSkillPreview[] }>();
+    for (const row of previewRows) {
+      const asset = assetById.get(String(row.asset_object_id));
+      if (!asset) continue;
+      const url = await signedUrl(String(asset.bucket), String(asset.object_path));
+      if (!url) continue;
+      const slug = slugById.get(String(row.skill_id));
+      if (!slug) continue;
+      const entry: PublishedSkillPreview = {
+        id: String(row.id),
+        role: row.role === "cover" ? "cover" : "example",
+        caption: typeof row.caption === "string" ? row.caption : null,
+        imageUrl: url,
+      };
+      const bucket = grouped.get(slug) ?? { cover: null, examples: [] };
+      if (entry.role === "cover" && !bucket.cover) bucket.cover = entry;
+      else bucket.examples.push(entry);
+      grouped.set(slug, bucket);
+    }
+
+    return [...grouped.entries()].map(([slug, group]) => ({ slug, cover: group.cover, examples: group.examples }));
+  }
 }

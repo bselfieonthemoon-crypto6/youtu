@@ -1,11 +1,13 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 
 import {
+  PUBLISHED_SKILL_PREVIEW_SLUG_LIMIT,
   adminSkillCatalogResponseSchema,
   adminSkillPreviewListResponseSchema,
   adminSkillPreviewOrderRequestSchema,
   adminSkillPreviewReasonRequestSchema,
   adminWriteErrorResponseSchema,
+  publishedSkillPreviewBatchResponseSchema,
   publishedSkillPreviewsResponseSchema,
   unauthenticatedErrorResponseSchema,
 } from "@loomic/shared";
@@ -161,6 +163,24 @@ export async function registerAdminSkillRoutes(
       if (!slug || !SLUG_PATTERN.test(slug)) return invalidRequest(reply);
       const result = await options.adminSkillService.listPublishedPreviews(slug);
       return reply.code(200).send(publishedSkillPreviewsResponseSchema.parse(result));
+    } catch (error) {
+      return sendSkillError(error, reply);
+    }
+  });
+
+  // The catalog list asks for every visible skill at once; one bounded batch read
+  // instead of one request per card. Declared before the parametric route so
+  // "skill-previews" is never read as a slug.
+  app.get("/api/skill-previews", async (request, reply) => {
+    try {
+      const user = await options.auth.authenticate(request);
+      if (!user) return unauthenticated(reply);
+      const query = request.query as { slugs?: string };
+      const slugs = (query.slugs ?? "").split(",").map(slug => slug.trim()).filter(Boolean);
+      if (!slugs.length) return invalidRequest(reply);
+      if (slugs.length > PUBLISHED_SKILL_PREVIEW_SLUG_LIMIT) return invalidRequest(reply);
+      const result = await options.adminSkillService.listPublishedPreviewGroups(slugs);
+      return reply.code(200).send(publishedSkillPreviewBatchResponseSchema.parse(result));
     } catch (error) {
       return sendSkillError(error, reply);
     }

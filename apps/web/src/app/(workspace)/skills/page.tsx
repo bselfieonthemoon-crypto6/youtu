@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Plus, RefreshCw, Search } from "lucide-react";
-import type { SkillCategory, SkillDetail, SkillListItem } from "@loomic/shared";
+import type { PublishedSkillPreview, PublishedSkillPreviewGroup, SkillCategory, SkillDetail, SkillListItem } from "@loomic/shared";
 import { SkillCard } from "@/components/skills/skill-card";
 import { CreateSkillDialog, type SkillFormData } from "@/components/skills/create-skill-dialog";
 import { ImportPanel } from "@/components/skills/import-panel";
@@ -11,7 +11,7 @@ import { SkillDetailDialog } from "@/components/skills/skill-detail-dialog";
 import { SkillsSkeleton } from "@/components/skeletons/skills-skeleton";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/lib/auth-context";
-import { createSkill, deleteSkill, fetchSkillDetail, installSkill, toggleSkill, uninstallSkill, updateSkill } from "@/lib/server-api";
+import { createSkill, deleteSkill, fetchPublishedSkillPreviewGroups, fetchSkillDetail, installSkill, toggleSkill, uninstallSkill, updateSkill } from "@/lib/server-api";
 import { mergeSkillInstallation, notifySkillsChanged, readSkills, SKILL_CATEGORY_LABELS, skillErrorMessage } from "@/lib/skills-client";
 import { cn } from "@/lib/utils";
 
@@ -41,6 +41,7 @@ export default function SkillsPage() {
   const [detailOpen, setDetailOpen] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [previewGroups, setPreviewGroups] = useState<Record<string, PublishedSkillPreviewGroup>>({});
   const selectedSkill = useRef<SkillListItem | null>(null);
 
   const load = useCallback(async () => {
@@ -141,6 +142,33 @@ export default function SkillsPage() {
     && `${skill.name} ${skill.description}`.toLowerCase().includes(query.trim().toLowerCase())
   )), [skills, tab, category, officialOnly, query]);
 
+  // Published cover/example images for the visible cards, in ONE bounded request
+  // per list change. The key keeps the effect from re-running on every render and
+  // silently caps the batch at the server's limit of 50 slugs.
+  const previewSlugs = useMemo(
+    () => [...new Set(filtered.map((skill) => skill.slug).filter(Boolean))].sort().slice(0, 50),
+    [filtered],
+  );
+  const previewKey = previewSlugs.join(",");
+  useEffect(() => {
+    const token = getToken();
+    if (!token || !previewKey) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await fetchPublishedSkillPreviewGroups(token, previewKey.split(","));
+        if (cancelled || token !== getToken()) return;
+        const next: Record<string, PublishedSkillPreviewGroup> = {};
+        for (const group of response.groups) next[group.slug] = group;
+        setPreviewGroups(next);
+      } catch {
+        // Images are decoration: a failed read must never break the skill list.
+        if (!cancelled) setPreviewGroups({});
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [getToken, previewKey, session?.access_token]);
+
   if (authLoading || (loading && !skills.length && !error)) return <SkillsSkeleton />;
   if (!session) return <p role="alert" className="p-8">请登录后管理技能。</p>;
 
@@ -165,12 +193,17 @@ export default function SkillsPage() {
         </div>
         {tab === "catalog" && <p className="mb-4 text-xs text-muted-foreground">目录包含可安装的官方、社区和自定义技能。</p>}
         {!filtered.length ? <div className="py-16 text-center text-sm text-muted-foreground">{query || category || officialOnly ? "未找到匹配的技能" : tab === "installed" ? "尚未安装技能，可前往技能目录选择或创建自定义技能。" : "暂无可用技能"}</div>
-          : <div aria-busy={loading} className="grid gap-4 lg:grid-cols-2">{filtered.map((skill) => <SkillCard key={skill.id} skill={skill} busy={busyIds.has(skill.id)} onToggle={toggle} onClick={(item) => { void showDetail(item); }} onInstall={(id) => { void install(id).catch((cause) => setError(skillErrorMessage(cause, "安装失败，请重试。"))); }} />)}</div>}
+          : <div aria-busy={loading} className="grid gap-4 lg:grid-cols-2">{filtered.map((skill) => {
+            const group = previewGroups[skill.slug];
+            return <SkillCard key={skill.id} skill={skill} busy={busyIds.has(skill.id)} coverUrl={group?.cover?.imageUrl ?? null} exampleCount={group?.examples.length ?? 0} onToggle={toggle} onClick={(item) => { void showDetail(item); }} onInstall={(id) => { void install(id).catch((cause) => setError(skillErrorMessage(cause, "安装失败，请重试。"))); }} />;
+          })}</div>}
       </>}
       {tab === "marketplace" && <MarketplacePanel accessToken={getToken} onInstalled={refresh} />}
       {tab === "import" && <ImportPanel accessToken={getToken} onImported={refresh} onSwitchToInstalled={() => setTab("installed")} />}
       <CreateSkillDialog open={formOpen} onOpenChange={setFormOpen} onSubmit={save} skill={editingSkill} />
       <SkillDetailDialog skill={detail} open={detailOpen} loading={detailLoading} error={detailError} busy={detail ? busyIds.has(detail.id) : false}
+        cover={detail ? previewGroups[detail.slug]?.cover ?? null : null}
+        examples={detail ? previewGroups[detail.slug]?.examples ?? [] : []}
         onRetry={() => { if (selectedSkill.current) void showDetail(selectedSkill.current); }}
         onOpenChange={(open) => { setDetailOpen(open); if (!open) { detailSequence.current += 1; setDetail(null); } }}
         onInstall={install} onUninstall={uninstall} onDelete={remove}

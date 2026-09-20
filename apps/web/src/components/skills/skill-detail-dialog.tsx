@@ -1,17 +1,20 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { SkillDetail } from "@loomic/shared";
+import type { PublishedSkillPreview, SkillDetail } from "@loomic/shared";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { SkillMetadata } from "@/components/skills/skill-metadata";
 import { skillErrorMessage } from "@/lib/skills-client";
 
-export function SkillDetailDialog({ skill, open, onOpenChange, onInstall, onUninstall, onDelete, onEdit, canDelete = false, loading = false, error, onRetry, busy = false }: {
+export function SkillDetailDialog({ skill, open, onOpenChange, onInstall, onUninstall, onDelete, onEdit, canDelete = false, loading = false, error, onRetry, busy = false, cover = null, examples = [] }: {
   skill: SkillDetail | null; open: boolean; onOpenChange: (open: boolean) => void;
   onInstall: (id: string) => Promise<void>; onUninstall: (id: string) => Promise<void>;
   onDelete?: (id: string) => Promise<void>; onEdit?: (() => void) | undefined; canDelete?: boolean;
   loading?: boolean; error?: string | null; onRetry?: () => void; busy?: boolean;
+  /** Published images for this skill, from the platform catalog. */
+  cover?: PublishedSkillPreview | null;
+  examples?: readonly PublishedSkillPreview[];
 }) {
   const [action, setAction] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -30,6 +33,28 @@ export function SkillDetailDialog({ skill, open, onOpenChange, onInstall, onUnin
     <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-y-auto">
       <DialogHeader><DialogTitle>{skill?.name ?? "技能详情"}</DialogTitle><DialogDescription>{skill?.description ?? "查看工作说明、依赖要求和参考文件。"}</DialogDescription></DialogHeader>
       {loading ? <p role="status">正在加载技能详情…</p> : error ? <div role="alert" className="space-y-2 text-sm text-destructive"><p>{error}</p><Button variant="outline" size="sm" onClick={onRetry}>重试详情</Button></div> : skill ? <>
+        {cover || examples.length ? (
+          <section aria-label="技能效果图" data-testid="skill-detail-gallery" className="space-y-3">
+            {cover ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={cover.imageUrl} alt={cover.caption ? `${skill.name}：${cover.caption}` : `${skill.name} 效果图`}
+                className="max-h-72 w-full rounded-lg border border-border bg-muted/40 object-contain" />
+            ) : null}
+            {examples.length ? (
+              <ul className="grid gap-3 sm:grid-cols-2">
+                {examples.map(example => (
+                  <li key={example.id} className="rounded-lg border border-border p-2">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={example.imageUrl} alt={example.caption ? `${skill.name} 示例：${example.caption}` : `${skill.name} 示例`}
+                      loading="lazy" className="h-40 w-full rounded bg-muted/40 object-contain" />
+                    {example.caption ? <p className="mt-2 text-xs text-muted-foreground">{example.caption}</p> : null}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            <p className="text-[11px] text-muted-foreground">效果图由平台维护，仅作能力示意，不代表你的实际生成结果。</p>
+          </section>
+        ) : null}
         <div className="grid grid-cols-2 gap-3 text-xs">
           <div><span className="text-muted-foreground">安装状态</span><p>{skill.installed ? `已安装 · ${skill.enabled ? "已启用" : "已停用"}` : "未安装"}</p></div>
           <div><span className="text-muted-foreground">来源</span><p>{skill.source === "system" ? "官方" : skill.source === "community" ? "社区" : "自定义"}</p></div>

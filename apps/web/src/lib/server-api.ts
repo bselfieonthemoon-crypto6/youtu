@@ -50,6 +50,7 @@ import type {
   AdminSkillCatalogResponse,
   AdminSkillPreviewListResponse,
   PublishedSkillPreviewsResponse,
+  PublishedSkillPreviewBatchResponse,
 } from "@loomic/shared";
 import {
   canvasGetResponseSchema,
@@ -1461,4 +1462,16 @@ export async function fetchPublishedSkillPreviews(
   });
   if (!response.ok) return handleErrorResponse(response);
   return (await response.json()) as PublishedSkillPreviewsResponse;
+}
+
+/** One request for a whole page of skills, so cards do not each fetch their own. */
+export async function fetchPublishedSkillPreviewGroups(
+  accessToken: string,
+  slugs: readonly string[],
+): Promise<PublishedSkillPreviewBatchResponse> {
+  const response = await fetch(`${getServerBaseUrl()}/api/skill-previews?slugs=${encodeURIComponent(slugs.join(","))}`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as PublishedSkillPreviewBatchResponse;
 }

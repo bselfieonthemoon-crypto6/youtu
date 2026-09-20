@@ -76,6 +76,20 @@ export const publishedSkillPreviewsResponseSchema = z.object({
   previews: z.array(publishedSkillPreviewSchema),
 });
 
+/**
+ * One skill's published images, as the customer-facing card and detail need them:
+ * the cover separately so a card never has to guess which example is the card image.
+ */
+export const publishedSkillPreviewGroupSchema = z.object({
+  slug: z.string().min(1),
+  cover: publishedSkillPreviewSchema.nullable(),
+  examples: z.array(publishedSkillPreviewSchema),
+});
+
+export const publishedSkillPreviewBatchResponseSchema = z.object({
+  groups: z.array(publishedSkillPreviewGroupSchema),
+});
+
 export type AdminSkillCatalogEntry = z.infer<typeof adminSkillCatalogEntrySchema>;
 export type AdminSkillCatalogResponse = z.infer<typeof adminSkillCatalogResponseSchema>;
 export type AdminSkillPreview = z.infer<typeof adminSkillPreviewSchema>;
@@ -83,3 +97,8 @@ export type AdminSkillPreviewListResponse = z.infer<typeof adminSkillPreviewList
 export type AdminSkillPreviewOrderRequest = z.infer<typeof adminSkillPreviewOrderRequestSchema>;
 export type PublishedSkillPreview = z.infer<typeof publishedSkillPreviewSchema>;
 export type PublishedSkillPreviewsResponse = z.infer<typeof publishedSkillPreviewsResponseSchema>;
+export type PublishedSkillPreviewGroup = z.infer<typeof publishedSkillPreviewGroupSchema>;
+export type PublishedSkillPreviewBatchResponse = z.infer<typeof publishedSkillPreviewBatchResponseSchema>;
+
+/** How many slugs one batch read may ask for. */
+export const PUBLISHED_SKILL_PREVIEW_SLUG_LIMIT = 50;

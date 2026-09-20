@@ -23,27 +23,22 @@ function fakeAdmin(input: {
   const assetDeletes: string[] = [];
   const from = (table: string) => {
     let filters: Array<[string, unknown]> = [];
+    let inFilter: [string, readonly unknown[]] | null = null;
+    const source = () => (table === "skills" ? (input.skills ?? [])
+      : table === "skill_previews" ? (input.previews ?? [])
+        : table === "asset_objects" ? (input.assets ?? [])
+          : []) as Array<Record<string, unknown>>;
     const rows = () => {
-      const source = table === "skills" ? (input.skills ?? [])
-        : table === "skill_previews" ? (input.previews ?? [])
-          : table === "asset_objects" ? (input.assets ?? [])
-            : [];
-      let result = [...source] as Array<Record<string, unknown>>;
+      let result = [...source()];
       for (const [column, value] of filters) result = result.filter(row => row[column] === value);
+      if (inFilter) result = result.filter(row => (inFilter![1] as readonly unknown[]).includes(row[inFilter![0]]));
       return result;
     };
     const builder: any = {
       select() { return builder; },
       eq(column: string, value: unknown) { filters.push([column, value]); return builder; },
       is(column: string, value: unknown) { filters.push([column, value]); return builder; },
-      in(column: string, values: readonly unknown[]) {
-        filters.push([column, (values as readonly unknown[])[0]]);
-        return {
-          then: (resolve: (value: unknown) => unknown) => Promise.resolve({
-            data: (input.assets ?? []).filter(row => (values as readonly unknown[]).includes(row.id)), error: null,
-          }).then(resolve),
-        };
-      },
+      in(column: string, values: readonly unknown[]) { inFilter = [column, values]; return builder; },
       order() { return builder; },
       delete() { return builder; },
       insert: () => ({
@@ -289,5 +284,51 @@ describe("admin skill service", () => {
       assets: [],
     });
     await expect(listPublishedPreviews("logo-design")).resolves.toEqual({ previews: [] });
+  });
+
+  it("groups a batch read by slug with the cover separated from the examples", async () => {
+    const otherSkill = "372f4760-ffe1-4f09-8211-cf0c5dbc0606";
+    const { listPublishedPreviewGroups } = service({
+      skills: [{ id: SKILL, slug: "logo-design" }, { id: otherSkill, slug: "json-image-prompt" }],
+      previews: [
+        { id: PREVIEW, skill_id: SKILL, asset_object_id: "asset-1", role: "cover", caption: "封面", sort_order: 0, status: "published" },
+        { id: "ex-1", skill_id: SKILL, asset_object_id: "asset-2", role: "example", caption: "示例", sort_order: 1, status: "published" },
+        { id: "ex-2", skill_id: SKILL, asset_object_id: "asset-3", role: "example", caption: null, sort_order: 2, status: "published" },
+        { id: "draft-1", skill_id: otherSkill, asset_object_id: "asset-4", role: "cover", caption: null, sort_order: 0, status: "draft" },
+      ],
+      assets: [
+        { id: "asset-1", bucket: "platform-assets", object_path: "skills/x/cover.png" },
+        { id: "asset-2", bucket: "platform-assets", object_path: "skills/x/ex1.png" },
+        { id: "asset-3", bucket: "platform-assets", object_path: "skills/x/ex2.png" },
+        { id: "asset-4", bucket: "platform-assets", object_path: "skills/x/draft.png" },
+      ],
+    });
+    const result = await listPublishedPreviewGroups(["logo-design", "json-image-prompt", "logo-design"]);
+    expect(result.groups).toHaveLength(1);
+    expect(result.groups[0]).toMatchObject({
+      slug: "logo-design",
+      cover: { id: PREVIEW, role: "cover", imageUrl: "https://signed.test/skills/x/cover.png" },
+      examples: [
+        { id: "ex-1", role: "example", caption: "示例" },
+        { id: "ex-2", role: "example", caption: null },
+      ],
+    });
+    // A skill with only drafts is absent, not an empty group.
+    expect(JSON.stringify(result)).not.toContain("json-image-prompt");
+  });
+
+  it("bounds and sanitizes the batch slug list", async () => {
+    const { listPublishedPreviewGroups, fake } = service({ skills: [], previews: [], assets: [] });
+    await expect(listPublishedPreviewGroups([])).resolves.toEqual({ groups: [] });
+    await expect(listPublishedPreviewGroups(["  ", "not a slug!", "UPPER--ok"])).resolves.toEqual({ groups: [] });
+    // Invalid entries are dropped rather than queried; the valid one still runs.
+    const batches: string[][] = [];
+    const spy = vi.spyOn(fake.client as unknown as { from: (table: string) => unknown }, "from");
+    await listPublishedPreviewGroups(["logo-design", "", "bad slug"]);
+    expect(spy).toHaveBeenCalled();
+    void batches;
+
+    const many = Array.from({ length: 120 }, (_, index) => `skill-${index}`);
+    await expect(listPublishedPreviewGroups(many)).resolves.toEqual({ groups: [] });
   });
 });
