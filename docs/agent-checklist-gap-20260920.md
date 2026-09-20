@@ -155,7 +155,10 @@ queue `4 queues empty` 34ms、storage `bucket reachable` 25ms、worker `1 online
    这条比之前任何时候都强 —— 之前只有"删除前要求确认是对的"这种观察。
 2. **执行的一半仍未验证,而且拿到一个具体缺陷线索**:阶段①**已经断言到页面里存在"确认删除"这段文字**,
    而 `getByRole('button', { name: '确认删除', exact: true })` 拿到 **0 个** —— 说明这段文字**没有以可访问的
-   `<button>` 暴露**(可能根本不是 button 元素,或可访问名夹带其它文字)。这与此前 CLI 侧
+   `<button>` 暴露 —— **但该推测随后被源码推翻**:`tool-block-view.tsx:1463-1480` 显示确认控件就是真正的
+   `<button type="button">`,文本正是 `确认删除`。因此失败在**探针的卡片定位/作用域**(崩溃点
+   `check-delete-confirmation.mjs:671` 用 `cardButtons(root)` 取按钮,而阶段①已能断言页面里存在该文字),
+   **不是产品缺陷**。这与此前 CLI 侧
    `confirmation_execution_failed` / `Confirm is not_found` 一直没有对照物相吻合:
    **"点击确认并真正删除"这条路至今没有任何一次通过的验证记录**。
 3. **下一步(未做)**:查看确认卡片组件的 DOM/可访问名,判定是"控件不是 button(可访问性与可测性问题)"
