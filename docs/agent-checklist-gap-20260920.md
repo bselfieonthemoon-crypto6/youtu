@@ -92,6 +92,12 @@
      若只需改一个技能，走那条路更小、更安全。
    - **做之前先想清楚**：`--write` 会重写覆盖全部技能的生成 SQL（大 diff）。若本次只改
      `series-visual-design` 一个技能，优先用单技能增量脚本而不是整体重建目录。
+   - **已发现的既有静默缺陷（正在修）**：`node scripts/build-design-skill-catalog.mjs --check` 当前**直接失败**
+     （`background-removal.loomic: unknown field whenToUse`）—— 生成器的 `validateManifest` 字段白名单没跟上
+     `whenToUse`，于是 `--write` 根本跑不起来。后果是真实的：`whenToUse` 在**所有迁移里零命中**，
+     而运行时（`design-skill-catalog.ts:44-48`）正是用它作为**模型可见的选型信号**（缺失回落 `description`），
+     所以那次改动**从未到达模型**，且无人发现 —— 测试只覆盖消费端与磁盘 manifest，不覆盖数据库种子行。
+     这条链修好后，"Skills 输出协议统一"才有可用的流水线。
 
 7. **删除确认浏览器验收**（阶段二 #5）— 本轮 E 工作流在做（创建/过期/执行/刷新四阶段 + 判定 CLI 的 `not_found` 是否只存在于 CLI）。
 
