@@ -43,6 +43,9 @@ import type {
   AdminOverviewResponse,
   AdminPlatformAdminListResponse,
   AdminAuditListResponse,
+  AdminUserDirectoryResponse,
+  AdminWorkspaceDirectoryResponse,
+  AdminAssignableRole,
 } from "@loomic/shared";
 import {
   canvasGetResponseSchema,
@@ -1241,4 +1244,78 @@ export async function fetchAdminAudit(
   });
   if (!response.ok) return handleErrorResponse(response);
   return (await response.json()) as AdminAuditListResponse;
+}
+
+export async function fetchAdminUsers(
+  accessToken: string,
+  options: { query?: string; userId?: string; limit?: number; offset?: number } = {},
+): Promise<AdminUserDirectoryResponse> {
+  const search = new URLSearchParams();
+  if (options.query) search.set("query", options.query);
+  if (options.userId) search.set("userId", options.userId);
+  if (options.limit !== undefined) search.set("limit", String(options.limit));
+  if (options.offset !== undefined) search.set("offset", String(options.offset));
+  const suffix = search.toString() ? `?${search.toString()}` : "";
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/users${suffix}`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminUserDirectoryResponse;
+}
+
+export async function fetchAdminWorkspaces(
+  accessToken: string,
+  options: { query?: string; limit?: number } = {},
+): Promise<AdminWorkspaceDirectoryResponse> {
+  const search = new URLSearchParams();
+  if (options.query) search.set("query", options.query);
+  if (options.limit !== undefined) search.set("limit", String(options.limit));
+  const suffix = search.toString() ? `?${search.toString()}` : "";
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/workspaces${suffix}`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminWorkspaceDirectoryResponse;
+}
+
+/** Membership writes all require a reason; the server stores it in the audit row. */
+export async function adminAddWorkspaceMember(
+  accessToken: string,
+  workspaceId: string,
+  input: { userId: string; role: AdminAssignableRole; reason: string },
+): Promise<void> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/workspaces/${workspaceId}/members`, {
+    method: "POST",
+    headers: authJsonHeaders(accessToken),
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+}
+
+export async function adminSetWorkspaceMemberRole(
+  accessToken: string,
+  workspaceId: string,
+  userId: string,
+  input: { role: AdminAssignableRole; reason: string },
+): Promise<void> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/workspaces/${workspaceId}/members/${userId}`, {
+    method: "PATCH",
+    headers: authJsonHeaders(accessToken),
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+}
+
+export async function adminRemoveWorkspaceMember(
+  accessToken: string,
+  workspaceId: string,
+  userId: string,
+  reason: string,
+): Promise<void> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/workspaces/${workspaceId}/members/${userId}`, {
+    method: "DELETE",
+    headers: authJsonHeaders(accessToken),
+    body: JSON.stringify({ reason }),
+  });
+  if (!response.ok) return handleErrorResponse(response);
 }

@@ -60,6 +60,11 @@ export const adminWriteErrorCodeSchema = z.enum([
   "admin_not_platform_admin",
   "admin_last_platform_admin",
   "admin_reason_required",
+  "admin_workspace_not_found",
+  "admin_member_not_found",
+  "admin_member_already_exists",
+  "admin_owner_immutable",
+  "admin_invalid_role",
 ]);
 
 export const adminWriteErrorResponseSchema = z.object({

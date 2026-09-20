@@ -161,8 +161,10 @@ import { registerImageLayerElementRoutes } from "./http/image-layer-elements.js"
 import { registerJobRoutes } from "./http/jobs.js";
 import { registerAdminOverviewRoutes } from "./http/admin-overview.js";
 import { registerAdminAccessRoutes } from "./http/admin-access.js";
+import { registerAdminUserRoutes } from "./http/admin-users.js";
 import { createAdminOverviewService } from "./features/admin/admin-overview-service.js";
 import { createAdminAccessService } from "./features/admin/admin-access-service.js";
+import { createAdminUserService } from "./features/admin/admin-user-service.js";
 import {
   finalizeTerminalImageJobPlaceholder,
   finalizeTerminalVideoJobPlaceholder,
@@ -767,6 +769,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   void registerAdminAccessRoutes(app, {
     auth,
     adminAccessService: createAdminAccessService({ getAdminClient }),
+  });
+  // Platform-level user directory and cross-workspace membership management. The
+  // membership writes are audited database functions (reason required, owner
+  // membership immutable), so this layer only authorizes and validates.
+  void registerAdminUserRoutes(app, {
+    auth,
+    adminUserService: createAdminUserService({ getAdminClient }),
   });
 
   // Payment routes — only registered when Lemon Squeezy is configured

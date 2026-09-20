@@ -40,6 +40,11 @@ vi.mock("../src/components/admin/admin-audit-section", () => ({
     <div>审计面板:{accessToken}</div>
   ),
 }));
+vi.mock("../src/components/admin/admin-users-section", () => ({
+  AdminUsersSection: ({ accessToken }: { accessToken: string }) => (
+    <div>用户目录面板:{accessToken}</div>
+  ),
+}));
 
 function viewer(role: "owner" | "admin" | "member") {
   return { membership: { role, workspaceId: "workspace-1" } };
@@ -110,7 +115,7 @@ describe("admin page", () => {
     await userEvent.click(tab);
     expect(screen.getByText("平台总览面板:token")).toBeInTheDocument();
     // Workspace administration is still reachable from the same page.
-    await userEvent.click(screen.getByRole("button", { name: "用户管理" }));
+    await userEvent.click(screen.getByRole("button", { name: "本工作区成员" }));
     expect(screen.getByText("成员面板")).toBeInTheDocument();
   });
 
@@ -123,11 +128,15 @@ describe("admin page", () => {
     expect(screen.getByText("权限面板:token")).toBeInTheDocument();
     expect(screen.getByText("审计面板:token")).toBeInTheDocument();
 
+    await userEvent.click(screen.getByRole("button", { name: "用户目录" }));
+    expect(screen.getByText("用户目录面板:token")).toBeInTheDocument();
+
     cleanup();
     fetchAdminAccessMock.mockResolvedValue({ platformAdmin: false });
     render(<AdminPage />);
     expect(await screen.findByText("成员面板")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "权限与审计" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "用户目录" })).not.toBeInTheDocument();
   });
 
   it("keeps workspace administration working when the platform probe fails", async () => {

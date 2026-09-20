@@ -9,10 +9,11 @@ import { WorkspaceMembersSection } from "@/components/settings/workspace-members
 import { AdminOverviewSection } from "@/components/admin/admin-overview-section";
 import { AdminAccessSection } from "@/components/admin/admin-access-section";
 import { AdminAuditSection } from "@/components/admin/admin-audit-section";
+import { AdminUsersSection } from "@/components/admin/admin-users-section";
 import { useAuth } from "@/lib/auth-context";
 import { fetchAdminAccess, fetchViewer } from "@/lib/server-api";
 
-type AdminTab = "overview" | "access" | "users" | "providers" | "resources";
+type AdminTab = "overview" | "access" | "directory" | "users" | "providers" | "resources";
 
 export default function AdminPage() {
   const { session } = useAuth();
@@ -113,8 +114,8 @@ export default function AdminPage() {
       <div className="mb-7 inline-flex rounded-lg bg-muted p-1">
         {(
           [
-            ...(platformAdmin ? ([["overview", "平台总览"], ["access", "权限与审计"]] as const) : []),
-            ["users", "用户管理"],
+            ...(platformAdmin ? ([["overview", "平台总览"], ["access", "权限与审计"], ["directory", "用户目录"]] as const) : []),
+            ["users", "本工作区成员"],
             ["providers", "第三方模型供应商"],
             ["resources", "设计资源"],
           ] as ReadonlyArray<readonly [AdminTab, string]>
@@ -129,7 +130,7 @@ export default function AdminPage() {
           </button>
         ))}
       </div>
-      <div className={tab === "overview" || tab === "access" ? "w-full" : "max-w-3xl"}>
+      <div className={tab === "overview" || tab === "access" || tab === "directory" ? "w-full" : "max-w-3xl"}>
         {tab === "overview" && platformAdmin ? (
           <AdminOverviewSection accessToken={authenticatedToken} />
         ) : tab === "access" && platformAdmin ? (
@@ -137,6 +138,8 @@ export default function AdminPage() {
             <AdminAccessSection accessToken={authenticatedToken} />
             <AdminAuditSection accessToken={authenticatedToken} />
           </div>
+        ) : tab === "directory" && platformAdmin ? (
+          <AdminUsersSection accessToken={authenticatedToken} />
         ) : tab === "users" ? (
           <WorkspaceMembersSection
             accessToken={authenticatedToken}
