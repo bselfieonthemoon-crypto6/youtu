@@ -25,6 +25,11 @@ vi.mock("../src/components/settings/workspace-members-section", () => ({
 vi.mock("../src/components/settings/provider-settings-section", () => ({
   ProviderSettingsSection: () => <div>供应商面板</div>,
 }));
+vi.mock("../src/components/admin/default-model-section", () => ({
+  DefaultModelSection: ({ accessToken }: { accessToken: string }) => (
+    <div>默认模型面板:{accessToken}</div>
+  ),
+}));
 vi.mock("../src/components/admin/admin-overview-section", () => ({
   AdminOverviewSection: ({ accessToken }: { accessToken: string }) => (
     <div>平台总览面板:{accessToken}</div>
@@ -103,6 +108,8 @@ describe("admin page", () => {
       screen.getByRole("button", { name: "第三方模型供应商" }),
     );
     expect(screen.getByText("供应商面板")).toBeInTheDocument();
+    // The default model is drawn from those channels, so it lives in the same tab.
+    expect(screen.getByText("默认模型面板:token")).toBeInTheDocument();
   });
 
   it("shows the viewer error and retries instead of reporting missing permission", async () => {

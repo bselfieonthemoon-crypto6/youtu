@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { DesignResourceAdminSection } from "@/components/settings/design-resource-admin-section";
 import { ProviderSettingsSection } from "@/components/settings/provider-settings-section";
+import { DefaultModelSection } from "@/components/admin/default-model-section";
 import { WorkspaceMembersSection } from "@/components/settings/workspace-members-section";
 import { AdminOverviewSection } from "@/components/admin/admin-overview-section";
 import { AdminAccessSection } from "@/components/admin/admin-access-section";
@@ -164,7 +165,12 @@ export default function AdminPage() {
             viewerRole={role}
           />
         ) : tab === "providers" ? (
-          <ProviderSettingsSection accessToken={authenticatedToken} />
+          <div className="space-y-5">
+            {/* The default model is drawn from these channels, so it is configured
+                next to them - and only here, never in a user's own settings. */}
+            <DefaultModelSection accessToken={authenticatedToken} />
+            <ProviderSettingsSection accessToken={authenticatedToken} />
+          </div>
         ) : (
           <DesignResourceAdminSection
             accessToken={authenticatedToken}
