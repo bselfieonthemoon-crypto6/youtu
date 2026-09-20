@@ -105,7 +105,7 @@ describe("admin page", () => {
     render(<AdminPage />);
     expect(await screen.findByText("成员面板")).toBeInTheDocument();
     await userEvent.click(
-      screen.getByRole("button", { name: "第三方模型供应商" }),
+      screen.getByRole("button", { name: "模型与渠道" }),
     );
     expect(screen.getByText("供应商面板")).toBeInTheDocument();
     // The default model is drawn from those channels, so it lives in the same tab.
@@ -177,7 +177,7 @@ describe("admin page", () => {
     await userEvent.click(screen.getByRole("button", { name: "任务" }));
     expect(screen.getByText("任务面板:token")).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "渠道与模型" }));
+    await userEvent.click(screen.getByRole("button", { name: "渠道健康" }));
     expect(screen.getByText("渠道面板:token")).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "首页内容" }));
@@ -195,7 +195,7 @@ describe("admin page", () => {
     expect(screen.queryByRole("button", { name: "套餐与额度" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "技能与图片" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "任务" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "渠道与模型" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "渠道健康" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "首页内容" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "存储" })).not.toBeInTheDocument();
   });

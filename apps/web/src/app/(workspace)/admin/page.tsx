@@ -124,9 +124,9 @@ export default function AdminPage() {
       <div className="mb-7 inline-flex rounded-lg bg-muted p-1">
         {(
           [
-            ...(platformAdmin ? ([["overview", "平台总览"], ["jobs", "任务"], ["channels", "渠道与模型"], ["content", "首页内容"], ["storage", "存储"], ["access", "权限与审计"], ["directory", "用户目录"], ["billing", "套餐与额度"], ["skills", "技能与图片"]] as const) : []),
+            ...(platformAdmin ? ([["overview", "平台总览"], ["jobs", "任务"], ["channels", "渠道健康"], ["content", "首页内容"], ["storage", "存储"], ["access", "权限与审计"], ["directory", "用户目录"], ["billing", "套餐与额度"], ["skills", "技能与图片"]] as const) : []),
             ["users", "本工作区成员"],
-            ["providers", "第三方模型供应商"],
+            ["providers", "模型与渠道"],
             ["resources", "设计资源"],
           ] as ReadonlyArray<readonly [AdminTab, string]>
         ).map(([id, label]) => (

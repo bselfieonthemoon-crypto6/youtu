@@ -160,7 +160,7 @@ export function AdminChannelsSection({ accessToken }: { accessToken: string }) {
     <div className="space-y-5" data-testid="admin-channels">
       <section className="rounded-lg border border-border bg-card p-5">
         <div>
-          <h2 className="text-base font-semibold">渠道与模型</h2>
+          <h2 className="text-base font-semibold">渠道健康</h2>
           <p className="mt-1 text-xs text-muted-foreground">
             跨工作区查看第三方渠道：连接自检结果、配置变更记录、按错误码的失败率。
             失败归属用服务端记录的 <span className="font-mono">provider_execution_snapshots</span>（真正跑过该任务的渠道），

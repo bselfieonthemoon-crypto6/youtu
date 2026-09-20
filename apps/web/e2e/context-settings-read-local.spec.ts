@@ -44,9 +44,9 @@ test("exposes actual context controls without inventing model capacity or changi
     expect(before.ok()).toBe(true);
     const providers = await before.json();
     // Provider management moved out of the user settings page; the same section now
-    // lives in the platform admin page, which is where this read-only review looks.
+    // lives in the workspace admin page, which is where this read-only review looks.
     await page.goto("/admin");
-    await page.getByRole("button", { name: "第三方模型供应商", exact: true }).click();
+    await page.getByRole("button", { name: "模型与渠道", exact: true }).click();
     await expect(page.getByRole("heading", { name: "模型供应商", exact: true })).toBeVisible({ timeout: 60000 });
     await page.getByRole("button", { name: "编辑", exact: true }).first().click();
     await page.getByLabel("筛选模型类型").selectOption("text");
