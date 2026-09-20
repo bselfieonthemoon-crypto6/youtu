@@ -22,7 +22,7 @@
 | 1 | 否定意图优先级（`禁止执行 > 查询/分析 > 澄清 > 编辑 > 新生成`） | ✅ | 见第一阶段 #3。确定性回退已按"否定/提问优先"落 `non_design`。 |
 | 2 | 路由结果与最终工具行为一致（`detectedIntent` / `executedAction`） | ❌ | 现状只记录**路由判定**（`design.routing` 事件：intent / reasonCode / source / confidence），**没有**"本轮实际执行了什么"的第二层记录；campaign 中确实出现过路由 `new_generation` 而模型只澄清。计划：run 结束后记录 `executedAction`（是否调用 generate_image/edit_image/ask_clarification/纯文本）+ 最终交付资产，并与路由并列展示，让"路由说新生成、实际只澄清"可见而不是矛盾。 |
 | 3 | Skills 组合冲突 | ❌ | 见第三阶段 #1（`skill_output_kind_conflict`）。 |
-| 4 | 自动匹配结果让用户看得懂 | 🟡 | **已有**：`describeDesignRouting()` 给出候选技能 + 命中关键词 + 判定依据（模型判定/模型不可用回退/规则 + 置信度）+ 候选助手指南 + 非标准尺寸启用。**缺**：① "本轮是否会生图"的**诚实**表述 —— 路由的 `new_generation` **不等于**真的会生图（必须等工具回执），现在没有任何字段表达这一点；② 普通界面与调试/高级模式的分层 —— web 的 toast 目前**始终**把 summary + detail 多行一起显示（`use-design-routing-notice.ts:50`）。 |
+| 4 | 自动匹配结果让用户看得懂 | 🟡 | **已有**：`describeDesignRouting()` 给出候选技能 + 命中关键词 + 判定依据（模型判定/模型不可用回退/规则 + 置信度）+ 候选助手指南 + 非标准尺寸启用。**② 分层已修**（`5cf51bf`）：普通界面只显示短提示（候选技能 + 命中关键词），判定依据/助手指南/尺寸启用这些**用户无法据以行动**的诊断信息移入高级模式（`localStorage.setItem("loomic:routing-detail","1")`，无需重建；存储不可用时保持短提示）。措辞**刻意不改**：运行时不再"选定"技能，所以不能说"正在使用某技能"。**① 仍缺**："本轮是否会生图"的诚实表述 —— 路由的 `new_generation` **不等于**真的会生图（必须等工具回执），需要与 `executedAction` 一起做。 |
 
 ## 第二阶段
 
