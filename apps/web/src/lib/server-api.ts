@@ -65,6 +65,10 @@ import type {
   AdminHomeContentDeleteRequest,
   AdminHomeDiscoveryCaseUpsertRequest,
   AdminHomeExampleUpsertRequest,
+  AdminAssetOverviewResponse,
+  AdminAssetOrphanListResponse,
+  AdminAssetQueueResponse,
+  AdminAssetLargeObjectsResponse,
 } from "@loomic/shared";
 import {
   canvasGetResponseSchema,
@@ -1683,4 +1687,69 @@ export async function deleteAdminHomeContent(
     method: "POST", headers: authJsonHeaders(accessToken), body: JSON.stringify(input),
   });
   if (!response.ok) return handleErrorResponse(response);
+}
+
+/** Storage health: occupancy, orphan candidates, the deletion queue, biggest objects. */
+export async function fetchAdminStorageOverview(accessToken: string): Promise<AdminAssetOverviewResponse> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/storage/overview`, { headers: authHeaders(accessToken) });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminAssetOverviewResponse;
+}
+
+export async function fetchAdminAssetOrphans(
+  accessToken: string,
+  filters: { bucket?: string; workspaceId?: string; minBytes?: number; limit?: number; offset?: number } = {},
+): Promise<AdminAssetOrphanListResponse> {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== "") query.set(key, String(value));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/storage/orphans${suffix}`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminAssetOrphanListResponse;
+}
+
+export async function fetchAdminAssetQueue(
+  accessToken: string,
+  kind: string,
+  options: { limit?: number; offset?: number } = {},
+): Promise<AdminAssetQueueResponse> {
+  const query = new URLSearchParams({ kind });
+  for (const [key, value] of Object.entries(options)) {
+    if (value !== undefined) query.set(key, String(value));
+  }
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/storage/queue?${query.toString()}`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminAssetQueueResponse;
+}
+
+export async function fetchAdminAssetLargeObjects(
+  accessToken: string,
+  limit = 20,
+): Promise<AdminAssetLargeObjectsResponse> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/storage/large-objects?limit=${limit}`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AdminAssetLargeObjectsResponse;
+}
+
+/** The one storage write: it reuses the existing orphan pipeline server-side. */
+export async function purgeAdminOrphanAsset(
+  accessToken: string,
+  assetId: string,
+  reason: string,
+): Promise<{ bucket: string; objectPath: string }> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/storage/orphans/purge`, {
+    method: "POST", headers: authJsonHeaders(accessToken),
+    body: JSON.stringify({ assetId, reason: reason.trim() }),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  const body = (await response.json()) as { bucket: string; objectPath: string };
+  return { bucket: body.bucket, objectPath: body.objectPath };
 }

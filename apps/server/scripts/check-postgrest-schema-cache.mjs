@@ -48,6 +48,12 @@ const ADMIN_FUNCTIONS = [
   "admin_reorder_home_content",
   "admin_reorder_home_categories",
   "admin_delete_home_content",
+  "admin_asset_overview",
+  "admin_asset_orphan_candidates",
+  "admin_asset_queue",
+  "admin_asset_large_objects",
+  "admin_claim_orphan_asset",
+  "admin_finalize_orphan_asset",
 ];
 
 const expected = process.argv.slice(2).filter(argument => !argument.startsWith("--"));

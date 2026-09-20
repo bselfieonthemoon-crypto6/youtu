@@ -167,6 +167,7 @@ import { registerAdminSkillRoutes } from "./http/admin-skills.js";
 import { registerAdminJobRoutes } from "./http/admin-jobs.js";
 import { registerAdminChannelRoutes } from "./http/admin-channels.js";
 import { registerAdminHomeContentRoutes } from "./http/admin-home-content.js";
+import { registerAdminStorageRoutes } from "./http/admin-storage.js";
 import { createAdminOverviewService } from "./features/admin/admin-overview-service.js";
 import { createAdminAccessService } from "./features/admin/admin-access-service.js";
 import { createAdminUserService } from "./features/admin/admin-user-service.js";
@@ -175,6 +176,7 @@ import { createAdminSkillService } from "./features/admin/admin-skill-service.js
 import { createAdminJobService } from "./features/admin/admin-job-service.js";
 import { createAdminChannelService } from "./features/admin/admin-channel-service.js";
 import { createAdminHomeContentService } from "./features/admin/admin-home-content-service.js";
+import { createAdminStorageService } from "./features/admin/admin-storage-service.js";
 import {
   finalizeTerminalImageJobPlaceholder,
   finalizeTerminalVideoJobPlaceholder,
@@ -824,6 +826,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   void registerAdminHomeContentRoutes(app, {
     auth,
     adminHomeContentService: createAdminHomeContentService({ getAdminClient }),
+  });
+  // Storage health: occupancy, orphan candidates (with the authoritative verdict for
+  // the page), the deletion/GC queues, the biggest objects, and a purge that reuses
+  // the existing orphan pipeline instead of removing rows on its own authority.
+  void registerAdminStorageRoutes(app, {
+    auth,
+    adminStorageService: createAdminStorageService({ getAdminClient }),
   });
 
   // Payment routes — only registered when Lemon Squeezy is configured
