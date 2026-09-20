@@ -82,7 +82,7 @@ describe("image job canvas finalization", () => {
   });
 
   it("does not resurrect a chat card whose placeholder the user deleted via edit", async () => {
-    const { admin, chatUpdate, update } = createAdmin();
+    const { admin, chatUpdate, update, upsert } = createAdmin();
     // The "edit and resend" path deleted the placeholder, so the scoped update
     // matches nothing. The canvas result must still be recorded.
     chatUpdate.mockImplementationOnce(() => ({
@@ -95,7 +95,47 @@ describe("image job canvas finalization", () => {
     expect(update).toHaveBeenCalledWith(expect.objectContaining({
       result: expect.objectContaining({ chat_finalized_at: expect.any(String) }),
     }));
+    // A discarded turn must not gain a new bubble either: appending here would put
+    // the attempt the user threw away back in front of them.
+    expect(upsert).not.toHaveBeenCalled();
   });
+
+  // Reproduced by a 2026-09-20 simulated user: the job had already succeeded and
+  // the canvas already carried the image, yet the closing line the user read was
+  // still "正在生成中…出图后告诉你". The card is rewritten in place — it keeps its
+  // submission-time position — so only a message created now can be the last line.
+  it("appends a success notice carrying the source pixel size so the promise is not the last line", async () => {
+    insertImageElement.mockResolvedValue({ elementId: "element-4", inserted: true });
+    const { admin, upsert } = createAdmin();
+    const job = {
+      ...successfulJob,
+      session_id: "session-1",
+      result: { ...successfulJob.result, signed_url: "https://example.com/generated.png" },
+    };
+
+    await finalizeImageJobToCanvas(admin as never, job as never);
+
+    // The canvas element only knows its display frame (a 880×1184 render sits in a
+    // 381×512 frame); the job receipt is where the real pixel size is authoritative.
+    const notice = "图片已生成并放入画布：Logo（原始像素 1024×1024）。";
+    expect(upsert).toHaveBeenCalledExactlyOnceWith({
+      id: expect.any(String),
+      session_id: "session-1",
+      role: "assistant",
+      content: notice,
+      content_blocks: [{ type: "text", text: notice }],
+    }, { onConflict: "id" });
+    const noticeIds = () => (upsert.mock.calls as unknown[][]).map(call => (call[0] as { id: string }).id);
+    expect(noticeIds()[0]).not.toBe("job-1");
+
+    // Derived from the job id, so a recovery replay rewrites the same row instead
+    // of leaving two success notices in the session.
+    const firstId = noticeIds()[0];
+    upsert.mockClear();
+    await finalizeImageJobToCanvas(admin as never, job as never);
+    expect(noticeIds()[0]).toBe(firstId);
+  });
+
   beforeEach(() => {
     insertImageElement.mockReset();
     markImageGenerationPlaceholderFailed.mockReset();
@@ -682,6 +722,46 @@ describe("image job canvas finalization", () => {
     );
   });
 
+  // The design path has the same successful-outcome gap as the canvas path, so it
+  // must not be fixed in only one of the two branches.
+  it("appends the design success outcome carrying the source pixel size", async () => {
+    const { admin, upsert } = createAdmin();
+    const finalized = await finalizeDesignImageJobChat(
+      admin as never,
+      {
+        ...successfulJob,
+        canvas_id: null,
+        target_kind: "design",
+        design_id: "20000000-0000-4000-8000-000000000001",
+        session_id: "session-1",
+        result: {
+          ...successfulJob.result,
+          signed_url: "https://example.com/design-image.png",
+        },
+      } as never,
+      {
+        status: "completed",
+        result: {
+          design_id: "20000000-0000-4000-8000-000000000001",
+          object_id: "30000000-0000-4000-8000-000000000001",
+          revision: 4,
+        },
+      } as never,
+    );
+
+    expect(finalized).toBe(true);
+    const notice = "图片生成完成（原始像素 1024×1024）。";
+    const appended = (upsert.mock.calls as unknown[][])
+      .map(call => call[0] as { id: string })
+      .find(entry => entry.id !== "job-1");
+    expect(appended).toMatchObject({
+      session_id: "session-1",
+      role: "assistant",
+      content: notice,
+      content_blocks: [{ type: "text", text: notice }],
+    });
+  });
+
   it.each(["needs_attention", "failed"] as const)(
     "persists a truthful terminal chat card when design delivery is %s",
     async (status) => {
@@ -876,7 +956,10 @@ describe("image job canvas finalization", () => {
       "loomic_recoverable_design_image_chats",
       { p_limit: 100 },
     );
-    expect(upsert).toHaveBeenCalledTimes(1);
+    // Two writes per recovered design job: the card (keyed by the job id, so it
+    // keeps its submission-time position) and the appended notice that makes the
+    // real outcome the newest line instead of leaving the optimistic promise last.
+    expect(upsert).toHaveBeenCalledTimes(2);
   });
 });
 

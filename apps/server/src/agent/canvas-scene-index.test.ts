@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { buildCanvasSceneIndex, queryCanvasScene, renderCanvasSceneContext } from "./canvas-scene-index.js";
+import {
+  CANVAS_FRAME_DIMENSION_NOTE,
+  CANVAS_ORDER_NOTE,
+  buildCanvasSceneIndex,
+  compactSceneEntry,
+  queryCanvasScene,
+  renderCanvasSceneContext,
+  type CanvasSceneIndex,
+} from "./canvas-scene-index.js";
 
 const element = (id: string, index: number, extra: Record<string, unknown> = {}) => ({
   id, type: "rectangle", x: -500 + index * 20, y: -200 + (index % 7) * 100,
@@ -112,5 +120,48 @@ describe("canvas scene index", () => {
     const changed = buildCanvasSceneIndex([...index.entries.map(entry => entry.raw), element("new", 20)]);
     expect(queryCanvasScene(changed, { types: ["rectangle"], limit: 5, cursor: first.nextCursor! }))
       .toMatchObject({ error: "canvas_revision_changed" });
+  });
+
+  it("names the canvas display frame instead of leaving a bare width/height beside an image", () => {
+    // The defect: a generated 880x1184 PNG sits in a 381x512 Excalidraw frame,
+    // and a status answer reported the frame as the image's "实际像素".
+    const index = buildCanvasSceneIndex([
+      element("poster", 0, { type: "image", x: 80, y: 80, width: 381, height: 512,
+        customData: { assetId: "70000000-0000-4000-8000-000000000010" } }),
+    ]);
+    const compact = compactSceneEntry(index.entries[0]!);
+    expect(compact).toMatchObject({ canvas_index: 0, canvas_frame_width: 381, canvas_frame_height: 512 });
+    expect(compact).not.toHaveProperty("width");
+    expect(compact).not.toHaveProperty("height");
+    const context = renderCanvasSceneContext(index)!;
+    expect(context).toContain("canvasIndex=0");
+    expect(context).toContain("canvasFrame=381x512");
+    // The two semantics lines must survive even a tight character budget,
+    // because they are exactly what the wrong answer omitted.
+    expect(context).toContain(CANVAS_FRAME_DIMENSION_NOTE);
+    expect(context).toContain(CANVAS_ORDER_NOTE);
+    expect(renderCanvasSceneContext(index, [], 800)).toContain(CANVAS_FRAME_DIMENSION_NOTE);
+  });
+
+  it("returns the identical canvas order for two reads of the same scene, including same-size images", () => {
+    // Two 512x512 squares once came back reversed between reads: one surface
+    // listed canvas order and another listed recency. Canvas order is now the
+    // single documented order, so a repeated read cannot reshuffle them.
+    const scene = [
+      element("poster", 0, { type: "image", x: 80, y: 80, width: 381, height: 512, customData: { assetId: "asset-poster" } }),
+      element("square-first", 1, { type: "image", x: 501, y: 80, width: 512, height: 512, customData: { assetId: "asset-first" } }),
+      element("square-edit", 2, { type: "image", x: 1_053, y: 80, width: 512, height: 512, customData: { assetId: "asset-edit" } }),
+    ];
+    const order = (index: CanvasSceneIndex) => {
+      const page = queryCanvasScene(index, { types: ["image"] });
+      if (!("entries" in page)) throw new Error("expected an image page");
+      return page.entries.map(entry => `${entry.ordinal}:${entry.id}`);
+    };
+    const first = buildCanvasSceneIndex(scene);
+    const second = buildCanvasSceneIndex(scene.map(item => ({ ...item })));
+    expect(order(first)).toEqual(["0:poster", "1:square-first", "2:square-edit"]);
+    expect(order(second)).toEqual(order(first));
+    expect(second.entries.map(entry => entry.id)).toEqual(first.entries.map(entry => entry.id));
+    expect(renderCanvasSceneContext(second)).toBe(renderCanvasSceneContext(first));
   });
 });

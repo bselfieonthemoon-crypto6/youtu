@@ -3,6 +3,8 @@ import sharp from "sharp";
 
 import type { MastraImageSubmitContext } from "./mastra-image-tool.js";
 import { createMastraImageEditTool, createMastraImageTool, createMastraImageTools } from "./mastra-image-tool.js";
+import { createMastraImageSourceGrounder } from "./mastra-image-source-grounding.js";
+import type { MastraImageSourceReviewer } from "./mastra-image-source-grounding.js";
 import { MastraImagePreflightError } from "./mastra-image-jobs.js";
 import { SESSION_REFUSED_OUTPUTS_KEY, SESSION_UNFINISHED_MAX_ITEMS } from "./session-design-context.js";
 import { toolExecutionContext } from "./tools/tool-run-context.js";
@@ -541,10 +543,48 @@ describe("Mastra direct image tool", () => {
     const groundSources = vi.fn(async () => ({ decision: "recoverable" as const,
       code: "source_grounding_ambiguous" as const, summary: "请明确参考图", authorizationGranted: false as const }));
     const f = fixture({ groundSources });
-    await expect(f.generate.execute({ title: "横幅", prompt: "参考刚才图片" }, toolExecutionContext(baseConfig)))
+    // Its own run context: a grounding refusal is recorded as unfinished work now,
+    // and `baseConfig.configurable` is shared by every test in this file.
+    const configurable: Record<string, unknown> = { ...baseConfig.configurable };
+    await expect(f.generate.execute({ title: "横幅", prompt: "参考刚才图片" }, toolExecutionContext({ ...baseConfig, configurable })))
       .resolves.toMatchObject({ status: "failed", error: "source_grounding_ambiguous" });
     expect(f.submit).not.toHaveBeenCalled();
     expect(groundSources).toHaveBeenCalledOnce();
+  });
+
+  it("submits the second same-run zero-source image from the run's frozen verdict", async () => {
+    // One user request, two generate_image calls in the same run: the reviewer is
+    // asked once. A second invocation would have answered "ambiguous" — exactly
+    // the verdict that stalled the two-image series — so the tool must never reach
+    // it again for the same run+manifest.
+    let reviewCalls = 0;
+    const reviewer = vi.fn(async (input: Parameters<MastraImageSourceReviewer>[0]) => {
+      reviewCalls += 1;
+      return reviewCalls === 1
+        ? { decision: "independent" as const, manifestDigest: input.manifestDigest,
+          reasonCode: "explicit_independent" as const }
+        : { decision: "ambiguous" as const, manifestDigest: input.manifestDigest, candidateKeys: ["source-1"],
+          reasonCode: "insufficient_context" as const };
+    });
+    const groundSources = createMastraImageSourceGrounder({
+      currentRequest: { sourceId: "message-series", text: "生成两张宣传图", provenance: "current_user" },
+      effectiveBrief: [],
+      // The unrelated canvas material that made the real run's second call look
+      // like it needed a source.
+      candidates: [{ candidateKey: "source-1", assetId, provenance: ["live_canvas_image"], title: "香薰机素材" }],
+      reviewer, materialize: async () => [],
+    });
+    const submit = vi.fn(async () => ({ jobId: "job", status: "processing" as const }));
+    const tools = directTool(createMastraImageTools({ createUserClient: vi.fn(), submitter: { submit },
+      availableImageModels: models, currentUserMessage: { runId: "run", text: "生成两张宣传图" }, groundSources }));
+    const config = { ...baseConfig, configurable: { ...baseConfig.configurable, user_prompt: "生成两张宣传图" } };
+
+    await expect(tools.generateImage.execute({ title: "新品主视觉", prompt: "hero" }, toolExecutionContext(config)))
+      .resolves.toMatchObject({ status: "processing" });
+    await expect(tools.generateImage.execute({ title: "日常场景", prompt: "lifestyle" }, toolExecutionContext(config)))
+      .resolves.toMatchObject({ status: "processing" });
+    expect(submit).toHaveBeenCalledTimes(2);
+    expect(reviewCalls).toBe(1);
   });
 
   it("reselects Auto after a square generation gains references, without overriding explicit choices", async () => {
@@ -714,7 +754,11 @@ describe("pre-submission refusal marking", () => {
     // Trusted source grounding could not decide.
     const grounding = fixture({ groundSources: async () => ({ decision: "recoverable" as const,
       code: "source_grounding_ambiguous" as const, summary: "请明确参考图", authorizationGranted: false as const }) });
-    expect(await grounding.generate.execute({ title: "横幅", prompt: "参考刚才图片" }, toolExecutionContext(baseConfig)))
+    // Its own run context: a grounding refusal is recorded as unfinished work now,
+    // and `baseConfig.configurable` is shared by every test in this file.
+    const groundingConfigurable: Record<string, unknown> = { ...baseConfig.configurable };
+    expect(await grounding.generate.execute({ title: "横幅", prompt: "参考刚才图片" },
+      toolExecutionContext({ ...baseConfig, configurable: groundingConfigurable })))
       .toMatchObject({ status: "failed", error: "source_grounding_ambiguous", refused: true });
 
     // The selected canvas source contradicts the explicit source set.
@@ -874,5 +918,24 @@ describe("unfinished work recorded for the next continuation turn", () => {
       toolExecutionContext({ ...baseConfig, configurable })))
       .toMatchObject({ refused: true });
     expect(configurable[SESSION_REFUSED_OUTPUTS_KEY]).toBeUndefined();
+  });
+
+  it("records a grounding refusal as unfinished work, so a stalled series member survives the turn", async () => {
+    // A source-ambiguous refusal created nothing, so the member it refused is
+    // still owed. Without this record the model cannot know it: it never sees a
+    // prior turn's tool results, so a series that stalled mid-run used to vanish.
+    const configurable: Record<string, unknown> = { ...baseConfig.configurable, user_prompt: "生成两张宣传图" };
+    const f = fixture({ currentUserText: "生成两张宣传图", groundSources: async () => ({ decision: "recoverable" as const,
+      code: "source_grounding_ambiguous" as const, summary: "请明确参考图", authorizationGranted: false as const }) });
+    expect(await f.generate.execute({ title: "日常场景", prompt: "lifestyle 4:5" },
+      toolExecutionContext({ ...baseConfig, configurable })))
+      .toMatchObject({ status: "failed", error: "source_grounding_ambiguous", refused: true });
+
+    const recorded = configurable[SESSION_REFUSED_OUTPUTS_KEY] as Array<{ title: string; prompt: string; operation: string }>;
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]).toMatchObject({ title: "日常场景", prompt: "lifestyle 4:5", operation: "generate" });
+    expect(f.submit).not.toHaveBeenCalled();
+    // Progress state only: recording a missing output is never a design write.
+    expect(configurable.session_design_write_run_id).toBeUndefined();
   });
 });

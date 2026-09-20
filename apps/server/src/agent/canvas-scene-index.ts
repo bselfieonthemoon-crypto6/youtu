@@ -4,12 +4,29 @@ export type CanvasSceneElement = Record<string, unknown>;
 export type CanvasSceneBounds = { minX: number; minY: number; maxX: number; maxY: number };
 export type CanvasSceneRelation = { kind: string; targetId: string };
 export type CanvasSceneIndexEntry = {
+  /**
+   * Stable canvas order: the element's zero-based position in the canvas
+   * document's own element array. Every model-facing surface lists and refers
+   * to elements by this value, so the same scene always produces the same
+   * order. Two same-size square images were once reported in reversed order
+   * because one surface listed the canvas array and another listed recency
+   * with no shared ordinal to join them on.
+   */
   ordinal: number;
   id: string;
   type: string;
   logicalType: string;
   x: number;
   y: number;
+  /**
+   * CANVAS DISPLAY FRAME — never the source image's pixel size.
+   *
+   * Both come from the Excalidraw element, so a generated 880x1184 PNG is
+   * carried by a 381x512 frame. A status answer once reported that frame as
+   * "实际像素". The real pixels exist only on the job receipt
+   * (`background_jobs.result.width/height`); `public.asset_objects` has no
+   * width/height columns and the canvas document never stores them.
+   */
   width: number;
   height: number;
   text?: string;
@@ -79,6 +96,26 @@ const MAX_ID = 200;
 const MAX_RELATIONS_PER_ELEMENT = 100;
 const MAX_REGION_SAMPLES = 4;
 const GRID_SIZE = 4;
+
+/**
+ * The one order every canvas listing uses, and the label that says so.
+ *
+ * These two notes travel with every rendered/JSON canvas observation because
+ * both defects they prevent were silent: a status answer reported an element's
+ * 381x512 display frame as the 880x1184 PNG's "实际像素", and reversed two
+ * same-size square images because nothing stated which order it was listing.
+ */
+export const CANVAS_FRAME_DIMENSION_NOTE = "Dimension note: canvas_frame_width/height (canvasFrame=) is the element's CANVAS DISPLAY FRAME on the canvas, not the image's 原始像素 (source pixel size); source pixels are only on the generation job receipt (background_jobs.result.width/height, surfaced as recentJobs[].sourcePixelWidth/Height) or the chat card image artifact.";
+export const CANVAS_ORDER_NOTE = "Order note: entries are in canvas order, ascending canvas_index (the element's position in the canvas document), deterministic and identical across repeated reads.";
+
+/**
+ * Explicit, documented canvas order. Exported so every listing surface (scene
+ * context, queries, related-image candidates) shares one comparator instead of
+ * inventing a second order that could disagree with this one.
+ */
+export function compareCanvasOrder(left: { ordinal: number }, right: { ordinal: number }) {
+  return left.ordinal - right.ordinal;
+}
 
 function record(value: unknown): CanvasSceneElement | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -284,7 +321,7 @@ export function queryCanvasScene(index: CanvasSceneIndex, query: CanvasSceneQuer
     && (!query.types?.length || query.types.includes(entry.logicalType))
     && (!query.region || overlaps(entry, query.region))
     && (!text || [entry.text, entry.title, entry.name, entry.role].some(value => value?.toLocaleLowerCase().includes(text))));
-  matches = matches.sort((a, b) => Number(selected.has(b.id)) - Number(selected.has(a.id)) || a.ordinal - b.ordinal);
+  matches = matches.sort((a, b) => Number(selected.has(b.id)) - Number(selected.has(a.id)) || compareCanvasOrder(a, b));
   const offset = decoded?.offset ?? 0;
   const limit = Math.min(100, Math.max(1, Math.floor(query.limit ?? 40)));
   const page = matches.slice(offset, offset + limit);
@@ -298,8 +335,15 @@ export function queryCanvasScene(index: CanvasSceneIndex, query: CanvasSceneQuer
 }
 
 export function compactSceneEntry(entry: CanvasSceneIndexEntry) {
-  const { raw: _raw, ordinal: _ordinal, ...rest } = entry;
+  const { raw: _raw, ordinal, width, height, ...rest } = entry;
   return { ...rest,
+    // Both fields are renamed rather than merely documented: the model reads
+    // this JSON, and a bare `width`/`height` beside an image id is exactly what
+    // got reported as the source PNG's pixel size. `canvas_index` is the stable
+    // ordinal a later observation can be joined and re-ordered against.
+    canvas_index: ordinal,
+    canvas_frame_width: width,
+    canvas_frame_height: height,
     ...(rest.text && rest.text.length > 240 ? { text: rest.text.slice(0, 237) + "..." } : {}),
     bindings: rest.bindings.slice(0, 20),
   };
@@ -316,9 +360,14 @@ export function renderCanvasSceneContext(
   const representatives = index.entries
     .filter(entry => (selected.has(entry.id) || index.regions.some(region => region.sampleElementIds.includes(entry.id)))
       && (!options.omitImageRepresentativeDetails || entry.logicalType !== "image"))
-    .sort((a, b) => Number(selected.has(b.id)) - Number(selected.has(a.id)) || a.ordinal - b.ordinal);
+    .sort((a, b) => Number(selected.has(b.id)) - Number(selected.has(a.id)) || compareCanvasOrder(a, b));
   const coverageLine = `Coverage: globalMapComplete=${index.coverage.complete}; detailTruncated=${representatives.length < index.coverage.indexedCount}; use inspect_canvas with filters and revision-bound cursor to page every matching element.`;
-  const bodyLimit = Math.max(0, maxCharacters - coverageLine.length - 1);
+  // The two semantic notes ride the always-present tail, like `coverageLine`:
+  // they are the fact a status answer got wrong, so a tight budget must drop
+  // regions or representatives rather than the sentence that says what a
+  // width/height is and which order the entries are in.
+  const notes = `${CANVAS_FRAME_DIMENSION_NOTE}\n${CANVAS_ORDER_NOTE}\n${coverageLine}`;
+  const bodyLimit = Math.max(0, maxCharacters - notes.length - 1);
   const lines = [
     `Canvas scene index revision=${index.revision.slice(0, 16)} raw=${index.coverage.rawCount} live=${index.coverage.liveCount} indexed=${index.coverage.indexedCount} deleted=${index.coverage.deletedCount} malformed=${index.coverage.malformedCount} duplicateIds=${index.coverage.duplicateIdCount}`,
     `Global bounds (${Math.round(index.bounds.minX)},${Math.round(index.bounds.minY)})→(${Math.round(index.bounds.maxX)},${Math.round(index.bounds.maxY)}); regions=${index.regions.length}; relationEdges=${index.coverage.relationCount}; dangling=${index.coverage.danglingRelationCount}`,
@@ -328,9 +377,9 @@ export function renderCanvasSceneContext(
   for (const entry of representatives) {
     const relation = [entry.frameId ? `frame=${entry.frameId}` : "", entry.containerId ? `container=${entry.containerId}` : "",
       entry.groupIds.length ? `groups=${entry.groupIds.join(",")}` : "", entry.bindings.length ? `links=${entry.bindings.map(link => `${link.kind}:${link.targetId}`).join(",")}` : ""].filter(Boolean).join(" ");
-    lines.push(`${selected.has(entry.id) ? "SELECTED " : ""}${entry.logicalType}#${entry.id} @(${Math.round(entry.x)},${Math.round(entry.y)}) ${Math.round(entry.width)}x${Math.round(entry.height)}${entry.assetId ? ` assetId=${entry.assetId}` : ""}${entry.generationStatus ? ` generationStatus=${entry.generationStatus}${entry.generationJobId ? ` jobId=${entry.generationJobId}` : ""}` : ""}${entry.text ? ` text=${JSON.stringify(entry.text.slice(0, 160))}` : ""}${relation ? ` ${relation}` : ""}`);
+    lines.push(`${selected.has(entry.id) ? "SELECTED " : ""}${entry.logicalType}#${entry.id} canvasIndex=${entry.ordinal} @(${Math.round(entry.x)},${Math.round(entry.y)}) canvasFrame=${Math.round(entry.width)}x${Math.round(entry.height)}${entry.assetId ? ` assetId=${entry.assetId}` : ""}${entry.generationStatus ? ` generationStatus=${entry.generationStatus}${entry.generationJobId ? ` jobId=${entry.generationJobId}` : ""}` : ""}${entry.text ? ` text=${JSON.stringify(entry.text.slice(0, 160))}` : ""}${relation ? ` ${relation}` : ""}`);
     if (lines.join("\n").length > bodyLimit) { lines.pop(); break; }
   }
   const body = lines.join("\n").slice(0, bodyLimit);
-  return body ? `${body}\n${coverageLine}` : coverageLine.slice(0, maxCharacters);
+  return body ? `${body}\n${notes}` : notes.slice(0, maxCharacters);
 }

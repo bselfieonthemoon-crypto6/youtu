@@ -24,6 +24,21 @@ describe("Mastra runtime context policy", () => {
     });
   });
 
+  it("carries an image's real pixels and its canvas element on the receipt, never onto the frame", () => {
+    // The receipt is the only authority for source pixels: asset_objects has no
+    // dimensions and the canvas element only holds the 381x512 display frame of
+    // this 880x1184 PNG, which a status answer once reported as "实际像素".
+    const receipt = projectMastraImageReceipt({
+      id: first, status: "succeeded", model: "workspace:nano",
+      result: { asset_id: second, width: 880, height: 1_184, canvas_element_id: "000fba30-7066-4b11-a1c0-a6af26b3ad6b" },
+    }, []);
+    expect(receipt).toMatchObject({ assetId: second, sourcePixelWidth: 880, sourcePixelHeight: 1_184,
+      canvasElementId: "000fba30-7066-4b11-a1c0-a6af26b3ad6b" });
+    // A receipt with no result (failed or in flight) must not claim dimensions.
+    expect(projectMastraImageReceipt({ id: second, status: "running" }, []))
+      .not.toHaveProperty("sourcePixelWidth");
+  });
+
   it("derives the history byte ceiling from the current model budget", () => {
     const budget = createContextBudget(undefined, "lean-expandable");
     const limits = resolveMastraHistoryLimits(budget);

@@ -1,5 +1,7 @@
 import { z } from "zod";
 import {
+  CANVAS_FRAME_DIMENSION_NOTE,
+  CANVAS_ORDER_NOTE,
   buildCanvasSceneIndex,
   compactSceneEntry,
   queryCanvasScene,
@@ -59,7 +61,7 @@ export function buildCanvasSummaryForContext(
 export function createInspectCanvasTool(deps: { createUserClient: (accessToken: string) => any }) {
   return createAgentTool({
     id: "inspect_canvas",
-    description: "Inspect a revision-bound global index of the current infinite canvas. Every response states source coverage, malformed/duplicate facts, global spatial regions and pagination truncation. Query all live elements safely by exact ID, text, type, group or finite region; follow nextCursor without changing filters. A cursor fails if the canvas revision changes, preventing mixed snapshots. Selected elements can be prioritized but selection is read-only evidence, not write permission.",
+    description: "Inspect a revision-bound global index of the current infinite canvas. Every response states source coverage, malformed/duplicate facts, global spatial regions and pagination truncation. Query all live elements safely by exact ID, text, type, group or finite region; follow nextCursor without changing filters. A cursor fails if the canvas revision changes, preventing mixed snapshots. Selected elements can be prioritized but selection is read-only evidence, not write permission. Elements are always returned in stable canvas order (canvas_index); canvas_frame_width/height is the canvas display frame, never an image's source pixel size — read dimensions.note for where the real pixels come from.",
     inputSchema: inspectCanvasSchema,
     execute: async (input, context) => {
     const runContext = runContextOf(context);
@@ -101,6 +103,11 @@ export function createInspectCanvasTool(deps: { createUserClient: (accessToken: 
       canvas_revision: Number.isSafeInteger(data.revision) && data.revision >= 0 ? data.revision : null,
       revisionUsage: "canvas_revision is the database integer for expected_canvas_revision in write tools; revision is only the scene pagination fingerprint.",
       coverage: index.coverage,
+      // A status answer reported an element's canvas display frame (381x512) as
+      // an 880x1184 PNG's "实际像素". The canvas document cannot answer that
+      // question, so every response states what its numbers mean and where the
+      // real pixels live instead of leaving `width`/`height` to be guessed at.
+      dimensions: { note: CANVAS_FRAME_DIMENSION_NOTE, order: CANVAS_ORDER_NOTE },
       duplicateIds: index.duplicateIds.slice(0, 50), danglingRelations: index.danglingRelations,
       globalMap: { bounds: index.bounds, regions: index.regions },
       query: { matchedCount: result.matchedCount, returnedCount: result.returnedCount,

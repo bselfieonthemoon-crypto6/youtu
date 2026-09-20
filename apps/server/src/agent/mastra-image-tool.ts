@@ -350,8 +350,18 @@ function createMastraImageSubmissionTool(input: MastraImageToolDependencies, mod
         return refusal("source_grounding_unavailable",
           "当前候选参考来源暂时无法核验，未提交图片生成；请稍后重试或明确指定参考图。");
       }
-      if (grounding.decision === "recoverable")
+      if (grounding.decision === "recoverable") {
+        // A grounding refusal created nothing and charged nothing, so the output
+        // it refused is genuinely MISSING. Record it like every other
+        // pre-submission refusal: a series that stalls in the middle would
+        // otherwise vanish, because the model never sees a prior turn's tool
+        // results and the next "继续" cannot know which member is still owed.
+        // Progress state only — the next turn re-binds every source on its own.
+        recordRefusedOutput(configurable, { title: normalized.title, prompt: normalized.prompt,
+          operation: normalized.operation,
+          ...(typeof proposalArgs.aspectRatio === "string" ? { aspectRatio: proposalArgs.aspectRatio } : {}) });
         return refusal(grounding.code, grounding.summary);
+      }
       if (grounding.decision === "bind") {
         // The runtime materializes every source after RLS/lineage checks. Keep
         // a structural fence here so a faulty integration cannot inject a URL.

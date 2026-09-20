@@ -191,22 +191,50 @@ export function createMastraImageSourceGrounder(input: {
   // This grounder is created for one runtime request. Retain only a few
   // validated reviewer decisions, never materialized inputs or failures.
   const reviewerDecisionCache = new Map<string, MastraImageSourceReviewerDecision>();
+  // A review that is still running is SHARED, not duplicated. A series submitted
+  // as several calls in one model step reaches this grounder about 10ms apart;
+  // without this map the second call would start its own review against the same
+  // pre-run manifest and could reach a different verdict about the same request.
+  // Both callers live in the same run, so the caller signal and its abort
+  // behaviour are unchanged.
+  const reviewerReviewInFlight = new Map<string, Promise<MastraImageSourceReviewerDecision | undefined>>();
   const timeoutMs = Math.min(15_000, Math.max(20, Math.floor(input.timeoutMs ?? 8_000)));
 
   return async ({ context, proposal }) => {
     if (!candidates.length) return { decision: "independent", authorizationGranted: false };
+    // The reviewer answers exactly one question — does the CURRENT USER REQUEST
+    // require one of the listed candidates — and that answer belongs to this
+    // turn's frozen request + manifest, not to one proposal. The key therefore
+    // deliberately excludes `proposal`: every later zero-source call in the SAME
+    // run reuses the verdict the run already reached instead of re-litigating it
+    // per call, which is how a same-step pair used to diverge into a mid-series
+    // stall. A different run (or a different manifest) still reviews separately.
     const key = digest({ userId: context.userId, workspaceId: context.workspaceId, sessionId: context.sessionId,
-      canvasId: context.canvasId, runId: context.runId, proposal, manifestDigest });
+      canvasId: context.canvasId, runId: context.runId, manifestDigest });
     let review = reviewerDecisionCache.get(key);
     if (review) {
       // Map insertion order provides a tiny LRU cache without retaining prior
-      // runs or unbounded proposal variants.
+      // runs or unbounded variants.
       reviewerDecisionCache.delete(key);
       reviewerDecisionCache.set(key, review);
     } else {
-      review = await resolveReviewerDecision({ context, proposal, manifestDigest, currentRequest, effectiveBrief,
-        reviewerCandidates, byKey, evidenceById, reviewer: input.reviewer, timeoutMs });
-      if (review) setBoundedReviewerDecision(reviewerDecisionCache, key, review);
+      // The check-and-set below is synchronous, so two concurrent calls can never
+      // both create a review for the same key.
+      let pending = reviewerReviewInFlight.get(key);
+      if (!pending) {
+        pending = resolveReviewerDecision({ context, proposal, manifestDigest, currentRequest, effectiveBrief,
+          reviewerCandidates, byKey, evidenceById, reviewer: input.reviewer, timeoutMs })
+          .then(decision => {
+            // Only a validated decision becomes a reusable verdict. A failure,
+            // timeout or unusable reviewer reply (`undefined`) is never retained,
+            // so the next call still reaches the reviewer.
+            if (decision) setBoundedReviewerDecision(reviewerDecisionCache, key, decision);
+            return decision;
+          })
+          .finally(() => { reviewerReviewInFlight.delete(key); });
+        reviewerReviewInFlight.set(key, pending);
+      }
+      review = await pending;
     }
     if (review?.decision === "bind" && requiredSourceAssetId && !review.selected.some(candidate =>
       candidate.assetId === requiredSourceAssetId)) return ambiguous();

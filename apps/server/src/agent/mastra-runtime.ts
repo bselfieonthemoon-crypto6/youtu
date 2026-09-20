@@ -92,7 +92,25 @@ export const MASTRA_RECENT_IMAGE_JOB_PROJECTION = "id,status,result,error_code,e
 export function projectMastraImageReceipt(job: any, images: readonly { id: string; upstreamModelId?: string }[]) {
   const errorCode = typeof job.error_code === "string" ? job.error_code : undefined;
   const errorLabel = providerFailureDescription(errorCode);
-  return { id: job.id, status: job.status, assetId: job.result?.asset_id,
+  const result = job.result && typeof job.result === "object" && !Array.isArray(job.result)
+    ? job.result as Record<string, unknown> : undefined;
+  const sourcePixels = (key: "width" | "height") => {
+    const value = result?.[key];
+    return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
+  };
+  const sourcePixelWidth = sourcePixels("width");
+  const sourcePixelHeight = sourcePixels("height");
+  const canvasElementId = typeof result?.canvas_element_id === "string" ? result.canvas_element_id : undefined;
+  return { id: job.id, status: job.status, assetId: result?.asset_id,
+    // The receipt is the ONLY place an image's real pixel size exists:
+    // `asset_objects` has no width/height columns and a canvas element stores
+    // the display frame, so a status answer once reported a 381x512 frame as an
+    // 880x1184 PNG's "实际像素". Both the real pixels and the canvas element
+    // that carries them are named here, so the answer can be joined to a scene
+    // observation without guessing.
+    ...(sourcePixelWidth !== undefined ? { sourcePixelWidth } : {}),
+    ...(sourcePixelHeight !== undefined ? { sourcePixelHeight } : {}),
+    ...(canvasElementId ? { canvasElementId } : {}),
     actualSubmittedModel: job.model,
     actualSubmittedUpstreamModel: job.result?.upstream_model ?? images.find(item => item.id === job.model)?.upstreamModelId,
     requestedAspectRatio: job.aspectRatio,

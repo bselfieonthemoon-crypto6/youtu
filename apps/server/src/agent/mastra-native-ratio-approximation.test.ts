@@ -138,6 +138,26 @@ describe("Mastra native ratio approximation", () => {
     }));
   });
 
+  // Boundary case from the 2026-09-20 simulated-user campaign. The harness could
+  // not submit 320:70 at all — the UI preference's `aspectRatio` is a closed enum
+  // of presets — which left "320×70" unverified and easy to misread as "the Agent
+  // cannot do it". The real path is the request TEXT: 320:70 is 4.571:1, above the
+  // 3:1 ceiling this path may submit, so the nearest legal ratio is 3:1 and the
+  // deviation must be disclosed instead of promising exact pixels.
+  it("substitutes 3:1 for an out-of-range 320×70 target stated in the request text", async () => {
+    const f = fixture();
+    const result = await f.generate.execute({ title: "Banner", prompt: "blue banner", model: native.id,
+      aspectRatio: "3:1", aspectRatioIntent: "approximate" }, toolExecutionContext({ signal,
+      configurable: { ...configurable, user_prompt: "做一张 320×70 的横幅，尺寸差不多就好",
+        nonstandard_size_skill_loaded_run_id: "run" } }));
+    expect(result).toMatchObject({ status: "processing", actualQuality: "Low", actualResolution: "1K",
+      approximateSizePlan: { target: { width: 320, height: 70 }, aspectRatio: "3:1", substituted: true } });
+    expect(result.summary).toContain("计划比例偏差约");
+    expect(f.submit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      aspectRatio: "3:1", quality: "standard", resolution: "1k",
+    }));
+  });
+
   it("does not let a loaded marker replace an exact request or authorize an arbitrary ratio", async () => {
     for (const [prompt, aspectRatio] of [["做一张 656:176 的图，必须精确", "3:1"],
       [configurable.user_prompt, "2:1"]] as const) {

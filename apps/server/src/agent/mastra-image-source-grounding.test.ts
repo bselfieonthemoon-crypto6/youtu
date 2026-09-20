@@ -125,17 +125,69 @@ describe("Mastra image source grounding", () => {
     expect(f.materialize).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps the per-grounder reviewer memo bounded", async () => {
+  it("reviews one verdict per run+manifest and keeps the memo bounded across runs", async () => {
     const reviewer = vi.fn(async input => ({ decision: "independent", manifestDigest: input.manifestDigest,
       reasonCode: "explicit_independent" }));
     const f = grounder(reviewer);
     const proposals = Array.from({ length: 9 }, (_, index) => ({ ...proposal, title: `方案 ${index}` }));
 
+    // Nine zero-source proposals of ONE run ask the same question about the same
+    // frozen request+manifest, so the run answers it once whatever each proposal
+    // says. This is the mid-series fix: a same-step pair used to review twice and
+    // could reach two different verdicts for one user request.
     for (const item of proposals) await f.resolve({ context, proposal: item });
     await f.resolve({ context, proposal: proposals[0]! });
 
-    expect(reviewer).toHaveBeenCalledTimes(10);
+    expect(reviewer).toHaveBeenCalledOnce();
     expect(f.materialize).not.toHaveBeenCalled();
+
+    // Nine DIFFERENT runs still review separately, and the memo stays bounded.
+    const runContexts = Array.from({ length: 9 }, (_, index) => ({ ...context, runId: id(30 + index) }));
+    for (const [index, runContext] of runContexts.entries())
+      await f.resolve({ context: runContext, proposal: proposals[index]! });
+    expect(reviewer).toHaveBeenCalledTimes(10);
+
+    // A run still inside the memo answers from it...
+    await f.resolve({ context: runContexts[8]!, proposal: proposals[0]! });
+    expect(reviewer).toHaveBeenCalledTimes(10);
+    // ...while a run whose entry was evicted is reviewed again instead of
+    // inheriting another run's verdict.
+    await f.resolve({ context: runContexts[0]!, proposal: proposals[0]! });
+    expect(reviewer).toHaveBeenCalledTimes(11);
+  });
+
+  it("shares one in-flight review between two concurrent calls of the same run", async () => {
+    let releaseReview!: () => void;
+    const gate = new Promise<void>(resolve => { releaseReview = resolve; });
+    const reviewer = vi.fn(async (input: Parameters<MastraImageSourceReviewer>[0]) => {
+      await gate;
+      return { decision: "independent" as const, manifestDigest: input.manifestDigest,
+        reasonCode: "explicit_independent" as const };
+    });
+    const f = grounder(reviewer);
+
+    // The reviewer is invoked inside the synchronous part of `resolve`, so both
+    // calls already share ONE invocation before either is awaited.
+    const first = f.resolve({ context, proposal: { ...proposal, title: "新品主视觉" } });
+    const second = f.resolve({ context, proposal: { ...proposal, title: "日常场景" } });
+    expect(reviewer).toHaveBeenCalledOnce();
+
+    releaseReview();
+    await expect(first).resolves.toEqual({ decision: "independent", authorizationGranted: false });
+    await expect(second).resolves.toEqual({ decision: "independent", authorizationGranted: false });
+    expect(reviewer).toHaveBeenCalledOnce();
+    expect(f.materialize).not.toHaveBeenCalled();
+  });
+
+  it("does not leak one run's frozen verdict into another run", async () => {
+    const reviewer = vi.fn(async input => ({ decision: "independent", manifestDigest: input.manifestDigest,
+      reasonCode: "explicit_independent" }));
+    const f = grounder(reviewer);
+
+    await f.resolve({ context, proposal });
+    await f.resolve({ context: { ...context, runId: id(15) }, proposal });
+
+    expect(reviewer).toHaveBeenCalledTimes(2);
   });
 
   it("returns recoverable without materialization for mismatched evidence, ambiguity, errors, and timeout", async () => {
@@ -283,7 +335,7 @@ describe("Mastra image source grounding", () => {
   it("freezes ordered trusted candidates and merges provenance without exposing source IDs as keys", () => {
     const candidates = buildMastraImageSourceCandidates({
       currentAttachments: [],
-      canvasCandidates: [{ elementId: "element-private", assetId, title: "双叶", priority: "selected" }],
+      canvasCandidates: [{ elementId: "element-private", canvasIndex: 0, assetId, title: "双叶", priority: "selected" }],
       recentJobs: [{ id: jobId, status: "succeeded", result: { asset_id: assetId }, title: "最近双叶",
         prompt: "深蓝双叶", createdAt: "2026-09-13T00:00:00.000Z", designId }],
       canvasId, liveDesignIds: new Set([designId]),

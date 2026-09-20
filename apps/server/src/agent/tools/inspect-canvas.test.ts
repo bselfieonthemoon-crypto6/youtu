@@ -105,4 +105,26 @@ describe("inspect_canvas global scene queries", () => {
     expect(output.elements[0]).toMatchObject({ id: "full-0", rawPropertiesTruncated: true });
     expect(JSON.stringify(output).length).toBeLessThan(80_000);
   });
+
+  it("reports canvas images in one stable order and states what their dimensions mean", async () => {
+    // Two same-size squares plus the poster, in the canvas's own document order.
+    const f = fixture([
+      node("poster", 0, { type: "image", x: 80, y: 80, width: 381, height: 512, customData: { assetId: "asset-poster" } }),
+      node("square-first", 1, { type: "image", x: 501, y: 80, width: 512, height: 512, customData: { assetId: "asset-first" } }),
+      node("square-edit", 2, { type: "image", x: 1_053, y: 80, width: 512, height: 512, customData: { assetId: "asset-edit" } }),
+    ]);
+    const read = async () => JSON.parse(await f.tool.execute({ detail_level: "summary", filter_type: ["image"] },
+      toolExecutionContext(f.config))) as { elements: Array<Record<string, unknown>>;
+        dimensions: { note: string; order: string } };
+    const first = await read();
+    const second = await read();
+    expect(first.elements.map(item => item.id)).toEqual(["poster", "square-first", "square-edit"]);
+    expect(second.elements.map(item => item.id)).toEqual(first.elements.map(item => item.id));
+    expect(first.elements[0]).toMatchObject({ canvas_index: 0, canvas_frame_width: 381, canvas_frame_height: 512 });
+    // The bare keys that were read as real pixels are gone from the surface.
+    expect(first.elements[0]).not.toHaveProperty("width");
+    expect(first.dimensions.note).toContain("CANVAS DISPLAY FRAME");
+    expect(first.dimensions.note).toContain("sourcePixelWidth");
+    expect(first.dimensions.order).toContain("canvas order");
+  });
 });

@@ -356,3 +356,65 @@ describe("a question carrying an action verb defers to the model", () => {
     expect(resolution).toMatchObject({ intent: "new_generation", source: "fallback", clamped: false });
   });
 });
+
+describe("a prohibition of the act is not a creation request", () => {
+  // T03/T05/T08 of the 2026-09-20 simulated-user campaign (Luna-C2). Every one of
+  // these turns explicitly closed generation to the assistant, and every one was
+  // published as `new_generation / explicit_creation` with confidence 1 — the
+  // routing notice then told a user who had just declined that a new round had
+  // been chosen. `NEGATION_PATTERN` only knows a marker glued to its verb
+  // ("不要生成"); here the act token sits elsewhere ("不要创建任务",
+  // "不能自行选择或生成", "不要自行猜目标或开始生成").
+  it.each([
+    "我现在传了两张图。你觉得这张和上一张哪个适合当编辑目标？我说“这张”时可能指刚才上传的任意一张；先问我具体是哪一张，不要自行猜目标或开始生成。",
+    "请查一下当前会话的真实任务状态。前面只是讨论方案，没有让我提交生成；如果没有正在运行的任务，请明确回答没有任务，不要创建任务。",
+    "我刚才上传了咖啡杯截图和 Loomic 首页截图。请说一下“上一张”和“这张”各是哪一张；如果我的说法不能确定编辑目标，就先问我，不能自行选择或生成。",
+  ] as const)("keeps a status or clarification turn out of new_generation", prompt => {
+    const assessment = assessDesignTurnIntent({ prompt, mentions: [], activeSkill: null, hasSeries: false,
+      hasAttachments: true });
+    expect(assessment).toMatchObject({ intent: "non_design", reasonCode: "declined_or_hedged",
+      rule: "prohibited_action", needsModel: true });
+    expect(assessment.confidence).toBeLessThan(1);
+  });
+
+  // The clause scope is what keeps the guard from cancelling real work: these
+  // forbid a PROPERTY in a clause that holds no act token, so the request in the
+  // next clause still reads as a confident creation request.
+  it("still reads a directive that forbids one option as a creation request", () => {
+    for (const prompt of ["不要用蓝色，做成红色海报", "不要那种风格，重新做一版海报"]) {
+      expect(classify(prompt), prompt).toBe("new_generation");
+      expect(assessDesignTurnIntent({ prompt, mentions: [], activeSkill: null, hasSeries: false,
+        hasAttachments: false }).rule, prompt).toBe("generation_verb");
+    }
+  });
+
+  // Deliberately NOT clamped like `hedged_negation`: the same clause can forbid one
+  // option inside a request the user really made, and the regex must never be able
+  // to cancel it.
+  it("lets the model publish a creation label for a prohibition it did not clamp", async () => {
+    const resolution = await resolveDesignTurnIntent({
+      prompt: "不要创建新任务，直接做一张红色海报",
+      mentions: [], activeSkill: null, hasSeries: false, signal: new AbortController().signal,
+      classifier: async () => ({ intent: "new_generation" as const, reasonCode: "explicit_creation" as const,
+        confidence: 0.9 }),
+    } as never);
+    expect(resolution).toMatchObject({ intent: "new_generation", source: "model", clamped: false });
+  });
+
+  it("falls back to non_design when no classifier answers", async () => {
+    const resolution = await resolveDesignTurnIntent({
+      prompt: "请查一下状态，不要创建任务", mentions: [], activeSkill: null, hasSeries: false,
+      signal: new AbortController().signal,
+    } as never);
+    expect(resolution).toMatchObject({ intent: "non_design", source: "fallback" });
+  });
+
+  // 哪个 / 哪一张 were missing from the interrogative vocabulary (only 哪些 was
+  // there), so a disambiguation question was not even marked as a question.
+  it("treats 哪个/哪一张 as the questions they are", () => {
+    const assessment = assessDesignTurnIntent({ prompt: "这两张图哪一张更适合做编辑目标？",
+      mentions: [], activeSkill: null, hasSeries: false, hasAttachments: true });
+    expect(assessment.rules).toContain("informational_question");
+    expect(assessment.intent).toBe("non_design");
+  });
+});

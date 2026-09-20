@@ -135,6 +135,12 @@ export async function finalizeDesignImageJobChat(
     throw new Error(
       `Failed to persist design image job ${job.id} in chat: ${chatError.message}`,
     );
+  // Same successful-outcome gap as the canvas path: the card is keyed by the job
+  // id, so it stays older than the optimistic promise of the same turn. The
+  // design path always owns its placeholder (the upsert above created it when it
+  // was missing), so the notice is unconditional here.
+  await appendSettledNotice(admin, job.id, job.session_id,
+    `${outcomeSummary}（原始像素 ${width}×${height}）。`);
   const { error: updateError } = await admin
     .from("background_jobs")
     .update({
@@ -234,6 +240,38 @@ function terminalNoticeId(seed: string): string {
   return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-a${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
 }
 
+/**
+ * Append a settled outcome as a NEW message, for every terminal status.
+ *
+ * Every chat card is keyed by the job id, so rewriting it keeps the POSITION it
+ * was created at — which is earlier than the optimistic "正在生成中…出图后告诉你"
+ * line the same turn emitted. Without a notice created now, the last thing the
+ * user reads is that promise. That was reproduced for failures, and a 2026-09-20
+ * simulated-user campaign reproduced it for SUCCESS as well: the job had
+ * succeeded and the canvas already carried the image, while the closing line
+ * still promised a result to come. One appender for all three outcomes is what
+ * keeps the success path from drifting away from the failure path again.
+ *
+ * The id is derived from the job id, so a retry or the recovery scan rewrites
+ * this row instead of appending the same outcome twice, and a job can never
+ * receive both a terminal notice and a success notice.
+ */
+async function appendSettledNotice(
+  admin: AdminSupabaseClient,
+  jobId: string,
+  sessionId: string,
+  text: string,
+): Promise<void> {
+  const { error } = await admin.from("chat_messages").upsert({
+    id: terminalNoticeId(`${jobId}:terminal-notice`),
+    session_id: sessionId,
+    role: "assistant",
+    content: text,
+    content_blocks: [{ type: "text", text }],
+  }, { onConflict: "id" });
+  if (error) throw new Error(`Failed to append terminal image notice ${jobId}: ${error.message}`);
+}
+
 /** Converge a terminal image job's persisted chat and canvas placeholder. This
  * never creates or retries provider work; every write is bound to the job id. */
 export async function finalizeTerminalImageJobPlaceholder(  admin: AdminSupabaseClient,
@@ -291,19 +329,7 @@ export async function finalizeTerminalImageJobPlaceholder(  admin: AdminSupabase
       }],
     }, { onConflict: "id" });
     if (chatError) throw new Error(`Failed to settle terminal image chat ${job.id}: ${chatError.message}`);
-    // The submission card is rewritten in place, so it keeps the POSITION it was
-    // created at — which is earlier than the optimistic "正在生成中…出图后告诉你"
-    // line the same turn emitted. Without a notice created now, the last thing the
-    // user reads is that promise. Appending one row makes the real outcome the
-    // newest message; the deterministic id keeps it exactly-once.
-    const { error: noticeError } = await admin.from("chat_messages").upsert({
-      id: terminalNoticeId(`${job.id}:terminal-notice`),
-      session_id: job.session_id,
-      role: "assistant",
-      content: summary,
-      content_blocks: [{ type: "text", text: summary }],
-    }, { onConflict: "id" });
-    if (noticeError) throw new Error(`Failed to append terminal image notice ${job.id}: ${noticeError.message}`);
+    await appendSettledNotice(admin, job.id, job.session_id, summary);
     finalizedResult.chat_terminal_finalized_at = new Date().toISOString();
     finalizedResult.chat_terminal_status = job.status;
     changed = true;
@@ -417,14 +443,7 @@ export async function finalizeTerminalVideoJobPlaceholder(
 
   // Same reason as the image path: the submission card keeps its original
   // position, so the outcome must be a message created now to be the newest line.
-  const { error: noticeError } = await admin.from("chat_messages").upsert({
-    id: terminalNoticeId(`${job.id}:terminal-notice`),
-    session_id: job.session_id,
-    role: "assistant",
-    content: summary,
-    content_blocks: [{ type: "text", text: summary }],
-  }, { onConflict: "id" });
-  if (noticeError) throw new Error(`Failed to append terminal video notice ${job.id}: ${noticeError.message}`);
+  await appendSettledNotice(admin, job.id, job.session_id, summary);
 
   const { error: updateError } = await admin.from("background_jobs").update({ result: {
     ...result,
@@ -834,6 +853,18 @@ async function finalizeCurrentImageJobToCanvas(
     }
     if (!chatRows?.length) {
       console.info("[job-finalizer] chat card skipped; turn was discarded", { jobId: job.id });
+    } else {
+      // Success needs the appended notice for exactly the reason failures do (see
+      // `appendSettledNotice`): the card above was rewritten in place and kept its
+      // submission-time position, so without this row the closing line the user
+      // reads is still the optimistic "正在生成中…出图后告诉你" of the same turn.
+      //
+      // The notice also states the SOURCE pixel size, because the canvas element
+      // only carries its display frame: a simulated user was told "实际像素
+      // 381×512" for a render whose real size is 880×1184. The job receipt is the
+      // one place that number is authoritative.
+      await appendSettledNotice(admin, job.id, job.session_id,
+        `图片已生成并放入画布：${title}（原始像素 ${width}×${height}）。`);
     }
     // Recorded either way: the placeholder is gone for good, so a recovery scan
     // must not keep trying to write this card.
