@@ -17,6 +17,11 @@ import type {
 } from "@loomic/shared";
 import type { AgentRunService, RoutedRunCreateRequest } from "../agent/runtime.js";
 import { appendImageRefusalCorrection } from "../agent/mastra-refusal-notice.js";
+import {
+  buildDesignTurnRecord,
+  formatDesignTurnRecord,
+  type DesignTurnDetectedInput,
+} from "../agent/design-turn-record.js";
 import type { RetryableReadToolExecutor } from "../agent/tools/read-tool-registry.js";
 import type { DestructiveConfirmationService } from "../features/agent-actions/destructive-confirmation-service.js";
 import type { AgentRunMetadataService } from "../features/agent-runs/agent-run-service.js";
@@ -1078,6 +1083,13 @@ async function handleRunCommand(
   const assistantText: string[] = [];
   const assistantBlocks: ContentBlock[] = [];
   const executionIdByToolCall = new Map<string, string>();
+  /**
+   * The DETECTED layer of this turn, quoted from the run's own `design.routing`
+   * event as it passes through. It is read here rather than re-derived, so the
+   * turn record can never disagree with the notice the user already saw, and it
+   * stays `undefined` for a turn where the router published nothing.
+   */
+  let detectedTurnIntent: DesignTurnDetectedInput | undefined;
 
   try {
     let firstEvent = true;
@@ -1087,6 +1099,17 @@ async function handleRunCommand(
       if (firstEvent) {
         log.lap("first_event", { runId, type: event.type });
         firstEvent = false;
+      }
+      // The DETECTED layer of this turn: the router's verdict, captured verbatim
+      // as it goes past so the turn record quotes the notice the user already
+      // saw instead of re-deriving (or contradicting) it.
+      if (outboundEvent.type === "design.routing") {
+        detectedTurnIntent = {
+          intent: outboundEvent.intent,
+          reasonCode: outboundEvent.reasonCode,
+          source: outboundEvent.source,
+          confidence: outboundEvent.confidence,
+        };
       }
       if (
         firstModelOutput &&
@@ -1311,6 +1334,51 @@ async function handleRunCommand(
           },
         );
         log.lap("assistant_message_persisted", { runId });
+        // ── Per-turn two-layer record ──────────────────────────────────────────
+        // The one seam where both layers are on hand at once: the router's
+        // verdict was captured above, and the run's OWN tool receipts are the
+        // `assistantBlocks` that were just persisted. The record is emitted only
+        // after that persistence succeeded, so it can never describe a turn whose
+        // message does not exist. It comes after `run.completed` in the stream,
+        // which is why it is also pushed into the event buffer: a client that had
+        // already left the run's stream still receives it on reconnect.
+        //
+        // It reports, never acts: it creates no job, charges nothing, grants
+        // nothing, and its `summary`/`detail` are rendered only in the existing
+        // advanced mode on the client.
+        try {
+          const turnRecord = buildDesignTurnRecord({
+            runId,
+            ...(detectedTurnIntent ? { detected: detectedTurnIntent } : {}),
+            contentBlocks: assistantBlocks,
+          });
+          const display = formatDesignTurnRecord(turnRecord);
+          const turnEvent: StreamEvent = {
+            type: "design.turn",
+            runId,
+            timestamp: new Date().toISOString(),
+            summary: display.summary,
+            ...(display.detail ? { detail: display.detail } : {}),
+          };
+          console.info("[design-turn-record]", {
+            runId,
+            detectedIntent: turnRecord.detectedIntent,
+            executedAction: turnRecord.executed.kind,
+            ...(turnRecord.executed.kind === "unknown" ? { executedCode: turnRecord.executed.code } : {}),
+            ...(turnRecord.executed.kind === "refused" ? { executedCode: turnRecord.executed.code } : {}),
+            executionJobIds: turnRecord.summary.executionJobIds,
+            deliveredAssetIds: turnRecord.summary.deliveredAssetIds,
+          });
+          services.eventBuffer?.push(canvasId, turnEvent);
+          connectionManager.pushToCanvas(canvasId, turnEvent);
+        } catch (recordError) {
+          // Never fail the run's own persistence because the record could not be
+          // built. A missing record is a missing diagnostic, not a lost turn.
+          log.warn("design_turn_record_failed", {
+            runId,
+            error: recordError instanceof Error ? recordError.message : String(recordError),
+          });
+        }
         // A run whose image submission was refused before contact but whose
         // closing text promises that it is under way just wrote a false last
         // line. The refusal receipt is right here in this run's blocks, so the

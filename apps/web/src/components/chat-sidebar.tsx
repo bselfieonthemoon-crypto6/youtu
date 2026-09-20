@@ -1139,8 +1139,10 @@ export function ChatSidebar({
 
           // Part ①: the runtime's routing decision for THIS turn, shown once as
           // a non-blocking notice. Deduplicated per runId by the hook, so a
-          // reconnect replay cannot repeat it.
-          if (event.type === "design.routing") {
+          // reconnect replay cannot repeat it. The same entry point also carries
+          // `design.turn` (the two-layer turn record + summary), which the hook
+          // renders only in advanced mode.
+          if (event.type === "design.routing" || event.type === "design.turn") {
             presentRoutingNotice(event);
           }
 
@@ -1738,8 +1740,10 @@ export function ChatSidebar({
             if (submissionVersionRef.current !== resumeVersion || evt.runId !== activeRunId) return;
 
             // A resumed run may still be before its first token, so the routing
-            // notice can arrive here for the first time.
-            if (evt.type === "design.routing") {
+            // notice can arrive here for the first time; the turn record can also
+            // arrive here from the replay buffer when it landed after this client
+            // had already left the run's stream.
+            if (evt.type === "design.routing" || evt.type === "design.turn") {
               presentRoutingNotice(evt);
             }
 

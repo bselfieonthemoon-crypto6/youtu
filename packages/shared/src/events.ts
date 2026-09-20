@@ -199,6 +199,44 @@ export const designRoutingEventSchema = z.object({
 
 export type DesignRoutingEvent = z.infer<typeof designRoutingEventSchema>;
 
+// ---------------------------------------------------------------------------
+// Turn record (what was DETECTED vs what was EXECUTED)
+// ---------------------------------------------------------------------------
+
+/**
+ * The turn record, emitted once per run AFTER the run's assistant message was
+ * persisted — the only server seam where both layers are on hand at the same
+ * time:
+ *
+ *   - DETECTED: the `design.routing` verdict the router published for this turn
+ *     before the first token (intent / reasonCode / source / confidence);
+ *   - EXECUTED: the run's ACTUAL behaviour, derived from its own tool receipts
+ *     (`generate_image`/`edit_image` with a real `jobId`, `ask_clarification`,
+ *     canvas writes, declared Skills read) and never from the intent.
+ *
+ * It exists because those two layers disagree, and the disagreement used to be
+ * invisible: the router said `new_generation`, the model only asked a clarifying
+ * question, and the transcript showed a routing notice plus a question with
+ * nothing tying them together. This event is the tie.
+ *
+ * The copy is authored by the server next to the receipts it describes, so the
+ * client never re-derives product wording from a machine code — the same
+ * discipline `design.routing` follows. Its `summary`/`detail` are rendered only
+ * in the existing advanced mode (`localStorage "loomic:routing-detail"`), which
+ * is why nothing here is safe to show a normal user as-is.
+ */
+export const designTurnEventSchema = z.object({
+  type: z.literal("design.turn"),
+  runId: runIdSchema,
+  timestamp: timestampSchema,
+  /** One-line conclusion: 用户意图 (detected) + what the run actually did. */
+  summary: z.string().min(1).max(400),
+  /** Advanced-mode only: judgement basis, execution code, per-field unknowns. */
+  detail: z.string().min(1).max(400).optional(),
+});
+
+export type DesignTurnEvent = z.infer<typeof designTurnEventSchema>;
+
 export const billingErrorCodeSchema = z.enum([
   "insufficient_credits",
   "model_not_accessible",
@@ -234,6 +272,7 @@ export const streamEventSchema = z.union([
   runFailedEventSchema,
   canvasSyncEventSchema,
   designRoutingEventSchema,
+  designTurnEventSchema,
   billingErrorEventSchema,
 ]);
 
