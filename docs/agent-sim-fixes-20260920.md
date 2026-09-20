@@ -182,3 +182,25 @@ CLI 用 `agent.confirm_action` 复现得到 `confirmation_execution_failed` / `C
 代码事实：`canvasFailureLabel("canceled", …)` 已把占位框文案写成"生成已取消"，但占位框自身的
 `status` 字段仍是 `error`。结构检查通过（它指向本会话的终态任务），但产品语义未定：
 (a) 取消后移除占位框；(b) 保留但标明"已取消"且不可重试；(c) 保留并作为重试入口。
+
+## 回归结论（2026-09-20）
+
+| 项目 | 结果 |
+| --- | --- |
+| `apps/server` typecheck（12 批：production 242 + tests 各批） | 全通过，exit 0 |
+| server 测试 | **268 文件 / 2181 测试全通过**（改动前基线 2162，本次新增 19 条） |
+| web 测试 | **133 文件 / 908 测试全通过**（本次未改 web） |
+| 涉及改动的 9 个测试文件单独跑 | 209 通过 |
+| 提交 | `abba46a`，`feat/mastra-migration` 与 `main` 均已推送（`a188de5..abba46a`） |
+
+**本地环境的生效条件**：本机 API / worker 以 `node --import tsx src/server.ts` 启动，**没有 `--watch`**，
+改动必须重启进程才生效（已重启并确认 `/api/health` 正常、worker 已就绪）。
+
+**未闭环（不属本轮四项，需要真实浏览器或产品定义）**：
+
+1. 删除确认卡片的**真实浏览器点击**验收（CLI 伪造 `agent.confirm_action` 走不通，不能据此判定 UI 缺陷）。
+2. 取消后占位框语义（见上）。
+3. P2 的方法层 Skill 条款：技能正文同时经 SQL 迁移入库，单独改 `SKILL.md` 到不了运行时，
+   需要走技能打包/迁移流水线。
+4. 端到端的"成功终态通知"复验：需要一次**新的真实生成**（旧会话的历史消息不会追溯变化），
+   随后用 `apps/server/scripts/agent-sim-tools.mjs check` 核对 `optimistic_tail` 不再出现。
