@@ -47,6 +47,20 @@ describe("ToolBlockView", () => {
         expect(receipt).not.toHaveTextContent("已扣");
       }
     });
+  it.each(["queued", "processing", "succeeded", "finished"])(
+    "says the cost is unavailable for a submitted %s job whose receipt is incomplete", (status) => {
+      // The old reader returned null for a partial receipt, so the card showed no
+      // cost line at all and its silence could be read as "free". A campaign turn
+      // hit exactly this: the assistant said the cost could not be confirmed while
+      // the card showed nothing.
+      render(<ToolBlockView block={{ type: "tool", toolCallId: `partial-${status}`, toolName: "generate_image",
+        status: "completed", output: { status, actualQuality: "Low", actualResolution: "1K" } }} />);
+      const receipt = screen.getByLabelText("图片任务成本回执");
+      expect(receipt).toHaveTextContent("费用数据暂不可用");
+      // It must not invent a number, a price basis, or an implied zero.
+      expect(receipt).not.toHaveTextContent("积分");
+      expect(receipt).not.toHaveTextContent("计价");
+    });
   it("shows input correction rather than a failed paid generation", () => {
     render(<ToolBlockView block={{ type: "tool", toolCallId: "invalid", toolName: "edit_image", status: "completed",
       output: { error: true, message: "Tool input validation failed for edit_image", validationErrors: { errors: ["Unrecognized key"] } } }} />);

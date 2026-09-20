@@ -1196,21 +1196,39 @@ function BillingSummary({ billing }: { billing: BillingDetails }) {
   );
 }
 
-type ImageCostReceipt = { creditsCost: number; pricingVersion: string; actualQuality: string; actualResolution: string };
+type ImageCostReceipt =
+  | { state: "known"; creditsCost: number; pricingVersion: string; actualQuality: string; actualResolution: string }
+  | { state: "unavailable" };
 
 /** Direct image tools return this only after durable submission. It is a cost
- * receipt, not a claim that a preflight failure, cancellation or refund charged. */
+ * receipt, not a claim that a preflight failure, cancellation or refund charged.
+ *
+ * An INCOMPLETE receipt is reported as unavailable rather than as nothing. The old
+ * reader returned `null` whenever a field was missing, so a submitted job's card
+ * simply had no cost line at all — and a user can reasonably read that silence as
+ * "this one was free". A campaign turn hit exactly that shape: the assistant said
+ * it could not confirm the cost while the card showed no cost information
+ * whatsoever. Silence is only correct for a result that never had a receipt
+ * (preflight failure, cancellation, refund), which is the `null` branch below. */
 function readImageCostReceipt(output: Record<string, unknown> | undefined): ImageCostReceipt | null {
   if (!output || !["queued", "processing", "succeeded", "finished"].includes(String(output.status))) return null;
   const creditsCost = readFiniteNumber(output.creditsCost);
   const pricingVersion = readNonEmptyString(output.pricingVersion);
   const actualQuality = readNonEmptyString(output.actualQuality);
   const actualResolution = readNonEmptyString(output.actualResolution);
-  if (creditsCost === undefined || creditsCost < 0 || !Number.isInteger(creditsCost) || !pricingVersion || !actualQuality || !actualResolution) return null;
-  return { creditsCost, pricingVersion, actualQuality, actualResolution };
+  if (creditsCost === undefined || creditsCost < 0 || !Number.isInteger(creditsCost) || !pricingVersion || !actualQuality || !actualResolution)
+    return { state: "unavailable" };
+  return { state: "known", creditsCost, pricingVersion, actualQuality, actualResolution };
 }
 
 function ImageCostReceipt({ receipt }: { receipt: ImageCostReceipt }) {
+  if (receipt.state === "unavailable")
+    return <div aria-label="图片任务成本回执" className="flex flex-wrap gap-x-3 gap-y-1 rounded-lg bg-muted/60 px-3 py-2 text-[11px] text-muted-foreground">
+      {/* No number, no price basis, no implied zero: the job was submitted, so a
+          cost exists somewhere, and claiming one we cannot read would be worse
+          than saying so. */}
+      <span>费用数据暂不可用</span>
+    </div>;
   return <div aria-label="图片任务成本回执" className="flex flex-wrap gap-x-3 gap-y-1 rounded-lg bg-muted/60 px-3 py-2 text-[11px] text-muted-foreground">
     <span>本次任务 {receipt.creditsCost} 积分</span><span>计价 {receipt.pricingVersion}</span><span>质量 {receipt.actualQuality}</span><span>分辨率 {receipt.actualResolution}</span>
   </div>;
