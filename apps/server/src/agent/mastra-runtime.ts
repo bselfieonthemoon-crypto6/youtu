@@ -29,6 +29,7 @@ import { createMastraImageJobScopeQuery, createMastraImageStatusTools } from "./
 import { createMastraLibraryTools, loadLibraryAssetRows, sampleRandom } from "./mastra-library-tools.js";
 import { createDesignTurnIntentClassifier, describeDesignRouting, extractStyleHints, extractTargetSizes, matchedSkillHints, mergeStyleHints, resolveDesignTurnIntent, shouldReplaceSessionSeries, skillRoutesFromMetadata } from "./design-turn-intent.js";
 import { explicitNonstandardRatio } from "./image-ratio-intent.js";
+import { projectImageJobDimensions } from "./export-dimension-contract.js";
 import { mastraImageExecutionPolicy } from "./mastra-image-execution-policy.js";
 import { formatEnabledSkillCatalog } from "./design-skill-catalog.js";
 import { collectUnfinishedSessionOutputs, loadSessionDesignContext, mergeSessionReadSkills, saveSessionDesignContext, sessionSkillMemoryEnabled, SESSION_REFUSED_OUTPUTS_KEY, type SessionReadSkill, type SessionUnfinishedOutput } from "./session-design-context.js";
@@ -94,23 +95,17 @@ export function projectMastraImageReceipt(job: any, images: readonly { id: strin
   const errorLabel = providerFailureDescription(errorCode);
   const result = job.result && typeof job.result === "object" && !Array.isArray(job.result)
     ? job.result as Record<string, unknown> : undefined;
-  const sourcePixels = (key: "width" | "height") => {
-    const value = result?.[key];
-    return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
-  };
-  const sourcePixelWidth = sourcePixels("width");
-  const sourcePixelHeight = sourcePixels("height");
-  const canvasElementId = typeof result?.canvas_element_id === "string" ? result.canvas_element_id : undefined;
+  // ①②③④ live in one place (`export-dimension-contract.ts`) so the receipt and
+  // `get_image_status` cannot name the same job row's numbers differently. The
+  // defect: a status answer reported the canvas element's 381x512 display frame
+  // as this 880x1184 PNG's "实际像素". The receipt is the ONLY place ② exists;
+  // ③ it can only point at by id; ④ it must state as unknown rather than omit.
+  const dimensions = projectImageJobDimensions(job, result);
   return { id: job.id, status: job.status, assetId: result?.asset_id,
-    // The receipt is the ONLY place an image's real pixel size exists:
-    // `asset_objects` has no width/height columns and a canvas element stores
-    // the display frame, so a status answer once reported a 381x512 frame as an
-    // 880x1184 PNG's "实际像素". Both the real pixels and the canvas element
-    // that carries them are named here, so the answer can be joined to a scene
-    // observation without guessing.
-    ...(sourcePixelWidth !== undefined ? { sourcePixelWidth } : {}),
-    ...(sourcePixelHeight !== undefined ? { sourcePixelHeight } : {}),
-    ...(canvasElementId ? { canvasElementId } : {}),
+    // Spread carries ①②③ (sourcePixelWidth/Height, canvasElementId), the ④
+    // unknown, and the canvas/design join keys that let an answer move between
+    // the job world and the canvas world without guessing.
+    ...dimensions,
     actualSubmittedModel: job.model,
     actualSubmittedUpstreamModel: job.result?.upstream_model ?? images.find(item => item.id === job.model)?.upstreamModelId,
     requestedAspectRatio: job.aspectRatio,

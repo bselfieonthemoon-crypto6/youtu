@@ -566,7 +566,7 @@ const CHECK_CODES = {
   missing_terminal_card: "a terminal Mastra-submitted job has no chat card at all, so its outcome never reached the user",
   missing_canvas_delivery: "a succeeded image job has no canvas element carrying its asset",
   stale_generating_placeholder: "the canvas still shows a generating placeholder for a job that already ended",
-  orphan_error_placeholder: "a failed placeholder points at a job that is not in this session",
+  orphan_error_placeholder: "a settled placeholder (failed or canceled) points at a job that is not in this session",
   optimistic_tail: "the last assistant message promises work in progress while every job is already terminal",
 };
 
@@ -615,8 +615,12 @@ async function runCheck() {
     const status = jobStatus(placeholder.jobId);
     if (placeholder.status === "generating" && status && terminalStatuses.has(status))
       add("stale_generating_placeholder", `placeholder ${placeholder.id} still generating for ${status} job ${placeholder.jobId}`);
-    if (placeholder.status === "error" && placeholder.jobId && !status)
-      add("orphan_error_placeholder", `placeholder ${placeholder.id} references job ${placeholder.jobId} outside this session`);
+    // Both settled states are checked, not only "error": a canceled placeholder is
+    // no longer persisted as an error (it carries status "canceled"), and if the
+    // check only looked at "error" the job-ownership half of this invariant would
+    // silently stop covering every user cancellation.
+    if (["error", "canceled"].includes(placeholder.status) && placeholder.jobId && !status)
+      add("orphan_error_placeholder", `placeholder ${placeholder.id} (${placeholder.status}) references job ${placeholder.jobId} outside this session`);
   }
 
   // Every job already ended, so a closing message that still promises a result is

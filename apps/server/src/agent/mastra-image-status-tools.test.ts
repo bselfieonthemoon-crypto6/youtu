@@ -36,6 +36,23 @@ function fixture(status = "running") {
     tools:directTools(createMastraImageStatusTools({user,scope,
       jobService:{getConversationImageJob,getConversationVideoJob,cancelJobAdmin} as never}))};
 }
+
+/**
+ * A finished job row as `getConversationImageJob` selects it: the requested
+ * submission on the payload, the real output pixels and the canvas placement on
+ * the result, plus the board the placement lives on.
+ */
+function succeededFixture() {
+  const f = fixture("succeeded");
+  f.getConversationImageJob.mockResolvedValue({
+    id: id(6), status: "succeeded", model: "workspace:nano", requestedAspectRatio: "3:4", resolution: "2k",
+    quality: "hd", pricingVersion: "credits-v1", creditsCostColumn: 7,
+    canvas_id: id(4), design_id: id(5),
+    result: { asset_id: id(9), width: 880, height: 1_184, canvas_element_id: "000fba30-7066-4b11-a1c0-a6af26b3ad6b" },
+  } as never);
+  return f;
+}
+
 describe("Mastra image status tools",()=>{
   it("returns persisted model/ratio via the authorized service",async()=>{
     const f=fixture();
@@ -49,6 +66,50 @@ describe("Mastra image status tools",()=>{
     expect(result).not.toHaveProperty("creditsCostColumn");
     expect(result).not.toHaveProperty("quality");
     expect(result).not.toHaveProperty("resolution");
+  });
+  it("returns the requested size, the AI's source pixels and the canvas element id together",async()=>{
+    // The join this exists for: "那张图多大" has one answer per size, and the
+    // answer must be able to move from the job's real pixels to the canvas
+    // placement that shows them without guessing which image either refers to.
+    const f=succeededFixture();
+    const result=await f.tools.getImageStatus.execute({jobId:id(6)}, toolExecutionContext({})) as Record<string,unknown>;
+    expect(result).toMatchObject({
+      // ① what the user's submission asked for — a ratio and a tier, not pixels.
+      requestedFrame:{aspectRatio:"3:4",resolution:"2k"},
+      requestedAspectRatio:"3:4",
+      requestedResolution:"2k",
+      // ② the AI image's real pixels, authoritative on this row.
+      sourcePixelWidth:880,sourcePixelHeight:1_184,
+      // ③ which canvas element displays it, and which board that is.
+      canvasElementId:"000fba30-7066-4b11-a1c0-a6af26b3ad6b",
+      canvasId:id(4),designId:id(5),
+      // ④ never this job's answer, stated rather than omitted.
+      exportSize:null,
+      hasSourcePixels:true,canvasElementIdKnown:true,
+    });
+    // The dimension payload names all four sizes, so a status answer cannot
+    // collapse them into one number.
+    const sizes=String(result.sizes);
+    for(const key of ["image_requested_frame","image_source_pixels","image_canvas_frame","image_export_size"])
+      expect(sizes).toContain(key);
+    // ③ must never be presented as a pixel size: the frame is not on this payload.
+    expect(result).not.toHaveProperty("width");
+    expect(result).not.toHaveProperty("height");
+    expect((result.authorities as Record<string,string>).canvasFrame).toContain("never evidence of an image's real pixels");
+  });
+  it("reports an unfinished job's unknown pixels as unknown instead of substituting the requested size",async()=>{
+    const f=fixture("running");
+    const result=await f.tools.getImageStatus.execute({jobId:id(6)}, toolExecutionContext({})) as Record<string,unknown>;
+    expect(result).toMatchObject({
+      // ① is known because the submission is persisted even before the result is.
+      requestedFrame:{aspectRatio:"3:4",resolution:"2k"},
+      exportSize:null,hasSourcePixels:false,canvasElementIdKnown:false,
+    });
+    expect(result).not.toHaveProperty("sourcePixelWidth");
+    expect(result).not.toHaveProperty("canvasElementId");
+    // The negative claim: the requested 3:4 is a ratio, and nothing on this
+    // payload turns it into the image's pixel size.
+    expect(JSON.stringify(result)).not.toMatch(/"sourcePixel(Width|Height)":\s*\d/);
   });
   it("uses the service authorization for cancellation and preserves live scope",async()=>{
     const f=fixture();f.scope.liveDesignIds.add(id(7));

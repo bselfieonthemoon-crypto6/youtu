@@ -4,6 +4,12 @@ export const DEFAULT_APIYI_AGENT_MODEL = "gemini-3.1-flash-lite";
 export const DEFAULT_AGENT_MODEL = `apiyi:${DEFAULT_APIYI_AGENT_MODEL}`;
 export const DEFAULT_SERVER_PORT = 3001;
 export const DEFAULT_WEB_ORIGIN = "http://localhost:3000";
+/**
+ * Bucket the health endpoint's storage probe checks. `workspace-assets` is where
+ * ordinary uploads land; a deployment can point `LOOMIC_STORAGE_HEALTH_BUCKET`
+ * at whichever bucket its own traffic uses.
+ */
+export const DEFAULT_STORAGE_HEALTH_BUCKET = "workspace-assets";
 
 /** Resolve the single environment-backed text model through APIYI. */
 export function resolveDefaultAgentModel(_env: {
@@ -54,6 +60,12 @@ export type ServerEnv = {
   lemonSqueezyVariantBusinessMonthly?: string;
   lemonSqueezyVariantBusinessYearly?: string;
   skillsRoot?: string;
+  /**
+   * Bucket the health endpoint probes through the authenticated storage client.
+   * `loadServerEnv` always fills it (default `workspace-assets`); it is optional
+   * here so test fixtures that only care about one field do not have to carry it.
+   */
+  storageHealthBucket?: string;
   webOrigin: string;
   workerConcurrency?: number;
   workerImageConcurrency?: number;
@@ -159,6 +171,10 @@ export function loadServerEnv(
     normalizeOptionalString(source.LEMONSQUEEZY_VARIANT_BUSINESS_YEARLY);
   const skillsRoot =
     overrides.skillsRoot ?? normalizeOptionalString(source.LOOMIC_SKILLS_ROOT);
+  const storageHealthBucket =
+    overrides.storageHealthBucket ??
+    normalizeOptionalString(source.LOOMIC_STORAGE_HEALTH_BUCKET) ??
+    DEFAULT_STORAGE_HEALTH_BUCKET;
   const workerConcurrency =
     overrides.workerConcurrency ??
     (source.WORKER_CONCURRENCY
@@ -254,6 +270,7 @@ export function loadServerEnv(
       ? { lemonSqueezyVariantBusinessYearly }
       : {}),
     ...(skillsRoot ? { skillsRoot } : {}),
+    storageHealthBucket,
     ...(workerConcurrency ? { workerConcurrency } : {}),
     ...(workerImageConcurrency ? { workerImageConcurrency } : {}),
     ...(workerVideoConcurrency ? { workerVideoConcurrency } : {}),

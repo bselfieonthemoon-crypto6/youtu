@@ -29,7 +29,9 @@ describe("Mastra runtime context policy", () => {
     // dimensions and the canvas element only holds the 381x512 display frame of
     // this 880x1184 PNG, which a status answer once reported as "实际像素".
     const receipt = projectMastraImageReceipt({
-      id: first, status: "succeeded", model: "workspace:nano",
+      id: first, status: "succeeded", model: "workspace:nano", canvas_id: second,
+      design_id: "00000000-0000-4000-8000-000000000003",
+      requestedAspectRatio: "3:4", resolution: "2k",
       result: { asset_id: second, width: 880, height: 1_184, canvas_element_id: "000fba30-7066-4b11-a1c0-a6af26b3ad6b" },
     }, []);
     expect(receipt).toMatchObject({ assetId: second, sourcePixelWidth: 880, sourcePixelHeight: 1_184,
@@ -37,6 +39,51 @@ describe("Mastra runtime context policy", () => {
     // A receipt with no result (failed or in flight) must not claim dimensions.
     expect(projectMastraImageReceipt({ id: second, status: "running" }, []))
       .not.toHaveProperty("sourcePixelWidth");
+  });
+
+  it("keeps the four image sizes apart on one receipt and states the two it cannot answer", () => {
+    // ①用户要求尺寸 ②AI 原始图片像素 ③画布显示尺寸 ④最终导出尺寸. This receipt can
+    // authoritatively state ① and ②; ③ it can only point at by element id (the
+    // canvas element carries the display frame); ④ it must report as unknown
+    // rather than let ② or ③ be read as the export size.
+    const receipt = projectMastraImageReceipt({
+      id: first, status: "succeeded", model: "workspace:nano", canvas_id: second,
+      design_id: "00000000-0000-4000-8000-000000000003",
+      requestedAspectRatio: "3:4", resolution: "2k",
+      result: { asset_id: second, width: 880, height: 1_184, canvas_element_id: "000fba30-7066-4b11-a1c0-a6af26b3ad6b" },
+    }, []);
+    expect(receipt).toMatchObject({
+      // ① the requested frame: the submission's own ratio + resolution tier.
+      requestedFrame: { aspectRatio: "3:4", resolution: "2k" },
+      // ② the real pixels, authoritative on this row.
+      sourcePixelWidth: 880, sourcePixelHeight: 1_184,
+      // ③ a join key, not a size: the frame lives on this element in the canvas.
+      canvasElementId: "000fba30-7066-4b11-a1c0-a6af26b3ad6b",
+      // ④ never this job's answer, and stated rather than omitted.
+      exportSize: null,
+      hasSourcePixels: true, canvasElementIdKnown: true,
+      // So an answer can move between the job world and the canvas world.
+      canvasId: second, designId: "00000000-0000-4000-8000-000000000003",
+    });
+    for (const size of ["image_requested_frame", "image_source_pixels", "image_canvas_frame", "image_export_size"])
+      expect(String(receipt.sizes)).toContain(size);
+    expect(receipt.authorities.exportSize).toContain("design_export");
+    expect(receipt.authorities.sourcePixels).toContain("background_jobs.result.width/height");
+    // The frame cannot be inferred from this receipt at all, so the receipt must
+    // not carry any bare width/height a caller could read as ② or ③.
+    expect(receipt).not.toHaveProperty("width");
+    expect(receipt).not.toHaveProperty("height");
+
+    // A failed or in-flight job: ② is reported as absent rather than guessed, and
+    // ④ is still explicitly null rather than dropped.
+    const incomplete = projectMastraImageReceipt({ id: second, status: "running", requestedAspectRatio: "1:1" }, []);
+    expect(incomplete).toMatchObject({ exportSize: null, hasSourcePixels: false, canvasElementIdKnown: false });
+    expect(incomplete).not.toHaveProperty("sourcePixelWidth");
+    expect(incomplete).not.toHaveProperty("canvasElementId");
+    // Claimed pixels without a canvas placement must not pretend ③ is known.
+    const unplaced = projectMastraImageReceipt({ id: second, status: "succeeded",
+      result: { width: 1024, height: 1024 } }, []);
+    expect(unplaced).toMatchObject({ sourcePixelWidth: 1024, sourcePixelHeight: 1024, canvasElementIdKnown: false });
   });
 
   it("derives the history byte ceiling from the current model budget", () => {

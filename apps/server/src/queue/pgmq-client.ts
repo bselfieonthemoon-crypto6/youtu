@@ -10,7 +10,17 @@ export type PgmqMessage<T = Record<string, unknown>> = {
 
 export type PgmqClient = {
   send(queue: string, payload: Record<string, unknown>, delay?: number): Promise<number>;
-  read<T = Record<string, unknown>>(queue: string, vt: number, qty: number): Promise<PgmqMessage<T>[]>;
+  /**
+   * Claim up to `qty` messages with visibility timeout `vt`. The optional
+   * `signal` is used by the health probe so a wedged database cannot hold the
+   * health endpoint open; consumers keep polling without it.
+   */
+  read<T = Record<string, unknown>>(
+    queue: string,
+    vt: number,
+    qty: number,
+    signal?: AbortSignal,
+  ): Promise<PgmqMessage<T>[]>;
   /**
    * Server-side long poll — blocks in Postgres until messages arrive or
    * `maxPollSeconds` elapses. Drastically reduces idle query volume vs
@@ -50,10 +60,15 @@ export function createPgmqClient(databaseUrl: string): PgmqClient {
       return rows[0].send;
     },
 
-    async read<T>(queue: string, vt: number, qty: number) {
+    async read<T>(queue: string, vt: number, qty: number, signal?: AbortSignal) {
       const { rows } = await pool.query(
-        `SELECT * FROM pgmq.read($1::text, $2::integer, $3::integer)`,
-        [queue, vt, qty],
+        {
+          text: `SELECT * FROM pgmq.read($1::text, $2::integer, $3::integer)`,
+          values: [queue, vt, qty],
+          // The health probe passes an AbortSignal; `pg` cancels the in-flight
+          // query when it aborts, so the pool connection is released at once.
+          ...(signal ? { signal } : {}),
+        },
       );
       return rows as PgmqMessage<T>[];
     },

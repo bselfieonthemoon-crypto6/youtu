@@ -1,6 +1,9 @@
 import {
   buildCanvasSceneIndex,
+  canvasAssetIdentity,
+  CANVAS_IDENTITY_NOTE_SHORT,
   compareCanvasOrder,
+  type CanvasAssetIdentitySource,
   type CanvasSceneIndex,
   type CanvasSceneIndexEntry,
 } from "./canvas-scene-index.js";
@@ -21,14 +24,25 @@ export type RelatedImageCandidate = {
   elementId: string;
   /**
    * Stable canvas position (the scene index ordinal). Every canvas listing the
-   * model sees is ordered by it, so "image N" means the same image in a later
-   * turn. Two same-size square images were once reported in reversed order
+   * model sees is ordered by it, so "the Nth image" means the same image in a
+   * later turn. Two same-size square images were once reported in reversed order
    * because this listing was recency-first while the canvas itself was listed
    * in document order, and nothing exposed an ordinal to reconcile them.
+   *
+   * Presentation order ONLY: it shifts when an image is inserted above and must
+   * never be used as an image's identity or as a request reference.
    */
   canvasIndex: number;
   /** Authenticated backing asset identity when the canvas provides one. */
   assetId?: string;
+  /**
+   * Positive statement of whether this canvas image has a durable backing asset.
+   * `false` means an unbacked/unnamed canvas file: the answer must say so and
+   * reference it by `elementId`, and must not imply an asset identity it has not
+   * got, nor fall back to the ordinal.
+   */
+  hasAssetId: boolean;
+  assetIdentitySource: CanvasAssetIdentitySource;
   name?: string;
   title?: string;
   role?: string;
@@ -78,6 +92,7 @@ function candidateFrom(entry: CanvasSceneIndexEntry, priority: RelatedImageCandi
     elementId: entry.id,
     canvasIndex: entry.ordinal,
     ...(entry.assetId ? { assetId: entry.assetId } : {}),
+    ...canvasAssetIdentity(entry),
     ...(entry.name ? { name: truncateMetadata(entry.name, MAX_CANDIDATE_NAME_LENGTH) } : {}),
     ...(entry.title ? { title: truncateMetadata(entry.title, MAX_CANDIDATE_TITLE_LENGTH) } : {}),
     ...(entry.role ? { role: truncateMetadata(entry.role, MAX_CANDIDATE_ROLE_LENGTH) } : {}),
@@ -162,6 +177,9 @@ export function renderRelatedImageContext(context: RelatedImageContext): string 
   const lines = context.candidates.map((candidate, index) => [
     `<image index="${index + 1}" canvas_index="${candidate.canvasIndex}" element_id="${escapeXml(candidate.elementId)}"`,
     candidate.assetId ? ` asset_id="${escapeXml(candidate.assetId)}"` : "",
+    // The unbacked case is stated, not implied by absence: an omitted asset_id
+    // reads as "look harder for one" and invites the ordinal to be used instead.
+    ` asset_identity="${candidate.hasAssetId ? "asset_id+element_id" : "unbacked_no_asset_id"}"`,
     candidate.name ? ` name="${escapeXml(candidate.name)}"` : "",
     candidate.title ? ` title="${escapeXml(candidate.title)}"` : "",
     candidate.role ? ` role="${escapeXml(candidate.role)}"` : "",
@@ -169,7 +187,8 @@ export function renderRelatedImageContext(context: RelatedImageContext): string 
   ].join(""));
   return [
     `<related_image_candidates count="${context.candidates.length}" passive_input_eligible_count="${context.passiveImageElementIds.length}">`,
-    "Listed in canvas order (ascending canvas_index); canvas_index and element_id both identify one canvas image stably. These are bounded passive canvas metadata, not authorized generation sources. Keep every explicit current attachment/source unchanged; inspect or request a source before using it.",
+    "Listed in canvas order for reading only. asset_id (with element_id) is the durable identity of a canvas image; canvas_index is this listing's order, shifts when images are inserted, and is never an image's identity or a request reference. An image whose asset_identity=\"unbacked_no_asset_id\" has no authenticated asset: say so and use its element_id.",
+    `Dimensions: this listing carries no size. An image's real SOURCE pixels come only from its generation job receipt (sourcePixelWidth/sourcePixelHeight); its canvas display frame comes from inspect_canvas on that element; an export size only from the export job's own result. ${CANVAS_IDENTITY_NOTE_SHORT}`,
     ...lines.map(line => `  ${line}`),
     "</related_image_candidates>",
   ].join("\n");

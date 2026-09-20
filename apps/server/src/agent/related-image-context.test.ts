@@ -74,6 +74,54 @@ describe("related image context", () => {
     expect(rendered).toContain("Listed in canvas order");
   });
 
+  it("carries the asset id as the durable reference and says the ordinal is order only", () => {
+    // 图片编号和顺序也应该绑定稳定的 asset ID，不能靠位置猜测: the ordinal orders
+    // the listing, the asset id answers "which image", and the text must say which
+    // of the two is durable.
+    const context = selectRelatedImageContext({
+      elements: [
+        image("poster", 0, "70000000-0000-4000-8000-000000000010"),
+        // No assetId at all: an unnamed/unbacked canvas file.
+        { id: "loose-png", type: "image", x: 30, y: 0, width: 10, height: 10, customData: { name: "loose" } },
+      ],
+    });
+    expect(context.candidates[0]).toMatchObject({ elementId: "poster", canvasIndex: 0,
+      assetId: "70000000-0000-4000-8000-000000000010", hasAssetId: true, assetIdentitySource: "customData.assetId" });
+    // The unbacked case is stated positively rather than left as a missing key.
+    expect(context.candidates[1]).toMatchObject({ elementId: "loose-png", canvasIndex: 1,
+      hasAssetId: false, assetIdentitySource: "unbacked" });
+    expect(context.candidates[1]).not.toHaveProperty("assetId");
+
+    const rendered = renderRelatedImageContext(context)!;
+    expect(rendered).toContain('asset_id="70000000-0000-4000-8000-000000000010"');
+    expect(rendered).toContain('asset_identity="asset_id+element_id"');
+    expect(rendered).toContain('element_id="loose-png"');
+    expect(rendered).toContain('asset_identity="unbacked_no_asset_id"');
+    expect(rendered).toContain("canvas_index is this listing's order");
+    expect(rendered).toContain("never an image's identity or a request reference");
+    // The negative claim: the listing never presents the position as the identity
+    // — an ordinal is not an id, and no candidate may be identified by "image N".
+    expect(rendered).not.toMatch(/asset_identity="canvas_index/);
+    expect(rendered).not.toMatch(/asset_identity="\d/);
+    expect(rendered).toContain("this listing carries no size");
+  });
+
+  it("states that it carries none of the four image sizes instead of implying the frame is the pixels", () => {
+    // The candidate block is the listing the status answer was built from, so it
+    // must not look like it knows a size: ② lives on the job receipt and ③ on the
+    // canvas element, and neither is here.
+    const rendered = renderRelatedImageContext(selectRelatedImageContext({
+      elements: [image("poster", 0, "asset-poster")],
+    }))!;
+    expect(rendered).toContain("this listing carries no size");
+    expect(rendered).toContain("generation job receipt (sourcePixelWidth/sourcePixelHeight)");
+    expect(rendered).toContain("canvas display frame comes from inspect_canvas");
+    expect(rendered).toContain("an export size only from the export job's own result");
+    // No bare size keys on the candidate itself.
+    expect(rendered).not.toMatch(/width="\d+"/);
+    expect(rendered).not.toMatch(/canvas_frame_width="\d+"/);
+  });
+
   it("bounds verbose candidate metadata without truncating stable identities", () => {
     const elementId = `element-${"e".repeat(150)}`;
     const assetId = `asset-${"a".repeat(1_000)}`;
@@ -110,9 +158,17 @@ describe("related image context", () => {
     }));
     // Ten long scene labels remain bounded; stable IDs are intentionally not
     // shortened and are therefore tested independently above. The bound moved
-    // from 5_000 only because every candidate now also carries the stable
-    // `canvas_index` that keeps a repeated read from reshuffling same-size
-    // images; per-candidate metadata caps are unchanged.
-    expect(boundedRendered?.length).toBeLessThan(5_300);
+    // again because the block now states the identity and four-size rules once
+    // for the whole listing; per-candidate metadata caps are unchanged, which is
+    // what the second assertion below guards.
+    expect(boundedRendered?.length).toBeLessThan(6_200);
+    // The fixed rule text is constant, so per-candidate cost is what actually
+    // scales: ten maximal labels add ~3.6 KB here, while the same ten candidates
+    // with ordinary labels add none of it. A regression that stopped truncating
+    // verbose metadata would add tens of KB in this difference, not hundreds.
+    const shortRendered = renderRelatedImageContext(selectRelatedImageContext({
+      elements: Array.from({ length: 10 }, (_, index) => image(`short-${index}`, index)),
+    }))!;
+    expect(boundedRendered!.length - shortRendered.length).toBeLessThan(4_500);
   });
 });

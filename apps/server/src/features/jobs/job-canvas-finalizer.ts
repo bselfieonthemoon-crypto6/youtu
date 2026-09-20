@@ -4,7 +4,13 @@ import type { BackgroundJobStatus, JobTargetFinalizationDto, Json } from "@loomi
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import { imageSubmissionReceipt } from "./image-submission-receipt.js";
-import { insertImageElement, markImageGenerationPlaceholderFailed, removeCompletedImagePlaceholder } from "../canvas/canvas-element-writer.js";
+import { generationIdentity } from "./generation-identity.js";
+import {
+  IMAGE_GENERATION_CANCELED_LABEL,
+  insertImageElement,
+  markImageGenerationPlaceholderFailed,
+  removeCompletedImagePlaceholder,
+} from "../canvas/canvas-element-writer.js";
 import { isAgentTaskAttachmentRejected } from "../agent-tasks/agent-task-service.js";
 
 const RECONCILE_BATCH_SIZE = 100;
@@ -75,10 +81,15 @@ export async function finalizeDesignImageJobChat(
       : "图片已生成，但应用到设计失败";
   const output = {
     status: "succeeded",
-    jobId: job.id,
     visualStatus: "unverified",
     viewed: false,
-    ...(typeof result.asset_id === "string" ? { assetId: result.asset_id } : {}),
+    // The shared ids, so this card can be joined to the job and the asset without
+    // re-deriving anything (see generation-identity). A design target has no
+    // canvas element, so `canvasElementId` stays absent here on purpose.
+    ...generationIdentity({
+      jobId: job.id,
+      assetId: result.asset_id,
+    }),
     design_id: designId,
     ...(typeof finalized.object_id === "string"
       ? { object_id: finalized.object_id }
@@ -213,7 +224,7 @@ function asRecord(value: unknown): Record<string, unknown> {
  * code the worker can actually dead-letter with has its own label — a code that
  * fell through to the generic sentence was the defect this fixes. */
 export function canvasFailureLabel(status: string, errorCode: string | null): string {
-  if (status === "canceled") return "生成已取消";
+  if (status === "canceled") return IMAGE_GENERATION_CANCELED_LABEL;
   switch (errorCode) {
     case "provider_rate_limited": return "渠道过载，未生成";
     case "provider_rejected": return "渠道拒绝，未生成";
@@ -283,6 +294,16 @@ export async function finalizeTerminalImageJobPlaceholder(  admin: AdminSupabase
   const finalizedResult: Record<string, unknown> = { ...result };
   let changed = false;
   const terminalStatus = job.status === "canceled" ? "canceled" : "failed";
+  // The placeholder's own state, which is NOT the card's: a canceled job is a
+  // legitimately finished job with a `canceled` placeholder, never an `error`
+  // one (see ImageGenerationPlaceholderStatus).
+  const placeholderStatus = job.status === "canceled" ? "canceled" : "error";
+  const target = asRecord(payload.target as Json | null);
+  const canvasPlaceholderId = job.target_kind === "canvas" && typeof job.canvas_id === "string"
+    && (target.kind === undefined || (target.kind === "canvas" && target.canvas_id === job.canvas_id))
+    && typeof (target.element_id ?? payload.placeholder_element_id) === "string"
+    ? (target.element_id ?? payload.placeholder_element_id) as string
+    : undefined;
   // Both codes mean "no image was produced": the channels refused the request, or
   // the upstream was momentarily overloaded. Either way the user may ask again.
   const retryEligible = job.status === "dead_letter"
@@ -315,7 +336,10 @@ export async function finalizeTerminalImageJobPlaceholder(  admin: AdminSupabase
         output: {
           ...imageSubmissionReceipt(job),
           status: job.status,
-          jobId: job.id,
+          // Same ids as the placeholder and the eventual image, so a card that
+          // failed or was canceled still names the element the user must deal
+          // with (the placeholder box), not just the job.
+          ...generationIdentity({ jobId: job.id, canvasElementId: canvasPlaceholderId }),
           ...(job.error_code ? { error_code: job.error_code } : {}),
           // The card shows this string to the customer, so it carries the same
           // code-derived copy as the summary. The raw provider text (upstream
@@ -335,24 +359,19 @@ export async function finalizeTerminalImageJobPlaceholder(  admin: AdminSupabase
     changed = true;
   }
 
-  if (job.target_kind === "canvas" && typeof job.canvas_id === "string"
+  if (canvasPlaceholderId && job.target_kind === "canvas" && typeof job.canvas_id === "string"
     && typeof result.canvas_terminal_finalized_at !== "string") {
-    const target = asRecord(payload.target as Json | null);
-    const validTarget = target.kind === undefined
-      || (target.kind === "canvas" && target.canvas_id === job.canvas_id);
-    const placeholderId = target.element_id ?? payload.placeholder_element_id;
-    if (validTarget && typeof placeholderId === "string" && placeholderId) {
-      await markImageGenerationPlaceholderFailed(
-        admin,
-        job.canvas_id,
-        placeholderId,
-        job.id,
-        canvasFailureLabel(job.status, job.error_code ?? null),
-      );
-      finalizedResult.canvas_terminal_finalized_at = new Date().toISOString();
-      finalizedResult.canvas_terminal_status = job.status;
-      changed = true;
-    }
+    await markImageGenerationPlaceholderFailed(
+      admin,
+      job.canvas_id,
+      canvasPlaceholderId,
+      job.id,
+      canvasFailureLabel(job.status, job.error_code ?? null),
+      { status: placeholderStatus },
+    );
+    finalizedResult.canvas_terminal_finalized_at = new Date().toISOString();
+    finalizedResult.canvas_terminal_status = job.status;
+    changed = true;
   }
   if (!changed) return false;
   const { error } = await admin.from("background_jobs").update({ result: {
@@ -427,8 +446,8 @@ export async function finalizeTerminalVideoJobPlaceholder(
       toolName: "generate_video",
       status: job.status === "canceled" ? "canceled" : "failed",
       output: {
+        ...generationIdentity({ jobId: job.id }),
         status: job.status,
-        jobId: job.id,
         ...(typeof payload.duration === "number" ? { durationSeconds: payload.duration } : {}),
         ...(typeof payload.resolution === "string" ? { resolution: payload.resolution } : {}),
         ...(job.error_code ? { error_code: job.error_code } : {}),
@@ -608,8 +627,9 @@ export async function finalizeImageJobToCanvas(
             output: {
               ...imageSubmissionReceipt(job),
               status: "succeeded",
-              jobId: job.id,
-              ...(typeof result.asset_id === "string" ? { assetId: result.asset_id } : {}),
+              // No canvas element was attached (the attachment was rejected), so
+              // this card names the job and the retained asset only.
+              ...generationIdentity({ jobId: job.id, assetId: result.asset_id }),
               source: { jobId: job.id },
               visualStatus: "unverified",
               viewed: false,
@@ -753,6 +773,10 @@ async function finalizeCurrentImageJobToCanvas(
           {
             canvasId: job.canvas_id,
             sourceJobId: `${job.id}:${kind}:${index}`,
+            // The per-layer key above is not a job id, so the owning job is
+            // named explicitly: every layer must still point at the same job and
+            // the same card as the original submission.
+            jobId: job.id,
             assetId: layerAssetId,
             objectPath: layerObjectPath,
             width: layerWidth,
@@ -815,7 +839,21 @@ async function finalizeCurrentImageJobToCanvas(
         toolCallId: `job-result-${job.id}`,
         toolName: "generate_image",
         status: "completed",
-        output: { ...imageSubmissionReceipt(job), status: "succeeded", jobId: job.id, assetId, visualStatus: "unverified", viewed: false },
+        output: {
+          ...imageSubmissionReceipt(job),
+          status: "succeeded",
+          // The canvas element id is the one that was just finalized (an
+          // in-place replacement keeps the placeholder's id, so this is the same
+          // element the user watched). `result.canvas_element_id` is the fallback
+          // for a replay where this run did not insert anything.
+          ...generationIdentity({
+            jobId: job.id,
+            assetId,
+            canvasElementId: elementId ?? result.canvas_element_id,
+          }),
+          visualStatus: "unverified",
+          viewed: false,
+        },
         outputSummary: "图片生成完成",
         artifacts: [
           {

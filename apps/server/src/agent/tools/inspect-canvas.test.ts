@@ -127,4 +127,86 @@ describe("inspect_canvas global scene queries", () => {
     expect(first.dimensions.note).toContain("sourcePixelWidth");
     expect(first.dimensions.order).toContain("canvas order");
   });
+
+  it("distinguishes all four image sizes and names the unknown ones instead of omitting them", async () => {
+    const f = fixture([
+      node("poster", 0, { type: "image", x: 80, y: 80, width: 381, height: 512,
+        customData: { assetId: "asset-poster" } }),
+      node("label", 1, { type: "text", text: "hero", x: 600, y: 80, width: 120, height: 30 }),
+    ]);
+    const read = async () => JSON.parse(await f.tool.execute({ detail_level: "summary", filter_type: ["image"] },
+      toolExecutionContext(f.config))) as { elements: Array<Record<string, unknown>>;
+        dimensions: { note: string; order: string; identity: string } };
+    const output = await read();
+    // ③ the display frame — the only size the canvas can answer, and it is named
+    // as the frame rather than handed over as a bare pixel pair.
+    expect(output.elements[0]).toMatchObject({
+      image_canvas_frame: { width: 381, height: 512, source_of_truth: "canvas element display frame" },
+      canvas_frame_width: 381, canvas_frame_height: 512,
+    });
+    // ①②④ are present as explicit nulls with a stated authority: an absent key
+    // reads as "no such size", a bare number reads as "this is the size".
+    expect(output.elements[0]).toMatchObject({
+      image_source_pixels: null, image_requested_frame: null, image_export_size: null,
+    });
+    expect(output.elements[0]).not.toHaveProperty("width");
+    const authority = String(output.elements[0]!.image_size_authority);
+    for (const key of ["image_requested_frame", "image_source_pixels", "image_canvas_frame", "image_export_size"])
+      expect(authority).toContain(key);
+    expect(authority).toContain("generation job receipt");
+    expect(authority).toContain("design_export job's result");
+    expect(output.dimensions.note).toContain("NOT the image's pixels");
+
+    // A non-image element keeps a display frame and never claims an image size.
+    const all = JSON.parse(await f.tool.execute({ detail_level: "summary", filter_type: ["text"] },
+      toolExecutionContext(f.config))) as { elements: Array<Record<string, unknown>> };
+    expect(all.elements[0]).toMatchObject({ canvas_frame_width: 120, canvas_frame_height: 30 });
+    expect(all.elements[0]).not.toHaveProperty("image_canvas_frame");
+    expect(all.elements[0]).not.toHaveProperty("image_source_pixels");
+  });
+
+  it("identifies canvas images by stable id and states that the ordinal is only order", async () => {
+    const f = fixture([
+      node("first", 0, { type: "image", x: 80, y: 80, width: 381, height: 512,
+        customData: { assetId: "asset-first" } }),
+      node("second", 1, { type: "image", x: 501, y: 80, width: 512, height: 512,
+        customData: { assetId: "asset-second" } }),
+      // No assetId: an unbacked canvas file, which must be named as such.
+      node("loose", 2, { type: "image", x: 1_053, y: 80, width: 300, height: 300 }),
+    ]);
+    const read = async () => JSON.parse(await f.tool.execute({ detail_level: "summary", filter_type: ["image"] },
+      toolExecutionContext(f.config))) as { elements: Array<Record<string, unknown>>;
+        dimensions: { identity: string } };
+    const output = await read();
+    expect(output.elements.map(item => [item.id, item.canvas_index, item.assetId ?? null])).toEqual([
+      ["first", 0, "asset-first"], ["second", 1, "asset-second"], ["loose", 2, null],
+    ]);
+    expect(output.elements[2]).toMatchObject({ hasAssetId: false, assetIdentitySource: "unbacked" });
+    expect(output.dimensions.identity).toContain("STABLE identity");
+    expect(output.dimensions.identity).toContain("presentation order only");
+    expect(output.dimensions.identity).toContain("must never be used as an image's identity");
+    expect(output.dimensions.identity).toContain("unbacked");
+
+    // Inserting an image above shifts the ordinal while the ids stay put: the
+    // listing's numbers cannot be the identity it is answered by.
+    f.setElements([
+      node("prepended", 0, { type: "image", x: 0, y: 0, width: 100, height: 100, customData: { assetId: "asset-prepended" } }),
+      node("first", 1, { type: "image", x: 80, y: 80, width: 381, height: 512, customData: { assetId: "asset-first" } }),
+      node("second", 2, { type: "image", x: 501, y: 80, width: 512, height: 512, customData: { assetId: "asset-second" } }),
+      node("loose", 3, { type: "image", x: 1_053, y: 80, width: 300, height: 300 }),
+    ]);
+    const shifted = await read();
+    expect(shifted.elements.map(item => [item.id, item.canvas_index])).toEqual([
+      ["prepended", 0], ["first", 1], ["second", 2], ["loose", 3],
+    ]);
+    expect(shifted.elements.map(item => item.assetId)).toEqual([
+      "asset-prepended", "asset-first", "asset-second", undefined,
+    ]);
+    // The negative assertion: nothing in this payload offers an ordinal as an
+    // identity, so nothing here can be cited as "image 2" and resolved by
+    // position. `identity` is prose, never a value that points at canvas_index.
+    expect(shifted.elements.every(item => !("identity" in item))).toBe(true);
+    expect(shifted.elements.every(item => "assetIdentitySource" in item)).toBe(true);
+    expect(shifted.dimensions.identity).toMatch(/must never be used/);
+  });
 });

@@ -50,11 +50,93 @@ describe("@loomic/shared contracts", () => {
       service: "loomic-server",
       version: "0.1.0",
       agentRuntime: "mastra",
+      cached: false,
+      checkedAt: "2026-09-21T00:00:00.000Z",
+      components: {
+        database: { status: "ok", detail: "write+read ok", latencyMs: 12 },
+        agentRuntime: { status: "ok", detail: "mastra configured", latencyMs: 3 },
+        queue: { status: "ok", detail: "4 queues empty", latencyMs: 8 },
+        storage: { status: "ok", detail: "bucket reachable", latencyMs: 21 },
+        worker: { status: "ok", detail: "1 online (w1)", latencyMs: 6 },
+      },
     });
 
     expect(parsed.ok).toBe(true);
     expect(parsed.service).toBe("loomic-server");
     expect(parsed.agentRuntime).toBe("mastra");
+    expect(Object.keys(parsed.components).sort()).toEqual([
+      "agentRuntime",
+      "database",
+      "queue",
+      "storage",
+      "worker",
+    ]);
+  });
+
+  it("accepts a degraded health payload so a serving server can still report problems", () => {
+    const parsed = healthResponseSchema.parse({
+      ok: true,
+      service: "loomic-server",
+      version: "0.1.0",
+      agentRuntime: "mastra",
+      cached: true,
+      checkedAt: "2026-09-21T00:00:00.000Z",
+      components: {
+        database: { status: "ok", detail: "write+read ok", latencyMs: 12 },
+        agentRuntime: { status: "ok", detail: "mastra configured", latencyMs: 3 },
+        queue: { status: "ok", detail: "4 queues empty", latencyMs: 8 },
+        storage: { status: "failed", detail: "error:404", latencyMs: 700 },
+        worker: {
+          status: "degraded",
+          detail: "offline: no heartbeat within 30s",
+          latencyMs: 5,
+        },
+      },
+    });
+
+    // `ok` reports whether the stack can SERVE, not whether everything is
+    // perfect, which is exactly what flips to false for a database write failure.
+    expect(parsed.ok).toBe(true);
+    expect(parsed.components.worker.status).toBe("degraded");
+    expect(parsed.components.storage.detail).toBe("error:404");
+  });
+
+  it("refuses a health payload that omits a probed component or hides its status", () => {
+    const base = {
+      agentRuntime: "mastra",
+      cached: false,
+      checkedAt: "2026-09-21T00:00:00.000Z",
+      ok: true,
+      service: "loomic-server",
+      version: "0.1.0",
+    };
+    const components = {
+      agentRuntime: { status: "ok", detail: "mastra configured", latencyMs: 3 },
+      database: { status: "ok", detail: "write+read ok", latencyMs: 12 },
+      queue: { status: "ok", detail: "4 queues empty", latencyMs: 8 },
+      storage: { status: "ok", detail: "bucket reachable", latencyMs: 21 },
+      worker: { status: "ok", detail: "1 online (w1)", latencyMs: 6 },
+    };
+
+    const { storage: _omitted, ...withoutStorage } = components;
+    expect(
+      healthResponseSchema.safeParse({ ...base, components: withoutStorage }).success,
+    ).toBe(false);
+    expect(
+      healthResponseSchema.safeParse({
+        ...base,
+        components: { ...components, database: { detail: "ok", latencyMs: 1 } },
+      }).success,
+    ).toBe(false);
+    expect(
+      healthResponseSchema.safeParse({
+        ...base,
+        components: {
+          ...components,
+          worker: { status: "unknown", detail: "?", latencyMs: 1 },
+        },
+      }).success,
+    ).toBe(false);
   });
 
   it("accepts canvasId as optional field", () => {

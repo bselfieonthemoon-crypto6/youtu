@@ -7,6 +7,7 @@ import { compactMastraToolResult } from "./tool-result-projection.js";
 import { createAgentTool } from "./tools/tool-run-context.js";
 import { sanitizeErrorForClient } from "../utils/error-sanitizer.js";
 import { GENERIC_PROVIDER_FAILURE_COPY, providerFailureDescription } from "./provider-failure-copy.js";
+import { projectImageJobDimensions } from "./export-dimension-contract.js";
 
 function numeric(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -14,7 +15,15 @@ function numeric(value: unknown): number | undefined {
   return undefined;
 }
 
-/** Expose the same persisted receipt as the chat card, without raw payloads. */
+/**
+ * Expose the same persisted receipt as the chat card, without raw payloads.
+ *
+ * `requestedResolution` is separated from `actualResolution` on purpose: the
+ * former is ① what the user's submission asked for (a tier), the latter is what
+ * the pricing receipt records as actually billed. Collapsing them would put a
+ * requested tier and a billed tier under one name, which is the same class of
+ * defect as reporting a display frame as an image's pixels.
+ */
 function withImageSubmissionReceipt(job: Record<string, unknown>) {
   const { creditsCost, creditsCostColumn, pricingVersion, quality, resolution, ...rest } = job;
   const cost = numeric(creditsCostColumn) ?? numeric(creditsCost);
@@ -23,6 +32,7 @@ function withImageSubmissionReceipt(job: Record<string, unknown>) {
     ...(typeof rest.error_message === "string"
       ? { error_message: sanitizeErrorForClient(new Error(rest.error_message)) }
       : {}),
+    ...(typeof resolution === "string" && resolution.trim() ? { requestedResolution: resolution } : {}),
     ...imageSubmissionReceipt({
       payload: { mastra_pricing_version: pricingVersion, quality, resolution },
       ...(cost !== undefined ? { credits_cost: cost } : {}),
@@ -69,14 +79,14 @@ export function createMastraImageStatusTools(input: {
   }
   const getImageStatus = createAgentTool({
     id: "get_image_status",
-    description: "Read the latest or exact image job in this workspace conversation. Workspace members may view scoped jobs. Never resubmits or charges.",
+    description: "Read the latest or exact image job in this workspace conversation. Returns the job's own four-size contract in one payload: requestedFrame (① the aspect ratio + resolution tier the user's submission asked for), sourcePixelWidth/Height (② the AI image's real pixels, authoritative, from this job's result), canvasElementId (③ which canvas placement shows it — read that element's display frame from the canvas, never as ②), and exportSize (④ always null here: an export size exists only on a design_export job's own result). Never resubmits or charges.",
     inputSchema: z.object({ jobId: z.string().uuid().optional() }),
     execute: async ({ jobId }) => {
       try {
         assertIdentity();
         const job = await input.jobService.getConversationImageJob(input.user, input.scope, jobId);
         if (!job) return compactMastraToolResult({ status: "not_found" });
-        return compactMastraToolResult(withImageSubmissionReceipt(job));
+        return compactMastraToolResult(withImageSubmissionReceipt({ ...job, ...projectImageJobDimensions(job) }));
       } catch (error) { return failure(error); }
     },
   });

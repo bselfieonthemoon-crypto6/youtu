@@ -14,6 +14,7 @@ import {
 } from "./agent/tools/read-tool-registry.js";
 import {
   type ServerEnv,
+  DEFAULT_STORAGE_HEALTH_BUCKET,
   loadServerEnv,
   resolveDefaultAgentModel,
 } from "./config/env.js";
@@ -154,6 +155,15 @@ import { registerDesignRoutes } from "./http/designs.js";
 import { registerFontsRoutes } from "./http/fonts.js";
 import { registerGenerateRoutes } from "./http/generate.js";
 import { registerHealthRoutes } from "./http/health.js";
+import {
+  type HealthService,
+  createHealthService,
+  createMastraRuntimeProbe,
+  createPgmqQueueProbe,
+  createPostgrestDatabaseProbe,
+  createPostgrestWorkerHeartbeatProbe,
+  createSupabaseStorageProbe,
+} from "./http/health-service.js";
 import { registerImageModelRoutes } from "./http/image-models.js";
 import { registerImageProxyRoute } from "./http/image-proxy.js";
 import { registerImageTextRoutes } from "./http/image-text.js";
@@ -202,6 +212,7 @@ import { registerVideoModelRoutes } from "./http/video-models.js";
 import { registerViewerRoutes } from "./http/viewer.js";
 import { registerWorkspaceMemberRoutes } from "./http/workspace-members.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
+import { WORKER_QUEUES } from "./queue/queues.js";
 import { createAdminSupabaseClient } from "./supabase/admin.js";
 import {
   type RequestAuthenticator,
@@ -247,6 +258,8 @@ export type BuildAppOptions = {
   connectionManager?: ConnectionManager;
   creditService?: CreditService;
   env?: Partial<ServerEnv>;
+  /** Test seam for the truthful health endpoint (P0 #3). */
+  healthService?: HealthService;
   jobService?: JobService;
   paymentService?: PaymentService;
   tierGuard?: TierGuard;
@@ -591,9 +604,38 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     }
   });
 
-  void registerHealthRoutes(app, env,
-    options.mastraRunFactory ? "mastra"
-      : configuredAgentRuntime);
+  const healthRuntimeProbe = createMastraRuntimeProbe({
+    agentModel: env.agentModel,
+    // Validate the model BINDING only against a real configured endpoint. The
+    // safe-provider-fetch wrapper refuses a synthetic URL, and reporting `failed`
+    // for a synthetic probe would be a false alarm, not a finding.
+    ...(env.apiYiApiKey && env.apiYiApiBase
+      ? { bindingProbe: { apiKey: env.apiYiApiKey, baseUrl: env.apiYiApiBase } }
+      : {}),
+  });
+  // Load and validate the agent runtime BEFORE the listener opens. If the Mastra
+  // entry cannot be imported at all, the server must not report itself ready —
+  // and doing it here keeps the health probe instantaneous, which matters because
+  // Playwright polls `/api/health` while the stack starts.
+  app.addHook("onReady", async () => {
+    const result = await healthRuntimeProbe.warmup();
+    if (result.reason) app.log.warn({ reason: result.reason }, "Agent runtime health probe is not ready");
+  });
+  void registerHealthRoutes(app, {
+    agentRuntime: options.mastraRunFactory ? "mastra" : configuredAgentRuntime,
+    healthService: options.healthService ?? createHealthService({
+      database: createPostgrestDatabaseProbe({ getAdminClient }),
+      // The queues the worker actually polls. Imported from the shared list so a
+      // new queue cannot be silently missing from the depth report.
+      queues: WORKER_QUEUES,
+      ...(pgmq ? { queue: createPgmqQueueProbe({ read: (queue, vt, qty, signal) => pgmq.read(queue, vt, qty, signal) }) } : {}),
+      runtime: healthRuntimeProbe,
+      storage: createSupabaseStorageProbe({ getAdminClient }),
+      storageBucket: env.storageHealthBucket ?? DEFAULT_STORAGE_HEALTH_BUCKET,
+      workerHeartbeat: createPostgrestWorkerHeartbeatProbe({ getAdminClient }),
+    }),
+    version: env.version,
+  });
   void registerPromptLibraryRoutes(app, { auth, promptLibraryService });
   void registerFontsRoutes(app, { env });
   void registerImageProxyRoute(app);

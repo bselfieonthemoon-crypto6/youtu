@@ -5,7 +5,7 @@ import type {
   ImageQualityLevel,
 } from "@loomic/shared";
 
-import { insertImageGenerationPlaceholder, markImageGenerationPlaceholderFailed } from "../features/canvas/canvas-element-writer.js";
+import { insertImageGenerationPlaceholder, markImageGenerationPlaceholderFailed, IMAGE_GENERATION_CANCELED_LABEL } from "../features/canvas/canvas-element-writer.js";
 import type { CreditService } from "../features/credits/credit-service.js";
 import type { TierGuard } from "../features/credits/tier-guard.js";
 import { imageResolutionBillingQuality } from "../features/credits/tier-guard.js";
@@ -16,6 +16,7 @@ import type { AuthenticatedUser, UserSupabaseClient } from "../supabase/user.js"
 import type { ConnectionManager } from "../ws/connection-manager.js";
 import type { SubmitImageJobFn } from "./image-generation-contracts.js";
 import { imageSubmissionReceipt } from "../features/jobs/image-submission-receipt.js";
+import { generationIdentity } from "../features/jobs/generation-identity.js";
 import { mastraImageDefaultRunLimit, validateMastraImageExecution, validateMastraImageResolutionSupport } from "./mastra-image-execution-policy.js";
 
 export type MastraImageDesignTargetInput = Omit<DesignJobTarget, "idempotency_key"> & {
@@ -323,7 +324,12 @@ export function createMastraImageJobSubmitter(deps: MastraImageJobDependencies):
         session_id: context.sessionId, role: "assistant", content: "图片任务正在提交或排队",
         content_blocks: [{ type: "tool", toolCallId: `job-result-${job.id}`, toolName: "generate_image",
           status: "running", input: { title: input.title, model: input.model, aspectRatio: input.aspectRatio },
-          output: { ...receipt, status: "queued", jobId: job.id, jobType: "image_generation" },
+          output: {
+            ...receipt,
+            ...generationIdentity({ jobId: job.id, canvasElementId: placeholderElementId }),
+            status: "queued",
+            jobType: "image_generation",
+          },
           outputSummary: "图片任务正在提交或排队" }] }, { onConflict: "id" });
       if (error) console.error("[mastra-image-jobs] failed to persist chat placeholder:", error);
     }
@@ -336,8 +342,11 @@ export function createMastraImageJobSubmitter(deps: MastraImageJobDependencies):
         jobId: job.id, runId: context.runId, submissionKey,
       }).catch(() => false);
       if (!canceled) return { ...receipt, jobId: job.id, status: "processing" };
+      // The user stopped this run, so the placeholder must say `canceled`, not
+      // `error`: the abort is the customer's own action, not a generation
+      // failure (see ImageGenerationPlaceholderStatus).
       if (placeholderElementId) await markImageGenerationPlaceholderFailed(client, context.canvasId,
-        placeholderElementId, job.id, "生成已取消").catch(() => false);
+        placeholderElementId, job.id, IMAGE_GENERATION_CANCELED_LABEL, { status: "canceled" }).catch(() => false);
       return { ...receipt, jobId: job.id, error: "Run was canceled" };
     }
     try {

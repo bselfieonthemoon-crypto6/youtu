@@ -335,7 +335,8 @@ describe("Mastra image source grounding", () => {
   it("freezes ordered trusted candidates and merges provenance without exposing source IDs as keys", () => {
     const candidates = buildMastraImageSourceCandidates({
       currentAttachments: [],
-      canvasCandidates: [{ elementId: "element-private", canvasIndex: 0, assetId, title: "双叶", priority: "selected" }],
+      canvasCandidates: [{ elementId: "element-private", canvasIndex: 0, assetId, title: "双叶",
+        hasAssetId: true, assetIdentitySource: "customData.assetId", priority: "selected" }],
       recentJobs: [{ id: jobId, status: "succeeded", result: { asset_id: assetId }, title: "最近双叶",
         prompt: "深蓝双叶", createdAt: "2026-09-13T00:00:00.000Z", designId }],
       canvasId, liveDesignIds: new Set([designId]),

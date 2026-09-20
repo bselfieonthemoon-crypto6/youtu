@@ -16,11 +16,57 @@ import {
   workspaceSummarySchema,
 } from "./contracts.js";
 
+/**
+ * Health is a truthful liveness+readiness report, not a constant.
+ *
+ * The complaint that produced this contract: `/api/health` answered
+ * `{ok:true}` while the database could not accept a message write, so every
+ * monitor and acceptance script believed the stack was healthy. `ok` is now
+ * derived from independently probed components.
+ *
+ * Vocabulary, fixed on purpose so the payload stays comparable across runs:
+ *   - `ok`      : at least one CRITICAL component is `failed` (traffic cannot be
+ *                 served). Degraded-but-serving is still `ok:true`, which keeps
+ *                 the existing readiness probes (Playwright `webServer.url`,
+ *                 `scripts/start-local-api.ps1`, the acceptance scripts) working
+ *                 while still surfacing the problem in `components`.
+ *   - `degraded`: the component works but is not fully healthy (an offline
+ *                 worker on a laptop, a queue with a backlog).
+ *   - `failed`  : the component did not answer its probe.
+ *
+ * `detail` is a short SANITIZED token list: no secrets, no provider text, no
+ * stack traces. `latencyMs` is the measured probe duration.
+ */
+export const healthComponentStatusSchema = z.enum(["ok", "degraded", "failed"]);
+
+export const healthComponentSchema = z.object({
+  status: healthComponentStatusSchema,
+  detail: z.string().min(1).max(200),
+  latencyMs: z.number().int().nonnegative(),
+});
+
+export const healthComponentsSchema = z.object({
+  /** A real WRITE (upsert) plus a read-back of the same row, not `select 1`. */
+  database: healthComponentSchema,
+  /** Mastra runtime mode plus the bound run factory/probe. */
+  agentRuntime: healthComponentSchema,
+  /** pgmq reachability and depth of the worker queues. */
+  queue: healthComponentSchema,
+  /** Authenticated storage call; its own timeout. */
+  storage: healthComponentSchema,
+  /** Freshest worker heartbeat row in `private.loomic_worker_heartbeats`. */
+  worker: healthComponentSchema,
+});
+
 export const healthResponseSchema = z.object({
-  ok: z.literal(true),
+  ok: z.boolean(),
   service: z.literal("loomic-server"),
   version: z.string().min(1),
   agentRuntime: z.literal("mastra"),
+  components: healthComponentsSchema,
+  /** Bounded server-side cache window, so a polling probe cannot stampede. */
+  cached: z.boolean(),
+  checkedAt: z.string().min(1),
 });
 
 export const runCancelResponseSchema = z.object({
@@ -154,6 +200,9 @@ export const canvasSaveResponseSchema = z.object({
   revision: z.number().int().nonnegative(),
 });
 
+export type HealthComponentStatus = z.infer<typeof healthComponentStatusSchema>;
+export type HealthComponent = z.infer<typeof healthComponentSchema>;
+export type HealthComponents = z.infer<typeof healthComponentsSchema>;
 export type HealthResponse = z.infer<typeof healthResponseSchema>;
 export type RunCancelResponse = z.infer<typeof runCancelResponseSchema>;
 export type ViewerCredits = z.infer<typeof viewerCreditsSchema>;

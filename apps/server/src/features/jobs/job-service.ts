@@ -1261,8 +1261,11 @@ export function createJobService(options: {
     async getConversationImageJob(user, scope, jobId) {
       const admin = options.getAdminClient();
       await authorizeConversationImageJobs(admin, user.id, scope);
+      // `canvas_id`/`design_id` ride along so a status answer can join the job's
+      // real pixels (result.width/height) to the canvas placement that shows
+      // them instead of guessing which image the numbers describe.
       let query = scopeConversationImageJobs(admin.from("background_jobs")
-        .select("id,status,result,error_code,error_message,created_at,model:payload->>model,requestedAspectRatio:payload->>aspect_ratio,creditsCost:payload->>mastra_credits_cost,creditsCostColumn:credits_cost,pricingVersion:payload->>mastra_pricing_version,quality:payload->>quality,resolution:payload->>resolution"), scope);
+        .select("id,status,result,error_code,error_message,created_at,canvas_id,design_id,model:payload->>model,requestedAspectRatio:payload->>aspect_ratio,creditsCost:payload->>mastra_credits_cost,creditsCostColumn:credits_cost,pricingVersion:payload->>mastra_pricing_version,quality:payload->>quality,resolution:payload->>resolution"), scope);
       if (jobId) query = query.eq("id", jobId);
       const { data, error } = await query.order("created_at", { ascending: false }).limit(1).maybeSingle();
       if (error) throw new JobServiceError("job_query_failed", "Failed to query image status.", 500);

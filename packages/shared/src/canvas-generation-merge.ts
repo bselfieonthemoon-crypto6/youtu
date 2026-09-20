@@ -8,6 +8,21 @@ const submissionRevision = (request: Element | undefined) =>
   typeof request?.submissionRevision === "number" && Number.isSafeInteger(request.submissionRevision)
     ? request.submissionRevision : 0;
 
+/**
+ * The attempt is over, so its frozen request stops being enforced and its
+ * visible fields become an editable draft for the next explicit retry.
+ *
+ * `canceled` is a terminal outcome of its own — the USER stopped the job — and it
+ * has to behave exactly like `error` here. Until the canceled status existed,
+ * every terminal placeholder was persisted as `error`; if the merge kept
+ * treating only `error` as terminal, a canceled node would still count as an
+ * "active accepted attempt" and a newer submission with a different request id
+ * would be rejected as unmergeable (or the canceled attempt's frozen
+ * prompt/model would overwrite the new draft). Both are cross-job identity
+ * leaks, which is why this predicate lives in one place.
+ */
+const isTerminalAttempt = (status: unknown) => status === "error" || status === "canceled";
+
 /** Completion changes content, while a concurrent drag may change geometry. */
 export function mergeCompletedImageReplacement(a: Element, b: Element): Element | null {
   if (a.id !== b.id) return null;
@@ -60,15 +75,15 @@ export function mergePendingNodeImageSubmission(a: Element, b: Element): Element
     const acceptedRequest = accepted === a ? ra : rb;
     // A terminal attempt may be replaced by an explicit new submission. An
     // active attempt, however, cannot lose its binding to any old browser copy.
-    if ((accepted.customData as Element).status === "error" &&
+    if (isTerminalAttempt((accepted.customData as Element).status) &&
       typeof otherRequest?.requestId === "string" &&
       otherRequest.requestId !== acceptedRequest?.requestId) return null;
   }
   const acceptedData = accepted.customData as Element;
   const request = acceptedData.nodeImageRequest as Element;
-  // After failure the visible fields become an editable draft for the next
-  // explicit retry; the old request record itself remains frozen.
-  const frozenData = Object.fromEntries((acceptedData.status === "error" ? [] : ["prompt", "model", "aspectRatio", "quality"])
+  // After failure or cancellation the visible fields become an editable draft for
+  // the next explicit retry; the old request record itself remains frozen.
+  const frozenData = Object.fromEntries((isTerminalAttempt(acceptedData.status) ? [] : ["prompt", "model", "aspectRatio", "quality"])
     .filter(key => request[key] !== undefined).map(key => [key, request[key]]));
   if (accepted === base && Object.entries(frozenData).every(([key, value]) => acceptedData[key] === value)) return base;
   return { ...accepted, ...geometryOf(base), version: Math.max(versionOf(a), versionOf(b)) + 1,

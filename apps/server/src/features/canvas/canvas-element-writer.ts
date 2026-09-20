@@ -1,6 +1,7 @@
 // apps/server/src/features/canvas/canvas-element-writer.ts
 
 import type { CanvasContent, Json } from "@loomic/shared";
+import { generationIdentity } from "../jobs/generation-identity.js";
 import { mergeCanvasContent } from "./canvas-content-merge.js";
 
 // ---------------------------------------------------------------------------
@@ -11,7 +12,14 @@ type CanvasElement = Record<string, unknown>;
 
 type ImageInsertOpts = {
   canvasId: string;
+  /**
+   * Element-scoped provenance key: `findElementBySourceJobId` uses it for
+   * idempotency, and a layer split appends `:kind:index` to it, which is why it
+   * cannot be the canonical job id. `jobId` below is.
+   */
   sourceJobId: string;
+  /** The owning job. Defaults to `sourceJobId` for single-element inserts. */
+  jobId?: string;
   assetId: string;
   objectPath: string;       // Storage path for oss:// marker (already uploaded by worker)
   width: number;
@@ -41,6 +49,24 @@ type VideoInsertOpts = {
   rejectDeletedSourceJob?: boolean;
   knownElementId?: string;
 };
+
+/**
+ * The persisted state of an image placeholder node (`customData.status`).
+ *
+ * `canceled` is a state of its own: the USER stopped the job, so it is not a
+ * failure and must never be rendered or summarized as one. Historical canvases
+ * persisted this outcome as `status: "error"` + the canceled label (see
+ * `IMAGE_GENERATION_CANCELED_LABEL`); readers must keep accepting that pair.
+ */
+export type ImageGenerationPlaceholderStatus = "generating" | "error" | "canceled";
+
+/**
+ * The one canceled label written onto a placeholder, and the string the web
+ * reader sniffs to recognize the pre-`canceled` rows. The web mirror lives in
+ * `apps/web/src/lib/canvas-image-generator.ts` (same name) because the browser
+ * cannot import server modules.
+ */
+export const IMAGE_GENERATION_CANCELED_LABEL = "生成已取消";
 
 type Placement = { x: number; y: number; width: number; height: number };
 
@@ -177,9 +203,10 @@ function buildVideoElement(
   placement: Placement,
   opts: VideoInsertOpts,
 ): CanvasElement {
+  const id = generateId();
   return {
     type: "embeddable",
-    id: generateId(),
+    id,
     x: placement.x,
     y: placement.y,
     width: placement.width,
@@ -205,6 +232,13 @@ function buildVideoElement(
     link: opts.signedUrl,
     locked: false,
     customData: {
+      // The four shared ids first, so every reader can join on them (see
+      // `features/jobs/generation-identity.ts`).
+      ...generationIdentity({
+        jobId: opts.sourceJobId,
+        assetId: opts.assetId,
+        canvasElementId: id,
+      }),
       source: "generated" as const,
       sourceJobId: opts.sourceJobId,
       assetId: opts.assetId,
@@ -329,8 +363,18 @@ function buildImageGenerationPlaceholder(
       model: opts.model,
       aspectRatio: opts.aspectRatio,
       quality: opts.quality,
-      jobId: opts.sourceJobId,
+      // Legacy alias kept for the readers written before `jobId` was canonical
+      // (`insertImageGenerationPlaceholder`, `markImageGenerationPlaceholderFailed`
+      // and the web node panel all still accept either).
       sourceJobId: opts.sourceJobId,
+      // Placeholder surface of the shared four ids (`jobId`, `canvasElementId`,
+      // `messageId`; `assetId` is deliberately absent — no pixels exist yet, and
+      // a guessed value would be worse than a missing one). See
+      // `features/jobs/generation-identity.ts`.
+      ...generationIdentity({
+        jobId: opts.sourceJobId,
+        canvasElementId: opts.elementId,
+      }),
     },
   };
 }
@@ -439,13 +483,26 @@ export async function insertImageGenerationPlaceholder(
   return { elementId: opts.elementId, placement: resolvedPlacement };
 }
 
+/**
+ * Settle a still-live placeholder with a terminal outcome.
+ *
+ * `options.status` distinguishes the two terminal states that used to be stored
+ * as the same `error`: a FAILURE (`error`, default) and a user CANCELLATION
+ * (`canceled`). Cancellation is not an error — the user stopped the job on
+ * purpose — and pretending otherwise is what made the canvas tell a customer
+ * their own action failed. `label` stays in `customData.errorMessage`: that
+ * field name predates the canceled state, it is what already-persisted canvases
+ * and the web reader use, and renaming it would orphan every stored row.
+ */
 export async function markImageGenerationPlaceholderFailed(
   client: CanvasClient,
   canvasId: string,
   elementId: string,
   sourceJobId: string,
   errorMessage: string,
+  options: { status?: Extract<ImageGenerationPlaceholderStatus, "error" | "canceled"> } = {},
 ): Promise<boolean> {
+  const settledStatus = options.status ?? "error";
   let changed = false;
   await writeCanvasWithRetry(client, canvasId, (content) => {
     changed = false;
@@ -474,8 +531,16 @@ export async function markImageGenerationPlaceholderFailed(
           ...element,
           customData: {
             ...customData,
-            status: "error",
+            status: settledStatus,
             errorMessage,
+            // The element keeps its four ids; only the state changes. `jobId`
+            // and `canvasElementId` are re-affirmed because the settling write
+            // is also the place a reader looks for "which job/element settled".
+            ...generationIdentity({
+              jobId: sourceJobId,
+              assetId: customData.assetId,
+              canvasElementId: element.id,
+            }),
           },
           version: (Number(element.version) || 1) + 1,
           versionNonce: Math.floor(Math.random() * 2_000_000_000),
@@ -597,6 +662,19 @@ export async function insertImageElement(
       isDeleted: replacement!.isDeleted === true,
       version: Number(replacement!.version ?? 1) + 1,
     });
+    // The id is final now (an in-place replacement inherits the placeholder's
+    // id), so the shared four ids can be written in one place. `jobId` is the
+    // owning job even when `sourceJobId` is a per-layer key, and
+    // `canvasElementId` is this very element — the same value the placeholder
+    // carried, which is what lets a reader follow job → placeholder → pixels.
+    element.customData = {
+      ...(element.customData as Record<string, unknown>),
+      ...generationIdentity({
+        jobId: opts.jobId ?? opts.sourceJobId,
+        assetId: opts.assetId,
+        canvasElementId: element.id,
+      }),
+    };
     insertedElementId = element.id as string;
     return {
       ...content,

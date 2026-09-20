@@ -4,7 +4,13 @@ const insertImageElement = vi.hoisted(() => vi.fn());
 const markImageGenerationPlaceholderFailed = vi.hoisted(() => vi.fn());
 const removeCompletedImagePlaceholder = vi.hoisted(() => vi.fn());
 
-vi.mock("../canvas/canvas-element-writer.js", () => ({
+// Spread the REAL module and override only the three writers. A plain object
+// factory hid every other export, and accessing one the finalizer now reads
+// (`IMAGE_GENERATION_CANCELED_LABEL`, the single source of the canceled label)
+// threw "No ... export is defined on the mock" — a test-only breakage that looked
+// like a product failure. importOriginal keeps the constants real automatically.
+vi.mock("../canvas/canvas-element-writer.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../canvas/canvas-element-writer.js")>()),
   insertImageElement,
   markImageGenerationPlaceholderFailed,
   removeCompletedImagePlaceholder,
@@ -152,8 +158,11 @@ describe("image job canvas finalization", () => {
       placeholder_element_id: "placeholder-1", target: { kind: "canvas", canvas_id: "canvas-1", element_id: "placeholder-1" } },
       result: null };
     await expect(finalizeTerminalImageJobPlaceholder(admin as never, terminal as never)).resolves.toBe(true);
+    // The placeholder's OWN status must match the outcome: a cancellation is not an
+    // error (that is exactly what the user asked for), while a dead letter still is.
     expect(markImageGenerationPlaceholderFailed).toHaveBeenCalledExactlyOnceWith(
       admin, "canvas-1", "placeholder-1", "job-1", message,
+      { status: status === "canceled" ? "canceled" : "error" },
     );
     expect(update).toHaveBeenCalledWith({ result: expect.objectContaining({
       canvas_terminal_finalized_at: expect.any(String), canvas_terminal_status: status,
@@ -366,6 +375,7 @@ describe("image job canvas finalization", () => {
     expect(scan.is).toHaveBeenCalledWith("result->>canvas_terminal_finalized_at", null);
     expect(markImageGenerationPlaceholderFailed).toHaveBeenCalledWith(
       admin, "canvas-1", "placeholder-recovery", "job-1", "图片生成失败",
+      { status: "error" },
     );
     expect(update).toHaveBeenCalledWith({ result: expect.objectContaining({
       canvas_terminal_status: "dead_letter", canvas_terminal_finalized_at: expect.any(String),

@@ -58,6 +58,25 @@ describe("durable node progress merge", () => {
       customData: { prompt: "retry draft", nodeImageRequest: { prompt: request.prompt } },
     });
   });
+  // A user cancellation is a terminal outcome, not an active attempt. If the
+  // merge kept only `error` as terminal, a canceled node would still hold the
+  // accepted job id and its frozen prompt/model could overwrite a newer
+  // submission's draft — the cross-job leak the four-id binding exists to stop.
+  it("treats a canceled attempt as terminal for a new request and for editing", () => {
+    const canceled = { ...accepted, version: 35,
+      customData: { ...accepted.customData, status: "canceled", errorMessage: "生成已取消" } };
+    const retry = { ...pending, customData: { ...pending.customData, status: "generating", nodeImageRequest: { ...request, requestId: "new-request", state: "submitting" } } };
+    expect(mergePendingNodeImageSubmission(retry, canceled)).toBeNull();
+    expect(mergePendingNodeImageSubmission(canceled, retry)).toBeNull();
+    // The canceled node itself stays readable and keeps the accepted job binding.
+    expect(mergePendingNodeImageSubmission(pending, canceled)).toMatchObject({
+      customData: { status: "canceled", jobId: "job-1", errorMessage: "生成已取消" },
+    });
+    const edited = { ...canceled, version: 36, customData: { ...canceled.customData, prompt: "retry draft" } };
+    expect(mergePendingNodeImageSubmission(canceled, edited)).toMatchObject({
+      customData: { status: "canceled", prompt: "retry draft", nodeImageRequest: { prompt: request.prompt } },
+    });
+  });
   it.each([undefined, { ...request, requestId: "previous-request", state: "accepted", submissionRevision: 1 }])("keeps completed node pixels over an old request: %j", oldRequest => {
     const old = { ...pending, isDeleted: true, customData: { type: "image-generator", jobId: oldRequest ? "old-job" : undefined, nodeImageRequest: oldRequest } };
     const image = { id: "node-1", type: "image", version: 12, fileId: "file",

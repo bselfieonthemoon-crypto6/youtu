@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   CANVAS_FRAME_DIMENSION_NOTE,
+  CANVAS_IDENTITY_NOTE,
   CANVAS_ORDER_NOTE,
+  IMAGE_CANVAS_FRAME_KEY,
+  IMAGE_EXPORT_SIZE_KEY,
+  IMAGE_REQUESTED_SIZE_KEY,
+  IMAGE_SIZE_KEYS,
+  IMAGE_SIZE_NOTE,
+  IMAGE_SOURCE_PIXELS_KEY,
   buildCanvasSceneIndex,
   compactSceneEntry,
   queryCanvasScene,
@@ -39,6 +46,11 @@ describe("canvas scene index", () => {
     expect(context.length).toBeLessThanOrEqual(800);
     expect(context).toContain("Coverage: globalMapComplete=true; detailTruncated=true");
     expect(context).toContain("use inspect_canvas with filters and revision-bound cursor");
+    // A budget smaller than the mandatory notes yields the notes, not a body that
+    // pushed them off the end: publishing the size/identity rule is the point.
+    expect(context).toContain(IMAGE_REQUESTED_SIZE_KEY);
+    expect(context).toContain(IMAGE_SOURCE_PIXELS_KEY);
+    expect(context).not.toContain("Representative details");
   });
 
   it("exposes authenticated image asset identity in representative context without image bytes or URLs", () => {
@@ -136,11 +148,94 @@ describe("canvas scene index", () => {
     const context = renderCanvasSceneContext(index)!;
     expect(context).toContain("canvasIndex=0");
     expect(context).toContain("canvasFrame=381x512");
-    // The two semantics lines must survive even a tight character budget,
+    // The three semantic lines must survive even a tight character budget,
     // because they are exactly what the wrong answer omitted.
     expect(context).toContain(CANVAS_FRAME_DIMENSION_NOTE);
     expect(context).toContain(CANVAS_ORDER_NOTE);
-    expect(renderCanvasSceneContext(index, [], 800)).toContain(CANVAS_FRAME_DIMENSION_NOTE);
+    expect(context).toContain(CANVAS_IDENTITY_NOTE);
+    // A budget smaller than the mandatory notes still states the four sizes and
+    // the identity rule — in their short forms — rather than truncating them.
+    const tight = renderCanvasSceneContext(index, [], 800)!;
+    expect(tight.length).toBeLessThanOrEqual(800);
+    expect(tight).toContain("image_requested_frame");
+    expect(tight).toContain("image_export_size");
+  });
+
+  it("states all four image sizes with their sources and never lets the frame stand in for the pixels", () => {
+    // Four numbers legitimately describe this one image: what the user asked for
+    // (①), the 880x1184 the model produced (②), the 381x512 the canvas displays
+    // (③), and whatever an export eventually renders (④). The canvas layer knows
+    // only ③, so it must name the other three as not-answerable rather than omit
+    // them — an absent key reads as "none", and a present unlabelled one reads as
+    // pixels, which is the defect being locked out here.
+    const index = buildCanvasSceneIndex([
+      element("poster", 0, { type: "image", x: 80, y: 80, width: 381, height: 512,
+        customData: { assetId: "70000000-0000-4000-8000-000000000010" } }),
+      element("note", 1, { type: "text", text: "hero copy", width: 200, height: 40 }),
+    ]);
+    const image = compactSceneEntry(index.entries[0]!);
+    expect(image).toMatchObject({
+      [IMAGE_CANVAS_FRAME_KEY]: { width: 381, height: 512, source_of_truth: "canvas element display frame" },
+      // ②③④ are explicit unknowns at this layer.
+      [IMAGE_SOURCE_PIXELS_KEY]: null,
+      [IMAGE_REQUESTED_SIZE_KEY]: null,
+      [IMAGE_EXPORT_SIZE_KEY]: null,
+    });
+    // The nested frame object is the only place the image's numbers live.
+    expect(image).not.toHaveProperty("width");
+    expect(image).not.toHaveProperty("height");
+    // Every non-image element still carries a display frame, but never as an
+    // "image" size.
+    const text = compactSceneEntry(index.entries[1]!);
+    expect(text).toMatchObject({ canvas_frame_width: 200, canvas_frame_height: 40 });
+    expect(text).not.toHaveProperty(IMAGE_CANVAS_FRAME_KEY);
+    expect(text).not.toHaveProperty(IMAGE_SOURCE_PIXELS_KEY);
+
+    for (const note of [IMAGE_SIZE_NOTE, CANVAS_FRAME_DIMENSION_NOTE, String(image.image_size_authority)]) {
+      for (const key of IMAGE_SIZE_KEYS) expect(note).toContain(key);
+    }
+    expect(IMAGE_SIZE_NOTE).toContain("NOT the image's pixels");
+    expect(IMAGE_SIZE_NOTE).toContain("never derivable");
+    const context = renderCanvasSceneContext(index)!;
+    for (const key of IMAGE_SIZE_KEYS) expect(context).toContain(key);
+  });
+
+  it("numbers canvas images by stable id and states that the ordinal is order, not identity", () => {
+    // The checklist item: 图片编号和顺序也应该绑定稳定的 asset ID，不能靠位置猜测.
+    // An ordinal shifts as soon as an image is inserted above, so it can order a
+    // listing but can never be an image's identity.
+    const scene = [
+      element("frame-a", 0, { type: "frame" }),
+      element("poster", 1, { type: "image", x: 80, y: 80, width: 381, height: 512,
+        customData: { assetId: "70000000-0000-4000-8000-000000000010" } }),
+      // A canvas file with no authenticated asset behind it: the listing must say
+      // so instead of implying an asset identity it does not have.
+      element("loose-png", 2, { type: "image", x: 501, y: 80, width: 300, height: 300 }),
+    ];
+    const index = buildCanvasSceneIndex(scene);
+    const [poster, loose] = [index.entries[1]!, index.entries[2]!];
+    expect(poster).toMatchObject({ ordinal: 1, id: "poster", hasAssetId: true,
+      assetIdentitySource: "customData.assetId", assetId: "70000000-0000-4000-8000-000000000010" });
+    expect(loose).toMatchObject({ ordinal: 2, id: "loose-png", hasAssetId: false, assetIdentitySource: "unbacked" });
+    expect(loose).not.toHaveProperty("assetId");
+
+    const context = renderCanvasSceneContext(index)!;
+    expect(context).toContain("assetId=70000000-0000-4000-8000-000000000010");
+    expect(context).toContain("identity=assetId+element_id");
+    expect(context).toContain("assetIdentity=unbacked(no authenticated asset id");
+    expect(context).toContain(CANVAS_IDENTITY_NOTE);
+    // The negative claim: the ordinal is never presented as the reference. A
+    // context that said "image 1" without saying whose id that is would pass a
+    // naive id test and still fail this one.
+    expect(context).not.toMatch(/canvasIndex=\d+[^\n]*\bidentity=canvasIndex/);
+    expect(CANVAS_IDENTITY_NOTE).toContain("presentation order only");
+    expect(CANVAS_IDENTITY_NOTE).toContain("unbacked");
+
+    // Reordering the document shifts canvas_index while both ids stay put: the
+    // ordinal is not an identity, and the identity is not derived from position.
+    const reordered = buildCanvasSceneIndex([scene[1]!, scene[0]!, scene[2]!]);
+    expect(reordered.entries.find(entry => entry.id === "poster")).toMatchObject({ ordinal: 0 });
+    expect(reordered.entries.find(entry => entry.id === "loose-png")).toMatchObject({ ordinal: 2 });
   });
 
   it("returns the identical canvas order for two reads of the same scene, including same-size images", () => {

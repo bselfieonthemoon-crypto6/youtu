@@ -1,15 +1,19 @@
 import { z } from "zod";
 import {
-  CANVAS_FRAME_DIMENSION_NOTE,
+  CANVAS_IDENTITY_NOTE,
   CANVAS_ORDER_NOTE,
   buildCanvasSceneIndex,
   compactSceneEntry,
   queryCanvasScene,
   renderCanvasSceneContext,
+  validatedImageSizeNotes,
   type CanvasSceneIndex,
   type CanvasSceneIndexEntry,
 } from "../canvas-scene-index.js";
 import { createAgentTool, runContextOf } from "./tool-run-context.js";
+
+/** Checked once at import, like the scene renderer's own copy. */
+const SIZE_NOTES = validatedImageSizeNotes("inspect_canvas");
 
 const regionSchema = z.object({
   min_x: z.number().finite(), min_y: z.number().finite(),
@@ -61,7 +65,7 @@ export function buildCanvasSummaryForContext(
 export function createInspectCanvasTool(deps: { createUserClient: (accessToken: string) => any }) {
   return createAgentTool({
     id: "inspect_canvas",
-    description: "Inspect a revision-bound global index of the current infinite canvas. Every response states source coverage, malformed/duplicate facts, global spatial regions and pagination truncation. Query all live elements safely by exact ID, text, type, group or finite region; follow nextCursor without changing filters. A cursor fails if the canvas revision changes, preventing mixed snapshots. Selected elements can be prioritized but selection is read-only evidence, not write permission. Elements are always returned in stable canvas order (canvas_index); canvas_frame_width/height is the canvas display frame, never an image's source pixel size — read dimensions.note for where the real pixels come from.",
+    description: "Inspect a revision-bound global index of the current infinite canvas. Every response states source coverage, malformed/duplicate facts, global spatial regions and pagination truncation. Query all live elements safely by exact ID, text, type, group or finite region; follow nextCursor without changing filters. A cursor fails if the canvas revision changes, preventing mixed snapshots. Selected elements can be prioritized but selection is read-only evidence, not write permission. Elements are always returned in stable canvas order (canvas_index) and every element's durable identity is its id (with assetId when the canvas carries one) — canvas_index is presentation order only, never an image's identity. For images, image_canvas_frame/image_source_pixels/image_requested_frame/image_export_size state all four sizes and which of them this surface can answer; read dimensions.note for where the other three really live.",
     inputSchema: inspectCanvasSchema,
     execute: async (input, context) => {
     const runContext = runContextOf(context);
@@ -105,9 +109,10 @@ export function createInspectCanvasTool(deps: { createUserClient: (accessToken: 
       coverage: index.coverage,
       // A status answer reported an element's canvas display frame (381x512) as
       // an 880x1184 PNG's "实际像素". The canvas document cannot answer that
-      // question, so every response states what its numbers mean and where the
-      // real pixels live instead of leaving `width`/`height` to be guessed at.
-      dimensions: { note: CANVAS_FRAME_DIMENSION_NOTE, order: CANVAS_ORDER_NOTE },
+      // question, so every response states what its numbers mean, where the real
+      // pixels live, and that the element id — not canvas_index — is the durable
+      // reference to this image.
+      dimensions: { note: SIZE_NOTES.long, order: CANVAS_ORDER_NOTE, identity: CANVAS_IDENTITY_NOTE },
       duplicateIds: index.duplicateIds.slice(0, 50), danglingRelations: index.danglingRelations,
       globalMap: { bounds: index.bounds, regions: index.regions },
       query: { matchedCount: result.matchedCount, returnedCount: result.returnedCount,

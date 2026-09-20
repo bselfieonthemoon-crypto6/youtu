@@ -2,11 +2,16 @@ import { createHash } from 'node:crypto';
 import { lstat, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+// The contract constant, not a second copy of the number: the runtime reader
+// enforces this same cap, and a seeded row it rejects silently degrades to the
+// package description (the exact fallback `whenToUse` exists to replace).
+import { SKILL_WHEN_TO_USE_MAX_CHARS } from '../packages/shared/dist/skill-runtime-contracts.js';
 
 export const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const MIGRATION_PATH = 'supabase/migrations/20260909000013_skill_library_composition.sql';
 const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const TOOL = /^[a-z][a-z0-9_]*$/;
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/;
 const sha256 = value => createHash('sha256').update(value).digest('hex');
 const fail = message => { throw new Error(message); };
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -24,6 +29,20 @@ function strings(value, label, { minimum = 0, pattern } = {}) {
 function text(value, label, maximum = 2000) {
   if (typeof value !== 'string' || !value.trim() || value.length > maximum) fail(`${label}: invalid text`);
 }
+/**
+ * Model-facing selection text (`whenToUse`). The runtime reader trims the value
+ * and rejects blank or over-long text, so those rows fall back to the package
+ * description instead of reaching the model; validating the same rules here
+ * keeps the seeded catalog from containing text the runtime will refuse. The
+ * value is reprinted on one line of the always-on catalog, so control
+ * characters (which can forge an extra line) are refused as well.
+ */
+function selection(value, label) {
+  if (typeof value !== 'string' || !value.trim()) fail(`${label}: invalid text`);
+  if (value !== value.trim()) fail(`${label}: text must be trimmed`);
+  if (value.length > SKILL_WHEN_TO_USE_MAX_CHARS) fail(`${label}: text exceeds ${SKILL_WHEN_TO_USE_MAX_CHARS} characters`);
+  if (CONTROL_CHARACTERS.test(value)) fail(`${label}: text contains control characters`);
+}
 
 export function validateManifest(manifest, expectedSlug, bundle) {
   keys(manifest, ['slug', 'name', 'description', 'version', 'category', 'iconName', 'license', 'metadata'], expectedSlug);
@@ -37,13 +56,16 @@ export function validateManifest(manifest, expectedSlug, bundle) {
   const meta = manifest.metadata.loomic;
   keys(meta, ['schemaVersion', 'execution', 'intents', 'outputKinds', 'requiredTools', 'optionalTools', 'models', 'limitations', 'examples', 'sources',
     ...('composition' in meta ? ['composition'] : []), ...('capabilities' in meta ? ['capabilities'] : []),
-    ...('attachWorkspaceLibrary' in meta ? ['attachWorkspaceLibrary'] : []), ...('routing' in meta ? ['routing'] : [])], `${expectedSlug}.loomic`);
+    ...('attachWorkspaceLibrary' in meta ? ['attachWorkspaceLibrary'] : []), ...('routing' in meta ? ['routing'] : []),
+    ...('whenToUse' in meta ? ['whenToUse'] : [])], `${expectedSlug}.loomic`);
   if (meta.capabilities !== undefined) strings(meta.capabilities, `${expectedSlug}.capabilities`, { minimum: 1, pattern: /^[a-z][a-z0-9-]*$/ });
   if (meta.attachWorkspaceLibrary !== undefined && typeof meta.attachWorkspaceLibrary !== 'boolean') fail(`${expectedSlug}: attachWorkspaceLibrary must be a boolean`);
+  if (meta.whenToUse !== undefined) selection(meta.whenToUse, `${expectedSlug}.whenToUse`);
   if (meta.routing !== undefined) {
-    keys(meta.routing, ['keywords', 'priority'], `${expectedSlug}.routing`);
+    keys(meta.routing, ['keywords', 'priority', ...('tier' in meta.routing ? ['tier'] : [])], `${expectedSlug}.routing`);
     strings(meta.routing.keywords, `${expectedSlug}.routing.keywords`, { minimum: 1 });
     if (!Number.isInteger(meta.routing.priority) || meta.routing.priority < 0 || meta.routing.priority > 1000) fail(`${expectedSlug}: invalid routing priority`);
+    if (meta.routing.tier !== undefined && !['primary', 'helper'].includes(meta.routing.tier)) fail(`${expectedSlug}: invalid routing tier`);
   }
   if (meta.composition) {
     keys(meta.composition, ['role', 'stages'], `${expectedSlug}.composition`);
@@ -195,20 +217,25 @@ export function generateMigration({ catalog, rows }) {
 }
 
 export function decodeMigrationPayload(migration) {
-  const match = /entries jsonb := (\$design_catalog_[0-9a-f]{16}\$)([\s\S]*?)\1::jsonb;/.exec(migration);
+  // A checkout with CRLF line endings (git core.autocrlf on Windows) must
+  // decode to the same payload: the JSON payload is a single line whose
+  // newlines are already escaped, so normalizing the surrounding SQL text
+  // cannot change its bytes or its checksum.
+  const text = migration.replace(/\r\n/g, '\n');
+  const match = /entries jsonb := (\$design_catalog_[0-9a-f]{16}\$)([\s\S]*?)\1::jsonb;/.exec(text);
   if (!match) fail('Missing generated migration payload');
   const payload = JSON.parse(match[2]);
   const hash = sha256(match[2]);
-  if (!migration.includes(`-- Content SHA256: ${hash}\n`)) fail('Migration payload checksum mismatch');
+  if (!text.includes(`-- Content SHA256: ${hash}\n`)) fail('Migration payload checksum mismatch');
   return payload;
 }
 
 export async function checkCatalog(repositoryRoot = REPOSITORY_ROOT) {
   const data = await readCatalog(repositoryRoot);
   const expected = generateMigration(data);
-  const actual = await readFile(path.join(repositoryRoot, MIGRATION_PATH), 'utf8');
+  const actual = (await readFile(path.join(repositoryRoot, MIGRATION_PATH), 'utf8')).replace(/\r\n/g, '\n');
   decodeMigrationPayload(actual);
-  if (actual.replace(/\r\n/g, '\n') !== expected) fail('Generated migration is stale; run node scripts/build-design-skill-catalog.mjs --write');
+  if (actual !== expected) fail('Generated migration is stale; run node scripts/build-design-skill-catalog.mjs --write');
   return data;
 }
 

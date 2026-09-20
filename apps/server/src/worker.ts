@@ -11,6 +11,7 @@ if (process.env.GLOBAL_AGENT_HTTP_PROXY) {
 }
 
 import { randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import { loadServerEnv } from "./config/env.js";
 import {createBackgroundMaintenance} from './background-maintenance.js';
 import {
@@ -82,12 +83,14 @@ import {
 } from "./generation/providers/workspace-provider-resolver.js";
 
 // 代码执行由 LocalShellBackend 的内置 execute 工具直接处理，不走 PGMQ。
-export const WORKER_QUEUES = [
-  "image_generation_jobs",
-  "video_generation_jobs",
-  "design_preview_jobs",
-  "design_export_jobs",
-] as const;
+// The queue list lives in `./queue/queues.ts` so the health probe can name the
+// same queues without importing this entry point (which starts polling loops).
+export { WORKER_QUEUES } from "./queue/queues.js";
+import { WORKER_QUEUES } from "./queue/queues.js";
+import {
+  startWorkerHeartbeat,
+  type WorkerHeartbeatWriter,
+} from "./worker-heartbeat.js";
 
 const QUEUE_TO_TYPE: Record<string, BackgroundJobType> = {
   image_generation_jobs: "image_generation",
@@ -185,11 +188,24 @@ async function main() {
     1,
     Math.floor((env.workerPollIntervalMs ?? 5000) / 1000),
   );
-  const workerId = env.workerId ?? randomUUID().slice(0, 8);
+  // WORKER_ID is set by the startup scripts (see `dev:workers:2/3`); when it is
+  // absent the id is DERIVED once per process from the host name plus a random
+  // suffix, and logged so the heartbeat row can be traced back to this process.
+  const workerId = env.workerId ?? `${hostname().slice(0, 12)}-${randomUUID().slice(0, 8)}`;
   const tag = `[worker:${workerId}]`;
 
   let running = true;
   let designResourceImportPoll: Promise<void> = Promise.resolve();
+
+  // Liveness for `/api/health`. Without this the API cannot distinguish "no work
+  // queued" from "no worker consuming", which is why the health check reported a
+  // healthy stack while queued jobs never ran.
+  const heartbeat: WorkerHeartbeatWriter = startWorkerHeartbeat({
+    getAdminClient,
+    onError: (error) => console.error(`${tag} Heartbeat write failed:`, error),
+    version: env.version,
+    workerId,
+  });
 
   // Graceful shutdown — wait for in-flight jobs then exit
   const shutdown = async () => {
@@ -201,6 +217,7 @@ async function main() {
       `${tag} Shutting down, waiting for ${totalInFlight} in-flight jobs...`,
     );
     running = false;
+    heartbeat.stop();
     const allTasks = [...inFlightByQueue.values()].flatMap((s) => [...s]);
     if (allTasks.length > 0) {
       await Promise.allSettled(allTasks);
@@ -217,7 +234,7 @@ async function main() {
     (q) => `${q}=${CONCURRENCY_BY_QUEUE[q] ?? 1}`,
   ).join(", ");
   console.log(
-    `${tag} Started. concurrency={${concurrencyDesc}}, longPollTimeout=${pollTimeoutSeconds}s`,
+    `${tag} Started. concurrency={${concurrencyDesc}}, longPollTimeout=${pollTimeoutSeconds}s, heartbeat=${env.workerId ? "WORKER_ID" : "derived"}`,
   );
 
   let lastCanvasReconcileAt = 0;

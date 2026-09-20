@@ -6,7 +6,12 @@ import { finalizeImageJobToCanvas, finalizeTerminalImageJobPlaceholder } from ".
 import { createMastraImageJobSubmitter as createRawMastraImageJobSubmitter,
   MastraImagePreflightError, mastraImageSubmissionKey, type MastraImageJobContext } from "./mastra-image-jobs.js";
 
-vi.mock("../features/canvas/canvas-element-writer.js", () => ({
+// Spread the REAL module: a plain factory also hid the label constants, and reading
+// one from the mocked module throws "No ... export is defined on the mock" — the same
+// test-only breakage the finalizer's own suite hit when the canceled label became a
+// shared constant. Only the writers are replaced.
+vi.mock("../features/canvas/canvas-element-writer.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../features/canvas/canvas-element-writer.js")>()),
   insertImageGenerationPlaceholder: vi.fn(async () => ({ elementId: "placeholder", placement: { x: 0, y: 0, width: 512, height: 512 } })),
   markImageGenerationPlaceholderFailed: vi.fn(async () => true),
   insertImageElement: vi.fn(async () => ({ elementId: "completed-image", inserted: true })),
