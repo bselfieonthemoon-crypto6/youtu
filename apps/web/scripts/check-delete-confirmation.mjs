@@ -395,7 +395,18 @@ async function waitForDeleteCard(page, sessionId, known = new Set(), timeoutMs =
 }
 
 function cardRoot(page) {
-  return page.locator("div").filter({ hasText: DELETE_TITLE }).last();
+  // The innermost container that holds BOTH the card's title and its confirm button.
+  //
+  // Filtering on the title alone and taking `.last()` returned the title's OWN div,
+  // which does not contain the controls (they live in a sibling block), so every
+  // scoped button query resolved to ZERO elements while the page had clearly
+  // rendered them — the probe then reported the whole execution phase as a product
+  // failure. Adding the `has:` filter keeps the intent (scope to one card, so a card
+  // left pending by another phase cannot satisfy the query) without the false zero.
+  return page.locator("div")
+    .filter({ hasText: DELETE_TITLE })
+    .filter({ has: page.getByRole("button", { name: CONFIRM_LABEL, exact: true }) })
+    .last();
 }
 
 async function waitForCardText(root, text, timeoutMs) {
